@@ -122,6 +122,25 @@ const codexSubagentPreamble = "[SUBAGENT · 直接执行] 你是被任务队列�
 	"结论/verdict/交付报告)，绝不以工具调用或中途推理结束回合，绝不把回合耗在读框架文档上。\n" +
 	"────────────────────────────────────────\n\n"
 
+// resolveCodexModel 决定一次 codex 执行用哪个模型。优先序：
+//  1. XCodexModel——交叉链入队冻结的引擎身份，恒最高（防入队后改配置静默换引擎）；
+//  2. 卡级 CodexModel（-codex-model 钉定）——用户显式意图，主跑/降级两径都尊重；
+//  3. 降级径的 config.codex_fallback_model——仅当卡不是 codex 主跑（runner_pref≠codex）
+//     且非远端（远端无降级径）：即 claude 卡被 codex_fallback 改道时（档位对等：opus→terra）；
+//  4. 全局 codex_model。
+func resolveCodexModel(cfg *Config, t *Task) string {
+	if t.XCodexModel != "" {
+		return t.XCodexModel
+	}
+	if t.CodexModel != "" {
+		return t.CodexModel
+	}
+	if t.PreferRunner != "codex" && t.RemoteHost == "" && cfg.CodexFallbackModel != "" {
+		return cfg.CodexFallbackModel
+	}
+	return cfg.CodexModel
+}
+
 func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	sandbox := "read-only"
 	var extra []string
@@ -135,12 +154,8 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	args := []string{"exec", "-C", t.Dir, "--sandbox", sandbox, "--skip-git-repo-check",
 		"--color", "never", "-o", outFile}
 	args = append(args, extra...)
-	// 模型：任务级冻结的 XCodexModel 优先（交叉链入队时钉死，防执行时被改/清），空才回落全局。
-	codexModel := t.XCodexModel
-	if codexModel == "" {
-		codexModel = cfg.CodexModel
-	}
-	if codexModel != "" {
+	// 模型：见 resolveCodexModel 优先序（交叉冻结 > 卡级钉定 > 降级专用 > 全局）。
+	if codexModel := resolveCodexModel(cfg, t); codexModel != "" {
 		args = append(args, "-m", codexModel)
 	}
 	// 思考等级：任务级 Effort 优先（交叉验证的 codex 卡据此跑指定档，如 max），空则回落全局 codex_reasoning。
@@ -314,10 +329,7 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	} else if rh.Reasoning != "" {
 		remoteCmd += " -c model_reasoning_effort=" + rh.Reasoning
 	}
-	codexModel := t.XCodexModel
-	if codexModel == "" {
-		codexModel = cfg.CodexModel
-	}
+	codexModel := resolveCodexModel(cfg, t)
 	if codexModel != "" {
 		remoteCmd += " -m " + codexModel
 	}
@@ -941,7 +953,9 @@ type emitTask struct {
 	ReviewAfter bool     `json:"review_after"`
 	FreshSteps  bool     `json:"fresh_steps"`
 	Runner      string   `json:"runner"`
-	Prompts     []string `json:"prompts"`
+	// CodexModel 卡级钉定 codex 模型（runner=codex 时随卡生效，档位对等制下协调器可按档发 terra/luna）。
+	CodexModel string   `json:"codex_model"`
+	Prompts    []string `json:"prompts"`
 	// 模型常见的字段名漂移，做别名容错：steps=[...] / prompt="..." / 标题写成 role 或 id。
 	Steps  []string `json:"steps"`
 	Prompt string   `json:"prompt"`
@@ -1608,6 +1622,11 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 			nt.PreferRunner = "codex"
 			if !codexEligible(nt) {
 				nt.PreferRunner = ""
+			}
+			// 卡级 codex 模型随卡（档位对等制：协调器按档发 terra/luna）。仅 codex 卡收——
+			// claude 卡想钉降级模型走 add 的 -codex-model，emit 契约不扩这条少用径。
+			if nt.PreferRunner == "codex" {
+				nt.CodexModel = s.CodexModel
 			}
 		}
 		if s.Model != "" {

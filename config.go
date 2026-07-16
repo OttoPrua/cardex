@@ -59,6 +59,10 @@ type Config struct {
 	// 带会话的多步任务仍等 claude 重置（跨 CLI 无法延续上下文）。
 	CodexBin      string `json:"codex_bin"`
 	CodexFallback bool   `json:"codex_fallback"`
+	// CodexFallbackModel 降级专用模型：claude 卡经 codex_fallback 改道 codex 时用它
+	// （档位对等映射：opus 档降级首选同档的 terra 而非设计档的 sol——设计档不降去干实现档活）。
+	// 空 = 沿用全局 codex_model。仅降级径生效；runner_pref=codex 主跑与远端 codex 不受影响。
+	CodexFallbackModel string `json:"codex_fallback_model,omitempty"`
 	CodexModel    string `json:"codex_model,omitempty"`
 	// CodexReasoning 透传 -c model_reasoning_effort，空则用 codex 默认。合法档位（实测 codex 0.144.1，
 	// 由低到高）：minimal < low < medium < high < xhigh < max < ultra（ultra 是多代理委派特档）。

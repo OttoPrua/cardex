@@ -40,6 +40,11 @@ type Task struct {
 	// PreferRunner 为 "codex" 时任务钉在 codex 上执行（不管 claude 忙闲），
 	// 用独立的 GPT 额度跑填充类任务；要求任务满足 codexEligible（fresh 或单步无会话）。
 	PreferRunner string `json:"runner_pref,omitempty"`
+	// CodexModel 钉定本卡经 codex 执行时的具体模型（-codex-model，如 gpt-5.6-terra）。
+	// 两条路径生效：①runner_pref=codex 主跑；②claude 卡触发 codex_fallback 降级改道。
+	// 空 = 按径回落（降级径先看 config.codex_fallback_model，再全局 codex_model；主跑径直接全局）。
+	// 交叉链卡的 XCodexModel（入队冻结的引擎身份）恒优先于本字段。
+	CodexModel string `json:"codex_model,omitempty"`
 	// RemoteHost 非空时任务在该远程主机执行（SSH → 远端 codex），键入 Config.RemoteHosts。
 	// 让远端机器进编排（跨机 dev）；要求 remoteEligible（单步/fresh、无 claude 会话）。
 	RemoteHost string `json:"remote_host,omitempty"`

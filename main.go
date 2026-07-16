@@ -205,6 +205,7 @@ func cmdAdd(args []string) error {
 	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
 	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
+	codexModel := fs.String("codex-model", "", "钉定经 codex 执行时的模型（如 gpt-5.6-terra）：配 -runner codex 主跑生效；不配 runner 时作为本卡 codex_fallback 降级模型")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
 	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
@@ -286,7 +287,13 @@ func cmdAdd(args []string) error {
 		if cfg.CodexBin == "" {
 			return fmt.Errorf("config.json 未配置 codex_bin，无法钉定 codex 执行器")
 		}
+		// -model 对 codex 引擎是零效 no-op（claude 专用旗标）——报错防"以为设了模型"的误导，
+		// 与交叉引擎 profile 校验同一原则；codex 模型请用 -codex-model。
+		if *model != "" {
+			return fmt.Errorf("-runner codex 的模型请用 -codex-model 指定（-model 是 claude 专用旗标，对 codex 无效）")
+		}
 	}
+	t.CodexModel = strings.TrimSpace(*codexModel)
 	if *host != "" {
 		t.RemoteHost = *host
 		if !codexEligible(t) {

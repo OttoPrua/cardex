@@ -86,6 +86,14 @@ type Config struct {
 	CrossProfiles map[string]CrossProfile `json:"cross_profiles,omitempty"`
 	// DefaultCrossProfile: `claudego cross` 未指定 -profile 时用的 profile 名。
 	DefaultCrossProfile string `json:"default_cross_profile,omitempty"`
+
+	// ---- 默认复审分流（把只读复审负载默认压到第二台机器，均衡两侧额度）----
+	// DefaultReviewHost 非空时：本地实现卡（RemoteHost 空）的 review_after 自动复审、未显式声明 ReviewHost 者，
+	// 默认分流到该主机（RemoteHosts 的键）。RemoteMirrorRoot 是远端镜像根，自动推导 ReviewDir=<root>/<worktree 名>；
+	// DefaultReviewSync 是分流前跑的同步命令（sh -c，cwd=实现卡 Dir），把本地泳道同步到远端镜像。三者齐备才生效。
+	DefaultReviewHost string `json:"default_review_host,omitempty"`
+	RemoteMirrorRoot  string `json:"remote_mirror_root,omitempty"`
+	DefaultReviewSync string `json:"default_review_sync,omitempty"`
 }
 
 // CrossEngine 描述交叉验证链中一个引擎的执行位置（模型来源可切换的落点）。

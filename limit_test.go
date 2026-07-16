@@ -75,3 +75,40 @@ func TestParseResetEpochClockPhrase(t *testing.T) {
 		t.Errorf("回退等待: got %d, want %d", got, want)
 	}
 }
+
+// 跨天（周限额）措辞：实战 429 "resets Jul 16 at 1am"——旧 resetTimeRe 跨不过 "Jul 16 at"
+// → 落 30min 回退，每 30min 空转到真解冻。回归此坑。
+func TestParseResetEpochCrossDay(t *testing.T) {
+	cfg := &Config{LimitFallbackMin: 30, CooldownMarginSec: 90}
+	loc := time.FixedZone("Asia/Shanghai", 8*3600)
+	now := time.Date(2026, 7, 13, 14, 23, 0, 0, loc)
+
+	got := parseResetEpoch("You've hit your limit · resets Jul 16 at 1am (Asia/Shanghai)", cfg, now)
+	want := time.Date(2026, 7, 16, 1, 0, 0, 0, loc).Unix() + 90
+	if got != want {
+		t.Errorf("跨天解析: got %s, want %s", time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+
+	// 带 :MM 与序数日 + "on" + 跨月（窗口内）
+	julEndNow := time.Date(2026, 7, 30, 10, 0, 0, 0, loc)
+	got = parseResetEpoch("resets on Aug 3rd at 9:30pm", cfg, julEndNow)
+	want = time.Date(2026, 8, 3, 21, 30, 0, 0, loc).Unix() + 90
+	if got != want {
+		t.Errorf("序数日+分钟: got %s, want %s", time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+
+	// 跨年：年末读到次年 1 月初的重置 → 滚到明年（1 月的日期本年已过，AddDate(1)）
+	decNow := time.Date(2026, 12, 30, 12, 0, 0, 0, loc)
+	got = parseResetEpoch("resets Jan 2 at 1am", cfg, decNow)
+	want = time.Date(2027, 1, 2, 1, 0, 0, 0, loc).Unix() + 90
+	if got != want {
+		t.Errorf("跨年滚动: got %s, want %s", time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+
+	// 越界（>14 天）不轻信 → 回退等待，不误锁多日
+	got = parseResetEpoch("resets Sep 1 at 1am", cfg, now)
+	want = now.Add(30*time.Minute).Unix() + 90
+	if got != want {
+		t.Errorf("越界回退: got %d, want %d", got, want)
+	}
+}

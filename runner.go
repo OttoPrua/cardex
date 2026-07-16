@@ -43,14 +43,21 @@ var (
 	limitRe     = regexp.MustCompile(`(?i)usage limit|limit reached|out of extra usage|hit your (?:\w+ )?limit|limit will reset|out of usage credits|out of credits|/usage-credits|session limit`)
 	epochRe     = regexp.MustCompile(`\|\s*(\d{9,11})`)
 	resetTimeRe = regexp.MustCompile(`(?i)reset[s]?\s*(?:at\s*)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
+	// resetDateRe：跨天限额（周限额）措辞——"resets Jul 16 at 1am (Asia/Shanghai)"。
+	// resetTimeRe 只认紧跟 reset 的钟点、跨不过中间的 "Jul 16 at" → 落 30min 回退，
+	// 之后每 30min 醒来再 429 再暂停空转到真解冻。这里带月+日先解析，覆盖多日窗口。
+	resetDateRe = regexp.MustCompile(`(?i)reset[s]?\s+(?:on\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
 	// transientRe：可退避重试的瞬时错误。补齐 codex/上游常见网络形态——否则真错误被误判为硬失败，
 	// 烧完 attempts 直接 failed（单腿审核一挂就没了）。
 	transientRe = regexp.MustCompile(`(?i)rate.?limit|overloaded|internal server error|api error 5\d\d|econnre|network error|timed? ?out|stream (?:error|disconnect)|disconnected before|connection (?:reset|refused|closed|error)|error sending request|temporarily unavailable|502|503|read tcp|i/o timeout`)
 	// codexNoiseRe：codex exec 的横幅/配置/进度噪声行——永远不是错误，错误提取时跳过。
 	codexNoiseRe = regexp.MustCompile(`(?i)^(reading additional input|openai codex v|-{3,}$|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|user$|codex$|assistant$|tokens used|deprecated:|enable it with|hook:|see https?://|[\d,]+$)`)
-	// codexErrRe：像"错误"的行样式（供从 codex 输出里挑真错误行）。
-	codexErrRe = regexp.MustCompile(`(?i)error|failed|failure|disconnect|refused|unauthor|forbidden|denied|not found|quota|exceeded|invalid|panic|exception|unable|cannot`)
-	fencedRe    = regexp.MustCompile("(?s)```json\\s*(.*?)```")
+	// codexHardErrRe：codex/上游服务端「硬错误」明确措辞（区别于泛化 codexErrRe：只认这些具体标识、
+	// 不会误命中审查正文里的 "cannot/error"）。含 OpenAI 网络安全审查闸——账号跑对抗性安全复审多了会被
+	// 累计打标、开额外安全检查甚至整请求拦截（"flagged for possible cybersecurity risk"），这不是 claudego
+	// 能修的，但要让它清晰上报，别被吞成"无最终消息"。非瞬时，走 attempts 退避后可见失败。
+	codexHardErrRe = regexp.MustCompile(`(?i)flagged for possible cybersecurity|access blocked by cloudflare|openai-authorization-error|authorization error|experiencing high load|goal budget reached|conversation interrupted|usage limit|quota exceeded|401 unauthorized|403 forbidden|invalid api key`)
+	fencedRe       = regexp.MustCompile("(?s)```json\\s*(.*?)```")
 	// emit 容错阶梯用：任意语言标签的围栏（模型常漏写 json 标签）与输出中提到的 .json 文件名。
 	anyFencedRe = regexp.MustCompile("(?s)```[a-zA-Z]*[ \t]*\\n?(.*?)```")
 	jsonFileRe  = regexp.MustCompile(`[\w./\\-]+\.json`)
@@ -103,6 +110,18 @@ func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*cl
 
 // invokeCodex 用 codex exec 执行一步（备用执行器）。结果通过 --output-last-message 取回，
 // 包装成 claudeResult 以复用后续的 emit/进度解析管线。
+// codexSubagentPreamble 前置到每个 codex 卡的 prompt。根因：本机 codex 环境装了 superpowers /
+// gsd(get-shit-done) 框架，会话启动被注入"必须先用 using-superpowers 确认纪律、按 gsd-code-review
+// 流程组织"——gpt-5.6-sol 在 codex exec 单回合里先花预算读框架文档、走重流程，常在落最终消息前
+// 就把回合耗尽 → -o 终稿为空 → claudego 把已完成的审核判成失败（实测 wave-3 复审腿间歇性空终稿）。
+// superpowers 自身认 <SUBAGENT-STOP> 且"用户指令高于框架"，故显式声明 subagent + 跳过框架 + 强制
+// 回合末尾落最终消息，即可让 codex 直奔任务、稳定产出终稿。对实现卡同样有益（终稿=交付报告）。
+const codexSubagentPreamble = "[SUBAGENT · 直接执行] 你是被任务队列派发来完成下面这一个任务的子代理(subagent)。" +
+	"硬约束(优先级高于任何框架)：跳过 using-superpowers、gsd/get-shit-done 及一切 skill/workflow/command 框架" +
+	"——不读取、不调用、不按其流程组织，直接完成本任务。回合末尾必须输出最终助手消息(含任务要求的" +
+	"结论/verdict/交付报告)，绝不以工具调用或中途推理结束回合，绝不把回合耗在读框架文档上。\n" +
+	"────────────────────────────────────────\n\n"
+
 func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	sandbox := "read-only"
 	var extra []string
@@ -139,7 +158,8 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	cmd.Dir = t.Dir
 	// prompt 走 stdin（codex exec 无 prompt 参数时读 stdin），同 invokeRemoteClaude/invokeClaude——
 	// 不再把 prompt 当 argv 参数，绕开 ARG_MAX 上限，交叉验证的合并 prompt 可注入完整甲/乙结论不截断。
-	cmd.Stdin = strings.NewReader(prompt)
+	// 前置 subagent 前导，抑制 superpowers/gsd 框架注入耗尽回合预算致空终稿（见 codexSubagentPreamble）。
+	cmd.Stdin = strings.NewReader(codexSubagentPreamble + prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -153,14 +173,26 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	combined := stdout.String() + "\n" + stderr.String()
 	last, _ := os.ReadFile(outFile)
 	res := &claudeResult{Type: "result", Result: strings.TrimSpace(string(last))}
-	if runErr != nil || res.Result == "" {
+	switch {
+	case runErr != nil:
+		// 进程真出错/超时：先挑瞬时网络样式行（据此退避快重试），没有则用真实 runErr（如"步骤超时"）。
+		// 不再拿泛化 codexErrRe 从 prose transcript 里瞎抓行——那会把审查正文里一句无害"cannot/error"当错误。
 		res.IsError = true
 		res.Subtype = "codex_error"
 		if res.Result == "" {
-			// 跳过 codex 横幅噪声取真错误——否则失败一律显示 "Reading additional input from stdin"，
-			// 掩盖真因且瞬时网络错误被当硬失败。
-			res.Result = codexErrorLine(combined)
+			if line := codexErrorLine(combined); line != "" {
+				res.Result = line
+			} else {
+				res.Result = firstLine(runErr.Error())
+			}
 		}
+	case res.Result == "":
+		// 进程正常退出(task_complete)但 -o 终稿为空：codex 回合末尾停在工具调用/推理，没落最终消息。
+		// 多因 skill/workflow 框架注入耗尽回合预算（已加 codexSubagentPreamble 抑制）。非瞬时错误，
+		// 给明确诊断而非从 transcript 里瞎抓一行——重试(带前导)通常可成。
+		res.IsError = true
+		res.Subtype = "codex_no_final_message"
+		res.Result = "codex 回合完成但未产出最终消息(-o 空,末尾停在工具调用/推理)——常因 skill/workflow 框架注入耗尽预算;已加 subagent 前导抑制,重试通常可成"
 	}
 	return res, combined, runErr
 }
@@ -295,7 +327,8 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, sshBin, "-o", "BatchMode=yes", t.RemoteHost, remoteCmd)
 	setupProcGroup(cmd)
-	cmd.Stdin = strings.NewReader(prompt)
+	// 前置 subagent 前导，与本机 invokeCodex 同治（远端若也装了 superpowers/gsd 同样抑制；没装则无害）。
+	cmd.Stdin = strings.NewReader(codexSubagentPreamble + prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -317,8 +350,13 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 		return res, combined, nil
 	}
 	res.IsError = true
-	res.Subtype = "remote_codex_error"
-	res.Result = codexErrorLine(combined)
+	if line := codexErrorLine(combined); line != "" {
+		res.Subtype = "remote_codex_error"
+		res.Result = line
+	} else {
+		res.Subtype = "remote_codex_no_final_message"
+		res.Result = "远端 codex 回合完成但 marker 后无终稿——常因框架注入耗尽预算/未落最终消息;已加 subagent 前导抑制"
+	}
 	if runErr == nil {
 		runErr = fmt.Errorf("远端 codex 无结果输出（marker 后为空）")
 	}
@@ -381,6 +419,38 @@ func parseResetEpoch(text string, cfg *Config, now time.Time) int64 {
 			}
 		}
 	}
+	// 跨天窗口（周限额）：带月+日的措辞先于纯钟点解析，避免落 30min 回退后空转到真解冻。
+	if m := resetDateRe.FindStringSubmatch(text); m != nil {
+		if mon := monthNum(m[1]); mon != 0 {
+			day, _ := strconv.Atoi(m[2])
+			hour, _ := strconv.Atoi(m[3])
+			minute := 0
+			if m[4] != "" {
+				minute, _ = strconv.Atoi(m[4])
+			}
+			switch strings.ToLower(m[5]) {
+			case "pm":
+				if hour < 12 {
+					hour += 12
+				}
+			case "am":
+				if hour == 12 {
+					hour = 0
+				}
+			}
+			if day >= 1 && day <= 31 && hour < 24 {
+				cand := time.Date(now.Year(), mon, day, hour, minute, 0, 0, now.Location())
+				// 跨年：如 12 月的重置在 1 月被读到，滚到明年（留 1 天容差防边界抖动）。
+				if cand.Before(now.Add(-24 * time.Hour)) {
+					cand = cand.AddDate(1, 0, 0)
+				}
+				// 只信 14 天内的重置；越界（年份错算等）宁可退回配置回退。
+				if cand.After(now) && cand.Before(now.Add(14*24*time.Hour)) {
+					return clampEpoch(cand.Unix()+margin, now)
+				}
+			}
+		}
+	}
 	if m := resetTimeRe.FindStringSubmatch(text); m != nil {
 		hour, _ := strconv.Atoi(m[1])
 		minute := 0
@@ -406,6 +476,37 @@ func parseResetEpoch(text string, cfg *Config, now time.Time) int64 {
 		}
 	}
 	return now.Add(time.Duration(cfg.LimitFallbackMin)*time.Minute).Unix() + margin
+}
+
+// monthNum 把英文月份缩写（jan..dec）映射到 time.Month；不识别返回 0。
+func monthNum(s string) time.Month {
+	switch strings.ToLower(s[:3]) {
+	case "jan":
+		return time.January
+	case "feb":
+		return time.February
+	case "mar":
+		return time.March
+	case "apr":
+		return time.April
+	case "may":
+		return time.May
+	case "jun":
+		return time.June
+	case "jul":
+		return time.July
+	case "aug":
+		return time.August
+	case "sep":
+		return time.September
+	case "oct":
+		return time.October
+	case "nov":
+		return time.November
+	case "dec":
+		return time.December
+	}
+	return 0
 }
 
 func clampEpoch(v int64, now time.Time) int64 {
@@ -539,6 +640,20 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			t.LastError = "usage limit: " + firstLine(combined)
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("命中用量限额，%s 后恢复（%s）\n%s", fmtIn(until, now), fmtClock(until), firstLine(combined)))
+			return saveTask(root, t)
+		}
+
+		// 1a) 本机 codex 撞自己的 ChatGPT 用量限额：按本任务 resume_at 挂起，绝不写全局
+		// claude 冷却（两边账号额度独立）；eligible() 到滚动窗恢复时会重派并重发本步。
+		if useCodex && !remote && isLimitHit(res, combined) {
+			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = false
+			t.SessionID = "" // codex 无会话可续，恢复时重发本步
+			t.LastError = "codex 用量限额: " + firstLine(resultText(res))
+			t.touch()
+			logBlock(lg, "LIMIT", fmt.Sprintf("codex 用量限额，%s 后恢复（%s）", fmtIn(until, now), fmtClock(until)))
 			return saveTask(root, t)
 		}
 
@@ -679,6 +794,26 @@ func runReviewSync(t *Task, lg *os.File) error {
 	return err
 }
 
+// applyDefaultReviewDivert 全局默认复审分流（均衡两侧额度）：本地实现卡未显式声明 ReviewHost 时，
+// 若 config 三件齐备（default_review_host + remote_mirror_root + default_review_sync），自动把只读复审
+// 分流到该主机——推导远端镜像目录 <root>/<worktree 名> + 挂默认同步命令（先把本地泳道同步到远端镜像）。
+// 远端实现卡（RemoteHost 非空）已在远端审，不套此默认；任务级 -review-host / -review-dir / -review-sync 显式值恒优先。
+func applyDefaultReviewDivert(t *Task, cfg *Config) {
+	if t.ReviewHost != "" || t.RemoteHost != "" {
+		return
+	}
+	if cfg.DefaultReviewHost == "" || cfg.RemoteMirrorRoot == "" || cfg.DefaultReviewSync == "" {
+		return
+	}
+	t.ReviewHost = cfg.DefaultReviewHost
+	if t.ReviewDir == "" {
+		t.ReviewDir = cfg.RemoteMirrorRoot + "/" + filepath.Base(t.Dir)
+	}
+	if t.ReviewSync == "" {
+		t.ReviewSync = cfg.DefaultReviewSync
+	}
+}
+
 // postComplete 处理任务链：进度报告落盘；装配/协调任务产出的新任务入队；review_after 自动入队设计审核。
 func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
 	// C 存在即意味 B→C 已成，甲结论侧车使命完成——清理（兜住 B→C 在删侧车前崩溃的残留）。
@@ -729,6 +864,7 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 			// 负载分流到第二台机器。分流前若有 ReviewSync 先本地同步改动，失败则只收掉 divert——
 			// reviewHost/reviewDir 回到初值 t.RemoteHost/t.Dir（远程实现卡仍在远程审，绝不抹主机把审核
 			// 错拉回本机以远端路径当本地目录），闭环不断。
+			applyDefaultReviewDivert(t, cfg) // 全局默认复审分流（config 配了 default_review_host 时自动压到第二台机器）
 			reviewDir := t.Dir
 			reviewHost := t.RemoteHost
 			divert := t.ReviewHost != ""
@@ -1542,29 +1678,25 @@ func firstLine(s string) string {
 // workdir/model/... 配置块——firstLine 恰好取到横幅，掩盖真因（网络/限额/流断在末尾），还让 transientRe
 // 匹配不到、把可退避的瞬时错误当硬失败烧 attempts（单腿审核一挂就没了）。优先返回命中错误/瞬时样式的
 // 行，否则返回最后一条非噪声行，都没有才回退 firstLine。
+// codexErrorLine 只挑「瞬时网络/上游」样式(transientRe)的真错误行，供 runErr 路径退避快重试。
+// 早期还兼挑泛化 codexErrRe(error|failed|cannot|invalid...)行，但 codex exec 把整段推理/审查正文
+// 都写进 stderr、正文天然充斥这些词——按 codexErrRe 挑行会把审查正文里一句无害内容当"错误"上报，
+// 掩盖真因（实测 superpowers/gsd 注入耗尽回合预算的空终稿故障，被误报成 "...You cannot rationalize..."）。
+// 故只认 transientRe；挑不到就返回空，由调用方回退到真实 runErr / 明确诊断。
 func codexErrorLine(combined string) string {
-	last := ""
 	for _, l := range strings.Split(combined, "\n") {
 		t := strings.TrimSpace(l)
 		if t == "" || codexNoiseRe.MatchString(t) {
 			continue
 		}
-		last = t
-		if transientRe.MatchString(t) || codexErrRe.MatchString(t) {
+		if transientRe.MatchString(t) || codexHardErrRe.MatchString(t) {
 			if len(t) > 300 {
 				return t[:300]
 			}
 			return t
 		}
 	}
-	if last != "" {
-		if len(last) > 300 {
-			return last[:300]
-		}
-		return last
-	}
-	// 全是横幅/配置噪声、无任何真错误行——回退 firstLine 只会取到横幅，故给通用说明。
-	return "codex 无有效错误输出（仅横幅/配置，可能超时/被截断/进程被杀）"
+	return ""
 }
 
 // summarizeResult 取一步最终输出里第一条实质内容行，作为 list 看板“最新进度概述”的回落来源。

@@ -74,11 +74,44 @@ func TestTransientMatchesCodexNetErrors(t *testing.T) {
 	}
 }
 
-// 只有噪声、无真错误行时,回退到最后一条非噪声行(而非空/横幅)。
-func TestCodexErrorLineFallback(t *testing.T) {
+// 无 transient/硬错误行时返回 ""，由调用方回退到真实 runErr / "无最终消息"诊断——
+// 绝不回退到横幅或从 transcript 里瞎抓一行。
+func TestCodexErrorLineEmptyWhenNoRealError(t *testing.T) {
 	onlyNoise := "Reading additional input from stdin...\nOpenAI Codex v0.144.1\n--------\nmodel: x\n"
-	got := codexErrorLine(onlyNoise)
-	if strings.Contains(got, "Reading additional input") {
-		t.Fatalf("全噪声时也不该回退到横幅, got %q", got)
+	if got := codexErrorLine(onlyNoise); got != "" {
+		t.Fatalf("全噪声应返回 空, got %q", got)
+	}
+}
+
+// 核心回归：codex exec 把整段审查正文写进 stderr，正文天然含 "cannot/error/failed/invalid"。
+// codexErrorLine 绝不能把这类无害审查内容当"错误"上报（旧 bug：报成 "...You cannot rationalize..."，
+// 掩盖真因=superpowers/gsd 框架注入耗尽回合预算的空终稿故障）。
+func TestCodexErrorLineIgnoresReviewProse(t *testing.T) {
+	prose := `user
+对抗复审 L5.1-b——独立验证 R+2 修复是否真闭。
+我会严格只读，先核对提交/差异。
+This is not negotiable. This is not optional. You cannot rationalize your way out of this.
+原漏洞是命令退0/磁盘0写；若断言未覆盖生产反例=假闭 block。
+appendTombstone 的失败被吞掉，CLI 无条件退 0，这是 invalid 的。
+`
+	if got := codexErrorLine(prose); got != "" {
+		t.Fatalf("审查正文里的 cannot/invalid/block 不该被当错误上报, got %q", got)
+	}
+}
+
+// codexHardErrRe：服务端硬错误（含 OpenAI 网络安全审查闸）必须被清晰上报，别被吞成空。
+func TestCodexErrorLineSurfacesProviderHardErrors(t *testing.T) {
+	cases := map[string]string{
+		"网络安全审查闸":  "This request has been flagged for possible cybersecurity risk.",
+		"cloudflare 拦": "Access blocked by Cloudflare",
+		"高负载":       "Codex is currently experiencing high load.",
+		"预算耗尽":      "Goal budget reached - the turn was stopped.",
+	}
+	for name, line := range cases {
+		combined := "OpenAI Codex v0.144.1\n--------\nmodel: x\nuser\n审核\n" + line + "\n"
+		got := codexErrorLine(combined)
+		if got == "" || !strings.Contains(got, strings.SplitN(line, " ", 3)[0]) {
+			t.Fatalf("%s: 服务端硬错误应被上报, line=%q got=%q", name, line, got)
+		}
 	}
 }

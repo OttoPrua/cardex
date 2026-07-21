@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>ClaudeGo 看板</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%232a78d6'/><rect x='7' y='8' width='5' height='16' rx='2' fill='white'/><rect x='14' y='8' width='5' height='11' rx='2' fill='white' opacity='.72'/><rect x='21' y='8' width='5' height='6' rx='2' fill='white' opacity='.45'/></svg>">
+</head>
+<body>
+
+<a class="skip-link" href="#app">跳到主内容</a>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <a class="brand" href="#/" aria-label="ClaudeGo 看板首页">
+      <span class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" width="22" height="22"><rect width="32" height="32" rx="7" fill="currentColor"/><rect x="7" y="8" width="5" height="16" rx="2" fill="#fff"/><rect x="14" y="8" width="5" height="11" rx="2" fill="#fff" opacity=".72"/><rect x="21" y="8" width="5" height="6" rx="2" fill="#fff" opacity=".45"/></svg>
+      </span>
+      <span class="brand-text">ClaudeGo<span class="brand-sub">看板</span></span>
+    </a>
+
+    <nav class="nav" aria-label="主导航">
+      <a class="nav-link" href="#/" data-nav="overview">总览</a>
+      <a class="nav-link" href="#/burn" data-nav="burn">燃尽</a>
+    </nav>
+
+    <div class="topbar-right">
+      <div class="quota-strip" id="quota-strip" aria-label="额度快照"></div>
+      <div class="refresh-box">
+        <span class="freshness" id="freshness" title="尚未加载">—</span>
+        <button type="button" class="btn-icon" id="btn-refresh" title="立即刷新" aria-label="立即刷新">
+          <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/><path d="M13.6 1.9v2.9h-2.9" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+        <label class="switch" title="每 30 秒自动刷新（页面隐藏时暂停）">
+          <input type="checkbox" id="auto-refresh" checked>
+          <span class="switch-track" aria-hidden="true"><span class="switch-thumb"></span></span>
+          <span class="switch-label">自动</span>
+        </label>
+      </div>
+    </div>
+  </div>
+  <div class="load-bar" id="load-bar" aria-hidden="true"></div>
+</header>
+
+<main id="app" class="app" tabindex="-1">
+  <div class="boot">正在加载…</div>
+</main>
+
+<div id="live" class="sr-only" role="status" aria-live="polite"></div>
+
+<script type="module" src="/static/app.js"></script>
+</body>
+</html>

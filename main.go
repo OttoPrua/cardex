@@ -48,6 +48,8 @@ func main() {
 		err = cmdCmd(os.Args[2:])
 	case "quota":
 		err = cmdQuota(os.Args[2:])
+	case "board":
+		err = cmdBoard(os.Args[2:])
 	case "list", "status", "ls":
 		err = cmdList(os.Args[2:])
 	case "run", "tick":
@@ -122,6 +124,8 @@ func printUsage() {
   list                             # 任务看板（-json 机器可读，-all 含已归档状态）
   log <id> [-n 60]                 # 查看任务执行日志
   quota                            # 5 小时额度视图：队列消耗/红线状态/外部用量源
+  board     [-port 8787] [-addr 127.0.0.1] [-ttl 10]
+            只读 Web 看板：项目/阶段/任务三层视图 + 额度燃尽曲线（默认只听本机回环）
 
 任务管理
   hold/release <id>                # 挂起 / 恢复排队

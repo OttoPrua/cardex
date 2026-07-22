@@ -252,6 +252,23 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 - 单实例锁（`.lock`）保证 launchd 的多次触发不会并发跑任务；持锁进程死掉会自动清锁。
 - 其他错误（网络、超时等）按 `retry_backoff_min` 退避重试，超过 `max_attempts_per_step` 次标记失败，`claudego retry <id>` 可带着会话与进度重新入队。
 
+## 事件账本（per-task `events.jsonl`）
+
+看板"活动流"由每张卡的事件账本驱动，不再拿 `task.Status` 反推伪造历史（把
+`queued→running→limit_paused→running→done` 压平成一句"当前 running"违反诚实性纪律）。
+
+- 位置：活动卡在 `~/.claudego/events/<id>.jsonl`，随 `clean` 归档到 `archive/events/<id>.jsonl`；
+- 每条事件是一行 JSON：`seq`（卡内单调递增）+ `ts`（RFC3339Nano）+ `type` + `actor`（谁触发）
+  + `status`（迁移后的状态快照）+ `step` + `detail`（如恢复时间戳、错误摘要、下游派生卡 ID 等）；
+- `type` 枚举与状态机迁移一一对应：`queued` / `dispatched` / `step_ok` / `limit_paused` / `held`
+  / `retry` / `canceled` / `done` / `failed` / `closeout`（完成后派生的下游卡入队）；
+- 写入是 `O_APPEND` + `fsync`：POSIX 保证追加是原子的（多进程 tick 与 CLI 同时改状态机也不会互写字节），
+  `fsync` 保证宣称已写的事件必落盘。`kill -9` 留在末尾的半截 JSON 下轮追加时先补 `\n` 封成独立坏行，
+  读者按行 `Unmarshal` 失败即丢弃，已落事件不受影响；
+- **事件缺口不掩盖**：看板活动流按 `seq` 单调检测跳号，见跳号即插一条"事件缺口（缺失 seq X..Y）"
+  显式披露；尾部残尾也披露一条"事件缺口（尾部残行或损坏行已丢弃）"。绝不用相邻事件补齐冒充完整历史。
+- 首期不做签名（防篡改无已证需求，只取追加留痕语义）。
+
 ## 权限与安全
 
 任务默认**不**使用 `--dangerously-skip-permissions`：

@@ -221,6 +221,31 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 - A single-instance lock (`.lock`) keeps launchd's repeated triggers from running tasks concurrently; the lock is cleared automatically if the holding process dies.
 - Other errors (network, timeout, etc.) back off and retry per `retry_backoff_min`; past `max_attempts_per_step` the task is marked failed, and `claudego retry <id>` re-enqueues it with session and progress intact.
 
+## Event ledger (per-task `events.jsonl`)
+
+The board's activity stream is driven by each card's event ledger; it no longer forges history by
+inferring from `task.Status` (which flattens the real `queued→running→limit_paused→running→done`
+trajectory into a single "currently running", contradicting the board's honesty-first discipline).
+
+- Location: `~/.claudego/events/<id>.jsonl` while the card is live; `clean` moves it to
+  `archive/events/<id>.jsonl` alongside the archived card.
+- Each event is one JSON line: `seq` (monotonic per card) + `ts` (RFC3339Nano) + `type` +
+  `actor` (who triggered it) + `status` (post-transition snapshot) + `step` + `detail` (e.g.
+  resume timestamp, error summary, downstream card ID).
+- The `type` enum maps 1-to-1 to state-machine transitions: `queued` / `dispatched` / `step_ok` /
+  `limit_paused` / `held` / `retry` / `canceled` / `done` / `failed` / `closeout` (downstream cards
+  enqueued after completion).
+- Writes use `O_APPEND` + `fsync`: POSIX guarantees append is atomic (concurrent tick + CLI writers
+  never interleave bytes), and `fsync` guarantees any claimed-written event has hit disk. A `kill -9`
+  half-JSON tail is sealed on the next append with a leading `\n` so subsequent readers reject only
+  the corrupt line; earlier events are untouched.
+- **Gaps are disclosed, never masked**: the board's activity stream monitors `seq` monotonicity and
+  inserts an explicit "event gap (missing seq X..Y)" item whenever a jump is detected, plus a
+  "event gap (trailing residue or corrupt line discarded)" item when the tail is corrupt. It never
+  synthesizes a fake event by inferring from status to plug the hole.
+- No signing in this first pass (no proven need for tamper-evidence — only append-only leave-trace
+  semantics are needed).
+
 ## Permissions and safety
 
 By default tasks do **not** use `--dangerously-skip-permissions`:

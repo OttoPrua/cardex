@@ -277,7 +277,7 @@ func (s *boardServer) handleProject(w http.ResponseWriter, r *http.Request) {
 		Project:        proj,
 		Columns:        s.buildColumns(snap.Cfg, pace, tasks, tasks, now, false),
 		PhaseLanes:     s.buildLanes(snap, proj, pace, tasks, now),
-		RecentActivity: buildActivity(tasks),
+		RecentActivity: buildActivity(s.root, tasks),
 	})
 }
 
@@ -364,42 +364,104 @@ func toDetail(cfg *Config, t *Task, pace *paceModel, siblings []*Task, now time.
 
 const activityLimit = 40
 
-// buildActivity 按最近更新时间列出活动流。任务卡没有事件日志，
-// 只有 updated_at 这一个时间戳，所以「事件」是由**当前状态**反推的一句话描述——
-// 它表示「这张卡最近一次变成了什么状态」，不是完整历史。
-func buildActivity(tasks []*Task) []ActivityItem {
-	ts := append([]*Task(nil), tasks...)
-	sort.Slice(ts, func(i, j int) bool { return ts[i].UpdatedAt > ts[j].UpdatedAt })
-	if len(ts) > activityLimit {
-		ts = ts[:activityLimit]
+// buildActivity 读事件账本（events.jsonl）拼装活动流——诚实历史锚点。
+//
+// 【为什么必须换】早期实现只用 task.Status + UpdatedAt 反推一句话事件，同一张 UpdatedAt 覆盖前
+// 只能显示"最后一次状态"。真实历史"queued→running→limit_paused→running→done"被压平成一句
+// "已完成"，与看板"诚实性第一"原则直接冲突。改读事件流后每条状态迁移都还原为独立事件。
+//
+// 【为什么显式披露事件缺口】事件账本用 seq 单调递增；崩溃残尾/手工删除会造成 seq 跳号。
+// 见跳号必须插入 event_gap 项让前端显示"事件缺口"——绝不能拿相邻事件补齐冒充完整历史，
+// 那是把"没记录到"伪装成"记录了什么"，还不如没有历史。
+func buildActivity(root string, tasks []*Task) []ActivityItem {
+	// 事件是 per-task 的，活动流是跨 task 时序合并——遍历所有 task 加载其事件账本，
+	// 缺账本（旧卡尚未生成事件）直接跳过：绝不为无事件的卡合成一条状态反推事件，
+	// 否则"事件流是诚实历史"的招牌就被 fallback 反推打脸。
+	type row struct {
+		item ActivityItem
+		key  string // sort key: at + "|" + taskID + "|" + seq (稳定次序)
 	}
-	out := make([]ActivityItem, 0, len(ts))
-	for _, t := range ts {
-		out = append(out, ActivityItem{
-			At: t.UpdatedAt, TaskID: t.ID, Title: t.Title, Event: activityEvent(t),
-		})
+	rows := make([]row, 0, len(tasks)*4)
+	for _, t := range tasks {
+		events, hadCorruption, err := loadTaskEvents(root, t.ID)
+		if err != nil || len(events) == 0 {
+			continue
+		}
+		var prevSeq int64
+		for i, ev := range events {
+			if i == 0 {
+				prevSeq = ev.Seq - 1
+			}
+			// seq 跳号即缺口，插一条 event_gap 显式披露"这里有事件读不出"（崩溃残尾/被删）。
+			if ev.Seq > prevSeq+1 {
+				rows = append(rows, row{
+					item: ActivityItem{
+						At: ev.TS, TaskID: t.ID, Title: t.Title,
+						Event: fmt.Sprintf("事件缺口（缺失 seq %d..%d）", prevSeq+1, ev.Seq-1),
+					},
+					key: ev.TS + "|" + t.ID + "|gap",
+				})
+			}
+			rows = append(rows, row{
+				item: ActivityItem{
+					At: ev.TS, TaskID: t.ID, Title: t.Title, Event: describeEvent(ev),
+				},
+				key: fmt.Sprintf("%s|%s|%010d", ev.TS, t.ID, ev.Seq),
+			})
+			prevSeq = ev.Seq
+		}
+		if hadCorruption {
+			// 尾部残尾/损坏行：整体披露一次（避免每条坏行都刷一条噪声）。
+			// 用当前 task.UpdatedAt 而非事件时间——损坏事件本身没有可信 ts。
+			rows = append(rows, row{
+				item: ActivityItem{
+					At: t.UpdatedAt, TaskID: t.ID, Title: t.Title,
+					Event: "事件缺口（尾部残行或损坏行已丢弃）",
+				},
+				key: t.UpdatedAt + "|" + t.ID + "|corrupt",
+			})
+		}
+	}
+	// 倒序排：最新在前。key 里含 seq 保证同一 ts 内按 seq 稳定排序。
+	sort.Slice(rows, func(i, j int) bool { return rows[i].key > rows[j].key })
+	if len(rows) > activityLimit {
+		rows = rows[:activityLimit]
+	}
+	out := make([]ActivityItem, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.item)
 	}
 	return out
 }
 
-func activityEvent(t *Task) string {
-	switch t.Status {
-	case statusDone:
-		return "已完成"
-	case statusRunning:
-		return fmt.Sprintf("执行中（第 %d/%d 步）", t.Step+1, len(t.Prompts))
-	case statusQueued:
-		return "排队中"
-	case statusLimitPaused:
+// describeEvent 把事件类型翻译成人读文本。event_gap 在 buildActivity 里独立生成不走这里。
+func describeEvent(ev TaskEvent) string {
+	switch ev.Type {
+	case evQueued:
+		return "入队"
+	case evDispatched:
+		return fmt.Sprintf("派上执行（第 %d 步）", ev.Step+1)
+	case evStepOK:
+		if final, _ := ev.Detail["final_step"].(bool); final {
+			return fmt.Sprintf("步完成（第 %d 步·末步）", ev.Step+1)
+		}
+		return fmt.Sprintf("步完成（第 %d 步）", ev.Step+1)
+	case evLimitPaused:
 		return "限额暂停，等待额度重置"
-	case statusHeld:
-		return "已挂起，等待人工放行"
-	case statusFailed:
-		return "失败"
-	case statusCanceled:
+	case evHeld:
+		return "已挂起"
+	case evRetry:
+		return "错误退避重试"
+	case evCanceled:
 		return "已取消"
+	case evDone:
+		return "已完成"
+	case evFailed:
+		return "失败"
+	case evCloseout:
+		return "派生下游卡（closeout）"
 	}
-	return t.Status
+	return ev.Type
 }
 
 // ---- 命令入口 ----

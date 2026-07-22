@@ -544,6 +544,13 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		_ = archiveTask(root, t)
 		return nil
 	}
+	// CG-4 幂等墓碑 reset-at-entry:上一轮盘上状态非 running(即 queued/limit_paused/held)才 reset
+	// 当前步的 resume 墓碑——这是"编排层认可的新一轮尝试"信号(合法限额恢复/人工 release),让新一轮
+	// 的 bound=2 保护从零起算;若上一轮仍是 running,则本次是"上一轮 runTask 中途崩溃遗留",保留墓碑
+	// 以让 bound 挡住崩溃风暴。详见 tombstones.go 文件头【为什么 reset-at-entry ...】。
+	if t.Status != statusRunning {
+		_ = resetTombstoneKind(root, t.ID, resumeKind(t.Step))
+	}
 	t.Status = statusRunning
 	// 交叉 C 重跑（如 claudego retry）先撤下旧的终局报告：否则若这次在执行器层就失败（未进 postComplete），
 	// 上一轮的旧报告仍会被 progress -show 当成当前终局。首跑时无报告可删，无害。
@@ -615,27 +622,59 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		var res *claudeResult
 		var combined string
 		var runErr error
-		switch {
-		case remote:
-			// 远端执行：runner_pref=codex 显式钉定优先；否则带 claude 模型(如 fable/opus)
-			// 或只读审核卡默认走远端 claude。其余无模型任务走远端 codex。
-			// 两者都走该远端主机自己的账号额度，不记本机 claude 账本、不写全局冷却。
-			if remoteUsesClaude(t) {
-				res, combined, runErr = invokeRemoteClaude(ctx, cfg, t, prompt)
-			} else {
-				res, combined, runErr = invokeRemoteCodex(ctx, cfg, t, prompt)
+		invoke := func() error {
+			switch {
+			case remote:
+				// 远端执行：runner_pref=codex 显式钉定优先；否则带 claude 模型(如 fable/opus)
+				// 或只读审核卡默认走远端 claude。其余无模型任务走远端 codex。
+				// 两者都走该远端主机自己的账号额度，不记本机 claude 账本、不写全局冷却。
+				if remoteUsesClaude(t) {
+					res, combined, runErr = invokeRemoteClaude(ctx, cfg, t, prompt)
+				} else {
+					res, combined, runErr = invokeRemoteCodex(ctx, cfg, t, prompt)
+				}
+			case useCodex:
+				// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
+				res, combined, runErr = invokeCodex(ctx, cfg, t, prompt)
+			default:
+				res, combined, runErr = invokeClaude(ctx, cfg, t, prompt)
+				if res != nil && res.SessionID != "" {
+					t.SessionID = res.SessionID
+				}
+				if res != nil {
+					appendUsage(root, cfg, t, res.Usage)
+				}
 			}
-		case useCodex:
-			// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
-			res, combined, runErr = invokeCodex(ctx, cfg, t, prompt)
-		default:
-			res, combined, runErr = invokeClaude(ctx, cfg, t, prompt)
-			if res != nil && res.SessionID != "" {
-				t.SessionID = res.SessionID
+			// 内部错误由 runErr/res.IsError 承接进下方 0/1/2/3 分支处理,墓碑侧不透传——
+			// 墓碑关心"是否已发起注入"而非"注入产物是否成功",inject 的 err 是"墓碑本身写不下"的
+			// IO 错误载体,与 LLM 侧错误正交(LLM 报错也算注入完成,该落 final)。
+			return nil
+		}
+		if resuming {
+			// CG-4:limit_paused/mid_step 续跑走 resume 提示是"至多一次注入"点。inject 前落 pending,
+			// 成功后落 final,tick 见 final 即跳过——即使进程在"提示已发送、成功未回写"处崩溃,重启后
+			// bound=2 保护也只允许再试一次,不会把一个残尾放大成 N 次续跑提示重发。
+			skipped, corrupted, tombErr := injectAtMostOnce(root, t.ID, resumeKind(t.Step), invoke)
+			if tombErr != nil {
+				return tombErr
 			}
-			if res != nil {
-				appendUsage(root, cfg, t, res.Usage)
+			if corrupted {
+				logBlock(lg, "TOMBSTONE", "resume 墓碑损坏字节,按无墓碑处理并披露——不 crash 不静默跳步(详见 stderr)")
 			}
+			if skipped {
+				// 触发场景要么是已 final(前次已成功注入但状态漂移到仍 MidStep=true,罕见,保守挂 held)
+				// 要么是 bound=2 已耗尽(崩溃风暴上限)——两者都升级到人工介入,避免静默卡死。
+				logBlock(lg, "TOMBSTONE", "resume 墓碑至多一次判据触发跳过,升级 held 等待人工 release/cancel")
+				t.Status = statusHeld
+				t.LastError = "CG-4 墓碑至多一次已耗尽:同一步续跑注入达上限(bound=2)"
+				t.touch()
+				emitTaskEvent(root, t.ID, evHeld, "runner:tombstone", statusHeld, t.Step, map[string]any{
+					"reason": "resume_tombstone_exhausted", "kind": resumeKind(t.Step),
+				})
+				return saveTask(root, t)
+			}
+		} else {
+			_ = invoke()
 		}
 
 		// 0) 取消：tick 对账发现盘上已标 canceled 后取消 ctx 击杀进程组；也可能进程
@@ -1607,15 +1646,31 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 		if archived[t.XKey][next] {
 			continue
 		}
-		t.Status = statusFailed
-		t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, next)
-		_ = os.Remove(crossPeerPath(root, t.XKey))
-		_ = saveTask(root, t)
-		// reconcile 判孤儿：这是崩溃窄缝里被扫出的"事后判 failed"事件，需在账本留一条明确迁移，
-		// 否则活动流只见 done→failed 状态跳变而无对应事件，触发 seq 缺口误判。
-		emitTaskEvent(root, t.ID, evFailed, "runner:reconcile", statusFailed, t.Step, map[string]any{
-			"reason": "cross_chain_orphan", "role": t.XRole, "missing_next": next,
+		// CG-4:reconcile 裁决也是"至多一次注入"点——若崩溃落在 saveTask 与 emit 之间,下一轮 tick 复扫
+		// 会再撞一次,把一条 failed 事件放大成 N 条,污染诚实活动流。用墓碑护栏把整段"状态变更 + 侧车清理
+		// + 事件账本"包成幂等原子。bound=2 允许"崩一次+重试一次"共 2 次注入;更多次直接放弃并 stderr 警告
+		// (状态已终态,不再重扫;事件账本靠 seq 缺口披露)。
+		nextRole := next // 逃逸进闭包时避免引用循环变量的老坑
+		_, corrupted, tombErr := injectAtMostOnce(root, t.ID, reconcileCrossKind(), func() error {
+			t.Status = statusFailed
+			t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, nextRole)
+			_ = os.Remove(crossPeerPath(root, t.XKey))
+			if err := saveTask(root, t); err != nil {
+				return err
+			}
+			// reconcile 判孤儿：这是崩溃窄缝里被扫出的"事后判 failed"事件，需在账本留一条明确迁移，
+			// 否则活动流只见 done→failed 状态跳变而无对应事件，触发 seq 缺口误判。
+			emitTaskEvent(root, t.ID, evFailed, "runner:reconcile", statusFailed, t.Step, map[string]any{
+				"reason": "cross_chain_orphan", "role": t.XRole, "missing_next": nextRole,
+			})
+			return nil
 		})
+		if tombErr != nil {
+			fmt.Fprintf(os.Stderr, "警告: reconcile 墓碑写入失败 %s: %v\n", t.ID, tombErr)
+		}
+		if corrupted {
+			fmt.Fprintf(os.Stderr, "警告: %s reconcile 墓碑损坏字节已披露,按无墓碑处理\n", t.ID)
+		}
 	}
 }
 

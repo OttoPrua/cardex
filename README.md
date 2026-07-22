@@ -269,6 +269,30 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
   显式披露；尾部残尾也披露一条"事件缺口（尾部残行或损坏行已丢弃）"。绝不用相邻事件补齐冒充完整历史。
 - 首期不做签名（防篡改无已证需求，只取追加留痕语义）。
 
+## 幂等墓碑（per-task `tombstones/<id>.json`）
+
+事件账本记录"发生了什么"；墓碑账本记录"这个副作用是否已被注入过"——防止进程重启在同一个注入点上反复重发。
+
+三处"至多一次注入"点由墓碑护栏包住：
+1. **limit_paused 恢复**：任务撞用量限额挂起后再被 tick 复派，`runTask` 顶部若 `MidStep=true+SessionID` 非空，
+   会向同一 claude 会话发 `resume_prompt`（"继续。上一条指令因为用量限额被中断…"）。若崩溃落在"提示已发送、
+   状态未回写"处，重启后 tick 会再撞一次，把一次续跑放大成 N 次重发烧 token。
+2. **mid_step 续跑**：与 1) 同一代码路径，区别在触发原因是崩溃中断而非限额。
+3. **cross 链 reconcile**：`tick` 每轮扫孤儿 A/B 卡，判 `done+无后继` 就 `saveTask(failed) + emit failed`。
+   崩溃落在两者之间会漏事件；两轮 tick 之间也可能重复裁决。
+
+护栏语义（`tombstones.go`）：
+- 每次注入前先写 `pending(attempt+1)`；注入成功后再落 `final`。
+- Tick 复扫时见 `phase=final` 即跳过；见 `phase=pending` 且 `attempt≥bound` 也跳过（bound=2，允许崩一次+重试一次）。
+- **反例注入**：损坏字节按无墓碑处理并 stderr 披露，不 crash 也不静默跳步——静默跳步会永远不再注入，卡死更隐蔽。
+- **reset-at-entry**：`runTask` 顶部若上一轮盘上状态非 `running`（`queued/limit_paused/held`），则清当前步的
+  resume 墓碑——这是"编排层认可的新一轮尝试"信号，让新一轮 bound=2 保护从零起算；若上一轮仍是 `running`，
+  则保留墓碑挡住崩溃风暴。
+- **随卡归档**：墓碑账本随 `archiveTask` 移到 `archive/tombstones/<id>.json`，审计可看"这张卡的每次注入都尝试了几次"。
+
+数据模型（单 JSON 而非 JSONL）：`{"version": 1, "entries": {"resume:0": {kind, attempt, phase, nonce, ts}, "reconcile:cross": {...}}}`
+——一次 `atomicWrite`（tmp→rename）即可原子替换整份账本，注入点数量少（步数上限），不需要行级追加语义。
+
 ## 权限与安全
 
 任务默认**不**使用 `--dangerously-skip-permissions`：

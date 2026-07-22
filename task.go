@@ -288,5 +288,11 @@ func archiveTask(root string, t *Task) error {
 	if err := archiveTaskEvents(root, t.ID); err != nil {
 		fmt.Fprintf(os.Stderr, "警告: 事件账本归档失败 %s: %v\n", t.ID, err)
 	}
+	// CG-4 墓碑随卡归档:审计要看"这张卡的注入尝试了几次、有没有耗尽 bound",归档后墓碑也得跟着走,
+	// 否则 clean 之后墓碑残留在 tombstones/,新卡碰到同 ID(极小概率)会读到旧墓碑误跳注入。
+	// 同事件账本策略:失败只警告不回退,避免"卡半档"。
+	if err := archiveTaskTombstones(root, t.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 墓碑账本归档失败 %s: %v\n", t.ID, err)
+	}
 	return nil
 }

@@ -246,6 +246,42 @@ trajectory into a single "currently running", contradicting the board's honesty-
 - No signing in this first pass (no proven need for tamper-evidence — only append-only leave-trace
   semantics are needed).
 
+## Idempotent tombstones (per-task `tombstones/<id>.json`)
+
+The event ledger records "what happened"; the tombstone ledger records "has this side effect
+already been injected" — preventing a process restart from repeating the same injection at the
+same site.
+
+Three "at-most-once injection" sites are guarded by the tombstone rail:
+1. **limit_paused recovery**: after a task hits the usage limit and is later re-dispatched by tick,
+   `runTask` sends `resume_prompt` (e.g. "Continue. The previous instruction was interrupted by a
+   usage limit…") into the same claude session when `MidStep=true+SessionID` is non-empty. If the
+   process crashes after "prompt sent, state not persisted", the next tick would send it again,
+   amplifying one continuation into N wasted-token re-sends.
+2. **mid_step continuation**: same code path as (1); the difference is the trigger (crash-interrupt
+   rather than limit-pause).
+3. **cross-chain reconcile**: each tick sweep looks for orphaned A/B cards (`done` + no successor)
+   and calls `saveTask(failed) + emit failed`. A crash between the two loses the event; two tick
+   rounds may repeat the verdict.
+
+Guard semantics (`tombstones.go`):
+- Write `pending(attempt+1)` before the injection; write `final` after it succeeds.
+- On tick re-sweep, `phase=final` → skip; `phase=pending && attempt≥bound` → skip
+  (`bound=2` allows one crash + one retry).
+- **Counter-example injection**: corrupt bytes are treated as no tombstone with stderr disclosure —
+  neither crash nor silent skip (silent skip would never re-inject, hiding the deadlock).
+- **Reset-at-entry**: when `runTask` enters and the previous on-disk status was NOT `running`
+  (`queued/limit_paused/held`), the current step's resume tombstone is cleared — a signal that
+  the orchestrator sanctioned a new attempt cycle, so the fresh `bound=2` counter starts from zero.
+  If the previous status was `running`, the tombstone is preserved to cap crash storms.
+- **Archived with the card**: the tombstone ledger is moved to `archive/tombstones/<id>.json`
+  by `archiveTask`, so an audit can inspect exactly how many attempts each injection needed.
+
+Data model (single JSON, not JSONL): `{"version": 1, "entries": {"resume:0": {kind, attempt,
+phase, nonce, ts}, "reconcile:cross": {...}}}` — one `atomicWrite` (tmp→rename) replaces the
+whole ledger atomically. Injection sites are few (bounded by step count), so line-append
+semantics are unnecessary.
+
 ## Permissions and safety
 
 By default tasks do **not** use `--dangerously-skip-permissions`:

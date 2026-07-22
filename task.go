@@ -280,5 +280,13 @@ func archiveTask(root string, t *Task) error {
 	if err := os.MkdirAll(archiveDir(root), 0o755); err != nil {
 		return err
 	}
-	return os.Rename(taskPath(root, t.ID), filepath.Join(archiveDir(root), t.ID+".json"))
+	if err := os.Rename(taskPath(root, t.ID), filepath.Join(archiveDir(root), t.ID+".json")); err != nil {
+		return err
+	}
+	// 事件账本随卡归档：activity 层遇归档卡时仍能取到完整历史,而不是"卡在但事件消失"的断线。
+	// 归档失败只打警告不回退——任务本体已归档,事件迁移属留痕,回退更容易造成"卡半档"的数据不一致。
+	if err := archiveTaskEvents(root, t.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 事件账本归档失败 %s: %v\n", t.ID, err)
+	}
+	return nil
 }

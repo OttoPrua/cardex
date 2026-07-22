@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -80,9 +81,32 @@ func eventsPathAnywhere(root, id string) string {
 	return archivedEventsPath(root, id)
 }
 
+// eventMuByTask 是每任务的进程内互斥锁——挡同进程内 goroutine 的并发 emit。
+// 【为什么进程内锁不可省】staleLock 有 bootstrap 竞态:文件锁"创建 lockfile"与"写 PID"两步之间,
+// 若第二个 goroutine 在 A 写 PID 前读 lockfile 得空内容,Unmarshal 失败被判 stale 强夺——两个
+// goroutine 同时进入临界区,seq 计算错位撞车。文件锁只挡跨进程,进程内的强序由 sync.Mutex 兜底,
+// 组合起来才既挡跨进程又挡同进程 goroutine,seq 单调契约才不漏。
+var eventMuByTask sync.Map // map[string]*sync.Mutex
+
+func lockForTask(taskID string) *sync.Mutex {
+	if v, ok := eventMuByTask.Load(taskID); ok {
+		return v.(*sync.Mutex)
+	}
+	mu := &sync.Mutex{}
+	actual, _ := eventMuByTask.LoadOrStore(taskID, mu)
+	return actual.(*sync.Mutex)
+}
+
 // recordEvent 追加一条事件到该任务的 events.jsonl。
 // 【纪律】写入路径必须与状态机的 saveTask 一一配对：状态机迁移后立即落一条事件。
 // 若追加失败只打警告不阻断状态机——事件账本是"审计凭证"层，不该反向卡死主流程。
+//
+// 【为什么 nextSeq+append+fsync 必须放在跨进程 + 进程内双层锁下】state.go 的调度实例 .lock 只挡
+// "多个 runner 同时开跑"，不挡 cli:cancel / cli:release / cli:hold 与 runner 并发写同一卡的事件。
+// 若不加锁,两个写者各读到 max=N、各写 seq=N+1——两条事件同 seq,"卡内 seq 单调递增"契约破,
+// 重复 seq 中删一条事件也不可检测(seq 序列仍显完整),"事件缺口显式披露"这道墙被绕过。O_APPEND
+// 只保证 write 定位原子,不解决 read-compute-write 的组合竞态。用 O_EXCL 短自旋锁挡跨进程,再叠
+// 一层进程内 sync.Mutex 挡 staleLock bootstrap 竞态(空 lockfile 被 unmarshal 判 stale 强夺)。
 func recordEvent(root, taskID string, ev TaskEvent) error {
 	if taskID == "" {
 		return nil // 任务尚未分配 ID：极少见的兜底，静默跳过
@@ -90,6 +114,17 @@ func recordEvent(root, taskID string, ev TaskEvent) error {
 	if err := os.MkdirAll(eventsDir(root), 0o755); err != nil {
 		return err
 	}
+	// 进程内锁在外层:保证同进程 goroutine 严格串行,不触发文件锁的 bootstrap 竞态。
+	mu := lockForTask(taskID)
+	mu.Lock()
+	defer mu.Unlock()
+	// 跨进程写锁：包 nextSeq+append+fsync 三步。锁文件位于 events/<id>.jsonl.lock，
+	// TTL 短(5s)——单次追加几个 ms，若持锁进程死亡按陈旧锁强夺（processAlive 检活）。
+	release, err := acquireEventLock(root, taskID)
+	if err != nil {
+		return err
+	}
+	defer release()
 	// 定 seq：读现有事件算下一个。iterEvents 已过滤崩溃残尾，seq 计数不会被半截行污染。
 	seq, err := nextSeq(root, taskID)
 	if err != nil {
@@ -106,8 +141,8 @@ func recordEvent(root, taskID string, ev TaskEvent) error {
 		return err
 	}
 	data = append(data, '\n')
-	// O_APPEND：POSIX 保证追加定位与写入是同一原子操作；多进程并发追加（launchd tick 与 cli
-	// 命令同时改状态机的窄缝）也不会互相截断——写者只会互相排后面，绝不会写进对方的字节中间。
+	// O_APPEND：POSIX 保证追加定位与写入是同一原子操作；进程内多次调用互不截断——写者只会互相
+	// 排后面，绝不会写进对方的字节中间。跨进程"读-算-写"竞态由上面的 acquireEventLock 挡住。
 	// O_RDWR 而非 O_WRONLY：ensureTrailingNewline 要 ReadAt 检末字节；write-only 描述符 ReadAt 报
 	// "bad file descriptor"（macOS/BSD 尤为严格），会让首次写入之后每次追加都失败。
 	f, err := os.OpenFile(eventsPath(root, taskID), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
@@ -130,6 +165,39 @@ func recordEvent(root, taskID string, ev TaskEvent) error {
 		return err
 	}
 	return f.Close()
+}
+
+// eventLockPath 每任务一把锁——不用全局锁是因为不同任务的写入互不干扰，全局锁会把 CLI 多命令
+// 组合与 runner tick 串行化，成本不值。
+func eventLockPath(root, taskID string) string {
+	return eventsPath(root, taskID) + ".lock"
+}
+
+// acquireEventLock 用 O_CREATE|O_EXCL 抢占单任务事件写锁；持锁进程已死或锁超龄视为陈旧强夺。
+// 复用 state.go:acquireLock 的语义但作用域为单任务：写事件的临界区极短(几毫秒)，TTL 5s 足够，
+// 极端崩溃(kill -9 于 nextSeq..fsync 之间)按陈旧锁清除，不会永久卡死后续写入。
+func acquireEventLock(root, taskID string) (func(), error) {
+	path := eventLockPath(root, taskID)
+	// 自旋：短临界区场景下自旋比 fsnotify/inotify 简单可靠。最多等 5s（1000×5ms），
+	// 覆盖单个写者的完整临界区仍抢不到就报错让 emitTaskEvent 打警告——绝不静默漏事件。
+	for i := 0; i < 1000; i++ {
+		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			data, _ := json.Marshal(lockInfo{PID: os.Getpid(), At: time.Now().Format(time.RFC3339)})
+			_, _ = f.Write(data)
+			_ = f.Close()
+			return func() { _ = os.Remove(path) }, nil
+		}
+		if !os.IsExist(err) {
+			return nil, err
+		}
+		if staleLock(path, 5*time.Second) {
+			_ = os.Remove(path)
+			continue
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("事件写锁抢占超时: %s", path)
 }
 
 // ensureTrailingNewline 若文件末尾不是 \n 就补一个。为空文件是 no-op。

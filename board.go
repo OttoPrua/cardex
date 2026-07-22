@@ -387,12 +387,12 @@ func buildActivity(root string, tasks []*Task) []ActivityItem {
 		if err != nil || len(events) == 0 {
 			continue
 		}
+		// prevSeq 从 0 起算而非 events[0].Seq-1:头部若被删(events[0].Seq>1)必须能触发缺口披露。
+		// 早期 i==0 特判把 prevSeq 硬拉到 ev.Seq-1,等于宣告"起点就是这里,前面没有历史"——手工删掉
+		// seq=1 后剩下 [2,3,...] 会被当完整历史,反例注入"删中间"能报红、"删头部"却逃检,守卫留后门。
 		var prevSeq int64
-		for i, ev := range events {
-			if i == 0 {
-				prevSeq = ev.Seq - 1
-			}
-			// seq 跳号即缺口，插一条 event_gap 显式披露"这里有事件读不出"（崩溃残尾/被删）。
+		for _, ev := range events {
+			// seq 跳号即缺口,插一条 event_gap 显式披露"这里有事件读不出"(崩溃残尾/被删/头部截断)。
 			if ev.Seq > prevSeq+1 {
 				rows = append(rows, row{
 					item: ActivityItem{
@@ -435,6 +435,12 @@ func buildActivity(root string, tasks []*Task) []ActivityItem {
 }
 
 // describeEvent 把事件类型翻译成人读文本。event_gap 在 buildActivity 里独立生成不走这里。
+//
+// 【步号语义纪律 · 一定要读】runner 侧 emit 事件时的 ev.Step 语义因迁移点不同而不同:
+//   - evDispatched: 派上时 Step=待执行步序(0-indexed),显示 +1 得到"第 1 步";
+//   - evStepOK/evDone/evFailed: 已在 runner.go:779 做过 t.Step++,Step 是"已完成步数"(1-indexed),
+//     直接显示即"第 N 步";若再 +1 会显示"第 N+1 步·末步"这类不存在的步(实测两步卡末步曾报"第 3 步")。
+// 其他 evLimitPaused/evRetry/evHeld/evCanceled 的 ev.Step 视迁移点各异但描述不显示步号,不受此坑影响。
 func describeEvent(ev TaskEvent) string {
 	switch ev.Type {
 	case evQueued:
@@ -443,9 +449,9 @@ func describeEvent(ev TaskEvent) string {
 		return fmt.Sprintf("派上执行（第 %d 步）", ev.Step+1)
 	case evStepOK:
 		if final, _ := ev.Detail["final_step"].(bool); final {
-			return fmt.Sprintf("步完成（第 %d 步·末步）", ev.Step+1)
+			return fmt.Sprintf("步完成（第 %d 步·末步）", ev.Step)
 		}
-		return fmt.Sprintf("步完成（第 %d 步）", ev.Step+1)
+		return fmt.Sprintf("步完成（第 %d 步）", ev.Step)
 	case evLimitPaused:
 		return "限额暂停，等待额度重置"
 	case evHeld:

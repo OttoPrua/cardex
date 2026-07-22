@@ -591,6 +591,11 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				t.LastError = "额度红线: " + reason
 				t.touch()
 				logBlock(lg, "BUDGET", reason)
+				// 事件缺则活动流呈现 dispatched→dispatched 静默断档且无 seq 缺口可测,漏了"红线让位"
+				// 这条真历史;必须记 evRetry(状态回到 queued 等窗口滑走,语义与"错误退避回排队"同类)。
+				emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, map[string]any{
+					"reason": "budget_redline", "not_before": t.NotBeforeEpoch, "detail": reason,
+				})
 				return saveTask(root, t)
 			}
 		}
@@ -845,12 +850,23 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 // finalizeCanceled 按取消收尾：执行进程（组）已被击杀或已自然结束，本步产物丢弃，
 // 归档盘上的任务文件——cancel 命令对 running 任务只写取消标记不归档（进程还活着），
 // 归档由这里补上；文件已被移走（非运行态 cancel 或人工删除）则忽略。
+//
+// 【为什么按 diskCanceled 做去重】cli:cancel(main.go:cmdSetStatus)对 running 卡的走位是"先写 canceled
+// 到盘 + emit evCanceled、进程留给 drain/tick 收尾"。drain 复扫见 diskCanceled 就把 ctx 撤了走这里,
+// 若在这里再 emit 一条 runner_cancel = 一次迁移双事件, 直接违背"每状态迁移恰一条事件"验收 + 活动流
+// 每次取消 running 卡刷两条"已取消"。而 ctx.Err()≠nil 又非 diskCanceled 的路径(进程组接 SIGTERM/父
+// 上下文超时等),盘上没有 cli:cancel 的记录,此时 runner 是"取消的第一手记录者",必须由这里 emit。
 func finalizeCanceled(root string, t *Task, lg *os.File) error {
+	// 先探盘上是否已由 cli:cancel emit 过。要在改写 t.Status 前问,因为 diskCanceled 读的是磁盘态
+	// (cmdSetStatus 已 saveTask 到磁盘),内存里的 t.Status 尚未持久化,不代表事件账本已有一条 canceled。
+	cliAlreadyEmitted := diskCanceled(root, t.ID)
 	t.Status = statusCanceled
 	logBlock(lg, "CANCELED", "任务已取消：终止执行进程，丢弃本步产物并归档。")
-	// 事件必须在 archiveTask 前落：archive 会把 events.jsonl 搬去 archive/events/，
-	// 先记事件再搬迁，保证"取消"事件既进账本又随卡归档一并留痕。
-	emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, map[string]any{"reason": "runner_cancel"})
+	if !cliAlreadyEmitted {
+		// 事件必须在 archiveTask 前落：archive 会把 events.jsonl 搬去 archive/events/，
+		// 先记事件再搬迁，保证"取消"事件既进账本又随卡归档一并留痕。
+		emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, map[string]any{"reason": "runner_cancel"})
+	}
 	if err := archiveTask(root, t); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -932,6 +948,12 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 			if t.XRole == "C" {
 				t.Status = statusFailed                          // C 的终局报告没落盘=终局缺失，别显示成功
 				_ = os.Remove(progressPath(root, t.ProgressKey)) // 清陈旧报告，别留旧的冒充当前终局
+				// 前面在 runTask 完成路径已 emit evDone(runner.go:815-817);此处终局又改判 failed 却不 emit,
+				// 事件账本终局为 done、盘上为 failed——活动流按事件流会展示"已完成"的假历史。
+				// 补一条 evFailed(actor=runner:postComplete)让终局改判有对应迁移事件,禁反推伪造。
+				emitTaskEvent(root, t.ID, evFailed, "runner:postComplete", statusFailed, t.Step, map[string]any{
+					"reason": "progress_persist_failed", "err": err.Error(), "role": t.XRole,
+				})
 			}
 		} else {
 			logBlock(lg, "PROGRESS", "进度报告已写入: "+progressPath(root, key))

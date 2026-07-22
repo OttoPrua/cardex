@@ -270,8 +270,13 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 - 写入是 `O_APPEND` + `fsync`：POSIX 保证追加是原子的（多进程 tick 与 CLI 同时改状态机也不会互写字节），
   `fsync` 保证宣称已写的事件必落盘。`kill -9` 留在末尾的半截 JSON 下轮追加时先补 `\n` 封成独立坏行，
   读者按行 `Unmarshal` 失败即丢弃，已落事件不受影响；
-- **事件缺口不掩盖**：看板活动流按 `seq` 单调检测跳号，见跳号即插一条"事件缺口（缺失 seq X..Y）"
-  显式披露；尾部残尾也披露一条"事件缺口（尾部残行或损坏行已丢弃）"。绝不用相邻事件补齐冒充完整历史。
+- **`seq` 分配用双层锁**：`O_APPEND` 只挡 write 定位竞态，不挡 `nextSeq`(读)-算-`Write` 的组合竞态——
+  两个写者同时读到 max=N 各写 seq=N+1 → 两条同 seq 被"删中间事件也测不出"绕过缺口检测。因此
+  `nextSeq+append+fsync` 三步整体加 (a) 进程内 `sync.Mutex`（挡同进程 goroutine + 挡 stale-lock
+  bootstrap 竞态）+ (b) `<id>.jsonl.lock` 文件锁（O_EXCL 抢占, TTL 5s, 挡跨进程）。
+- **事件缺口不掩盖**：看板活动流按 `seq` 单调检测跳号，见跳号（含 `seq=1` 之前的头部缺失）即插一条
+  "事件缺口（缺失 seq X..Y）"显式披露；尾部残尾也披露一条"事件缺口（尾部残行或损坏行已丢弃）"。
+  绝不用相邻事件补齐或用 `task.Status` 反推冒充完整历史。
 - 首期不做签名（防篡改无已证需求，只取追加留痕语义）。
 
 ## 幂等墓碑（per-task `tombstones/<id>.json`）

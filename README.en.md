@@ -244,10 +244,17 @@ trajectory into a single "currently running", contradicting the board's honesty-
   never interleave bytes), and `fsync` guarantees any claimed-written event has hit disk. A `kill -9`
   half-JSON tail is sealed on the next append with a leading `\n` so subsequent readers reject only
   the corrupt line; earlier events are untouched.
-- **Gaps are disclosed, never masked**: the board's activity stream monitors `seq` monotonicity and
-  inserts an explicit "event gap (missing seq X..Y)" item whenever a jump is detected, plus a
-  "event gap (trailing residue or corrupt line discarded)" item when the tail is corrupt. It never
-  synthesizes a fake event by inferring from status to plug the hole.
+- **`seq` assignment uses two layers of locking**: `O_APPEND` only makes the write positional-atomic;
+  it does not serialize the `nextSeq`(read)-compute-`Write` compound sequence. Two writers can each
+  read max=N and both write seq=N+1 — two events share a seq and "delete a middle event" no longer
+  triggers a gap. So the `nextSeq+append+fsync` trio is wrapped by (a) a per-task in-process
+  `sync.Mutex` (guards same-process goroutines and the stale-lock bootstrap race) plus (b) an
+  `<id>.jsonl.lock` file lock (O_EXCL grab, 5s TTL, guards cross-process contention).
+- **Gaps are disclosed, never masked**: the board's activity stream monitors `seq` monotonicity from
+  seq=1 (so a deleted head-of-file event also triggers a gap) and inserts an explicit "event gap
+  (missing seq X..Y)" item whenever a jump is detected, plus a "event gap (trailing residue or
+  corrupt line discarded)" item when the tail is corrupt. It never synthesizes a fake event by
+  inferring from status to plug the hole.
 - No signing in this first pass (no proven need for tamper-evidence — only append-only leave-trace
   semantics are needed).
 

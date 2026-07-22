@@ -286,6 +286,15 @@ Guard semantics (`tombstones.go`):
   (`queued/limit_paused/held`), the current step's resume tombstone is cleared — a signal that
   the orchestrator sanctioned a new attempt cycle, so the fresh `bound=2` counter starts from zero.
   If the previous status was `running`, the tombstone is preserved to cap crash storms.
+- **Explicit CLI reset (Round-1 addendum)**: `cmdSetStatus`' `retry` and `release` branches both
+  call `resetTombstoneKind(reconcileCrossKind())` — these are the only CLI paths from `held/failed`
+  back to `queued`, mirroring the resume side's fresh-entry rule. Without this reset, a `final`
+  tombstone would silently keep an orphaned card masquerading as a trustworthy `done`.
+- **Skipped upgrades to held (Round-1 addendum)**: when `reconcileCrossChains` sees
+  `injectAtMostOnce` return `skipped=true` (final already set, or bound exhausted), the card is
+  lifted from `done` to `held` and an `evHeld(reason=reconcile_cross_tombstone_exhausted,
+  actor=runner:reconcile-tombstone)` is emitted — no more single-leg `done` cards impersonating
+  trustworthy results, no more infinite stderr spam masquerading as disclosure.
 - **Archived with the card**: the tombstone ledger is moved to `archive/tombstones/<id>.json`
   by `archiveTask`, so an audit can inspect exactly how many attempts each injection needed.
 

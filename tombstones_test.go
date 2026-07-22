@@ -318,7 +318,15 @@ func TestRunTaskResetsResumeTombstoneOnFreshEntry(t *testing.T) {
 }
 
 // TestReconcileCrossChainsGuardsAtMostOnce 集成:reconcileCrossChains 首次孤儿判 failed 落墓碑 final;
-// 二次调用(即使 t.Status 被外部改回 done 冒充复发)应完全跳过(墓碑挡住)。
+// 二次调用(手工把 status 改回 done 冒充"cli retry 未清墓碑就复活"这种畸形序列)必须走 skipped→held
+// 披露路径:第二条 orphan 事件不涨(墓碑挡住 inject),status 升级到 held(不再冒充可采信 done)+
+// evHeld(reason=reconcile_cross_tombstone_exhausted) 落账本。
+//
+// 【为什么本轮修订"次轮期望 status=done + 零披露"为"次轮 status=held + 披露 held 事件"】
+// Round-0 审核报告 P1-1 明写:老版本把"卡留 done、零披露"当期望 → 固化了"final 挡住的孤儿卡永久
+// 冒充可采信结果"的盲区。Round-1 fix 让 skipped 升级 held+emit 披露事件,本测试同步跟进(不是弱化,
+// 是把测试对准新的正确契约)。此外正常 cli retry 会调 resetTombstoneKind(reconcileCrossKind()),
+// 本测试用"手工强设 done 冒充复发"是极端反例场景,专门检验最后一道护栏。
 func TestReconcileCrossChainsGuardsAtMostOnce(t *testing.T) {
 	root := testRoot(t)
 	cfg := testCfg()
@@ -365,7 +373,7 @@ func TestReconcileCrossChainsGuardsAtMostOnce(t *testing.T) {
 		t.Fatalf("首轮应 1 条孤儿 failed 事件,got %d, all=%+v", orphanCnt, events)
 	}
 
-	// 次轮:即便手工把 status 改回 done 让 reconcile 再撞一次,墓碑 final 应挡住。
+	// 次轮:手工把 status 改回 done 冒充"未清墓碑就复发"的畸形。
 	a1.Status = statusDone
 	if err := saveTask(root, a1); err != nil {
 		t.Fatal(err)
@@ -373,21 +381,33 @@ func TestReconcileCrossChainsGuardsAtMostOnce(t *testing.T) {
 	tasks2 := []*Task{a1}
 	reconcileCrossChains(root, tasks2, active)
 	events2 := readAllEventsRaw(t, root, a.ID)
+
+	// (1) inject 被墓碑挡住:cross_chain_orphan 事件不涨(仍为 1)。
 	orphanCnt2 := 0
+	// (2) 但必须披露 held(不再冒充可采信 done)——skipped 分支的新契约。
+	heldCnt := 0
 	for _, ev := range events2 {
 		if ev.Type == evFailed {
 			if r, _ := ev.Detail["reason"].(string); r == "cross_chain_orphan" {
 				orphanCnt2++
 			}
 		}
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			if r, _ := ev.Detail["reason"].(string); r == "reconcile_cross_tombstone_exhausted" {
+				heldCnt++
+			}
+		}
 	}
 	if orphanCnt2 != 1 {
-		t.Fatalf("次轮 reconcile 应被墓碑挡住,孤儿事件仍应为 1 条,got %d", orphanCnt2)
+		t.Fatalf("次轮 reconcile 应被墓碑挡住 inject,孤儿事件仍应为 1 条,got %d 序列=%v", orphanCnt2, eventTypes(events2))
 	}
-	// 也应仍是 status=done(墓碑挡住 → 未再次改 failed)
+	if heldCnt != 1 {
+		t.Fatalf("次轮 reconcile skipped 分支必须 emit 1 条 held 披露,got %d 序列=%v", heldCnt, eventTypes(events2))
+	}
+	// (3) status 应升级到 held(不再冒充可采信 done)。
 	a2, _ := loadTask(root, a.ID)
-	if a2.Status != statusDone {
-		t.Fatalf("次轮 reconcile 应被拦截(status 未再变),got %s", a2.Status)
+	if a2.Status != statusHeld {
+		t.Fatalf("次轮 reconcile skipped 分支应把 status 升级 held,got %s", a2.Status)
 	}
 }
 
@@ -492,5 +512,401 @@ func TestTombstoneJournalRoundtripJSON(t *testing.T) {
 	got := back.Entries["resume:0"]
 	if got.Phase != tombstonePhaseFinal || got.Attempt != 1 || got.Nonce != 1234 {
 		t.Fatalf("roundtrip 字段丢失: %+v", got)
+	}
+}
+
+// ---------- Round-1 修复回红反例（每个 P1 一个,反例注入即报红） ----------
+
+// TestRunTaskHoldsWhenRunningSideTombstoneExhausted (Round-1 P1-2 running 承重分支反例)
+// 验证 runner.go:551 的"if t.Status != statusRunning"承重分支的 running 侧:上一轮 runTask
+// 中途崩溃遗留(Status=running + MidStep=true + SessionID 非空 + resume:0 attempt=2 pending)
+// 再入 runTask 时,reset 不得触发,墓碑 bound 挡住 inject → fakeClaude 零调用 → 升级 statusHeld
+// + emit evHeld(reason=resume_tombstone_exhausted, actor=runner:tombstone)。
+//
+// 【为什么必须真调 runTask 而非手工验证 helper】原有 TestRunTaskResetsResumeTombstoneOnFreshEntry
+// 只手工调 resetTombstoneKind,把 runner.go:551 的条件整个删掉(无条件 reset、崩溃风暴保护完全
+// 失效)全套测试仍绿——承重分支等于零测试覆盖。本测试直接调 runTask,删条件即 reset 总触发 →
+// tombstone 清空 → inject 正常调 fakeClaude → 事件不再是 [dispatched, held] 而是 [dispatched,
+// step_ok(+ ...)] → 断言直接报红。
+func TestRunTaskHoldsWhenRunningSideTombstoneExhausted(t *testing.T) {
+	root := testRoot(t)
+	claudeBin := fakeClaudeBin(t, mkOKResultJSON("sess-A"), "", 0)
+	cfg := runTaskCfg(t, claudeBin)
+
+	work := t.TempDir()
+	tk := newTask(root, cfg, typeSequence, "崩溃残留-running", work, []string{"p1", "p2"}, 5)
+	tk.MidStep = true
+	tk.SessionID = "sess-A"         // 让 resuming=true
+	tk.Status = statusRunning       // 关键:running 侧入场——模拟"上一轮 runTask 中途崩溃遗留"
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	// 预置 resume:0 attempt=2 pending 墓碑(模拟上一轮已耗尽 bound):两轮崩溃 inject 即成。
+	_, _, _ = injectAtMostOnce(root, tk.ID, resumeKind(0), func() error { return errors.New("crash-round-1") })
+	_, _, _ = injectAtMostOnce(root, tk.ID, resumeKind(0), func() error { return errors.New("crash-round-2") })
+	preJ, _, err := readTombstoneJournal(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preJ.Entries[resumeKind(0)].Attempt != 2 || preJ.Entries[resumeKind(0)].Phase != tombstonePhasePending {
+		t.Fatalf("前置状态应 attempt=2 pending,got %+v", preJ.Entries[resumeKind(0)])
+	}
+
+	if err := runTask(context.Background(), root, cfg, tk, false); err != nil {
+		t.Fatal(err)
+	}
+
+	events := readAllEventsRaw(t, root, tk.ID)
+	if len(events) != 2 {
+		t.Fatalf("running 侧墓碑挡住应恰 [dispatched, held] 两条事件,got %d: %v", len(events), eventTypes(events))
+	}
+	if events[0].Type != evDispatched {
+		t.Fatalf("首条应 dispatched,got %v", eventTypes(events))
+	}
+	if events[1].Type != evHeld {
+		t.Fatalf("次条应 held,got %v", eventTypes(events))
+	}
+	if reason, _ := events[1].Detail["reason"].(string); reason != "resume_tombstone_exhausted" {
+		t.Fatalf("held.reason 应 resume_tombstone_exhausted,got %q", reason)
+	}
+	if events[1].Actor != "runner:tombstone" {
+		t.Fatalf("held.actor 应 runner:tombstone,got %q", events[1].Actor)
+	}
+	// 关键反例守卫:fakeClaude 零调用——若 inject 被调,fakeClaude 返回 mkOKResultJSON 会让
+	// runTask 推 Step→1、emit evStepOK。若事件里出现 step_ok 直接说明 reset 被误触发。
+	for _, ev := range events {
+		if ev.Type == evStepOK || ev.Type == evDone {
+			t.Fatalf("running 侧墓碑挡住路径不应出现 step_ok/done(fakeClaude 被调),got 序列=%v", eventTypes(events))
+		}
+	}
+	// 盘上状态应转 held。
+	tk2, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk2.Status != statusHeld {
+		t.Fatalf("running 侧墓碑挡住应 status=held,got %s", tk2.Status)
+	}
+	// 墓碑仍应停 attempt=2 pending(bound 未被误清):证明 reset-at-entry 没触发。
+	postJ, _, err := readTombstoneJournal(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if postJ.Entries[resumeKind(0)].Attempt != 2 || postJ.Entries[resumeKind(0)].Phase != tombstonePhasePending {
+		t.Fatalf("墓碑应仍停 attempt=2 pending(reset 未触发),got %+v", postJ.Entries[resumeKind(0)])
+	}
+}
+
+// TestRunTaskResetsAndInjectsWhenLimitPausedFreshEntry (Round-1 P1-2 对照组)
+// 承接上一测试构造的等价墓碑,把入场状态改为 statusLimitPaused → reset-at-entry 触发、bound 清零、
+// inject 恰调 1 次 → 事件流出现 evStepOK。这是 running/limit_paused 两侧的双向对照:
+// 承重条件的 running 侧走 held(上一测试),limit_paused 侧走正常续跑。
+//
+// 【为什么这两个测试要同一份墓碑构造】只测 running 侧不能证明"条件是 statusRunning";只测 limit_paused
+// 也不能证明差异。两个一起做才把承重分支的语义锁死:同墓碑、不同入场状态,恰好走不同路径。
+func TestRunTaskResetsAndInjectsWhenLimitPausedFreshEntry(t *testing.T) {
+	root := testRoot(t)
+	claudeBin := fakeClaudeBin(t, mkOKResultJSON("sess-A"), "", 0)
+	cfg := runTaskCfg(t, claudeBin)
+
+	work := t.TempDir()
+	tk := newTask(root, cfg, typeSequence, "限额恢复-fresh", work, []string{"p1", "p2"}, 5)
+	tk.MidStep = true
+	tk.SessionID = "sess-A"
+	tk.Status = statusLimitPaused // 关键:合法限额恢复入场——reset-at-entry 应触发
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	// 同样预置 resume:0 attempt=2 pending 墓碑。
+	_, _, _ = injectAtMostOnce(root, tk.ID, resumeKind(0), func() error { return errors.New("crash-round-1") })
+	_, _, _ = injectAtMostOnce(root, tk.ID, resumeKind(0), func() error { return errors.New("crash-round-2") })
+
+	if err := runTask(context.Background(), root, cfg, tk, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// fresh entry → reset → inject 成功 → 墓碑应为 final,attempt=1(而非仍是 pending 2)。
+	postJ, _, err := readTombstoneJournal(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := postJ.Entries[resumeKind(0)]
+	if e.Phase != tombstonePhaseFinal {
+		t.Fatalf("fresh-entry limit_paused 侧墓碑应 final,got %+v", e)
+	}
+	if e.Attempt != 1 {
+		t.Fatalf("fresh-entry attempt 应从 1 起算(reset 后新一轮 bound),got attempt=%d", e.Attempt)
+	}
+	// 事件流应有 step_ok(证明 fakeClaude 被调用了 1 次);不得升级 held。
+	events := readAllEventsRaw(t, root, tk.ID)
+	sawStepOK := false
+	for _, ev := range events {
+		if ev.Type == evStepOK {
+			sawStepOK = true
+		}
+		if ev.Type == evHeld {
+			t.Fatalf("fresh entry 不应升级 held,got 事件序列=%v", eventTypes(events))
+		}
+	}
+	if !sawStepOK {
+		t.Fatalf("fresh-entry inject 后应至少 1 条 step_ok,got 事件序列=%v", eventTypes(events))
+	}
+}
+
+// TestReconcileCrossChainsHoldsOnTombstoneSkipped (Round-1 P1-1 skipped-discard 类反例)
+// 验证 runner.go:1676 injectAtMostOnce 返回 skipped=true 时:reconcileCrossChains 必须升级 statusHeld
+// 并 emit evHeld(reason=reconcile_cross_tombstone_exhausted, actor=runner:reconcile-tombstone),
+// 而不是把 skipped 用 `_` 静默丢弃让单腿 done 卡永久冒充可采信结果。
+//
+// 【构造场景】预置 reconcile:cross final 墓碑 → 手工把孤儿 A 卡的状态从 failed 复位回 done(冒充
+// "cli retry 复活再次孤儿") → reconcileCrossChains 调 → injectAtMostOnce 见 phase=final 返回 skipped
+// → 期望:统一升级 held + emit 披露事件,不再让"final 挡住"的孤儿卡零披露永久冒充可采信。
+//
+// 【反例】把 runner.go 的 skipped 分支删掉(退回原 `_, corrupted, tombErr :=` 静默丢弃):
+// 卡留 status=done、零披露事件——本测试的 held 断言直接报红。
+func TestReconcileCrossChainsHoldsOnTombstoneSkipped(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "A孤儿-skipped 复活", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-skipped-1"
+	a.Status = statusDone
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 预置 reconcile:cross final 墓碑——模拟上一轮 reconcile 已经判过 failed 并落 final。
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return nil })
+	preJ, _, _ := readTombstoneJournal(root, a.ID)
+	if preJ.Entries[reconcileCrossKind()].Phase != tombstonePhaseFinal {
+		t.Fatalf("前置应 reconcile:cross final,got %+v", preJ.Entries[reconcileCrossKind()])
+	}
+
+	// 触发 reconcile:卡仍是 done+孤儿,injectAtMostOnce 应返回 skipped=true。
+	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+
+	// 期望:卡升级挂 held,不再冒充 done。
+	a2, err := loadTask(root, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a2.Status != statusHeld {
+		t.Fatalf("skipped 应升级 held(不再冒充 done),got status=%s", a2.Status)
+	}
+	// 事件流应有 evHeld,actor=runner:reconcile-tombstone,reason=reconcile_cross_tombstone_exhausted。
+	events := readAllEventsRaw(t, root, a.ID)
+	sawHeld := false
+	for _, ev := range events {
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			sawHeld = true
+			if reason, _ := ev.Detail["reason"].(string); reason != "reconcile_cross_tombstone_exhausted" {
+				t.Fatalf("held.reason 应 reconcile_cross_tombstone_exhausted,got %q", reason)
+			}
+			if kind, _ := ev.Detail["kind"].(string); kind != reconcileCrossKind() {
+				t.Fatalf("held.kind 应 %s,got %q", reconcileCrossKind(), kind)
+			}
+			if role, _ := ev.Detail["role"].(string); role != "A" {
+				t.Fatalf("held.role 应 A,got %q", role)
+			}
+			if miss, _ := ev.Detail["missing_next"].(string); miss != "B" {
+				t.Fatalf("held.missing_next 应 B,got %q", miss)
+			}
+		}
+	}
+	if !sawHeld {
+		t.Fatalf("skipped 分支必须 emit evHeld(runner:reconcile-tombstone),got 事件序列=%v", eventTypes(events))
+	}
+}
+
+// TestReconcileCrossChainsHoldsOnBoundExhausted (Round-1 P1-1 skipped-discard 类反例——bound 侧)
+// 验证 skipped=true 的第二条触发路径:bound 已耗尽(attempt=2 pending)。
+// 【构造场景】saveTask 连续两轮瞬时失败(如磁盘满)攒出 attempt=2 pending → 磁盘恢复后
+// 该卡仍是 done+孤儿 → reconcile 撞上时 injectAtMostOnce 返回 skipped=true(bound 耗尽) →
+// 期望:升级 held + emit 披露,不再无限 stderr 刷屏。
+func TestReconcileCrossChainsHoldsOnBoundExhausted(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "A孤儿-bound 耗尽", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-bound-1"
+	a.Status = statusDone
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 构造 reconcile:cross attempt=2 pending(两轮 inject 都返错)——模拟 saveTask 连续失败。
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return errors.New("saveTask 失败-1") })
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return errors.New("saveTask 失败-2") })
+	preJ, _, _ := readTombstoneJournal(root, a.ID)
+	pre := preJ.Entries[reconcileCrossKind()]
+	if pre.Phase != tombstonePhasePending || pre.Attempt != 2 {
+		t.Fatalf("前置应 reconcile:cross pending attempt=2,got %+v", pre)
+	}
+
+	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+
+	a2, err := loadTask(root, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a2.Status != statusHeld {
+		t.Fatalf("bound 耗尽应升级 held,got status=%s", a2.Status)
+	}
+	// 事件流必须含 held,不能只靠 stderr 刷屏。
+	events := readAllEventsRaw(t, root, a.ID)
+	sawHeld := false
+	for _, ev := range events {
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			sawHeld = true
+		}
+	}
+	if !sawHeld {
+		t.Fatalf("bound 耗尽应 emit evHeld,got 事件序列=%v", eventTypes(events))
+	}
+}
+
+// TestCmdRetryResetsReconcileCrossTombstone (Round-1 P1-1 no-reset-on-retry 类反例)
+// 验证 main.go 的 cmdSetStatus retry 分支必须显式重置 reconcile:cross 墓碑:
+// 场景 A 卡已被 reconcile 判 failed(final 墓碑落盘)→ 人工 claudego retry → 期望:reconcile:cross
+// 墓碑被清空 → 下一轮孤儿判可以重新起 bound=2 保护。
+//
+// 【反例】去掉 main.go retry 分支的 resetTombstoneKind(reconcileCrossKind()) 那行:
+// 墓碑 final 保留 → 复活后的 A 卡再次成为孤儿会被 final 静默挡住,单腿 done 永久冒充可采信结果。
+func TestCmdRetryResetsReconcileCrossTombstone(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "retry-reset A", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-retry-1"
+	a.Status = statusFailed // 已被 reconcile 判过 failed 的孤儿
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 造 reconcile:cross final 墓碑(模拟上一轮判 failed 时落的 final)。
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return nil })
+	// 顺手在同一账本里造 resume:0 final 观察 retry 不误伤(反例守卫)。
+	_, _, _ = injectAtMostOnce(root, a.ID, resumeKind(0), func() error { return nil })
+
+	if err := cmdSetStatus([]string{"-root", root, a.ID}, "retry"); err != nil {
+		t.Fatal(err)
+	}
+
+	j, corrupted, err := readTombstoneJournal(root, a.ID)
+	if err != nil {
+		t.Fatalf("读账本失败: err=%v corrupted=%v", err, corrupted)
+	}
+	if _, exists := j.Entries[reconcileCrossKind()]; exists {
+		t.Fatalf("retry 分支必须清 reconcile:cross 墓碑,got %+v", j.Entries[reconcileCrossKind()])
+	}
+	// 反例守卫:retry 只清 reconcile:cross,resume 侧留给 runTask reset-at-entry。
+	// 若 retry 无脑清全部,resume:0 会被误伤——本断言就该保住 resume 侧的归属。
+	if _, exists := j.Entries[resumeKind(0)]; !exists {
+		t.Fatalf("retry 不应触碰 resume:0 墓碑(reset-at-entry 归属 runTask),got 账本被清空 %+v", j.Entries)
+	}
+}
+
+// TestCmdReleaseResetsReconcileCrossTombstone (Round-1 P1-1 同类闭合——release 侧)
+// 同类闭合探针:审核报告只点 retry,但 release 是从 held→queued 的另一条 cli 路径,
+// 逻辑同源。若不闭合,新加的 skipped→held 路径会造出"ops release → runTask 走完 no_more_prompts
+// → 又 done+孤儿 → reconcile 再次 skipped → 再次挂 held"的 held↔release 无穷震荡。
+// 【反例】去掉 main.go release 分支的 resetTombstoneKind(reconcileCrossKind()) 那行:
+// 释放后墓碑仍 final/pending(2),孤儿再次撞 skipped 分支——本测试断言"释放后墓碑清空"直接报红。
+func TestCmdReleaseResetsReconcileCrossTombstone(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "release-reset A", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-release-1"
+	a.Status = statusHeld // 已经被 reconcile skipped 分支挂到 held
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 造 reconcile:cross final 墓碑(模拟 reconcile 之前已经落 final 挡住)。
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return nil })
+	// resume:1 用来验证 release 不误伤其他 kind。
+	_, _, _ = injectAtMostOnce(root, a.ID, resumeKind(1), func() error { return nil })
+
+	if err := cmdSetStatus([]string{"-root", root, a.ID}, "release"); err != nil {
+		t.Fatal(err)
+	}
+
+	j, corrupted, err := readTombstoneJournal(root, a.ID)
+	if err != nil {
+		t.Fatalf("读账本失败: err=%v corrupted=%v", err, corrupted)
+	}
+	if _, exists := j.Entries[reconcileCrossKind()]; exists {
+		t.Fatalf("release 分支必须清 reconcile:cross 墓碑,got %+v", j.Entries[reconcileCrossKind()])
+	}
+	// 同类闭合的反例守卫:release 只清 reconcile:cross,resume 侧留给 runTask reset-at-entry。
+	if _, exists := j.Entries[resumeKind(1)]; !exists {
+		t.Fatalf("release 不应触碰 resume:1 墓碑(归属 runTask),got 账本被清空 %+v", j.Entries)
+	}
+}
+
+// TestReconcileCrossChainsAfterRetryReAdjudicates (Round-1 P1-1 端到端契约反例)
+// 端到端串起 fix P1-1a + P1-1b:一张被 reconcile 判过 failed 的孤儿卡,人工 retry 后再次成为
+// 孤儿时应能被 reconcile 重新裁决(而非被 final 墓碑静默挡住)。
+//
+// 【为什么这条测试关键】P1-1a(retry 清墓碑)与 P1-1b(skipped 挂 held)单独测都不能证明端到端契约成立:
+// P1-1a 只保证墓碑被清、不管清完能否推进业务;P1-1b 只保证挡住时会披露、不管挡的正当性。串起来才
+// 证明:retry 复活 → 再次孤儿 → 不被误挡 → 事件账本再记一条 failed(reason=cross_chain_orphan)。
+//
+// 【反例】任何一条修复被回退,这条端到端就会报红:回退 P1-1a → 第二轮 reconcile 被 final 挡住 →
+// 事件不再是 [..., failed] 而是 [..., held];回退 P1-1b → skipped 静默丢弃 → 卡还留 done、事件里
+// 完全无第二条 failed/held。
+func TestReconcileCrossChainsAfterRetryReAdjudicates(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "retry+reconcile 端到端", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-e2e-1"
+	a.Status = statusDone
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 第一轮 reconcile:判 failed + 落 final 墓碑 + 一条 evFailed(cross_chain_orphan)。
+	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+	a1, _ := loadTask(root, a.ID)
+	if a1.Status != statusFailed {
+		t.Fatalf("首轮 reconcile 应判 failed,got %s", a1.Status)
+	}
+
+	// 人工 retry:期望墓碑被清,状态转 queued。
+	if err := cmdSetStatus([]string{"-root", root, a.ID}, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	a2, _ := loadTask(root, a.ID)
+	if a2.Status != statusQueued {
+		t.Fatalf("retry 应转 queued,got %s", a2.Status)
+	}
+
+	// 模拟"复活后再次成为孤儿":把状态设回 done,再触发 reconcile。
+	a2.Status = statusDone
+	if err := saveTask(root, a2); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCrossChains(root, []*Task{a2}, map[string]bool{})
+	a3, _ := loadTask(root, a.ID)
+	if a3.Status != statusFailed {
+		t.Fatalf("复活后再次孤儿,reconcile 应能重新判 failed(而非被 final 挡住),got %s", a3.Status)
+	}
+
+	events := readAllEventsRaw(t, root, a.ID)
+	orphanCnt := 0
+	heldCnt := 0
+	for _, ev := range events {
+		if ev.Type == evFailed {
+			if r, _ := ev.Detail["reason"].(string); r == "cross_chain_orphan" {
+				orphanCnt++
+			}
+		}
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			heldCnt++
+		}
+	}
+	// 端到端契约:两轮孤儿裁决 = 两条 cross_chain_orphan 事件(而非被 final 挡成 1 条+1 条 held)。
+	if orphanCnt != 2 {
+		t.Fatalf("retry 复活后再次判孤儿应恰 2 条 cross_chain_orphan(P1-1a 让 retry 清 final、P1-1b 备而未用),got %d 序列=%v", orphanCnt, eventTypes(events))
+	}
+	if heldCnt != 0 {
+		t.Fatalf("端到端不应触发 tombstone-held(retry 已把墓碑清干净),got %d", heldCnt)
 	}
 }

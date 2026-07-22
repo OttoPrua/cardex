@@ -1417,6 +1417,12 @@ func cmdSetStatus(args []string, action string) error {
 		}
 		t.Status = statusQueued
 		t.NotBeforeEpoch = 0
+		// CG-4 Round-1 修复(同类闭合):release 分支也须清 reconcile:cross 墓碑——否则
+		// reconcile skipped 分支挂 held 后,ops release → queued → runTask 走完 no_more_prompts
+		// 又回 done+孤儿 → tombstone 仍 pending(2)/final → 再次 skipped → 再次挂 held
+		// = 无穷 held↔release 循环。retry 只能作用于终态/limit_paused,唯一从 held→queued
+		// 的路径是 release,因此这条被审核审过的 P1 类还有一处同构位点必须一并闭合。
+		_ = resetTombstoneKind(root, t.ID, reconcileCrossKind())
 	case "retry":
 		if !t.terminal() && t.Status != statusLimitPaused {
 			return fmt.Errorf("%s 当前状态 %s 无需 retry", t.ID, t.Status)
@@ -1430,6 +1436,14 @@ func cmdSetStatus(args []string, action string) error {
 			t.Step = 0
 			t.MidStep = false
 		}
+		// CG-4 Round-1 修复:reconcile:cross 墓碑在人工 retry 时必须显式重置——
+		// 【为什么】resume:<step> 走 runTask 顶部 reset-at-entry(status!=running 即清)拿到重置路径,
+		// 但 reconcile:cross 由 tick 主循环写、不进 runTask,若不在这里清,一张被 reconcile 判 failed 的
+		// A 卡 retry 复活、再次成为孤儿时会被 final 墓碑静默挡住,单腿 done 卡永久冒充可采信结果、零披露。
+		// 【纪律对齐】retry 是"编排层认可的新一轮尝试",与 resume 侧的 fresh-entry 判据同源(见 tombstones.go
+		// 文件头【为什么 reset-at-entry ...】)。反例:去掉本行,TestCmdRetryResetsReconcileCrossTombstone
+		// 报红——保留 final、再撞 reconcile 直接跳过。
+		_ = resetTombstoneKind(root, t.ID, reconcileCrossKind())
 	case "cancel":
 		wasRunning := t.Status == statusRunning
 		t.Status = statusCanceled

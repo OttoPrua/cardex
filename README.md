@@ -298,6 +298,13 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 - **reset-at-entry**：`runTask` 顶部若上一轮盘上状态非 `running`（`queued/limit_paused/held`），则清当前步的
   resume 墓碑——这是"编排层认可的新一轮尝试"信号，让新一轮 bound=2 保护从零起算；若上一轮仍是 `running`，
   则保留墓碑挡住崩溃风暴。
+- **cli 明示重置（Round-1 追加）**：`cmdSetStatus` 的 `retry` 与 `release` 分支显式调
+  `resetTombstoneKind(reconcileCrossKind())` 清 reconcile 墓碑——这两条是 `held/failed → queued` 的唯一
+  cli 通道，与 `resume` 侧的 fresh-entry 同源；不清就会让"final 挡住的孤儿卡"永久冒充可采信 done。
+- **skipped 强升 held（Round-1 追加）**：`reconcileCrossChains` 的 `injectAtMostOnce` 返回 `skipped=true`
+  时（final 已在 / bound 耗尽），把卡从 `done` 升级到 `held` 并 emit
+  `evHeld(reason=reconcile_cross_tombstone_exhausted, actor=runner:reconcile-tombstone)`——不再让单腿
+  `done` 卡永久冒充可采信结果，也不再靠每轮 drain 的 stderr 无限刷屏当披露。
 - **随卡归档**：墓碑账本随 `archiveTask` 移到 `archive/tombstones/<id>.json`，审计可看"这张卡的每次注入都尝试了几次"。
 
 数据模型（单 JSON 而非 JSONL）：`{"version": 1, "entries": {"resume:0": {kind, attempt, phase, nonce, ts}, "reconcile:cross": {...}}}`

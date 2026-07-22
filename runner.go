@@ -1670,10 +1670,10 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 		}
 		// CG-4:reconcile 裁决也是"至多一次注入"点——若崩溃落在 saveTask 与 emit 之间,下一轮 tick 复扫
 		// 会再撞一次,把一条 failed 事件放大成 N 条,污染诚实活动流。用墓碑护栏把整段"状态变更 + 侧车清理
-		// + 事件账本"包成幂等原子。bound=2 允许"崩一次+重试一次"共 2 次注入;更多次直接放弃并 stderr 警告
-		// (状态已终态,不再重扫;事件账本靠 seq 缺口披露)。
+		// + 事件账本"包成幂等原子。bound=2 允许"崩一次+重试一次"共 2 次注入;更多次由 skipped 分支升级挂
+		// held+emit 披露(不再 stderr 刷屏,不再让单腿 done 卡永久冒充可采信结果)。
 		nextRole := next // 逃逸进闭包时避免引用循环变量的老坑
-		_, corrupted, tombErr := injectAtMostOnce(root, t.ID, reconcileCrossKind(), func() error {
+		skipped, corrupted, tombErr := injectAtMostOnce(root, t.ID, reconcileCrossKind(), func() error {
 			t.Status = statusFailed
 			t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, nextRole)
 			_ = os.Remove(crossPeerPath(root, t.XKey))
@@ -1689,9 +1689,31 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 		})
 		if tombErr != nil {
 			fmt.Fprintf(os.Stderr, "警告: reconcile 墓碑写入失败 %s: %v\n", t.ID, tombErr)
+			continue
 		}
 		if corrupted {
 			fmt.Fprintf(os.Stderr, "警告: %s reconcile 墓碑损坏字节已披露,按无墓碑处理\n", t.ID)
+		}
+		if skipped {
+			// CG-4 Round-1 修复:注入被墓碑挡住(phase=final 或 attempt>=bound)且卡仍在孤儿谓词内——
+			// 【为什么必须升级 held】前者是 reconcile 已判过 failed 后被 cli retry 拉回 done 再次孤儿的
+			// "永久盲区"(final 终生挡住);后者是 saveTask 连续崩溃耗尽 bound。都不能任其反复 stderr 刷屏
+			// (会淹没其他告警,且下一轮 drain 又撞一次)、也不能让单腿 done 卡永久冒充可采信结果。升级挂
+			// held 让 t.Status != statusDone 从而下一轮不再进本孤儿谓词,同时 emit 披露事件,活动流讲清
+			// "墓碑挡住不再裁决,已挂人工"。运维 release+retry 走 cmdSetStatus 的 reset 分支重新起 bound。
+			// 【反例】去掉本分支,TestReconcileCrossChainsHoldsOnTombstoneSkipped 报红——卡留 done、零披露。
+			t.Status = statusHeld
+			t.LastError = fmt.Sprintf("CG-4 reconcile 墓碑至多一次已耗尽或已终态挡住(role=%s missing_next=%s),需人工核查后 retry 复活",
+				t.XRole, nextRole)
+			t.touch()
+			if err := saveTask(root, t); err != nil {
+				fmt.Fprintf(os.Stderr, "警告: reconcile 挂 held 落盘失败 %s: %v\n", t.ID, err)
+				continue
+			}
+			emitTaskEvent(root, t.ID, evHeld, "runner:reconcile-tombstone", statusHeld, t.Step, map[string]any{
+				"reason": "reconcile_cross_tombstone_exhausted", "kind": reconcileCrossKind(),
+				"role": t.XRole, "missing_next": nextRole,
+			})
 		}
 	}
 }

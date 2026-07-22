@@ -59,8 +59,8 @@ func TestReviewDivertToRemoteHost(t *testing.T) {
 	}
 }
 
-// P0-1 类闭合：远端 typeReview 的执行器选择必须命中远端 claude,绝不因 Model 为空被路由到远端 codex。
-// remoteUsesClaude 是 runTask 远端分支的选择判据(抽出可测),这里直接钉住该契约。
+// P0-1 类闭合：远端 typeReview 默认命中远端 claude；但 runner_pref=codex 是用户显式钉定，
+// 必须优先于 type/model 默认值。remoteUsesClaude 是 runTask 远端分支的选择判据。
 func TestRemoteReviewRoutesToClaudeNotCodex(t *testing.T) {
 	// 空 Model 的远程审核卡:必须走远端 claude(平衡 claude 额度),绝不走烧 GPT 额度的远端 codex。
 	if !remoteUsesClaude(&Task{Type: typeReview, RemoteHost: "remotehost"}) {
@@ -73,6 +73,17 @@ func TestRemoteReviewRoutesToClaudeNotCodex(t *testing.T) {
 	// 带模型的远程卡走远端 claude。
 	if !remoteUsesClaude(&Task{Type: typeSequence, Model: "opus", RemoteHost: "h"}) {
 		t.Fatal("带模型的远程卡应走远端 claude")
+	}
+	// 显式 runner_pref=codex 必须覆盖审核类型和由 type_defaults 继承来的 fable 模型。
+	// 这是远端 Sol 复审卡的真实形态：若不覆盖，会名义用 Codex、实际继续烧 Fable。
+	if remoteUsesClaude(&Task{
+		Type:         typeReview,
+		Model:        "claude-fable-5",
+		PreferRunner: "codex",
+		CodexModel:   "gpt-5.6-sol",
+		RemoteHost:   "remotehost",
+	}) {
+		t.Fatal("显式 runner_pref=codex 的远端审核卡应走远端 codex")
 	}
 }
 

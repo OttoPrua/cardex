@@ -376,9 +376,13 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 }
 
 // remoteUsesClaude 判定远端任务走远端 claude(true)还是远端 codex(false)：
-// 带 claude 模型走 claude；只读审核卡(typeReview)强制走 claude——审核分流的立项目标是平衡
-// 两侧 claude 额度,空 Model 也绝不路由到烧 GPT 额度的远端 codex(空则用远端账号默认模型)。
+// runner_pref=codex 是用户的显式执行器钉定，优先级最高；否则带 claude 模型或只读审核卡
+// (typeReview)默认走远端 claude，以保留审核分流的既有额度平衡策略。这样显式 Codex 复审会
+// 真正消耗 GPT 额度，而未指定执行器的审核卡仍使用远端 Claude/Fable。
 func remoteUsesClaude(t *Task) bool {
+	if t.PreferRunner == "codex" {
+		return false
+	}
 	return t.Model != "" || t.Type == typeReview
 }
 
@@ -606,9 +610,8 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		var runErr error
 		switch {
 		case remote:
-			// 远端执行：带 claude 模型(如 opus)走远端 claude；只读审核卡强制走远端 claude——
-			// 审核分流的立项目标是平衡两侧 claude 额度,绝不把审核路由到烧 GPT 额度的远端 codex
-			// (即便 Model 为空,空则用远端账号默认模型)。其余无模型的填充类任务仍走远端 codex。
+			// 远端执行：runner_pref=codex 显式钉定优先；否则带 claude 模型(如 fable/opus)
+			// 或只读审核卡默认走远端 claude。其余无模型任务走远端 codex。
 			// 两者都走该远端主机自己的账号额度，不记本机 claude 账本、不写全局冷却。
 			if remoteUsesClaude(t) {
 				res, combined, runErr = invokeRemoteClaude(ctx, cfg, t, prompt)

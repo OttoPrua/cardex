@@ -3,7 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -216,7 +221,9 @@ func preWindowHold(cfg *Config, now time.Time) (bool, string) {
 }
 
 // budgetBlocked 判定额度红线是否生效（true 则本轮不派发）。
-// 两条通道相互独立：本地队列预算封顶；外部用量源按全局百分比停。外部样本过期放行。
+// 三通道：本地队列预算封顶；外部用量源(usage_feed)与 oauth 端点(oauth_usage)按全局百分比停。
+// 两个百分比源合并规则=**最保守值优先**（可用样本里 percent 最大者判线）——分歧不猜测，最坏假设兜住；
+// 全部不可用 → fail-open 放行（沿用既有语义：数据不足不该锁队列）。
 func budgetBlocked(root string, cfg *Config, now time.Time) (bool, string) {
 	if hold, reason := preWindowHold(cfg, now); hold {
 		return true, reason
@@ -229,17 +236,328 @@ func budgetBlocked(root string, cfg *Config, now time.Time) (bool, string) {
 				label, spent, qb, windowHours)
 		}
 	}
-	if rp > 0 && cfg.UsageFeed != "" {
-		if s, err := latestFeedSample(cfg.UsageFeed); err == nil {
-			if at, err := time.Parse(time.RFC3339, s.SampledAt); err == nil {
-				age := now.Sub(at)
-				maxAge := time.Duration(cfg.UsageFeedMaxAgeMin) * time.Minute
-				if age <= maxAge && s.UsedPercent >= rp {
-					return true, fmt.Sprintf("%s全局 5h 窗口已用 %d%%（红线 %d%%，样本 %s 前）",
-						label, s.UsedPercent, rp, age.Round(time.Minute))
-				}
+	if rp <= 0 {
+		return false, ""
+	}
+	reads := collectPercentReads(cfg, now)
+	worst := worstAvailable(reads)
+	if worst == nil || worst.Percent < rp {
+		return false, ""
+	}
+	return true, fmt.Sprintf("%s全局 5h 窗口已用 %d%%（红线 %d%%，来源 %s%s）",
+		label, worst.Percent, rp, worst.Source, worst.AgeSuffix)
+}
+
+// ---- 第三用量源：oauth/usage 端点 ----
+
+// oauthUsageDefaultURL 是端点默认路径。**未文档化**——任何时刻 Anthropic 都可能改路径/格式。
+// 因此实现里：所有异常一律按"数据不足"处理（返回 error 交由 fail-open 兜底），绝不 crash 或猜测。
+const oauthUsageDefaultURL = "https://api.anthropic.com/api/oauth/usage"
+
+// oauthCreds 是 ~/.claude/.credentials.json 的 accessToken 载体。字段名与 Claude Code 硬编码对齐。
+// macOS 上凭据实际存 keychain（"Claude Code-credentials"），走 loadOAuthAccessToken 的 fallback。
+type oauthCreds struct {
+	ClaudeAI struct {
+		AccessToken string `json:"accessToken"`
+	} `json:"claudeAiOauth"`
+}
+
+// loadOAuthAccessToken 复用 Claude Code 的 OAuth accessToken。
+// 优先顺序：
+//  1. 配置 OAuthUsageCredsPath（测试/自定义部署用）；
+//  2. ~/.claude/.credentials.json（Linux/Windows 明文存储）；
+//  3. macOS keychain "Claude Code-credentials"（macOS 默认存储，明文文件不存在）。
+//
+// 取不到返回 ""——上层视为"凭据缺失"，fail-open 放行且日志披露。
+func loadOAuthAccessToken(cfg *Config) string {
+	if cfg != nil && cfg.OAuthUsageCredsPath != "" {
+		if tok := readCredsFile(cfg.OAuthUsageCredsPath); tok != "" {
+			return tok
+		}
+	}
+	home, err := os.UserHomeDir()
+	if err == nil {
+		if tok := readCredsFile(filepath.Join(home, ".claude", ".credentials.json")); tok != "" {
+			return tok
+		}
+	}
+	if runtime.GOOS == "darwin" {
+		if tok := readKeychainCreds(); tok != "" {
+			return tok
+		}
+	}
+	return ""
+}
+
+func readCredsFile(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil || len(data) == 0 {
+		return ""
+	}
+	var c oauthCreds
+	if json.Unmarshal(data, &c) != nil {
+		return ""
+	}
+	return c.ClaudeAI.AccessToken
+}
+
+// readKeychainCreds 走 macOS `security` 工具读 "Claude Code-credentials" 项；-w 打印明文。
+// 该项由 Claude Code 桌面端写入，用户已在系统里授权 claudego 二进制访问时才能读到。
+// 未授权/未登录 → 返回 ""，fail-open。
+func readKeychainCreds() string {
+	out, err := exec.Command("security", "find-generic-password", "-w", "-s", "Claude Code-credentials").Output()
+	if err != nil {
+		return ""
+	}
+	var c oauthCreds
+	if json.Unmarshal(out, &c) != nil {
+		return ""
+	}
+	return c.ClaudeAI.AccessToken
+}
+
+// oauthUsageSample 是 oauth/usage 端点的一次拉取结果。
+// PercentOK=false 表示端点响应本身有（HTTP 200 + body），但里面缺 5h 字段——按"数据不足"处理。
+// 与"网络/凭据/HTTP 4xx-5xx 失败"分开，是为让 quota 命令能诚实披露到底哪一步断的。
+type oauthUsageSample struct {
+	Percent   int
+	PercentOK bool
+	SampledAt time.Time
+}
+
+// fetchOAuthUsage 直读端点，取 5h 窗口百分比。
+// **只信 body**——响应头绝不参与判定（核验已推翻"响应头带 unified 限流数值"之说；
+// 且响应头是最容易被中间层伪造/覆盖的信道，用它做闸门等于开天窗）。
+// 任何 error → 数据不足语义；调用方按 fail-open 放行。
+func fetchOAuthUsage(cfg *Config, now time.Time) (*oauthUsageSample, error) {
+	tok := loadOAuthAccessToken(cfg)
+	if tok == "" {
+		return nil, fmt.Errorf("oauth 凭据缺失（未找到 ~/.claude/.credentials.json 或 keychain 项）")
+	}
+	url := cfg.OAuthUsageURL
+	if url == "" {
+		url = oauthUsageDefaultURL
+	}
+	timeout := cfg.OAuthUsageTimeoutSec
+	if timeout <= 0 {
+		timeout = 6
+	}
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+tok)
+	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
+	req.Header.Set("User-Agent", "claudego/"+version)
+	client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("端点返回 HTTP %d", resp.StatusCode)
+	}
+	// 64KB 上限：即便端点某日返回巨响应，也不允许它吃光内存把 tick 拖崩。
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return nil, err
+	}
+	return parseOAuthUsageBody(body, now)
+}
+
+// parseOAuthUsageBody 从 body 里挖 5h 窗口的百分比。
+// 端点未文档化 → 用宽松+防御式解析：
+//  - 尝试几种已观察到的字段路径（five_hour / fiveHour / windows[]）；
+//  - 兼容 utilization / used_percent / percent 命名；
+//  - 数值域自动识别 0-1（乘 100）或 0-100（原样）；
+//  - **拿不到就返回 PercentOK=false**（"端点已变更/字段缺失"=数据不足，不猜、不用 header 兜底）。
+func parseOAuthUsageBody(body []byte, now time.Time) (*oauthUsageSample, error) {
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("响应不是有效 JSON")
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil, err
+	}
+	pct, ok := extractFiveHourPercent(raw)
+	if !ok {
+		return &oauthUsageSample{PercentOK: false, SampledAt: now}, nil
+	}
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	return &oauthUsageSample{Percent: pct, PercentOK: true, SampledAt: now}, nil
+}
+
+// extractFiveHourPercent 深度容错——只挖已知形态；未知形态一律拒绝。
+// 教训："只要看到任意百分比就用"是常见 bug 温床：端点某天新增字段 seven_day.utilization=95
+// 会被误判成"5h 窗口 95%"锁死队列。所以只认明确指向 5h 的键。
+func extractFiveHourPercent(raw map[string]any) (int, bool) {
+	// 形态 A：{"five_hour": {"utilization": 0.42}} / {"fiveHour": {"used_percent": 42}}
+	for _, key := range []string{"five_hour", "fiveHour", "five_hour_window", "primary"} {
+		if node, ok := raw[key].(map[string]any); ok {
+			if v, got := readPercentFields(node); got {
+				return v, true
 			}
 		}
 	}
-	return false, ""
+	// 形态 B：{"windows": [{"name": "5h", ...}, ...]}
+	if arr, ok := raw["windows"].([]any); ok {
+		for _, item := range arr {
+			node, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := node["name"].(string)
+			kind, _ := node["kind"].(string)
+			mins, _ := node["window_minutes"].(float64)
+			if !isFiveHourWindow(name, kind, int(mins)) {
+				continue
+			}
+			if v, got := readPercentFields(node); got {
+				return v, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func isFiveHourWindow(name, kind string, mins int) bool {
+	if mins == windowHours*60 {
+		return true
+	}
+	n := strings.ToLower(strings.TrimSpace(name))
+	k := strings.ToLower(strings.TrimSpace(kind))
+	switch n {
+	case "5h", "5_hour", "5-hour", "5hour", "five_hour", "primary":
+		return true
+	}
+	return k == "primary" || k == "5h"
+}
+
+// readPercentFields 从节点里挖 utilization / used_percent / percent 字段。
+// 数值域自动归一：0-1 视为分数、乘 100；>1 视为百分比、原样取整（0-100 clamp 由外层做）。
+func readPercentFields(node map[string]any) (int, bool) {
+	for _, key := range []string{"utilization", "used_percent", "usedPercent", "percent"} {
+		v, ok := node[key]
+		if !ok {
+			continue
+		}
+		num, ok := toFloat(v)
+		if !ok {
+			continue
+		}
+		if num > 0 && num <= 1 {
+			num *= 100
+		}
+		return int(num + 0.5), true
+	}
+	return 0, false
+}
+
+func toFloat(v any) (float64, bool) {
+	switch x := v.(type) {
+	case float64:
+		return x, true
+	case int:
+		return float64(x), true
+	case int64:
+		return float64(x), true
+	case json.Number:
+		f, err := x.Float64()
+		return f, err == nil
+	}
+	return 0, false
+}
+
+// ---- 三源合并：取最保守值 ----
+
+// percentRead 是"百分比通道"的一次读数（usage_feed / oauth_usage 各贡献一条）。
+// Available=false 表示该源不可用（未配置/端点失败/凭据缺失/字段缺失/样本过期），
+// worstAvailable 忽略这类读数——数据不足不该锁队列，也不该假装保守。
+type percentRead struct {
+	Source    string
+	Available bool
+	Percent   int
+	Reason    string // 不可用原因披露文案（quota 命令展示用）
+	AgeSuffix string // "，样本 3m 前" 之类
+}
+
+// collectPercentReads 采集所有百分比通道的当前读数（可用与不可用都保留，供 quota 展示）。
+func collectPercentReads(cfg *Config, now time.Time) []percentRead {
+	var out []percentRead
+	out = append(out, readUsageFeedPercent(cfg, now))
+	if cfg.OAuthUsage {
+		out = append(out, readOAuthUsagePercent(cfg, now))
+	}
+	return out
+}
+
+func readUsageFeedPercent(cfg *Config, now time.Time) percentRead {
+	r := percentRead{Source: "usage_feed"}
+	if cfg.UsageFeed == "" {
+		r.Reason = "未配置"
+		return r
+	}
+	s, err := latestFeedSample(cfg.UsageFeed)
+	if err != nil {
+		r.Reason = err.Error()
+		return r
+	}
+	at, perr := time.Parse(time.RFC3339, s.SampledAt)
+	if perr != nil {
+		r.Reason = "样本时间无法解析"
+		return r
+	}
+	age := now.Sub(at)
+	maxAge := time.Duration(cfg.UsageFeedMaxAgeMin) * time.Minute
+	if maxAge > 0 && age > maxAge {
+		r.Reason = fmt.Sprintf("样本已过期（%s 前）", age.Round(time.Minute))
+		return r
+	}
+	r.Available = true
+	r.Percent = s.UsedPercent
+	r.AgeSuffix = fmt.Sprintf("，样本 %s 前", age.Round(time.Minute))
+	return r
+}
+
+func readOAuthUsagePercent(cfg *Config, now time.Time) percentRead {
+	r := percentRead{Source: "oauth_usage"}
+	sample, err := fetchOAuthUsage(cfg, now)
+	if err != nil {
+		r.Reason = err.Error()
+		return r
+	}
+	if !sample.PercentOK {
+		r.Reason = "响应缺 5h 窗口字段（端点可能已变更）"
+		return r
+	}
+	maxAge := time.Duration(cfg.OAuthUsageMaxAgeMin) * time.Minute
+	if maxAge > 0 && now.Sub(sample.SampledAt) > maxAge {
+		r.Reason = "样本已过期"
+		return r
+	}
+	r.Available = true
+	r.Percent = sample.Percent
+	return r
+}
+
+// worstAvailable 返回可用读数里最保守（百分比最大）的那条。全不可用返回 nil。
+// 语义："取最保守值"=最坏假设兜住分歧,而不是平均或投票——观测口径不一致时,只有极端值不会误放行。
+func worstAvailable(reads []percentRead) *percentRead {
+	var best *percentRead
+	for i := range reads {
+		r := &reads[i]
+		if !r.Available {
+			continue
+		}
+		if best == nil || r.Percent > best.Percent {
+			best = r
+		}
+	}
+	return best
 }

@@ -174,19 +174,24 @@ If you'd rather not install launchd, just run `claudego daemon` as a foreground 
 
 ## 5-hour quota redline (reserve headroom)
 
-To leave headroom for bursty/interactive work: when the redline is active the queue stops dispatching (multi-step tasks also yield between steps), and `-force` crosses it. Two independent channels, inspectable anytime with `claudego quota`:
+To leave headroom for bursty/interactive work: when the redline is active the queue stops dispatching (multi-step tasks also yield between steps), and `-force` crosses it. Three channels, inspectable anytime with `claudego quota`:
 
 ```jsonc
 // ~/.claudego/config.json
 "queue_budget_tokens": 2000000,  // ① local ledger: max weighted tokens the queue may spend in the sliding 5h window; 0 disables
-"redline_percent": 85,           // ② external global usage feed: stop when the 5h-window usedPercent hits the line; 0 disables
+"redline_percent": 85,           // ②③ shared redline for percentage channels: stop when any source's usedPercent hits the line; 0 disables
 "usage_feed": "/Users/you/Library/Application Support/CodexBar/usage-history.jsonl",
-"usage_feed_max_age_min": 90,    //    a stale sample is treated as unavailable → dispatch allowed (fail-open)
+"usage_feed_max_age_min": 90,    // ②   a stale sample is treated as unavailable → dispatch allowed (fail-open)
+"oauth_usage": true,             // ③   subscription usage endpoint (third source), off by default; endpoint is undocumented
+"oauth_usage_max_age_min": 15,   // ③   how long the endpoint response is considered fresh (minutes)
+"oauth_usage_timeout_sec": 6,    // ③   HTTP timeout (seconds)
 "model_weights": {"default":1,"opus":5,"sonnet":1,"haiku":0.2}   // per-model weighting for the ledger
 ```
 
 - ① counts **only claudego's own calls** (desktop consumption is invisible to it); its semantics are a "queue budget ceiling" — your reserve = total quota − queue budget. Run `claudego quota` for a few days to see typical consumption before setting a value.
 - ② is the global view; its sample format is compatible with CodexBar's usage-history.jsonl (enable the Claude-usage probe in CodexBar). Any tool that appends one JSONL line in the same format works too.
+- ③ reads `api.anthropic.com/api/oauth/usage` directly (`anthropic-beta: oauth-2025-04-20` header + reusing the OAuth access token from `~/.claude/.credentials.json` or the macOS keychain), pulling 5h-window utilization. **The endpoint is undocumented and can change without notice** — any anomaly (network / creds / HTTP 4xx-5xx / missing field / format drift) is treated as "insufficient data" → fail-open. The implementation trusts **response body only** and never parses response headers (headers are trivially forged/overwritten by intermediaries, and verification has refuted the "response headers carry unified ratelimit numbers" claim). Override `oauth_usage_creds_path` / `oauth_usage_url` for tests or custom deployments.
+- ②③ merge rule = **worst-value-wins** (redline is judged against the highest available percent) — when observations disagree, the worst-case assumption wins over voting or averaging. `claudego quota` prints all three sources side-by-side and flags any spread ≥5%.
 - Genuine exhaustion still has the limit cooldown as a backstop (parse the reset time, resume when it arrives); the redline only yields *early*.
 
 **Time-windowed redline** (`redline_windows`): inside a window, non-zero fields override the global thresholds; outside it they revert; cross midnight with `from > to`. `redline_lead_min` adds a pre-window buffer: for N minutes before a window, no new claude task is launched — a single-step task can't yield once started, so without the buffer a long task that starts right on the line burns into the reserved window (codex-pinned tasks are unaffected). Align a window's `from` with the quota window's real reset moment. A typical use — leave 25% headroom for interaction during the morning trading session, use the queue to the full the rest of the day:
@@ -308,6 +313,7 @@ For full autonomy on a single task, add `-skip-permissions`, or set `skip_permis
 | `no_fallback_models` | ["claude-fable-5","fable"] | design-tier models never downgraded to the codex backup — they wait for Claude |
 | `thinking_tokens` | 0 | when >0, sets MAX_THINKING_TOKENS on Claude calls (larger thinking budget for design work) |
 | `queue_budget_tokens` etc. | 0 (off) | 5-hour quota redline — see the dedicated section |
+| `oauth_usage` / `oauth_usage_*` | false | subscription endpoint (third source); undocumented endpoint — anomalies treated as insufficient data |
 | `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types like design-review / progress-pull are exempt and may run concurrently in the same repo) |
 | `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the dedicated section |
 | `codex_reasoning` | "" | global codex reasoning effort (minimal/low/medium/high/xhigh/max/ultra) → `-c model_reasoning_effort=…`; a per-task effort overrides it |

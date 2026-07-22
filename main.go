@@ -1172,24 +1172,56 @@ func cmdQuota(args []string) error {
 	}
 
 	_, effRP, _ := effectiveThresholds(cfg, now)
-	if cfg.UsageFeed != "" {
-		if s, err := latestFeedSample(cfg.UsageFeed); err != nil {
-			fmt.Println("外部用量源：暂无 claude 样本（放行）——", err)
-		} else if at, perr := time.Parse(time.RFC3339, s.SampledAt); perr == nil {
-			age := now.Sub(at).Round(time.Minute)
-			stale := ""
-			if age > time.Duration(cfg.UsageFeedMaxAgeMin)*time.Minute {
-				stale = "，已过期→放行"
-			}
-			rpNote := "红线未启用"
-			if effRP > 0 {
-				rpNote = fmt.Sprintf("当前红线 %d%%", effRP)
-			}
-			fmt.Printf("外部用量源：全局 5h 窗口已用 %d%%（%s，样本 %s 前%s）\n",
-				s.UsedPercent, rpNote, age, stale)
+	rpNote := "红线未启用"
+	if effRP > 0 {
+		rpNote = fmt.Sprintf("当前红线 %d%%", effRP)
+	}
+	// 三源并列展示（队列账本 / usage_feed / oauth_usage 端点）。
+	// 百分比通道两条（feed + oauth）并肩：合并规则=可用样本里最保守（percent 最大）判线。
+	// 读数分歧显式披露，不做投票也不做平均——观测口径不一致时,极端值兜住比"折中"更诚实。
+	feedRead := readUsageFeedPercent(cfg, now)
+	printSource := func(label, cfgHint string, r percentRead) {
+		if r.Available {
+			fmt.Printf("%s：全局 5h 窗口已用 %d%%（%s%s）\n", label, r.Percent, rpNote, r.AgeSuffix)
+			return
 		}
+		if r.Reason == "" {
+			fmt.Printf("%s：%s\n", label, cfgHint)
+			return
+		}
+		fmt.Printf("%s：不可用→放行——%s\n", label, r.Reason)
+	}
+	if cfg.UsageFeed != "" {
+		printSource("外部用量源(usage_feed)", "", feedRead)
 	} else {
-		fmt.Println("外部用量源：未配置（usage_feed，支持 CodexBar usage-history.jsonl 格式）")
+		fmt.Println("外部用量源(usage_feed)：未配置（支持 CodexBar usage-history.jsonl 格式）")
+	}
+	var reads []percentRead
+	reads = append(reads, feedRead)
+	if cfg.OAuthUsage {
+		oauthRead := readOAuthUsagePercent(cfg, now)
+		printSource("oauth 端点(oauth_usage)", "", oauthRead)
+		reads = append(reads, oauthRead)
+	} else {
+		fmt.Println("oauth 端点(oauth_usage)：未启用（config.json 的 oauth_usage=true 开启；端点未文档化，任何异常均按数据不足处理）")
+	}
+	// 分歧披露：两源都可用且百分比差 >= 5 → 明确报出来（合并已按最保守值判线，这里只做诚实披露）。
+	available := 0
+	minP, maxP := 100, 0
+	for _, r := range reads {
+		if r.Available {
+			available++
+			if r.Percent < minP {
+				minP = r.Percent
+			}
+			if r.Percent > maxP {
+				maxP = r.Percent
+			}
+		}
+	}
+	if available >= 2 && maxP-minP >= 5 {
+		fmt.Printf("⚠ 用量源分歧：读数区间 %d%%..%d%%（差 %d%%）——判线取最保守值 %d%%\n",
+			minP, maxP, maxP-minP, maxP)
 	}
 
 	for _, w := range cfg.RedlineWindows {

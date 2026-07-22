@@ -201,19 +201,24 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 
 ## 5 小时额度红线（保底额度）
 
-给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。两条独立通道，`claudego quota` 随时查看：
+给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。三条通道，`claudego quota` 随时查看：
 
 ```jsonc
 // ~/.claudego/config.json
 "queue_budget_tokens": 2000000,  // ① 本地账本：滑动 5h 窗口内队列最多消耗的加权 token，0 关
-"redline_percent": 85,           // ② 外部全局用量源：5h 窗口 usedPercent 达线即停，0 关
+"redline_percent": 85,           // ②③ 百分比通道共享红线：任一源 usedPercent 达线即停，0 关
 "usage_feed": "/Users/you/Library/Application Support/CodexBar/usage-history.jsonl",
-"usage_feed_max_age_min": 90,    //    样本过期视为不可用→放行（fail-open）
+"usage_feed_max_age_min": 90,    // ②   样本过期视为不可用→放行（fail-open）
+"oauth_usage": true,             // ③   订阅端点直读（第三用量源），默认关；端点未文档化
+"oauth_usage_max_age_min": 15,   // ③   端点响应可用期（分钟）
+"oauth_usage_timeout_sec": 6,    // ③   HTTP 超时（秒）
 "model_weights": {"default":1,"opus":5,"sonnet":1,"haiku":0.2}   // 账本的模型加权
 ```
 
-- ①只统计 claudego 自己的调用（桌面端消耗不可见），语义是"队列预算上限"——保底 = 总额度 − 队列预算。先跑几天 `claudego quota` 看典型消耗再定值。
-- ②是全局视角，样本格式兼容 CodexBar 的 usage-history.jsonl（需在 CodexBar 里开启 Claude 用量探测）；任何工具按同格式落一行 JSONL 都能接。
+- ① 只统计 claudego 自己的调用（桌面端消耗不可见），语义是"队列预算上限"——保底 = 总额度 − 队列预算。先跑几天 `claudego quota` 看典型消耗再定值。
+- ② 是全局视角，样本格式兼容 CodexBar 的 usage-history.jsonl（需在 CodexBar 里开启 Claude 用量探测）；任何工具按同格式落一行 JSONL 都能接。
+- ③ 直读 `api.anthropic.com/api/oauth/usage`（`anthropic-beta: oauth-2025-04-20` 头 + 复用 `~/.claude/.credentials.json` 或 macOS keychain 的 OAuth accessToken），取 5h 窗口 utilization。**端点未文档化、可随时变更**——任何异常（网络/凭据/HTTP 4xx-5xx/字段缺失/格式漂移）一律按"数据不足"→ fail-open 放行；实现只信响应 body，绝不解析响应头（响应头容易被中间层伪造/覆盖，且核验已推翻"响应头带 unified 限流数值"之说）。可用 `oauth_usage_creds_path` / `oauth_usage_url` 覆盖凭据文件路径/端点（测试或自定义部署用）。
+- ②③ 合并规则=**最保守值优先**（可用样本里 percent 最大者判线）——观测口径不一致时,最坏假设兜住,而不是投票或平均。`claudego quota` 会并列展示三源读数并在分歧 ≥5% 时明确披露区间。
 - 真正耗尽时仍有限额冷却兜底（解析重置时间、到点续跑），红线只是提前让路。
 
 **分时段红线**（`redline_windows`）：时段内非零字段覆盖全局阈值，时段外回落全局；跨零点用 from > to。
@@ -319,6 +324,7 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `thinking_tokens` | 0 | >0 时给 claude 调用设 MAX_THINKING_TOKENS（设计活加大思考预算） |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见上文专节 |
+| `oauth_usage` / `oauth_usage_*` | false | 订阅端点直读（第三用量源），端点未文档化——异常按数据不足处理 |
 | `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行；design-review/progress-pull 只读类型豁免，可同仓并发） |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见上文专节 |
 | `codex_reasoning` | "" | 全局 codex 推理档（minimal/low/medium/high/xhigh/max/ultra）→ `-c model_reasoning_effort=…`；任务级 effort 可覆盖 |

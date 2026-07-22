@@ -45,6 +45,16 @@ type Config struct {
 	RedlinePercent     int    `json:"redline_percent"`
 	UsageFeed          string `json:"usage_feed"`
 	UsageFeedMaxAgeMin int    `json:"usage_feed_max_age_min"`
+	// ---- 第三用量源：oauth/usage 端点直读 ----
+	// 端点未文档化（api.anthropic.com/api/oauth/usage + anthropic-beta: oauth-2025-04-20），
+	// 复用 ~/.claude/.credentials.json 的 OAuth accessToken。任何异常（网络/凭据/格式变更）
+	// 一律按"数据不足"处理，绝不 crash；判红线时与 usage_feed 合并取最保守（百分比更大）值。
+	// **只信响应 body，不解析响应头**（核验已推翻响应头带限流数值之说；沿用会被人蓄意伪造）。
+	OAuthUsage           bool   `json:"oauth_usage,omitempty"`
+	OAuthUsageURL        string `json:"oauth_usage_url,omitempty"`
+	OAuthUsageCredsPath  string `json:"oauth_usage_creds_path,omitempty"`
+	OAuthUsageMaxAgeMin  int    `json:"oauth_usage_max_age_min,omitempty"`
+	OAuthUsageTimeoutSec int    `json:"oauth_usage_timeout_sec,omitempty"`
 	// ModelWeights: 各模型 token 的额度权重（订阅限额按模型加权），键为 --model 值，"default" 兜底。
 	ModelWeights map[string]float64 `json:"model_weights"`
 	// RedlineWindows: 分时段红线。时段内非零字段覆盖全局阈值，时段外回落全局配置。

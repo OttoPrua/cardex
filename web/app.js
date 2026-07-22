@@ -289,7 +289,10 @@ const state = {
   timer: null,
   lastLoaded: null,
   // 记住展开态与分栏选择，自动刷新后不跳回默认。
-  ui: { openPhases: new Set(), closedPhases: new Set(), laneMode: false, burnAll: false },
+  // allCollapsed：全局「全部收起」开关。默认 false=所有阶段默认展开（含已完成项目），
+  // 这样 100% 完成的项目（如 PerlicaAnywhere/TLink，所有阶段都是 done）也把任务铺开，
+  // 不会因为「已完成=收起」而整卡看着空空如也。用户可一键收起，或单独折叠某个阶段。
+  ui: { openPhases: new Set(), closedPhases: new Set(), allCollapsed: false, laneMode: false, burnAll: false },
 };
 
 function setLoading(on) {
@@ -440,11 +443,25 @@ async function viewOverview() {
       h('p', { class: 'page-sub' },
         `${d.projects.length} 个项目并行・${activeN} 张待推进・最多 ${d.max_parallel} 路并发`,
         h('span', { text: `　数据目录 ${d.root}` }))),
-    h('div', { class: 'totals' }, STATUS_ORDER.filter((k) => totals[k] > 0).map((k) =>
-      h('span', { class: 'total-chip' },
-        statusDot(k, true),
-        h('span', { class: 'tc-n', text: String(totals[k]) }),
-        h('span', { class: 'tc-l', text: STATUS_ZH[k] }))))));
+    h('div', { class: 'head-right' },
+      h('button', {
+        class: 'ghost-btn', type: 'button',
+        'aria-pressed': String(state.ui.allCollapsed),
+        title: state.ui.allCollapsed ? '展开所有项目的所有阶段' : '收起所有阶段的任务清单（阶段介绍仍保留）',
+        onclick: () => {
+          state.ui.allCollapsed = !state.ui.allCollapsed;
+          // 清掉逐阶段的手动开关，让全局态说了算；否则旧的单独展开/收起会盖过全局按钮。
+          state.ui.openPhases.clear();
+          state.ui.closedPhases.clear();
+          load({ silent: true });
+        },
+        text: state.ui.allCollapsed ? '全部展开' : '全部收起',
+      }),
+      h('div', { class: 'totals' }, STATUS_ORDER.filter((k) => totals[k] > 0).map((k) =>
+        h('span', { class: 'total-chip' },
+          statusDot(k, true),
+          h('span', { class: 'tc-n', text: String(totals[k]) }),
+          h('span', { class: 'tc-l', text: STATUS_ZH[k] })))))));
 
   if (!d.projects.length) {
     frag.append(emptyState('队列里还没有任何任务卡。'));
@@ -482,32 +499,36 @@ function projectCard(p) {
 
 function phaseBlock(ph) {
   const key = ph.id;
-  const settled = ph.status === 'done' || ph.status === 'canceled';
-  // 默认展开还需推进的阶段；已完成/已取消的收起，点开才渲染内容。
-  const open = state.ui.openPhases.has(key) || (!settled && !state.ui.closedPhases.has(key));
+  // 默认展开所有阶段（含已完成的），让「所有内容都显示出来」；只有用户显式收起某阶段
+  // （closedPhases）或点了「全部收起」（allCollapsed）才折叠。openPhases 记录被单独重开的阶段，
+  // 优先级最高，这样在 allCollapsed 状态下也能单独展开某一个阶段。
+  const open = state.ui.openPhases.has(key) ||
+    (!state.ui.allCollapsed && !state.ui.closedPhases.has(key));
 
+  // 折叠只影响「具体任务清单」。阶段名/介绍/进度/ETA 都是**阶段自身属性**，
+  // 放进 <summary> 里恒常可见——折叠一个阶段不该把它是什么、进度如何一起藏掉。
   const body = h('div', { class: 'phase-body' });
   let filled = false;
   const fill = () => {
     if (filled) return;
     filled = true;
-    body.append(
-      ph.desc ? h('p', { class: 'phase-desc', text: ph.desc }) : null,
-      h('div', { class: 'phase-etaline' }, etaLine(ph.eta)),
-      taskList(ph.tasks, ph.stats.total));
+    body.append(taskList(ph.tasks, ph.stats.total));
   };
 
   const det = h('details', { class: 'phase', open: open || null },
     h('summary', {},
-      h('span', {
-        class: 'phase-caret', 'aria-hidden': 'true',
-        html: '<svg viewBox="0 0 12 12" width="11" height="11"><path d="M4 2.5 8 6l-4 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
-      }),
-      h('span', { class: 'phase-name', text: ph.name }),
-      h('span', { class: `phase-status ps-${ph.status}`, text: PHASE_ZH[ph.status] || ph.status }),
-      h('span', { class: 'phase-mini' },
-        h('span', { text: `${ph.stats.done}/${ph.stats.total}` }),
-        progressBar(ph.stats, ph.progress_percent).querySelector('.prog'))),
+      h('div', { class: 'phase-headrow' },
+        h('span', {
+          class: 'phase-caret', 'aria-hidden': 'true',
+          html: '<svg viewBox="0 0 12 12" width="11" height="11"><path d="M4 2.5 8 6l-4 3.5" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>',
+        }),
+        h('span', { class: 'phase-name', text: ph.name }),
+        h('span', { class: `phase-status ps-${ph.status}`, text: PHASE_ZH[ph.status] || ph.status }),
+        h('span', { class: 'phase-mini' },
+          h('span', { text: `${ph.stats.done}/${ph.stats.total}` }),
+          progressBar(ph.stats, ph.progress_percent).querySelector('.prog'))),
+      ph.desc ? h('p', { class: 'phase-desc', text: ph.desc }) : null,
+      h('div', { class: 'phase-etaline' }, etaLine(ph.eta))),
     body);
 
   det.addEventListener('toggle', () => {
@@ -543,7 +564,8 @@ function taskRow(t) {
   if (t.status === 'running' && t.elapsed_minutes > 0) tags.push(metaChip(`已跑 ${fmtDur(t.elapsed_minutes)}`));
   if (t.blocked_reason) tags.push(metaChip(t.blocked_reason, { title: t.blocked_reason }));
 
-  return h('div', { class: 'task-row' },
+  // 行左缘按模型等级着色（tier-旗舰/高/中/轻/未知），一眼分清 fable / opus / sonnet。
+  return h('div', { class: `task-row tier-${t.model_tier || '未知'}` },
     h('span', { class: 'tr-dot' }, statusDot(t.status)),
     h('div', { class: 'tr-main' },
       h('p', { class: 'task-title', text: t.title, title: t.title }),
@@ -640,6 +662,9 @@ const MODEL_SOURCE_ZH = { task: '卡上指定', codex_model: 'codex 侧解析', 
 
 function taskCard(t) {
   const tags = [];
+  // 卡片左缘改由模型等级着色（见下方 details 的 tier class），状态改由列/泳道位置 + 这枚
+  // 状态徽章承载——避免「状态只靠颜色」，也把左缘这条最显眼的色带让给用户要的模型区分。
+  tags.push(statusBadge(t.status));
   if (t.model) tags.push(tierBadge(t.model, t.model_tier));
   if (t.runner && t.runner !== 'claude') tags.push(metaChip(t.runner, { mono: true }));
   if (t.remote_host) tags.push(metaChip(`@${t.remote_host}`, { mono: true }));
@@ -691,7 +716,7 @@ function taskCard(t) {
     }
   };
 
-  const det = h('details', { class: 'tcard', style: `--tc-accent:var(--k-${t.status})` },
+  const det = h('details', { class: `tcard tier-${t.model_tier || '未知'}` },
     h('summary', {},
       h('p', { class: 'tcard-title', text: t.title }),
       t.desc ? h('p', { class: 'task-desc', text: t.desc }) : null,

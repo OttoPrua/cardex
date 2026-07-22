@@ -199,6 +199,11 @@ func (s *boardServer) handleStatic(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, "内嵌前端缺失: "+err.Error())
 		return
 	}
+	// 前端资源随二进制内嵌、无版本指纹（embed.FS 的 ModTime 为零，FileServer 也不发
+	// ETag/Last-Modified）。若任由浏览器启发式缓存，make install 换了新二进制后老页面仍
+	// 跑旧 app.js/style.css，看板显示与实际不符。故与 index 一致标 no-store，每次都取最新。
+	// 资源仅 ~80KB 且只走本机回环，重取成本可忽略。
+	w.Header().Set("Cache-Control", "no-store")
 	http.StripPrefix("/static/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
 }
 

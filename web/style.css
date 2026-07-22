@@ -264,6 +264,24 @@ button { font: inherit; color: inherit; }
 .page-title { font-size: 20px; font-weight: 680; letter-spacing: -.015em; margin: 0; }
 .page-sub { font-size: 13px; color: var(--ink-mute); margin: 2px 0 0; }
 
+/* 页头右侧：全局折叠按钮 + 总计条 */
+.head-right {
+  margin-left: auto; display: flex; align-items: center;
+  gap: 10px; flex-wrap: wrap; justify-content: flex-end;
+}
+.ghost-btn {
+  font: inherit; font-size: 12px; cursor: pointer; white-space: nowrap;
+  padding: 5px 12px; border-radius: 999px;
+  color: var(--ink-2); background: var(--surface);
+  border: 1px solid var(--border);
+  transition: background .12s, border-color .12s, color .12s;
+}
+.ghost-btn:hover { background: var(--surface-2); color: var(--ink); border-color: var(--border-2); }
+.ghost-btn[aria-pressed="true"] {
+  color: var(--s1); border-color: color-mix(in oklab, var(--s1) 40%, transparent);
+  background: color-mix(in oklab, var(--s1) 10%, var(--surface));
+}
+
 /* 总计条 */
 .totals { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
 .total-chip {
@@ -320,10 +338,15 @@ button { font: inherit; color: inherit; }
   width: 3px; height: 9px; border-radius: 1px;
   background: var(--tier-c, var(--ord-x)); flex: 0 0 auto;
 }
-.tier-旗舰 { --tier-c: var(--ord-1); }
-.tier-高   { --tier-c: var(--ord-2); }
-.tier-中   { --tier-c: var(--ord-3); }
-.tier-轻   { --tier-c: var(--ord-4); }
+/* 模型等级改用「分类色」而非蓝阶：用户要一眼区分 fable / opus / sonnet，靠明度差的单色蓝阶
+   分不开，改用相互可辨的 --s* 分类槽（含深色版）。此四色组已跑 validate_palette --pairs all
+   在浅色 + 深色双模式全部过闸（深色下品红↔蓝、蓝↔绿的最劣对也 >15 常视觉 ΔE；深色一对绿↔黄
+   CVD ΔE 6.9 落在 6–8 带，靠徽章文字做二级编码而合规）。等级高低仍由徽章文字承载，颜色只管身份。
+   fable/sol=旗舰=品红(s3)　opus/terra=高=蓝(s1)　sonnet/luna=中=绿(s2)　haiku=轻=黄(s4)。 */
+.tier-旗舰 { --tier-c: var(--s3); }
+.tier-高   { --tier-c: var(--s1); }
+.tier-中   { --tier-c: var(--s2); }
+.tier-轻   { --tier-c: var(--s4); }
 .tier-未知 { --tier-c: var(--ord-x); }
 
 .meta-chip {
@@ -436,11 +459,14 @@ button { font: inherit; color: inherit; }
 .phase:last-child { border-bottom: 0; }
 .phase > summary {
   list-style: none; cursor: pointer; padding: 11px 17px;
-  display: flex; align-items: center; gap: 10px;
+  display: flex; flex-direction: column; gap: 7px;
   transition: background .12s;
 }
 .phase > summary::-webkit-details-marker { display: none; }
 .phase > summary:hover { background: var(--surface-2); }
+/* 阶段头一行：折叠箭头 + 名称 + 状态 + 进度。介绍/ETA 是它下面的兄弟节点，
+   都在 summary 内 → 折叠时依旧可见（折叠只藏 summary 之外的任务清单）。 */
+.phase-headrow { display: flex; align-items: center; gap: 10px; }
 .phase-caret {
   flex: 0 0 auto; color: var(--ink-mute);
   transition: transform .16s; display: flex;
@@ -463,9 +489,11 @@ button { font: inherit; color: inherit; }
   flex: 0 0 auto; font-size: 11.5px; color: var(--ink-mute);
 }
 .phase-mini .prog { width: 62px; flex: 0 0 auto; height: 6px; }
-.phase-body { padding: 2px 17px 14px; }
-.phase-desc { margin: 0 0 9px; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
-.phase-etaline { margin: 0 0 10px; }
+.phase-body { padding: 4px 17px 14px; }
+/* 介绍/ETA 现在住在 summary 里（gap 管间距，故清零 margin）；左缩进对齐到阶段名下方，
+   避免顶到折叠箭头。折叠时它们照样在，只有下面的任务清单被收起。 */
+.phase-desc { margin: 0; padding-left: 21px; font-size: 12px; color: var(--ink-2); overflow-wrap: anywhere; }
+.phase-etaline { margin: 0; padding-left: 21px; }
 
 .phase-done-group > summary {
   padding: 9px 17px; font-size: 12px; color: var(--ink-mute);
@@ -486,6 +514,16 @@ button { font: inherit; color: inherit; }
   transition: background .12s, border-color .12s;
 }
 .task-row:hover { background: var(--surface-2); border-color: var(--border); }
+/* 按模型等级给任务行上色：左缘一条色带 + 极浅同色底。用 inset box-shadow 画色带，
+   不占布局宽度、不动 grid 对齐；hover 变底色时色带依旧在，模型身份不丢。 */
+.task-row.tier-旗舰, .task-row.tier-高, .task-row.tier-中, .task-row.tier-轻 {
+  box-shadow: inset 3px 0 0 var(--tier-c);
+  background: color-mix(in oklab, var(--tier-c) 6%, var(--surface));
+}
+.task-row.tier-旗舰:hover, .task-row.tier-高:hover, .task-row.tier-中:hover, .task-row.tier-轻:hover {
+  background: color-mix(in oklab, var(--tier-c) 11%, var(--surface-2));
+}
+.task-row.tier-未知 { box-shadow: inset 3px 0 0 color-mix(in oklab, var(--ord-x) 60%, transparent); }
 .task-row .tr-dot { margin-top: 6px; }
 .task-row .tr-main { min-width: 0; }
 .task-title {
@@ -578,6 +616,15 @@ button { font: inherit; color: inherit; }
   background: var(--surface); border: 1px solid var(--border);
   border-radius: var(--r-md); overflow: hidden;
   border-left: 3px solid var(--tc-accent, var(--axis));
+}
+/* kanban 卡片左缘＝模型等级色（状态已由所在列/状态徽章表达）；底也铺一层极浅同色。 */
+.tcard.tier-旗舰 { --tc-accent: var(--s3); }
+.tcard.tier-高   { --tc-accent: var(--s1); }
+.tcard.tier-中   { --tc-accent: var(--s2); }
+.tcard.tier-轻   { --tc-accent: var(--s4); }
+.tcard.tier-未知 { --tc-accent: var(--ord-x); }
+.tcard.tier-旗舰, .tcard.tier-高, .tcard.tier-中, .tcard.tier-轻 {
+  background: color-mix(in oklab, var(--tc-accent) 5%, var(--surface));
 }
 .tcard > summary {
   list-style: none; cursor: pointer; padding: 9px 11px;

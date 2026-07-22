@@ -563,6 +563,11 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	// 派发事件:tick 已把卡从 queued/limit_paused 拉进 running。actor=runner,detail 记录执行器身份
+	// (远端/codex/claude)与当前步序号——恢复限额后续跑与首次派发在这条事件上会有 step/mid_step 差异。
+	emitTaskEvent(root, t.ID, evDispatched, "runner", statusRunning, t.Step, map[string]any{
+		"runner": t.Runner, "mid_step": t.MidStep, "use_codex": useCodex,
+	})
 	lg, err := openTaskLog(root, t.ID)
 	if err != nil {
 		return err
@@ -597,6 +602,8 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		default:
 			t.Status = statusDone
 			t.touch()
+			// 无 prompt 可跑的空转 done(如 retry 后 Step 已越界的兜底路径):也是"终态"必须留事件。
+			emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, map[string]any{"reason": "no_more_prompts"})
 			return saveTask(root, t)
 		}
 
@@ -655,6 +662,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			t.LastError = "usage limit: " + firstLine(combined)
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("命中用量限额，%s 后恢复（%s）\n%s", fmtIn(until, now), fmtClock(until), firstLine(combined)))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+				"engine": "claude", "resume_at": until, "mid_step": t.MidStep,
+			})
 			return saveTask(root, t)
 		}
 
@@ -669,6 +679,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			t.LastError = "codex 用量限额: " + firstLine(resultText(res))
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("codex 用量限额，%s 后恢复（%s）", fmtIn(until, now), fmtClock(until)))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+				"engine": "codex", "resume_at": until,
+			})
 			return saveTask(root, t)
 		}
 
@@ -683,6 +696,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			t.LastError = "远端账号限额: " + firstLine(resultText(res))
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("远端账号限额，%s 后恢复（%s）", fmtIn(until, now), fmtClock(until)))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+				"engine": "remote", "host": t.RemoteHost, "resume_at": until,
+			})
 			return saveTask(root, t)
 		}
 
@@ -694,6 +710,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			logBlock(lg, "ERROR", fmt.Sprintf("第 %d 次失败: %s", t.Attempts, msg))
 			if t.Attempts >= cfg.MaxAttempts {
 				t.Status = statusFailed
+				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, map[string]any{
+					"err": msg, "attempts": t.Attempts,
+				})
 			} else {
 				t.Status = statusQueued
 				backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
@@ -703,6 +722,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 					backoff *= time.Duration(t.Attempts)
 				}
 				t.NotBeforeEpoch = now.Add(backoff).Unix()
+				emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, map[string]any{
+					"err": msg, "attempts": t.Attempts, "not_before": t.NotBeforeEpoch,
+				})
 			}
 			t.touch()
 			return saveTask(root, t)
@@ -746,6 +768,19 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				logBlock(lg, "CROSS", t.LastError)
 			}
 			t.touch()
+			// 最后一步的 step_ok 事件先记(与中间步一致语义),再据终局标 done 或交叉契约违规的 failed。
+			emitTaskEvent(root, t.ID, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+				"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
+			})
+			if t.Status == statusDone {
+				emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, map[string]any{
+					"turns_total": t.TurnsUsed, "cost_total": t.CostUSD,
+				})
+			} else {
+				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, map[string]any{
+					"err": t.LastError, "reason": "cross_merge_contract_violation",
+				})
+			}
 			if err := saveTask(root, t); err != nil {
 				return err
 			}
@@ -758,6 +793,10 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			return saveTask(root, t)
 		}
 		t.touch()
+		// 中间步成功事件:每推进一步一条,是"步数一致"验收的锚点(枚举遗漏就红)。
+		emitTaskEvent(root, t.ID, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+			"turns": res.NumTurns, "cost_usd": res.TotalCostUSD,
+		})
 		if err := saveTask(root, t); err != nil {
 			return err
 		}
@@ -770,6 +809,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 func finalizeCanceled(root string, t *Task, lg *os.File) error {
 	t.Status = statusCanceled
 	logBlock(lg, "CANCELED", "任务已取消：终止执行进程，丢弃本步产物并归档。")
+	// 事件必须在 archiveTask 前落：archive 会把 events.jsonl 搬去 archive/events/，
+	// 先记事件再搬迁，保证"取消"事件既进账本又随卡归档一并留痕。
+	emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, map[string]any{"reason": "runner_cancel"})
 	if err := archiveTask(root, t); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -909,6 +951,13 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 				rv.Model = t.Model
 			}
 			if saveTask(root, rv) == nil {
+				// review_after 派生的审核卡是实现卡完成后的下一环，父账本记 closeout 留指针。
+				emitTaskEvent(root, t.ID, evCloseout, "runner:review", statusDone, t.Step, map[string]any{
+					"kind": "review_after", "child": rv.ID,
+				})
+				emitTaskEvent(root, rv.ID, evQueued, "runner:review", statusQueued, 0, map[string]any{
+					"parent": t.ID, "review_of": t.ID,
+				})
 				logBlock(lg, "REVIEW", "已入队审核任务: "+rv.ID)
 			}
 		}
@@ -1160,6 +1209,13 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 				co.SkipPermissions = orig.SkipPermissions
 				co.RemoteHost = orig.RemoteHost
 				if saveTask(root, co) == nil {
+					// 父审核卡记 closeout：pass 触发的收口卡是"完成后派生动作"，在父账本留一条明确指针。
+					emitTaskEvent(root, t.ID, evCloseout, "runner:closeout", statusDone, t.Step, map[string]any{
+						"kind": "closeout", "child": co.ID, "review_of": t.ReviewOf,
+					})
+					emitTaskEvent(root, co.ID, evQueued, "runner:closeout", statusQueued, 0, map[string]any{
+						"parent": t.ID, "review_of": t.ReviewOf,
+					})
 					logBlock(lg, "FIXLOOP", "已入队收口卡 "+co.ID+"（pass→回写账本 done）")
 				}
 			}
@@ -1213,6 +1269,17 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		esc.RemoteHost = orig.RemoteHost
 		esc.FixRound = round
 		if saveTask(root, esc) == nil {
+			// 父审核卡 closeout：超轮限 held 卡是审核链的显式终点，父卡账本必须留指针。
+			emitTaskEvent(root, t.ID, evCloseout, "runner:escalation", statusDone, t.Step, map[string]any{
+				"kind": "escalation", "child": esc.ID, "round": round, "verdict": v.Verdict,
+			})
+			// 升级卡新建即 held——先 queued 再 held 忠实记录状态起点（newTask 默认 queued，覆写为 held）。
+			emitTaskEvent(root, esc.ID, evQueued, "runner:escalation", statusQueued, 0, map[string]any{
+				"parent": t.ID, "review_of": t.ReviewOf, "round": round,
+			})
+			emitTaskEvent(root, esc.ID, evHeld, "runner:escalation", statusHeld, 0, map[string]any{
+				"reason": "over_max_fix_rounds", "max_rounds": maxRounds,
+			})
 			logBlock(lg, "FIXLOOP", fmt.Sprintf("超轮限（R%d>上限%d），已挂 held 升级卡 %s 交人工裁定", round, maxRounds, esc.ID))
 		}
 		return
@@ -1255,6 +1322,14 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		logBlock(lg, "FIXLOOP", "修复卡保存失败: "+err.Error())
 		return
 	}
+	// 父审核卡 closeout：concerns/block 触发的修复卡是审核→修复闭环的下一环，父账本必须留指针。
+	emitTaskEvent(root, t.ID, evCloseout, "runner:fix", statusDone, t.Step, map[string]any{
+		"kind": "fix", "child": nt.ID, "verdict": v.Verdict, "round": round,
+		"p0_count": len(v.P0), "p1_count": len(v.P1),
+	})
+	emitTaskEvent(root, nt.ID, evQueued, "runner:fix", statusQueued, 0, map[string]any{
+		"parent": t.ID, "review_of": t.ReviewOf, "verdict": v.Verdict, "round": round,
+	})
 	logBlock(lg, "FIXLOOP", fmt.Sprintf("verdict=%s → 已自动入队第 %d 轮修复卡 %s（%dP0+%dP1，effort=%s）", v.Verdict, round, nt.ID, len(v.P0), len(v.P1), nt.Effort))
 }
 
@@ -1414,6 +1489,11 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		t.Status = statusFailed
 		t.LastError = "交叉链断裂: " + reason
 		_ = os.Remove(crossPeerPath(root, t.XKey)) // 断裂时清理侧车,不留甲结论长期残驻
+		// 断裂前先记 failed 事件：postComplete 后 runTask 会 saveTask 但不再进 failed 分支，
+		// 若不在此处记事件，"交叉链断裂"这条关键状态迁移会在事件账本里彻底缺席。
+		emitTaskEvent(root, t.ID, evFailed, "runner:cross", statusFailed, t.Step, map[string]any{
+			"reason": "cross_chain_break", "role": t.XRole, "detail": reason,
+		})
 		logBlock(lg, "CROSS", "链中断（母卡置 failed 留痕）: "+reason)
 	}
 	// 乙引擎用**冻结**规格（入队时钉死），不从当前 config 重解析——防身份漂移。
@@ -1445,6 +1525,13 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 			breakChain("B 卡落盘失败: " + err.Error())
 			return
 		}
+		// A 完成派生 B 卡：父卡（A）账本记 closeout 留链路指针，B 卡账本记 queued 起点。
+		emitTaskEvent(root, t.ID, evCloseout, "runner:cross-B", statusDone, t.Step, map[string]any{
+			"kind": "cross_b", "child": b.ID, "xkey": t.XKey, "profile": t.XProfile,
+		})
+		emitTaskEvent(root, b.ID, evQueued, "runner:cross-B", statusQueued, 0, map[string]any{
+			"parent": t.ID, "xkey": t.XKey, "profile": t.XProfile, "role": "B",
+		})
 		logBlock(lg, "CROSS", fmt.Sprintf("引擎甲完成 → 已派独立引擎乙 B 卡 %s（%s，不含甲结论、无 A 指针）", b.ID, label))
 	case "B":
 		tpl, err := loadTemplate(root, "crosscheck-merge")
@@ -1476,6 +1563,13 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 			return
 		}
 		_ = os.Remove(crossPeerPath(root, t.XKey)) // C 已烘入甲+乙全文，侧车使命完成，清理
+		// B 完成派生 C 卡：父卡（B）账本记 closeout 留链路指针，C 卡账本记 queued 起点。
+		emitTaskEvent(root, t.ID, evCloseout, "runner:cross-C", statusDone, t.Step, map[string]any{
+			"kind": "cross_c", "child": c.ID, "xkey": t.XKey, "profile": t.XProfile,
+		})
+		emitTaskEvent(root, c.ID, evQueued, "runner:cross-C", statusQueued, 0, map[string]any{
+			"parent": t.ID, "xkey": t.XKey, "profile": t.XProfile, "role": "C",
+		})
 		logBlock(lg, "CROSS", fmt.Sprintf("引擎乙完成 → 已派交叉查漏 C 卡 %s（%s，注入甲+乙完整结论）", c.ID, label))
 	}
 }
@@ -1517,6 +1611,11 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 		t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, next)
 		_ = os.Remove(crossPeerPath(root, t.XKey))
 		_ = saveTask(root, t)
+		// reconcile 判孤儿：这是崩溃窄缝里被扫出的"事后判 failed"事件，需在账本留一条明确迁移，
+		// 否则活动流只见 done→failed 状态跳变而无对应事件，触发 seq 缺口误判。
+		emitTaskEvent(root, t.ID, evFailed, "runner:reconcile", statusFailed, t.Step, map[string]any{
+			"reason": "cross_chain_orphan", "role": t.XRole, "missing_next": next,
+		})
 	}
 }
 
@@ -1644,6 +1743,16 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		}
 		if err := saveTask(root, nt); err != nil {
 			return ids, err
+		}
+		// emit 出的每张子卡都记 queued 起点，parent 指针留在 detail 里。
+		emitTaskEvent(root, nt.ID, evQueued, "runner:emit", statusQueued, 0, map[string]any{
+			"parent": parent.ID, "type": typ, "emit_hold": parent.EmitHold,
+		})
+		if parent.EmitHold {
+			// EmitHold 意味着新卡立即置 held——先 queued 后 held 忠实反映状态起点与人工待放行的实际语义。
+			emitTaskEvent(root, nt.ID, evHeld, "runner:emit", statusHeld, 0, map[string]any{
+				"reason": "emit_hold", "parent": parent.ID,
+			})
 		}
 		ids = append(ids, nt.ID)
 	}

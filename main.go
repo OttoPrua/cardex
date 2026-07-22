@@ -323,6 +323,14 @@ func cmdAdd(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	// 事件账本入队事件：actor 用 cli:add 让活动流能溯源到人工触发点。
+	// -hold 直入 held 的卡也从 queued 记起,再补一条 held——诚实历史"入了队但立刻被人挂"。
+	emitTaskEvent(root, t.ID, evQueued, "cli:add", statusQueued, t.Step, map[string]any{
+		"type": t.Type, "priority": t.Priority, "prompts": len(t.Prompts),
+	})
+	if *hold {
+		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step, map[string]any{"reason": "add -hold"})
+	}
 	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d）\n", t.ID, t.Type, t.Title, len(t.Prompts), t.Priority)
 	return nil
 }
@@ -448,6 +456,9 @@ func cmdCross(args []string) error {
 	if err := saveTask(root, a); err != nil {
 		return err
 	}
+	emitTaskEvent(root, a.ID, evQueued, "cli:cross", statusQueued, 0, map[string]any{
+		"profile": name, "x_role": "A", "x_key": a.XKey,
+	})
 	fmt.Printf(`已入队交叉验证链 [%s]  甲=%s  乙=%s
   A %s  引擎甲独立作答（第一性原理+对抗式自审）
   ↓ 完成后自动派：
@@ -548,6 +559,9 @@ func cmdAssemble(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:assemble", statusQueued, 0, map[string]any{
+		"type": t.Type, "emit_hold": t.EmitHold,
+	})
 	fmt.Printf("已入队装配任务 %s：完成后产出的任务序列会自动进入队列。\n", t.ID)
 	return nil
 }
@@ -588,6 +602,9 @@ func cmdReview(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:review", statusQueued, 0, map[string]any{
+		"type": t.Type, "focus": focus,
+	})
 	fmt.Printf("已入队审核任务 %s [%s]\n", t.ID, wd)
 	return nil
 }
@@ -630,6 +647,9 @@ func cmdAdopt(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:adopt", statusQueued, 0, map[string]any{
+		"session_id": sessionID,
+	})
 	fmt.Printf("已入队 %s：将 --resume %s 继续执行。\n", t.ID, sessionID)
 	return nil
 }
@@ -676,6 +696,9 @@ func cmdPlan(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:plan", statusQueued, 0, map[string]any{
+		"type": t.Type, "emit_hold": t.EmitHold,
+	})
 	if *holdOut {
 		fmt.Printf("已入队协调任务 %s：分工产出的任务将挂起等待人工放行（claudego release）。\n", t.ID)
 	} else {
@@ -788,6 +811,9 @@ func cmdBrief(args []string) error {
 		if err := saveTask(root, t); err != nil {
 			return err
 		}
+		emitTaskEvent(root, t.ID, evQueued, "cli:brief", statusQueued, 0, map[string]any{
+			"type": t.Type, "session_id": sess,
+		})
 		fmt.Printf("已入队进度回收任务 %s（--resume %s，模型 %s）：完成后报告写入 %s\n",
 			t.ID, sess, orDash(t.Model), progressPath(root, key))
 		return nil
@@ -1379,6 +1405,10 @@ func cmdSetStatus(args []string, action string) error {
 		if err := saveTask(root, t); err != nil {
 			return err
 		}
+		// cancel 事件先落再决定是否归档:即便随后 archive 失败,事件已记留痕。
+		emitTaskEvent(root, t.ID, evCanceled, "cli:cancel", statusCanceled, t.Step, map[string]any{
+			"was_running": wasRunning,
+		})
 		if wasRunning {
 			// 进程还活着，先别归档：drain 每个重扫周期对账任务文件，见 canceled 即
 			// 击杀其执行进程组、释放槽位与目录互斥，然后归档（调度进程不在场时由
@@ -1395,6 +1425,17 @@ func cmdSetStatus(args []string, action string) error {
 	t.touch()
 	if err := saveTask(root, t); err != nil {
 		return err
+	}
+	// hold/release/retry 事件:诚实历史需要人工介入的每次动作都留痕。
+	switch action {
+	case "hold":
+		emitTaskEvent(root, t.ID, evHeld, "cli:hold", statusHeld, t.Step, nil)
+	case "release":
+		// release 是 held→queued 的"重新入队":用 evQueued 保持类型枚举与状态一致(活动流才能标"入队")。
+		emitTaskEvent(root, t.ID, evQueued, "cli:release", statusQueued, t.Step, map[string]any{"reason": "release"})
+	case "retry":
+		// retry 是 terminal|limit_paused→queued 的"重新入队":同上,用 evQueued。
+		emitTaskEvent(root, t.ID, evQueued, "cli:retry", statusQueued, t.Step, map[string]any{"reason": "retry"})
 	}
 	fmt.Printf("%s -> %s\n", t.ID, zhStatus(t.Status))
 	return nil

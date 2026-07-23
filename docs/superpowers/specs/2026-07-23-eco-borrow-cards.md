@@ -114,6 +114,16 @@
 
 **规模**：M（设计）　**依赖**：开源裁决　**队列**：t0723-0304-c0d8（held，p1，opus，-review-after）
 
+## CG-8 看板目标锚定进度（追加 2026-07-23）
+
+**动机**：委托人指令"以落地到实际使用为目标重新调整 optimize 项目显示进度"。现状 progressPercent 只答"派出的卡干完了多少"，不答"离目标多远"——卡片完成率高与 test-ready NO_GO（9/21 pass、0/8 单元就绪）并存即是证明。临时解已落：board.json desc 静态快照文案（2026-07-23）。
+
+**范围**：board.json 新增可选 goal 块（statement/as_of/milestones 权重锚定/可选 evidence 文件折算——**看板绝不执行命令**，只读落盘 JSON）；合成"落地进度"与卡片进度**并列**显示（不替换），全链路 fail-honest（权重非法/evidence 缺失或超龄/pointer 取不到数 → 数据不足，绝不编数）。
+
+**验收**：含两条反例注入（同名字符串字段冒充数值须判数据不足；权重和为 0 须拒绝显示）+ evidence 删除不得回落旧值 + 现有 progressPercent 行为回归不变。
+
+**规模**：M　**依赖**：无　**队列**：t0723-1759-78fe（p3，opus，-review-after）
+
 ## 明确不做
 
 1. **ACP 统一执行器层替换三套 CLI 包装**（借鉴清单 #11）：规范由 Zed 主导演进、Claude adapter 非 Anthropic 原生、计费政策 2026-06 有过变动信号（暂缓执行但未撤回）；现有三套包装稳定且 mock 集成测试覆盖全状态机，无已证痛点。属"预留式重构"，违反第一性纪律。**再评估触发器**：Anthropic 发布官方 ACP adapter，或规范进中立基金会，或任一执行器 headless CLI 破坏性变更迫使重写包装。

@@ -501,6 +501,22 @@ async function viewOverview() {
   renderQuota(d.quota);
 
   const frag = document.createDocumentFragment();
+  // board.json 解析失败必须显式披露：静默降级会让"配错了但没生效"看起来完全正常，
+  // 违反 fail-honest。这条告警在总览顶端常驻，直到 board.json 修好为止。
+  // 【R3·P1-2】按 error_kind 分渲染：type 错时 loadBoardOverride 会跳过出错字段但保留
+  // 其他字段（json 反序列化在 UnmarshalTypeError 后仍继续填充其余字段）；syntax 错时全丢。
+  // 前端旧文案一律说"全部失效"→ 与后端"type 错保留部分"的实际行为对不上,委托人按告警去找
+  // 名称/阶段"没生效"实则在生效,误导排障。
+  if (d.board_override_error) {
+    const subText = d.board_override_error_kind === 'type'
+      ? '出错字段已按类型不匹配跳过，其余 name/desc/phases/goal 覆盖仍生效。'
+      : '项目 name/desc/phases/goal 覆盖已全部失效，页面显示回落自动推导。';
+    frag.append(callout('critical', '⚠',
+      h('div', {},
+        h('strong', { text: 'board.json 未生效：' }),
+        h('code', { text: d.board_override_error }),
+        h('p', { class: 'callout-sub', text: subText }))));
+  }
   const totals = d.totals || {};
   const activeN = (totals.queued || 0) + (totals.running || 0) +
     (totals.limit_paused || 0) + (totals.held || 0);

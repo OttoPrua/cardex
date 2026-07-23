@@ -201,6 +201,8 @@ Three inviolable rules:
 
 **`goal` field (CG-8 "landed progress")**: a mechanized "how far from the project goal" view, displayed **alongside** the card-based `progress_percent` (never replacing it). V1 does synthesis only — no history/trend.
 
+> ⚠️ **The `//` lines below are README comments only — the actual `board.json` is strict JSON: no comments, no trailing commas.** Strip the `//` before you paste. Break the JSON and the board top strip surfaces a red `board.json invalid` banner (`OverviewResp.board_override_error`). Two degradation shapes — both surface loudly, never silently: **syntax errors** (missing commas, jsonc comments, unclosed braces) cannot be partially recovered, so the entire override drops back to auto-derivation; **field-type typos** (e.g. `"weight":"1"`, `"done_percent":"50%"`) trigger `*json.UnmarshalTypeError` — Unmarshal skips the offending field but keeps filling the rest, so `loadBoardOverride` **preserves the partial result** (other projects' name/desc/phases/goal still take effect) alongside the banner. One typo does not collectively erase the whole override — but any degradation must be surfaced.
+
 ```jsonc
 "goal": {
   "statement": "Ship real usage",
@@ -209,10 +211,10 @@ Three inviolable rules:
     {"id":"M1","title":"Design freeze","weight":1,"done_percent":100,"basis":"REVIEW Go"},
     {"id":"M4","title":"test-ready gates","weight":1,
      "evidence": {                     // if present, overrides manual done_percent
-       "path":"/abs/path/to/check.json",
-       "numerator":"gate_counts.pass",         // dotted path; must resolve to a JSON number
+       "path":"/Users/you/.claudego/logs/check.json", // **must be absolute**; relative paths are rejected outright (no CWD/boardRoot fallback)
+       "numerator":"gate_counts.pass",  // dotted path; must resolve to a JSON number
        "denominator":["gate_counts.pass","gate_counts.blocked"],
-       "max_age_hours": 24              // stale → milestone marked stale + insufficient
+       "max_age_hours": 24              // stale → milestone marked stale + insufficient; negative rejected as config error
      },
      "basis":"ops/test-ready/check"}
   ]
@@ -224,7 +226,11 @@ Synthesis: `landed_percent = Σ(weight × done_percent) / Σweight`, shown next 
 **Fail-honest guarantees** (non-negotiable):
 - goal missing → the frontend **hides the whole block** (no guessing);
 - weight sum ≤ 0 or any weight < 0 → the whole block is marked "insufficient data", `landed_percent` is `null` (never NaN / Inf / any number);
-- evidence file missing / older than `max_age_hours` / pointer does not resolve to a **JSON numeric** (e.g. the field is a string like `"9/21"`) → that milestone is marked "insufficient data"; the composite is computed from remaining milestones only and flagged `partial` — **it never falls back to the stale value or the manual value** (silently swapping data provenance is a form of fabrication).
+- manual `done_percent` outside `[0, 100]` → that milestone is marked "insufficient data"; never render negative percentages or 250% (lesson: `round1`'s int64 truncation renders `-50` as `-49.9`, which then displays as authoritative "-49.9%");
+- evidence synthesis exceeds 100% (e.g. a misconfigured pointer yields `num=30, den=[10]` → 300%) or yields a negative value (numerator or denominator is negative) → same "insufficient data" treatment; the raw 300% or -30% is never surfaced. The guards sit on the **absolute values** of `num` and `den` (`num<0` rejected, `den≤0` rejected); guarding only `pct<0` gets bypassed by "sign cancellation" — e.g. `{pass:-9, blocked:-2}` cancels to `+81.8%`;
+- **evidence.path must be absolute**: relative paths — whether resolved against process CWD or the `board.json` directory — silently fall back to same-named files (e.g. scaffolding under `~/.claudego`), so a misconfiguration reads the wrong file with zero warning. Rejecting relative paths outright is the only way to keep the provenance auditable;
+- evidence file missing / older than `max_age_hours` / pointer does not resolve to a **JSON numeric** (e.g. the field is a string like `"9/21"`) → that milestone is marked "insufficient data"; the composite is computed from remaining milestones only and flagged `partial` — **evidence is exclusive once configured**; failure / staleness / bad pointer means "insufficient", **never a fallback to the manual value** (silently swapping data provenance is a form of fabrication);
+- `board.json` present but syntactically invalid (jsonc comments, trailing commas, unclosed braces) → `OverviewResp.board_override_error` is populated, the red banner stays up, and **the entire override block** drops back to auto-derivation; **field-type typos** (`"weight":"1"` / `"done_percent":"50%"`, i.e. `*json.UnmarshalTypeError`) → the banner is populated too, but **the partial-fill result is preserved** (other projects' unaffected name/desc/phases/goal still apply) — one typo does not collectively erase the whole override. Neither shape is **ever silently swallowed**.
 
 **The board only reads evidence files, never executes commands**: producing that JSON is the job of the orchestration session/card (e.g. `ops/test-ready/check`); the board only consumes what has been written to disk.
 

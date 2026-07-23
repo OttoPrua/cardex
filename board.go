@@ -38,6 +38,18 @@ type OverviewResp struct {
 	MaxParallel int          `json:"max_parallel"`
 	Projects    []*Project   `json:"projects"`
 	Quota       QuotaSummary `json:"quota"`
+	// BoardOverrideError 是 board.json 加载/解析失败的诊断串（有则挂前端告警）。
+	// omitempty：正常场景下响应里不出现该键；一旦出现，前端必须显式披露——
+	// 静默吞掉解析错误会让"整个 override 静默蒸发"与"没配 override"看起来完全一样，
+	// 违反 fail-honest 纪律（教训：一个逗号打错就把项目名 / desc / phases / goal 全丢）。
+	BoardOverrideError string `json:"board_override_error,omitempty"`
+	// 【R3·P1-2】BoardOverrideErrorKind ∈ {"type", "syntax"}(未出错时为空,omitempty 消失)。
+	// 前端 app.js 按此把顶端横幅文案分开:
+	//   type   → "部分覆盖仍生效,出错字段已跳过"（Go encoding/json 语义:skip 出错字段继续填充其它）
+	//   syntax → "覆盖全部失效,页面显示回落自动推导"（整块无法保留）
+	// 上一轮 review-divert P1-2 根因就是横幅无条件写 syntax 文案——name/desc 明明还生效,
+	// 披露自身失实即 fail-honest 卡自身破线。契约字段名不得擅改(app.js grep 有依赖)。
+	BoardOverrideErrorKind string `json:"board_override_error_kind,omitempty"`
 }
 
 // BoardColumn 是 kanban 的一列。
@@ -220,12 +232,14 @@ func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 	burn := s.burn.get(s.root, snap.Cfg, now)
 	writeJSON(w, http.StatusOK, OverviewResp{
-		GeneratedAt: now.Format(time.RFC3339),
-		Root:        snap.Root,
-		Totals:      snap.Totals,
-		MaxParallel: snap.Cfg.MaxParallel,
-		Projects:    projects,
-		Quota:       quotaSummary(burn.Sources),
+		GeneratedAt:            now.Format(time.RFC3339),
+		Root:                   snap.Root,
+		Totals:                 snap.Totals,
+		MaxParallel:            snap.Cfg.MaxParallel,
+		Projects:               projects,
+		Quota:                  quotaSummary(burn.Sources),
+		BoardOverrideError:     snap.BoardOverrideError,
+		BoardOverrideErrorKind: snap.BoardOverrideErrorKind,
 	})
 }
 

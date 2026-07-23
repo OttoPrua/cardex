@@ -16,6 +16,8 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -187,6 +189,16 @@ type boardSnapshot struct {
 	Cfg         *Config
 	Projects    []*Project
 	Totals      boardTotals
+	// BoardOverrideError 记录 board.json 加载/解析出错的原因（若无则为空）。
+	// 上层 handler 会把它塞进 /api/overview 顶层，前端显式挂告警——
+	// **不能**静默返回空 override，那等同"造读数"。
+	BoardOverrideError string
+	// 【R3·P1-2】BoardOverrideErrorKind ∈ {"", "type", "syntax"}：
+	//   type 时 name/desc/phases 覆盖仍生效(Unmarshal skip 掉出错字段继续填充),
+	//        前端应写"部分覆盖仍生效,出错字段已跳过"；
+	//   syntax 时整块覆盖蒸发,前端写"覆盖全部失效"（原文案）。
+	// 契约字段名进入前端 board_override_error_kind,不得擅改。
+	BoardOverrideErrorKind string
 	// byID 保留原始卡，供 /api/project 拼 TaskDetail（避免二次读盘）。
 	byID map[string]*Task
 	// projTasks 是 project id → 该项目全部原始卡（含归档），ETA 与详情页复用。
@@ -765,8 +777,13 @@ func round1(f float64) float64 { return float64(int64(f*10+0.5)) / 10 }
 // boardOverride 是可选的人工文案覆盖：<root>/board.json。
 // 自动推导的项目/阶段介绍难免干瘪，允许人工写一份更准的；文件不存在就全部走推导。
 // 看板只读它，永不写它。
+//
+// root 是加载时的目录，供 goal.evidence.path 相对路径解析用（相对 board.json 所在目录，
+// 不是进程 CWD——launchd/systemd/手动 cd 会漂移）。它由 loadBoardOverride 塞入，
+// 不进 JSON，也不对外暴露；因此 struct tag 用 `json:"-"`。
 type boardOverride struct {
 	Projects map[string]boardOverrideProject `json:"projects"`
+	root     string                          `json:"-"`
 }
 
 // boardOverrideProject 是 board.json 里单个项目的覆盖块。
@@ -779,16 +796,66 @@ type boardOverrideProject struct {
 	Goal   *boardOverrideGoal    `json:"goal,omitempty"`
 }
 
-func loadBoardOverride(root string) *boardOverride {
-	data, err := os.ReadFile(filepath.Join(root, "board.json"))
+// 【R3·P1-2】overrideErrKind 分类:app.js 需按这个把顶端横幅的文案区分开 ——
+//   "type" 场景 name/desc/phases 覆盖仍生效(Unmarshal skip 掉出错字段继续填充其它),
+//       写"全部失效"是失实披露(fail-honest 卡的披露自身失实,自身破线)。
+//   "syntax" 场景整块 override 蒸发,前端应写"全部失效,回落自动推导"。
+// 常量导出到包级,前端与测试可 grep 到具体字符串保防误改。
+const (
+	overrideErrKindSyntax = "syntax"
+	overrideErrKindType   = "type"
+)
+
+// loadBoardOverride 读 <root>/board.json。返回 (override, 错误串, 错误分类)：
+//   - 文件不存在（IsNotExist）→ 返回空 override + err="" + kind="" ，等价"未配置"；
+//   - 文件存在但 JSON 语法错 → 返回空 override + 具体错误描述 + kind="syntax"（部分保留不可能）；
+//   - 文件存在但**字段类型错**（如 goal.weight 写成字符串、done_percent 写成 "50%"）→
+//     保留 Unmarshal 已尽力填充的部分（name/desc/phases 与其它无手误项目）+ 错误描述 + kind="type"。
+//
+// 为什么解析错误不能静默返回空 override：原实现把「配了 override 但一个逗号打错 / 抄了 jsonc 注释」
+// 与「根本没有 override 文件」压成同一个状态，含 name/desc/phases/goal 在内的所有覆盖块
+// 会集体静默蒸发；这违反本卡的 fail-honest 纪律——「无声降级」正是"造读数"的一种，
+// 用户以为看到的是自己配的项目名，实际看到的是自动推导结果。落错 + 前端显式披露方能闭环。
+//
+// 为什么区分类型错与语法错：Go encoding/json 的语义是「遇到字段类型不匹配（*UnmarshalTypeError）
+// 会 skip 该字段但继续解析剩余字段，尽力填充后返回最早的类型错」。CG-8 新加 weight/done_percent/
+// max_age_hours 三个数值字段——委托人在 desc 里写"50%"这种手误概率高，不能因为一个 milestone 的
+// weight 写成字符串就把整个 board.json（含所有项目的 name/desc/phases）连坐蒸发。语法错（逗号少了、
+// 括号不闭合、抄了 jsonc 注释）无法部分保留，必须整块丢弃。
+//
+// 【R3·P1-2】为什么加 kind 第三返值:上一轮 web/app.js:511 顶端横幅无条件写"项目 name/desc/phases/goal
+// 覆盖已全部失效,页面显示回落自动推导",但类型错场景 name/desc/phases 明明生效(见
+// boardgoal_test.go TestLoadBoardOverrideTypeErrorPreservesOtherFields)——fail-honest 披露自身失实。
+// 前端要区分两态:type 显示"部分覆盖仍生效,出错字段已跳过",syntax 显示现有"全部失效"文案。
+// 教训（tool-output-reliability）：闸门级读数任何"静默连坐"都是造读数——凡有降级必有披露。
+func loadBoardOverride(root string) (*boardOverride, string, string) {
+	path := filepath.Join(root, "board.json")
+	data, err := os.ReadFile(path)
 	if err != nil {
-		return &boardOverride{}
+		if os.IsNotExist(err) {
+			return &boardOverride{root: root}, "", ""
+		}
+		msg := "读 board.json 失败: " + err.Error()
+		log.Printf("[board] %s", msg)
+		// I/O 错(非 IsNotExist)也走整块丢——保守按 syntax 归类,前端显示"全部失效"。
+		return &boardOverride{root: root}, msg, overrideErrKindSyntax
 	}
 	var o boardOverride
-	if json.Unmarshal(data, &o) != nil {
-		return &boardOverride{}
+	if jerr := json.Unmarshal(data, &o); jerr != nil {
+		msg := "board.json 解析失败（提示：board.json 是严格 JSON，不接受注释/尾逗号）: " + jerr.Error()
+		log.Printf("[board] %s", msg)
+		// *UnmarshalTypeError：字段类型不匹配，Unmarshal 已 skip 该字段并继续填充其它字段——
+		// 保留部分结果 + 挂错披露 + kind=type,前端渲染"部分覆盖仍生效"文案。
+		// 语法错走 else 分支整块丢 + kind=syntax。
+		var typeErr *json.UnmarshalTypeError
+		if errors.As(jerr, &typeErr) {
+			o.root = root
+			return &o, msg, overrideErrKindType
+		}
+		return &boardOverride{root: root}, msg, overrideErrKindSyntax
 	}
-	return &o
+	o.root = root
+	return &o, "", ""
 }
 
 // ---- 快照构建 ----
@@ -802,7 +869,7 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	ov := loadBoardOverride(root)
+	ov, ovErr, ovErrKind := loadBoardOverride(root)
 
 	byID := make(map[string]*Task, len(tasks))
 	for _, t := range tasks {
@@ -851,12 +918,14 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 	}
 
 	snap := &boardSnapshot{
-		GeneratedAt: now,
-		Root:        root,
-		Cfg:         cfg,
-		byID:        byID,
-		projTasks:   map[string][]*Task{},
-		phaseOf:     map[string]string{},
+		GeneratedAt:            now,
+		Root:                   root,
+		Cfg:                    cfg,
+		BoardOverrideError:     ovErr,
+		BoardOverrideErrorKind: ovErrKind,
+		byID:                   byID,
+		projTasks:              map[string][]*Task{},
+		phaseOf:                map[string]string{},
 	}
 
 	// 分量必须按稳定键遍历：Go 的 map 迭代顺序是随机化的，
@@ -1034,7 +1103,8 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 		}
 		// 目标锚定进度（CG-8）：goal 块缺失时 buildProjectGoal 返回 nil，
 		// Project.Goal 的 omitempty 保证 JSON 里不出现该键——前端"不显示"契约成立。
-		p.Goal = buildProjectGoal(o.Goal, now)
+		// root 是 board.json 所在目录，evidence.path 相对路径按它解析（不用进程 CWD）。
+		p.Goal = buildProjectGoal(o.Goal, ov.root, now)
 	}
 
 	// 注意：这里**不**截断 phases[].tasks——/api/project 契约要求完整清单。

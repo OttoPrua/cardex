@@ -839,3 +839,188 @@ func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 		}
 	}
 }
+
+// ⑮ 【R3 P0-1 + P1-1 结构断言】in-mirror .ps1 必须包含:
+//   (a) System.StringComparer::Ordinal 排序原语(消灭 R2 版 Sort-Object -CaseSensitive 的语言学序假 STALE);
+//   (b) System.Text.UTF8Encoding + [Console]::OutputEncoding + [Console]::InputEncoding 三处切换
+//       (消灭 Windows OEM CP 下 UTF-8 中文路径乱码 → Test-Path 假 + 逐行不等的假 STALE);
+//   (c) .claudego-fingerprint.files 伴生文件的 sha256 校验(TA-2 契约同源)。
+//
+// 【为什么单独立测】TestSyncDistributesPowerShellVerifyScript 已挡"分发/尺寸/param/Get-FileHash";
+// 本用例挡的是 R3 修法字面片段本身,防".ps1 回滚到 R2 版仍能过分发测试"的漂移。
+//
+// 【杀的突变】① 把 SortedSet+Ordinal 改回 Sort-Object -CaseSensitive -Unique → (a) 红;
+// ② 删掉 UTF-8 编码 setter 段 → (b) 红;
+// ③ 删掉伴生文件 sha256 校验 → (c) 红。
+func TestPowerShellVerifyScriptContainsR3Fixes(t *testing.T) {
+	src := mkSyncSourceRepo(t)
+	mroot := t.TempDir()
+	if _, _, code := runSyncLocal(t, src, mroot); code != 0 {
+		t.Fatalf("sync 应成功, got exit=%d", code)
+	}
+	m := mirrorDir(t, src, mroot)
+	ps1 := filepath.Join(m, ".claudego-scripts", "verify-mirror-fingerprint.ps1")
+	body, err := os.ReadFile(ps1)
+	if err != nil {
+		t.Fatalf(".ps1 应存在: %v", err)
+	}
+	must := []string{
+		"StringComparer]::Ordinal",         // P0-1: 字节序等同排序
+		"SortedSet",                        // P0-1: 单遍排序+去重
+		"System.Text.UTF8Encoding",         // P1-1: UTF-8 编码构造
+		"[Console]::OutputEncoding",        // P1-1: stdout 通道编码
+		"[Console]::InputEncoding",         // P1-1: stdin 通道编码
+		".claudego-fingerprint.files",      // TA-2: 伴生文件校验
+		"MANIFEST_SHA",                     // TA-2: 与 header 的 MANIFEST_SHA 交叉断言
+	}
+	for _, kw := range must {
+		if !strings.Contains(string(body), kw) {
+			t.Fatalf(".ps1 缺 R3 修法关键片段 %q —— 说明分发的是 R2 或更早版本(或修法漂), 完整 body 长度=%d", kw, len(body))
+		}
+	}
+	// 反面挡:R2 的 `| Sort-Object` 管道用法(语言学序)不应残留在代码路径。
+	// 【注】.ps1 rationale 注释里为解释修法会用反引号引用 `Sort-Object -CaseSensitive -Unique` 字面串,
+	// 那不是代码执行路径,不应误报;所以匹配"管道进入 Sort-Object"这一执行位模式(注释里的引用无 `| ` 前缀)。
+	for _, line := range strings.Split(string(body), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if strings.Contains(trimmed, "| Sort-Object") {
+			t.Fatalf(".ps1 代码路径仍含 `| Sort-Object`(R2 版走 .NET 语言学序,与 sh 的 LC_ALL=C sort -u 不同源)—— 该行必须已换成 SortedSet+Ordinal;命中行:%q", trimmed)
+		}
+	}
+}
+
+// ⑯ 【R3 P0-1 行为端到端·pwsh-if-available】混大小写 + 中文文件名的联合集,
+// R2 版 .ps1 走 Sort-Object 语言学序,与 sh 侧字节序不同源 → verify 假 STALE(exit 1);
+// R3 版 SortedSet+Ordinal 与字节序恒等 → verify 通过(exit 0)。
+//
+// 【纪律】pwsh/powershell 不在时 Skip(Mac 开发盒无 pwsh 是常态,不能红);
+// 装机验收流水在 Windows 端会跑到本用例,构成 P0-1 的行为闸门。
+//
+// 【杀的突变】.ps1 排序回滚到语言学序 → 本用例 Windows 上会红(混大小写 manifest 首行不等)。
+func TestVerifyPowerShellScriptOnMixedCaseAndChineseFixture(t *testing.T) {
+	pwsh := findPowerShell()
+	if pwsh == "" {
+		t.Skip("跳过:pwsh/powershell 不在 PATH(Mac 开发盒常态,Windows 装机验收流水必须跑到本用例)")
+	}
+	src := mkSyncSourceRepo(t)
+	// 混大小写 fixture:大写开头 + 小写开头交错。字节序('M'0x4D < 'a'0x61 < 'b'0x62 < 'z'0x7A)
+	// 与 .NET 默认语言学序('a'~'A'~'M'~'b' 相近字母集群)不同源;R2 版会在此翻车。
+	mixedNames := []string{"Makefile.notes", "README.local", "aaa.txt", "bbb.txt", "ZZZ.txt", "ccc.txt"}
+	for _, n := range mixedNames {
+		if err := os.WriteFile(filepath.Join(src, n), []byte("body-"+n+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 中文文件名也放一份(顺带覆盖 P1-1 UTF-8 编码切换在 pwsh 下起作用)。
+	if err := os.WriteFile(filepath.Join(src, "文档-混.md"), []byte("# 混大小写\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	mroot := t.TempDir()
+	if out, errOut, code := runSyncLocal(t, src, mroot); code != 0 {
+		t.Fatalf("sync 应成功, exit=%d\nstdout:%s\nstderr:%s", code, out, errOut)
+	}
+	m := mirrorDir(t, src, mroot)
+
+	// (a) pwsh 侧 verify 必须 exit 0(证 SortedSet+Ordinal 与 sh 侧字节序同源)。
+	code, output := runPowerShellVerify(t, pwsh, m)
+	if code != 0 {
+		t.Fatalf("混大小写 + 中文 fixture 下 pwsh verify 应 exit 0(SortedSet+Ordinal 与 sh 侧同源), got=%d\n输出:%s", code, output)
+	}
+
+	// (b) 篡改镜像上某文件内容后 pwsh 侧 verify 必须 exit 1(证内容防线真起作用,不是排序绕过)。
+	if err := os.WriteFile(filepath.Join(m, "aaa.txt"), []byte("tampered\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	code, output = runPowerShellVerify(t, pwsh, m)
+	if code != 1 {
+		t.Fatalf("篡改后 pwsh verify 必须 exit 1(内容不等), got=%d\n输出:%s", code, output)
+	}
+}
+
+// findPowerShell 探测 pwsh 或 powershell 可执行文件;都无则返回空串。
+// 【为什么两条】pwsh 是 PowerShell 7+ 的跨平台命令;powershell 是 Windows 5.1 内置;远端 Win 沙箱
+// 至少有一个,Mac/Linux 开发盒通常俩都没有 → 用它做 Skip 门。
+func findPowerShell() string {
+	if p, err := exec.LookPath("pwsh"); err == nil {
+		return p
+	}
+	if p, err := exec.LookPath("powershell"); err == nil {
+		return p
+	}
+	return ""
+}
+
+// runPowerShellVerify 用探到的 pwsh 跑 in-mirror .ps1,返回 (exit code, 输出)。
+func runPowerShellVerify(t *testing.T, pwsh, mirror string) (int, string) {
+	t.Helper()
+	ps1 := filepath.Join(mirror, ".claudego-scripts", "verify-mirror-fingerprint.ps1")
+	cmd := exec.Command(pwsh, "-File", ps1, "-Mirror", mirror)
+	cmd.Env = os.Environ()
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	err := cmd.Run()
+	if err == nil {
+		return 0, buf.String()
+	}
+	if ee, ok := err.(*exec.ExitError); ok {
+		return ee.ExitCode(), buf.String()
+	}
+	t.Fatalf("pwsh verify 非 ExitError 失败:%v\n输出:%s", err, buf.String())
+	return -1, buf.String()
+}
+
+// ⑰ 【R3 完整闭环·DELETED 分支端到端】HEAD 追踪的文件在源仓被 rm 后,workspace-fingerprint.sh
+// 的 [ -e "$f" ] 假分支应发 `DELETED\t<path>` 行;sync 全量重建镜像 → 镜像也无该文件 →
+// verify 侧 Test-Path 也假 → 同样 DELETED → 逐行比对通过。
+//
+// 【为什么单独立测】旧套件里 mkSyncSourceRepo 只覆盖 modified/untracked/gitignored/中文/staged
+// 几类,DELETED 分支从未端到端跑通;万一 sync 侧漏落 rm 或 verify 侧 Test-Path 语义漂,现在会红。
+//
+// 【杀的突变】① workspace-fingerprint.sh 里 else 分支不发 DELETED 行 → 联合集 COUNT 少 1 → 红;
+// ② sync 不 rm 镜像端已删的 tracked 文件 → 镜像该路径仍存在 → 一侧 DELETED / 一侧 sha → 首行不等 → 红。
+func TestVerifyPassesWithDeletedTrackedFile(t *testing.T) {
+	src := mkSyncSourceRepo(t)
+	// 基线 sync 前把 baseline 追踪文件删掉(不 commit,仿"修复卡·workspace 待复审"守则)。
+	if err := os.Remove(filepath.Join(src, "keep.txt")); err != nil {
+		t.Fatal(err)
+	}
+	// git 侧状态:keep.txt 在 diff --name-only HEAD 里,不在 ls-files --others 里。
+	statusOut, _ := exec.Command("git", "-C", src, "status", "--porcelain").CombinedOutput()
+	if !strings.Contains(string(statusOut), " D keep.txt") {
+		t.Fatalf("前置:源端 keep.txt 应为 deleted-tracked, got status=%q", statusOut)
+	}
+
+	mroot := t.TempDir()
+	if out, errOut, code := runSyncLocal(t, src, mroot); code != 0 {
+		t.Fatalf("sync 应成功, exit=%d\nstdout:%s\nstderr:%s", code, out, errOut)
+	}
+	m := mirrorDir(t, src, mroot)
+
+	// (a) 镜像端 keep.txt 应已被 sync 抹除(全量重建 workspace 覆盖)。
+	if _, err := os.Stat(filepath.Join(m, "keep.txt")); !os.IsNotExist(err) {
+		t.Fatalf("镜像 keep.txt 应被 sync 抹除(仿源端 rm), stat err=%v", err)
+	}
+
+	// (b) manifest 含 `DELETED\tkeep.txt` 行。
+	manifest := readFingerprintManifest(t, filepath.Join(m, ".claudego-fingerprint"))
+	foundDeleted := false
+	for _, ln := range manifest {
+		if ln == "DELETED\tkeep.txt" {
+			foundDeleted = true
+			break
+		}
+	}
+	if !foundDeleted {
+		t.Fatalf("manifest 应含 `DELETED\\tkeep.txt` 行(workspace-fingerprint.sh else 分支),实际:\n%s", strings.Join(manifest, "\n"))
+	}
+
+	// (c) verify 通过(两侧同 DELETED)。
+	if code := runVerify(t, m); code != 0 {
+		t.Fatalf("DELETED 分支两侧对称,verify 应 exit 0, got=%d", code)
+	}
+}

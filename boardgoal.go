@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 )
@@ -96,7 +97,12 @@ type boardOverrideEvidence struct {
 // buildProjectGoal 把 board.json 的 goal 覆盖块折算成对外 ProjectGoal。
 // 返回 nil 表示「未配置目标」——前端契约要求此时完全不显示该区块。
 // now 由调用方注入（便于测试与快照复现），evidence 的超龄判定基于文件 mtime。
-func buildProjectGoal(ov *boardOverrideGoal, now time.Time) *ProjectGoal {
+//
+// root 参数保留是历史约定（round-1 曾用它给相对 evidence.path 挂 boardRoot），
+// round-3 起 evidence.path **强制要求绝对路径**——相对路径无论解析到 CWD 还是 boardRoot，
+// 都存在「同名文件静默读错」的兜底路径（boardRoot 里存在同名脚手架/临时文件时零告警读错），
+// 与本卡 fail-honest 纪律冲突。root 目前只作为占位保留，供未来扩展。
+func buildProjectGoal(ov *boardOverrideGoal, root string, now time.Time) *ProjectGoal {
 	if ov == nil {
 		return nil
 	}
@@ -110,7 +116,7 @@ func buildProjectGoal(ov *boardOverrideGoal, now time.Time) *ProjectGoal {
 	// 单独一个 milestone 的失败不影响其它 milestone。
 	hasEvidence := false
 	for _, m := range ov.Milestones {
-		gm := buildGoalMilestone(m, ov.AsOf, now)
+		gm := buildGoalMilestone(m, root, ov.AsOf, now)
 		pg.Milestones = append(pg.Milestones, gm)
 		if m.Evidence != nil {
 			hasEvidence = true
@@ -192,9 +198,15 @@ func withAsOf(prefix, asOf string) string {
 	return prefix + "@" + asOf
 }
 
-// buildGoalMilestone 单个里程碑折算：evidence 优先（有配置就试）；失败/超龄回退到
-// 人工 done_percent；两者都无 → 数据不足。**不做插值、不回退旧值**。
-func buildGoalMilestone(m boardOverrideMilestone, asOf string, now time.Time) GoalMilestone {
+// buildGoalMilestone 单个里程碑折算：evidence **存在即独占**——一旦配了 evidence 就
+// 只按 evidence 取数，失败 / 超龄 / pointer 取不到数值一律 insufficient，
+// **绝不回退到 m.DonePercent**（人工值）：读数含义漂移是造假的一种。
+// 无 evidence 时才用人工 done_percent；两者都无 → 数据不足。
+// **不做插值、不回退旧值**。
+//
+// 人工 done_percent 强制在 [0, 100]：round1(int64 截断) 对 -50 会算出 -49.9，
+// 落地进度作为决策读数出现负值/超 100 都是造读数——语义上就是坏配置，标数据不足。
+func buildGoalMilestone(m boardOverrideMilestone, root, asOf string, now time.Time) GoalMilestone {
 	gm := GoalMilestone{
 		ID:     m.ID,
 		Title:  m.Title,
@@ -202,7 +214,7 @@ func buildGoalMilestone(m boardOverrideMilestone, asOf string, now time.Time) Go
 		Basis:  m.Basis,
 	}
 	if m.Evidence != nil {
-		v, src, stale, reason := readEvidencePercent(m.Evidence, now)
+		v, src, stale, reason := readEvidencePercent(m.Evidence, root, now)
 		if stale {
 			// 超龄一定标 Stale=true——快照断言依赖这个字段可见。
 			gm.Stale = true
@@ -226,8 +238,17 @@ func buildGoalMilestone(m boardOverrideMilestone, asOf string, now time.Time) Go
 		return gm
 	}
 	if m.DonePercent != nil {
-		v := round1(*m.DonePercent)
-		gm.DonePercent = &v
+		v := *m.DonePercent
+		if v < 0 || v > 100 {
+			// 越界的人工值一律拒绝。允许 -50 或 250 通过就会在合成值里出现负数或
+			// 200%——前端把这数字当权威展示，比"不显示"糟糕得多。
+			gm.Insufficient = true
+			gm.InsufficientReason = fmt.Sprintf("done_percent 越界 (%v，须在 [0,100])", v)
+			gm.Source = "insufficient"
+			return gm
+		}
+		rounded := round1(v)
+		gm.DonePercent = &rounded
 		gm.Source = withAsOf("manual", asOf)
 		return gm
 	}
@@ -240,20 +261,42 @@ func buildGoalMilestone(m boardOverrideMilestone, asOf string, now time.Time) Go
 // readEvidencePercent 从 evidence.Path 指向的 JSON 里按 numerator/denominator 折算百分比。
 // 返回：值(0-100)、source 标签、stale 标志、若非空则为「数据不足原因」。
 //
+// evidence.path 强制要求绝对路径（round-3 加固）：相对路径无论解析到进程 CWD 还是
+// board.json 所在目录，都存在「同名文件静默读错」的兜底路径——
+//   - CWD：launchd 从 / 起、shell 从项目目录起，同一配置读数「时有时无」；
+//   - boardRoot：默认 ~/.claudego 里若存在同名脚手架/临时文件也会零告警读错。
+// 两者都把「配错的路径」伪装成"数据不足"或"读到值"，无诊断可查。绝对路径是唯一
+// 能让读数出处一目了然的选项——若配错就当场 insufficient 报出来。
+// boardRoot 参数保留是为了 API 稳定性（其它调用点已透传），但内部不再回退到它。
+//
 // 反例注入①的关键：extractNumber 严格要求最终值是 JSON 数值（float64）。
 // 若 fixture 里同名字段是字符串 "9/21"，钻取会在类型断言处失败，直接返回 not-ok；
 // 绝不尝试把字符串 parse 成数字——那种"贴心"回退等于替用户凭空造读数。
-func readEvidencePercent(ev *boardOverrideEvidence, now time.Time) (float64, string, bool, string) {
-	src := "evidence@" + ev.Path
+func readEvidencePercent(ev *boardOverrideEvidence, boardRoot string, now time.Time) (float64, string, bool, string) {
+	_ = boardRoot // 保留形参供 API 稳定；round-3 起相对路径直接拒绝，不再回退到 boardRoot。
 	if ev.Path == "" {
 		return 0, "insufficient", false, "evidence.path 为空"
 	}
-	info, err := os.Stat(ev.Path)
+	// 绝对路径守卫：非绝对一律 insufficient。filepath.IsAbs 是跨平台权威判断
+	// （Windows 上 D:/foo 是绝对而 foo/bar 不是；Unix 上以 / 开头才算绝对）。
+	// 允许相对路径 = 允许「同名文件静默兜底」，与 fail-honest 冲突。
+	if !filepath.IsAbs(ev.Path) {
+		return 0, "insufficient", false, fmt.Sprintf("evidence.path 必须是绝对路径 (got %q)", ev.Path)
+	}
+	resolved := ev.Path
+	src := "evidence@" + resolved
+	if ev.MaxAgeHours < 0 {
+		// 负 max_age_hours 是明显的配置错误。0 意为"不限"（已有语义），负数若被
+		// 兜底成"不限"就把「配错的超龄门」变成永远不生效——同 P1-4 的隐匿降级同类，
+		// 一律 insufficient。
+		return 0, src, false, fmt.Sprintf("evidence.max_age_hours 为负值 (%v)", ev.MaxAgeHours)
+	}
+	info, err := os.Stat(resolved)
 	if err != nil {
 		return 0, src, false, "evidence 文件不存在或不可读: " + err.Error()
 	}
 	mtime := info.ModTime()
-	src = "evidence@" + ev.Path + "@" + mtime.UTC().Format(time.RFC3339)
+	src = "evidence@" + resolved + "@" + mtime.UTC().Format(time.RFC3339)
 	if ev.MaxAgeHours > 0 {
 		age := now.Sub(mtime)
 		maxAge := time.Duration(ev.MaxAgeHours * float64(time.Hour))
@@ -261,37 +304,58 @@ func readEvidencePercent(ev *boardOverrideEvidence, now time.Time) (float64, str
 			return 0, src, true, fmt.Sprintf("evidence 已超龄 (age=%s > max=%s)", age.Round(time.Second), maxAge.Round(time.Second))
 		}
 	}
-	data, err := os.ReadFile(ev.Path)
+	data, err := os.ReadFile(resolved)
 	if err != nil {
 		return 0, src, false, "读 evidence 文件失败: " + err.Error()
 	}
-	var root any
-	if err := json.Unmarshal(data, &root); err != nil {
+	var jroot any
+	if err := json.Unmarshal(data, &jroot); err != nil {
 		return 0, src, false, "evidence JSON 解析失败: " + err.Error()
 	}
-	num, ok := extractNumber(root, ev.Numerator)
+	num, ok := extractNumber(jroot, ev.Numerator)
 	if !ok {
 		return 0, src, false, fmt.Sprintf("evidence numerator %q 取不到数值", ev.Numerator)
+	}
+	if num < 0 {
+		// 分子为负 = 坏配置（fixture 里 pass=-9 或计数字段被误写成偏移量）。
+		// 单挡这一层是必需的：若同时 den<0 则 pct=num/den 会算出正数，绕过下方 pct<0 检查；
+		// 举例 {pass:-9, blocked:-2} 折算 -9/-11*100=81.8% 会被伪装成合理读数。
+		return 0, src, false, fmt.Sprintf("evidence numerator 为负值 (%v)", num)
 	}
 	if len(ev.Denominator) == 0 {
 		return 0, src, false, "evidence denominator 未配置"
 	}
 	den := 0.0
 	for _, p := range ev.Denominator {
-		v, ok := extractNumber(root, p)
+		v, ok := extractNumber(jroot, p)
 		if !ok {
 			return 0, src, false, fmt.Sprintf("evidence denominator %q 取不到数值", p)
 		}
 		den += v
 	}
-	if den == 0 {
-		// 除零守护。落地进度是决策读数，NaN/Inf 一旦渗出会污染合成值。
-		return 0, src, false, "evidence denominator 求和为 0"
+	if den <= 0 {
+		// 除零 + 负分母守护。落地进度是决策读数，NaN/Inf 一旦渗出会污染合成值。
+		// den<0 单独挡：num=0/den<0 会算出 -0（== 0，不 < 0），会绕过下方 pct<0；
+		// 更狡诈：num<0/den<0 会算出正数（见 num<0 注释）——两条都堵才是完备。
+		// 「符号相消」是一整类攻击面，闸门必须放在 den 与 num 各自的绝对值上，不是 pct 上。
+		return 0, src, false, fmt.Sprintf("evidence denominator 求和 ≤ 0 (%v)", den)
 	}
 	pct := num / den * 100
 	if pct < 0 {
-		// 负百分比在语义上就是坏数据（分子/分母有一个是负），拒绝。
+		// belt-and-suspenders：正常路径 num>=0 & den>0 时 pct 不会<0，但保留兜底
+		// 让防线在任何未来重构下都自证——比只加注释再回归稳。
 		return 0, src, false, fmt.Sprintf("evidence 折算为负值 (num=%v den=%v)", num, den)
+	}
+	// 上界越界同样是坏数据：pointer 里配错导致 num=30, den=[10] 会算出 300%。
+	// 前端把这数字当权威渲染，与"数据不足"相比是更糟糕的污染。
+	// 用小容差吸收浮点尾巴（0.1+0.2 会算成 0.30000000000000004 之类的经典漂移），
+	// 只有真实"分子>分母"的配置错误才会明显越界。
+	const upperTol = 1e-6
+	if pct > 100+upperTol {
+		return 0, src, false, fmt.Sprintf("evidence 折算越界 (%.4f%%，num=%v den=%v)", pct, num, den)
+	}
+	if pct > 100 {
+		pct = 100
 	}
 	return pct, src, false, ""
 }

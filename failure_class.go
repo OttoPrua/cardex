@@ -41,11 +41,29 @@ import (
 // held（无人值守静默停摆，基线本会退避重试自愈）或 auth 直接 held（同样静默）或 input_too_long
 // 直接 failed（永久终态）。这与文件顶部"越权就烧钱"的硬纪律直接冲突。
 //
-// 【根修】classifyFailure 只吃 msg——errorSummary 已把 res.Subtype/首行 result 或 runErr+首行
-// combined 提炼成 msg（"分类信号本该在的地方"），是执行结果里最集中且没有 transcript 噪声的一层。
-// combined 完全不看：分类特征若没进 msg，就让分类器坦然回落 unknown → 走 retry_backoff，即旧版
-// 基线行为，安全；宁可漏分类走退避，也不能凭 transcript 尾窗的裸短语误判成不可重试终态。tailWindow
-// 辅助函数一并删除，杜绝未来"再把 combined 拼回扫描串"的复辟诱惑。
+// 【根修 · 第一道防线】classifyFailure 只吃 msg——combined 完全不看：分类特征若没进 msg，就让分类器
+// 坦然回落 unknown → 走 retry_backoff，即旧版基线行为，安全；宁可漏分类走退避，也不能凭 transcript
+// 尾窗的裸短语误判成不可重试终态。tailWindow 辅助函数一并删除，杜绝未来"再把 combined 拼回扫描串"的
+// 复辟诱惑。
+//
+// 【P1 教训 · Round-3 复审】仅第一道防线不够：msg 不是"没有 transcript 噪声"——它是 errorSummary
+// 的产物，而 errorSummary 存在两条 transcript 旁路把 combined 挑出的行拼进 msg：
+//   1) res.IsError 分支：res.Result 若被 invokeCodex/invokeRemoteCodex/invokeRemoteClaude 从 combined
+//      挑行(codexErrorLine)或取首行(firstLine)填入,再由 firstLine(res.Result) 进 msg——见 runner.go
+//      各 invoke 函数与 errorSummary。
+//   2) res 为 nil 或非 IsError 时的 fallback：runErr.Error() + " | " + firstLine(combined) 直接
+//      拼 combined 首行进 msg——invokeClaude 的 parseClaudeJSON 返回 nil 时走这条。
+// 两条通路的证伪场景相同：codex 审查本仓代码时 transcript 天然含 authClassRe/permissionClassRe 等
+// 字面量,只要该步 runErr!=nil 或 -o 空,codexErrorLine 就会命中 codexHardErrRe 挑走裸 "401 unauthorized"
+// 行 → res.Result → msg → auth → held(基线本会退避自愈的超时被误判成不可重试终态)。
+//
+// 【根修 · 第二道防线】给 res 增加 ResultFromTranscript 标记(runner.go 的三处 invoke 挑行时打开),
+// runTask 分类后调 classificationFromTranscript(res, runErr) 判断分类信号是否 transcript 来源:
+//   - transcript 来源信号 + policy.Terminal!="" 一律**降级** retry_backoff(failure_class 事件仍写供审计,
+//     LastError 不加 [class] 前缀避免误导人工)。
+//   - 非 transcript 来源(claude 结构化 JSON 的 res.Result,或 runErr 本身的措辞如"步骤超时(...)")
+//     照常走终态,与 Round-2 语义一致。
+// 两道防线正交:第一道防 combined 全量污染分类,第二道防 combined 挑行经 res.Result 旁路进 msg。
 
 // failureClass 是失败分类的有限枚举。
 // 命名遵守"名词短语，语义与执行结果强绑定"，写进 events.jsonl 的 detail.failure_class 里做审计。
@@ -116,9 +134,15 @@ var (
 //      有交叉措辞（如 "401 unauthorized (forbidden)"）以更精确的 auth 优先，与 held 升级方向一致。
 //   3. **只扫 msg**——见文件顶部 P0 教训。combined 全量丢弃：分类信号本该在 msg（errorSummary 的
 //      产物），若不在则宁可 unknown 走 retry_backoff，也不能用裸短语正则去 transcript 尾窗里碰运气。
+//   4. **本函数只做归类，不做策略降级**——transcript 来源信号（msg 里的分类特征其实是从 combined
+//      挑行/取首行经 res.Result 或 fallback 分支旁路进来的）由上层 runTask 调 classificationFromTranscript
+//      判断后降级 retry_backoff（见文件顶部 P1 · Round-3 教训）。这里若擅自把 transcript 来源降级
+//      unknown，会丢失事件账本的原分类审计信号——分层清晰：本函数出 cls，上层出 policy。
 func classifyFailure(msg, combined string, res *claudeResult, runErr error) failureClass {
-	// combined/res/runErr 有意不看：msg 已经是 errorSummary 提炼的摘要，是执行结果里最集中且无
-	// transcript 噪声的一层；参数保留仅为签名向后兼容，避免打散上层 3 个调用点。Go 未用形参
+	// combined/res/runErr 有意不看：msg 已经是 errorSummary 提炼的摘要（第一道防线，见文件顶部
+	// P0 教训）；transcript 挑行经 res.Result 旁路的第二道防线由 runTask 侧的 classificationFromTranscript
+	// 承接（见 P1 · Round-3 教训）——本函数专职归类，不做策略侧的降级。
+	// 参数保留仅为签名向后兼容，避免打散上层调用点(生产调用点在 runner.go:runTask 一处)。Go 未用形参
 	// 不报错——若未来加"锚定错误行框架"式判据可以直接用这些字段，无需再改函数签名。
 	scan := msg
 	if authClassRe.MatchString(scan) {
@@ -182,6 +206,41 @@ func policyFor(cls failureClass) failurePolicy {
 // input_too_long → failed）加前缀，重试类（timeout/executor_crash/unknown/未来新增的可重试类）
 // 一律不加。判据挂在策略表上：README 契约与策略表同源，未来若新增终态类，前缀自动跟随策略扩展，
 // 不必手动同步这里。
+// classificationFromTranscript 判断 classifyFailure 用的 msg 是否源自 combined(transcript)。
+// 是则 runTask 侧必须把终态分类(held/failed) **降级** retry_backoff——transcript 天然充斥
+// permission denied / 401 unauthorized / context length exceeded 等分类正则字面量(审查引用/
+// 工具错误输出),不能作为不可重试终态的判据(基线本会退避自愈的超时/瞬时抖动会被误判静默停摆)。
+//
+// 【为什么这条判据挂在 failure_class.go】它与 classifyFailure/policyFor 是**同一条策略链**的
+// 三段——归类(classifyFailure)→策略(policyFor)→降级(classificationFromTranscript)。放这里
+// 便于把"transcript 来源不落终态"这个第二道防线与文件顶部的第一道防线(msg-only)成对阅读、
+// 成对维护。runTask 只做调用与事件写入,不掺策略逻辑。
+//
+// 判据（两条通道，任一命中即视为 transcript 来源）：
+//  1. res != nil && res.ResultFromTranscript ——invokeCodex/invokeRemoteCodex/invokeRemoteClaude
+//     从 combined 挑行(codexErrorLine)或取首行(firstLine)填入 res.Result 时打的标；errorSummary
+//     的 res.IsError 分支会把 firstLine(res.Result) 拼进 msg，分类信号即从 transcript 溢出。
+//  2. (res == nil || !res.IsError) && runErr != nil ——errorSummary 的 fallback 分支
+//     (`runErr.Error() + " | " + firstLine(combined)`) 会把 combined 首行直接拼进 msg；主要
+//     覆盖 invokeClaude 中 parseClaudeJSON 返回 nil 但 runErr!=nil 的场景（claude CLI 非 JSON 输出）。
+//
+// 非 transcript 来源（保持终态语义）：
+//   - claude 结构化 JSON 的 res.IsError=true 分支：res.Result 由 claude CLI 定义（如 "401
+//     Unauthorized: invalid api key"），不属 transcript，可信作终态判据。
+//   - runErr 里的错误措辞（如 "步骤超时(60 分钟)"、"signal: killed"）由 Go 侧构造，非 transcript；
+//     但会走通道 2（因 runErr!=nil 且 res 常为 nil/非 IsError），故也被视为 transcript 来源——
+//     这符合分类语义：真实 timeout/executor_crash 属可重试类，policy.Terminal="" 本就不受降级影响，
+//     误伤面为零。
+func classificationFromTranscript(res *claudeResult, runErr error) bool {
+	if res != nil && res.ResultFromTranscript {
+		return true
+	}
+	if (res == nil || !res.IsError) && runErr != nil {
+		return true
+	}
+	return false
+}
+
 func annotatedError(cls failureClass, msg string) string {
 	if policyFor(cls).Terminal == "" {
 		return msg

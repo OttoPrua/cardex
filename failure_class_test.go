@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -441,4 +442,238 @@ func TestAnnotatedError_PrefixOnlyForTerminalClasses(t *testing.T) {
 		})
 	}
 
+}
+
+// ---------- classificationFromTranscript 单元 & 反例注入(P1 · Round-3) ----------
+
+// TestClassificationFromTranscript_TwoChannels 断言 classificationFromTranscript 的两条判据通道:
+//  1) res.ResultFromTranscript=true (invokeCodex/invokeRemoteCodex/invokeRemoteClaude 挑行时打的标)
+//  2) (res==nil || !res.IsError) && runErr!=nil (errorSummary fallback 分支拼 combined 首行进 msg)
+//
+// 【mutation-kill】把 classificationFromTranscript 改成永远返回 false→本函数任一 want=true 分支即红;
+// 把改成永远返回 true→反例分支 (无信号却报 transcript 来源) 即红。
+func TestClassificationFromTranscript_TwoChannels(t *testing.T) {
+	cases := []struct {
+		name   string
+		res    *claudeResult
+		runErr error
+		want   bool
+	}{
+		// 通道1: res.ResultFromTranscript 显式打标
+		{"channel1_transcript_marked", &claudeResult{IsError: true, ResultFromTranscript: true}, nil, true},
+		{"channel1_marked_with_runErr", &claudeResult{IsError: true, ResultFromTranscript: true},
+			errors.New("步骤超时"), true},
+		// 通道1 反例: res.IsError=true 但未打标(claude 结构化 JSON 的 API 错误)——
+		// 应视作非 transcript,可信作终态判据。
+		{"channel1_unmarked_structured_error", &claudeResult{IsError: true, ResultFromTranscript: false}, nil, false},
+
+		// 通道2: (res==nil || !res.IsError) + runErr!=nil (errorSummary fallback)
+		{"channel2_nil_res_with_runErr", nil, errors.New("步骤超时(60 分钟)"), true},
+		{"channel2_non_error_res_with_runErr", &claudeResult{IsError: false},
+			errors.New("步骤超时"), true},
+
+		// 反例: 完全无信号
+		{"no_signal_nil_all", nil, nil, false},
+		{"no_signal_error_res_no_runErr", &claudeResult{IsError: true}, nil, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := classificationFromTranscript(tc.res, tc.runErr); got != tc.want {
+				t.Fatalf("%s: got=%v want=%v (mutation-kill:任一通道去掉判据即报红)",
+					tc.name, got, tc.want)
+			}
+		})
+	}
+}
+
+// ---------- runTask 集成 · P1 Round-3 反例注入(codex transcript 挑行导致的伪终态) ----------
+
+// fakeCodexTranscriptAuth 造一个假 codex:退出码非 0(runErr!=nil),写 codex 横幅+审查引用行(裸
+// "401 unauthorized")到 stderr,**不写** -o 输出文件(res.Result="")。触发 invokeCodex 的
+// codexErrorLine(combined) 挑行→ res.Result 被填成 transcript 里的 "401 unauthorized" 引用行,
+// ResultFromTranscript=true。
+//
+// 【为什么这条形态是核心证伪场景】codex 审查卡审查本仓代码时,stderr 天然含引用 failure_class.go 里
+// authClassRe 字面量的工具输出行(裸 "401 unauthorized"/"invalid api key",无 limitRe 词)。旧代码
+// 会经 codexErrorLine → res.Result → errorSummary → msg="codex_error: ...401 unauthorized..." →
+// authClassRe 命中 → auth → held——基线本会退避自愈的超时/瞬时抖动被误判成不可重试终态、无人值守
+// 静默停摆。修法给 res 打 ResultFromTranscript=true,runTask 侧的 classificationFromTranscript 判定
+// 后降级 retry_backoff。本测试就是该修法的正例(应走 retry)+回退验证(去掉打标必红)。
+func fakeCodexTranscriptAuth(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex")
+	// stderr 打 codex 横幅 + 审查引用行(裸 "401 unauthorized"),stdout 空,不写 -o,退出 1。
+	// codexErrorLine 会跳过横幅(codexNoiseRe 命中)、挑到裸 401 行(codexHardErrRe 命中)。
+	// 特意加了"—>"前缀,避免被 codexNoiseRe 误吞;并确保**不包含** limitRe 特征词避免走限额分支。
+	script := "#!/bin/sh\n" +
+		"cat >/dev/null\n" + // 吸掉 stdin(prompt)
+		"printf '%s\\n' 'OpenAI Codex v0.144.1' >&2\n" +
+		"printf '%s\\n' '--------' >&2\n" +
+		"printf '%s\\n' 'workdir: /tmp/x' >&2\n" +
+		"printf '%s\\n' 'model: mock' >&2\n" +
+		"printf '%s\\n' 'user' >&2\n" +
+		"printf '%s\\n' '审查 failure_class.go 的 authClassRe' >&2\n" +
+		"printf '%s\\n' '  -> 引用了字面量 401 unauthorized' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestRunTaskCodexTranscriptDerivedAuth_SoftenedToRetry 【P1 Round-3 反例注入】
+// mock codex(runErr!=nil、-o 空、combined 含 '401 unauthorized' 引用行) → 断言走 retry(queued、
+// attempts=1)而非 held。回退验证:把 invokeCodex 里 res.ResultFromTranscript=true 那行去掉,本测试
+// 必红(策略侧无法区分 transcript 来源 → 走 auth → held → status=held/attempts=0/前缀 [auth])。
+func TestRunTaskCodexTranscriptDerivedAuth_SoftenedToRetry(t *testing.T) {
+	root := testRoot(t)
+	work := t.TempDir()
+
+	cfg := defaultConfig("")
+	cfg.CodexBin = fakeCodexTranscriptAuth(t)
+	cfg.StepTimeoutMin = 1
+	cfg.MaxAttempts = 3
+	cfg.RetryBackoffMin = 1
+	cfg.LimitFallbackMin = 30
+	cfg.CooldownMarginSec = 0
+
+	tk := newTask(root, cfg, typeSequence, "codex transcript auth 引用", work, []string{"审核"}, 1)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	// useCodex=true → invokeCodex 主跑
+	if err := runTask(context.Background(), root, cfg, tk, true); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 反例断言 1: 状态 = queued(退避重试),不是 held
+	if got.Status != statusQueued {
+		t.Fatalf("transcript 挑走 '401 unauthorized' 不该落 held,应降级 retry_backoff\n"+
+			"got status=%q last_error=%q\n"+
+			"(回退验证:去掉 invokeCodex 的 ResultFromTranscript=true → 分类走 auth → held,本断言即红)",
+			got.Status, got.LastError)
+	}
+	// 反例断言 2: attempts 递增到 1(走 retry_backoff 分支)
+	if got.Attempts != 1 {
+		t.Fatalf("attempts 应递增到 1(retry 分支), got=%d", got.Attempts)
+	}
+	// 反例断言 3: LastError 不加 [auth] 前缀(softened 场景 lastErrCls 拉回 unknown)
+	if strings.HasPrefix(got.LastError, "[auth]") || strings.HasPrefix(got.LastError, "[") {
+		t.Fatalf("softened 场景 LastError 不该带 [class] 前缀(与旧版逐字节一致),got=%q", got.LastError)
+	}
+
+	// 反例断言 4: 事件是 evRetry,failure_class 记 auth(审计保留),softened_from_terminal=true
+	events := readAllEventsRaw(t, root, tk.ID)
+	if len(events) < 2 {
+		t.Fatalf("至少 dispatched+retry 两条事件,got=%v", eventTypes(events))
+	}
+	ev := events[len(events)-1]
+	if ev.Type != evRetry {
+		t.Fatalf("末条事件应为 retry(softened 走 retry_backoff 分支),got type=%q\n"+
+			"(若为 held,说明 transcript 来源判据未生效)", ev.Type)
+	}
+	if fc, _ := ev.Detail["failure_class"].(string); fc != "auth" {
+		t.Fatalf("failure_class 审计信号应保留=auth,got=%q\n"+
+			"(降级不该丢原分类信号,便于审计聚合识别『真 unknown』vs『被 transcript 降级的 auth』)", fc)
+	}
+	if softened, _ := ev.Detail["softened_from_terminal"].(bool); !softened {
+		t.Fatalf("softened_from_terminal 应=true,detail=%+v", ev.Detail)
+	}
+	if reason, _ := ev.Detail["reason"].(string); reason != "softened_transcript_derived" {
+		t.Fatalf("reason 应=softened_transcript_derived,got=%q", reason)
+	}
+}
+
+// TestRunTaskCodexTranscriptDerivedPermission_SoftenedToRetry 同类反例:transcript 挑到裸
+// "403 forbidden" 引用行(permissionClassRe 命中,policy 落 held)。同理应降级 retry。
+// 覆盖 codexHardErrRe∩permissionClassRe 的第二个交集点 (前一个是 auth 的 401 unauthorized)。
+func TestRunTaskCodexTranscriptDerivedPermission_SoftenedToRetry(t *testing.T) {
+	root := testRoot(t)
+	work := t.TempDir()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex")
+	script := "#!/bin/sh\n" +
+		"cat >/dev/null\n" +
+		"printf '%s\\n' 'OpenAI Codex v0.144.1' >&2\n" +
+		"printf '%s\\n' '--------' >&2\n" +
+		"printf '%s\\n' 'user' >&2\n" +
+		"printf '%s\\n' '审查引用 permissionClassRe 里的字面量: 403 forbidden' >&2\n" +
+		"exit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := defaultConfig("")
+	cfg.CodexBin = path
+	cfg.StepTimeoutMin = 1
+	cfg.MaxAttempts = 3
+	cfg.RetryBackoffMin = 1
+
+	tk := newTask(root, cfg, typeSequence, "codex transcript permission 引用", work, []string{"审核"}, 1)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTask(context.Background(), root, cfg, tk, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != statusQueued || got.Attempts != 1 {
+		t.Fatalf("permission 引用行应降级 retry,got status=%q attempts=%d", got.Status, got.Attempts)
+	}
+	events := readAllEventsRaw(t, root, tk.ID)
+	ev := events[len(events)-1]
+	if ev.Type != evRetry {
+		t.Fatalf("末条事件应为 retry,got=%q", ev.Type)
+	}
+	if fc, _ := ev.Detail["failure_class"].(string); fc != "permission" {
+		t.Fatalf("failure_class 审计信号应=permission,got=%q", fc)
+	}
+	if softened, _ := ev.Detail["softened_from_terminal"].(bool); !softened {
+		t.Fatalf("softened_from_terminal 应=true,detail=%+v", ev.Detail)
+	}
+}
+
+// TestRunTaskClaudeStructuredAuth_StillHeld 反向对照:claude 结构化 JSON 的 IsError=true(auth 类)
+// **不**被视为 transcript 来源,仍应直接 held——证明第二道防线不误伤 claude 的合法结构化错误。
+// 【为什么这条对照必要】softening 若过宽,会把 claude 真 401(res.IsError=true, ResultFromTranscript=false)
+// 也降级 retry_backoff——把不可重试的凭据错误重复烧 attempts,与 CG-3 立卡动机(直接 held 省额度)相悖。
+func TestRunTaskClaudeStructuredAuth_StillHeld(t *testing.T) {
+	root := testRoot(t)
+	authJSON := `{"type":"result","is_error":true,"subtype":"api_error","result":"401 Unauthorized: invalid api key"}`
+	claudeBin := fakeClaudeBin(t, authJSON, "", 1)
+	cfg := runTaskCfg(t, claudeBin)
+	cfg.MaxAttempts = 3
+
+	work := t.TempDir()
+	tk := newTask(root, cfg, typeSequence, "claude 结构化 401", work, []string{"p"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTask(context.Background(), root, cfg, tk, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != statusHeld {
+		t.Fatalf("claude 结构化 401(非 transcript 来源)应保持 held,got status=%q\n"+
+			"(若被误降级 retry_backoff,说明 classificationFromTranscript 通道 2 判据过宽)",
+			got.Status)
+	}
+	if got.Attempts != 0 {
+		t.Fatalf("held 不该烧 attempts,got=%d", got.Attempts)
+	}
+	if !strings.HasPrefix(got.LastError, "[auth]") {
+		t.Fatalf("结构化 auth 类应保留 [auth] 前缀,got=%q", got.LastError)
+	}
 }

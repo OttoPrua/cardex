@@ -31,6 +31,15 @@ type claudeResult struct {
 	TotalCostUSD float64    `json:"total_cost_usd"`
 	DurationMS   int64      `json:"duration_ms"`
 	Usage        *usageInfo `json:"usage"`
+	// ResultFromTranscript 标记 Result 是否源自 combined(stdout+stderr transcript)。
+	// 【P1 教训 · CG-3 Round-3】codex 本机/远端与远端 claude 的失败路径会把 codexErrorLine
+	// 挑走的行或 firstLine(combined) 直接写进 Result，经 errorSummary 拼进 msg 后参与
+	// classifyFailure 终态决策——但 transcript 天然充斥 permission denied / 401 unauthorized /
+	// context length exceeded 等分类正则字面量（审查引用/工具错误输出），会把超时/瞬时抖动
+	// 误判成 auth/permission 直接 held(静默停摆)或 input_too_long 直接 failed(永久终态)。
+	// 该字段供 runTask 判断是否属 transcript 来源、对终态分类降级 retry_backoff。
+	// json:"-" 不外泄——仅编排侧内部信号，不进 events/进 CLI wire。
+	ResultFromTranscript bool `json:"-"`
 }
 
 var (
@@ -200,6 +209,8 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 		if res.Result == "" {
 			if line := codexErrorLine(combined); line != "" {
 				res.Result = line
+				// 【P1 · Round-3】挑走的是 transcript 里的一行——runTask 分类时不能据此落终态。
+				res.ResultFromTranscript = true
 			} else {
 				res.Result = firstLine(runErr.Error())
 			}
@@ -276,7 +287,10 @@ func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string
 	combined := stdout.String() + "\n" + stderr.String()
 	res := parseClaudeJSON(stdout.String())
 	if res == nil {
-		res = &claudeResult{Type: "result", IsError: true, Subtype: "remote_claude_error", Result: firstLine(combined)}
+		// 【P1 · Round-3】firstLine(combined) 直接取远端 stdout+stderr 首行——那是 transcript,
+		// 分类时不能据此落终态(远端 claude 打的可能是横幅/进度/工具输出行,并非真实错误)。
+		res = &claudeResult{Type: "result", IsError: true, Subtype: "remote_claude_error",
+			Result: firstLine(combined), ResultFromTranscript: true}
 	} else if runErr != nil && !res.IsError {
 		// 远端 claude 已把完整结果 JSON 打到 stdout,但收尾被吊住（见上）或退出竞态非零——
 		// 结果在手即成功：看门狗击杀的退出码在此洗白（同 invokeRemoteCodex 的"有结果即成功"原则）。
@@ -370,6 +384,8 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	if line := codexErrorLine(combined); line != "" {
 		res.Subtype = "remote_codex_error"
 		res.Result = line
+		// 【P1 · Round-3】同 invokeCodex:transcript 挑行,分类时不能据此落终态。
+		res.ResultFromTranscript = true
 	} else {
 		res.Subtype = "remote_codex_no_final_message"
 		res.Result = "远端 codex 回合完成但 marker 后无终稿——常因框架注入耗尽预算/未落最终消息;已加 subagent 前导抑制"
@@ -768,6 +784,23 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			msg := errorSummary(res, combined, runErr)
 			cls := classifyFailure(msg, combined, res, runErr)
 			policy := policyFor(cls)
+			// 【P1 教训 · Round-3 复审】classifyFailure 只吃 msg 是第一道防线,但 msg 可能是
+			// invokeCodex/invokeRemoteCodex/invokeRemoteClaude 从 combined 挑走的 transcript 行,
+			// 或 errorSummary fallback 分支拼进的 firstLine(combined)——transcript 天然含分类正则
+			// 字面量,一旦命中 auth/permission/input_too_long 会误判成不可重试终态直接 held/failed
+			// (基线本会退避自愈的超时/瞬时抖动被无人值守静默停摆)。第二道防线:transcript 来源信号
+			// 一律降级 retry_backoff,failure_class 事件仍写供审计,与 classifyFailure 归类分层。
+			// 详见 failure_class.go 顶部 P1 · Round-3 教训与 classificationFromTranscript 判据说明。
+			softenedFromTranscript := false
+			if policy.Terminal != "" && classificationFromTranscript(res, runErr) {
+				logBlock(lg, "CLASS_SOFTENED", fmt.Sprintf(
+					"[%s→retry_backoff] transcript 来源判据不落终态(would-be %s),降级现行 retry_backoff: %s",
+					cls, policy.Terminal, msg))
+				softenedFromTranscript = true
+				// 把 policy 强制拉回 retry_backoff:cls 保留供事件审计,避免丢原分类信号。
+				policy = failurePolicy{Class: cls, Terminal: "", ConsumesAttempt: true,
+					Reason: "softened_transcript_derived"}
+			}
 			switch policy.Terminal {
 			case statusHeld:
 				// 认证/权限：不烧 attempts，直接挂 held 等人工 relogin/授权后 release。
@@ -791,13 +824,25 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				// 事件字段结构与旧版逐字节一致（annotatedError 对 unknown 返回原 msg，不加前缀）；
 				// 只多一个 detail.failure_class 供审计聚合。
 				t.Attempts++
-				t.LastError = annotatedError(cls, msg)
+				// softened 场景 cls 虽命中 auth/permission/input_too_long,但已被 transcript 来源降级;
+				// LastError 前缀按"实际执行的策略"挂 unknown(等价于"不加前缀"),与旧版逐字节一致;真
+				// 未知/超时/executor_crash 走同分支,由 annotatedError 内部按 policyFor 决定不加前缀。
+				lastErrCls := cls
+				if softenedFromTranscript {
+					lastErrCls = failureUnknown
+				}
+				t.LastError = annotatedError(lastErrCls, msg)
 				logBlock(lg, "ERROR", fmt.Sprintf("第 %d 次失败[%s]: %s", t.Attempts, cls, msg))
 				if t.Attempts >= cfg.MaxAttempts {
 					t.Status = statusFailed
-					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, map[string]any{
+					detail := map[string]any{
 						"err": msg, "attempts": t.Attempts, "failure_class": string(cls),
-					})
+					}
+					if softenedFromTranscript {
+						detail["softened_from_terminal"] = true
+						detail["reason"] = "softened_transcript_derived"
+					}
+					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, detail)
 				} else {
 					t.Status = statusQueued
 					backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
@@ -807,9 +852,15 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 						backoff *= time.Duration(t.Attempts)
 					}
 					t.NotBeforeEpoch = now.Add(backoff).Unix()
-					emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, map[string]any{
-						"err": msg, "attempts": t.Attempts, "not_before": t.NotBeforeEpoch, "failure_class": string(cls),
-					})
+					detail := map[string]any{
+						"err": msg, "attempts": t.Attempts, "not_before": t.NotBeforeEpoch,
+						"failure_class": string(cls),
+					}
+					if softenedFromTranscript {
+						detail["softened_from_terminal"] = true
+						detail["reason"] = "softened_transcript_derived"
+					}
+					emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, detail)
 				}
 			}
 			t.touch()
@@ -2072,13 +2123,20 @@ func firstLine(s string) string {
 // codexErrorLine 从 codex 的 stdout+stderr 里提取**真正的失败原因**，跳过横幅/配置/进度噪声。
 // codex exec 的第一行永远是横幅 "Reading additional input from stdin..."、随后是 OpenAI Codex 版本/
 // workdir/model/... 配置块——firstLine 恰好取到横幅，掩盖真因（网络/限额/流断在末尾），还让 transientRe
-// 匹配不到、把可退避的瞬时错误当硬失败烧 attempts（单腿审核一挂就没了）。优先返回命中错误/瞬时样式的
-// 行，否则返回最后一条非噪声行，都没有才回退 firstLine。
-// codexErrorLine 只挑「瞬时网络/上游」样式(transientRe)的真错误行，供 runErr 路径退避快重试。
-// 早期还兼挑泛化 codexErrRe(error|failed|cannot|invalid...)行，但 codex exec 把整段推理/审查正文
-// 都写进 stderr、正文天然充斥这些词——按 codexErrRe 挑行会把审查正文里一句无害内容当"错误"上报，
-// 掩盖真因（实测 superpowers/gsd 注入耗尽回合预算的空终稿故障，被误报成 "...You cannot rationalize..."）。
-// 故只认 transientRe；挑不到就返回空，由调用方回退到真实 runErr / 明确诊断。
+// 匹配不到、把可退避的瞬时错误当硬失败烧 attempts（单腿审核一挂就没了）。
+//
+// 判据：命中 transientRe(瞬时网络/上游样式)**或** codexHardErrRe(codex/上游硬错误明确措辞——401/
+// 403/quota/goal budget/authorization error 等)的行,返回该行(rune 截 300);挑不到就返回空,由调用方
+// 回退到真实 runErr / 明确诊断——**不做"最后一条非噪声行"回退**,因为 codex transcript 尾行常是无害
+// 推理/审查正文,回退会把它当错误上报(实测 superpowers/gsd 注入耗尽回合预算的空终稿故障被误报成
+// "...You cannot rationalize..." 就是该回退惹的祸)。
+//
+// 【P1 · Round-3 复审】codexHardErrRe 含裸 "401 unauthorized"/"403 forbidden"/"invalid api key"，
+// 与 failure_class.go 的 authClassRe/permissionClassRe 有交集——审查本仓代码时 transcript 会引用
+// 这些字面量;codexErrorLine 挑走该行进 res.Result 会被 classifyFailure 误判 auth/permission 直接
+// held(基线本会退避的超时被无人值守静默停摆)。上层 invokeCodex/invokeRemoteCodex 挑行时给 res 标
+// ResultFromTranscript=true,runTask 侧的 classificationFromTranscript 据此把终态分类降级
+// retry_backoff——本函数继续尽职挑行(诊断本身有价值),污染阻断由外层承接。
 func codexErrorLine(combined string) string {
 	for _, l := range strings.Split(combined, "\n") {
 		t := strings.TrimSpace(l)

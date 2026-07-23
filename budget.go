@@ -264,16 +264,18 @@ type oauthCreds struct {
 
 // loadOAuthAccessToken 复用 Claude Code 的 OAuth accessToken。
 // 优先顺序：
-//  1. 配置 OAuthUsageCredsPath（测试/自定义部署用）；
+//  1. 配置 OAuthUsageCredsPath（测试/自定义部署用）——**硬隔离**:一旦显式指定,只读该源,不兜底;
 //  2. ~/.claude/.credentials.json（Linux/Windows 明文存储）；
 //  3. macOS keychain "Claude Code-credentials"（macOS 默认存储，明文文件不存在）。
 //
 // 取不到返回 ""——上层视为"凭据缺失"，fail-open 放行且日志披露。
+// 教训:老版"OAuthUsageCredsPath 非空但读不到→fall through 到 ~/.claude"在 Windows 上让
+// UserHomeDir 读 USERPROFILE 命中真实用户凭据,测试隔离形同虚设(反例:凭据缺失路径本该不发 HTTP,
+// 却被兜底路径带出真凭据打到 mock),同时也剥夺了自定义部署"我明确指了别的路径,不要摸 ~/.claude"的
+// 严格语义——硬隔离直接根修。
 func loadOAuthAccessToken(cfg *Config) string {
 	if cfg != nil && cfg.OAuthUsageCredsPath != "" {
-		if tok := readCredsFile(cfg.OAuthUsageCredsPath); tok != "" {
-			return tok
-		}
+		return readCredsFile(cfg.OAuthUsageCredsPath)
 	}
 	home, err := os.UserHomeDir()
 	if err == nil {
@@ -317,12 +319,16 @@ func readKeychainCreds() string {
 }
 
 // oauthUsageSample 是 oauth/usage 端点的一次拉取结果。
-// PercentOK=false 表示端点响应本身有（HTTP 200 + body），但里面缺 5h 字段——按"数据不足"处理。
+// PercentOK=false 表示端点响应本身有（HTTP 200 + body），但里面缺 5h 字段或字段值歧义——按"数据不足"处理。
 // 与"网络/凭据/HTTP 4xx-5xx 失败"分开，是为让 quota 命令能诚实披露到底哪一步断的。
+// Reason 非空时携带具体不可信原因(例如"utilization=1 落在刻度歧义点"),供上层展示层露给委托人。
+// SampledAt 是**首次抓取该样本的墙钟时刻**(不是每次 read 的 now)——这样 now-SampledAt 才是真实 age,
+// oauth_usage_max_age_min 才有意义;老版 SampledAt=now 导致 age 恒为 0、配置形同虚设。
 type oauthUsageSample struct {
 	Percent   int
 	PercentOK bool
 	SampledAt time.Time
+	Reason    string
 }
 
 // fetchOAuthUsage 直读端点，取 5h 窗口百分比。
@@ -380,9 +386,9 @@ func parseOAuthUsageBody(body []byte, now time.Time) (*oauthUsageSample, error) 
 	if err := json.Unmarshal(body, &raw); err != nil {
 		return nil, err
 	}
-	pct, ok := extractFiveHourPercent(raw)
+	pct, ok, ambig := extractFiveHourPercent(raw)
 	if !ok {
-		return &oauthUsageSample{PercentOK: false, SampledAt: now}, nil
+		return &oauthUsageSample{PercentOK: false, SampledAt: now, Reason: ambig}, nil
 	}
 	if pct < 0 {
 		pct = 0
@@ -396,12 +402,18 @@ func parseOAuthUsageBody(body []byte, now time.Time) (*oauthUsageSample, error) 
 // extractFiveHourPercent 深度容错——只挖已知形态；未知形态一律拒绝。
 // 教训："只要看到任意百分比就用"是常见 bug 温床：端点某天新增字段 seven_day.utilization=95
 // 会被误判成"5h 窗口 95%"锁死队列。所以只认明确指向 5h 的键。
-func extractFiveHourPercent(raw map[string]any) (int, bool) {
+// 返回 (percent, ok, ambig)——命中 5h 节点但值歧义时,整体拒绝并向上冒 ambig 披露原因,
+// 不回退到别的形态(否则会给端点漂移开天窗:"这个字段可疑那就换个字段猜"是骗数据源)。
+func extractFiveHourPercent(raw map[string]any) (int, bool, string) {
 	// 形态 A：{"five_hour": {"utilization": 0.42}} / {"fiveHour": {"used_percent": 42}}
 	for _, key := range []string{"five_hour", "fiveHour", "five_hour_window", "primary"} {
 		if node, ok := raw[key].(map[string]any); ok {
-			if v, got := readPercentFields(node); got {
-				return v, true
+			v, got, ambig := readPercentFields(node)
+			if got {
+				return v, true, ""
+			}
+			if ambig != "" {
+				return 0, false, ambig
 			}
 		}
 	}
@@ -418,12 +430,16 @@ func extractFiveHourPercent(raw map[string]any) (int, bool) {
 			if !isFiveHourWindow(name, kind, int(mins)) {
 				continue
 			}
-			if v, got := readPercentFields(node); got {
-				return v, true
+			v, got, ambig := readPercentFields(node)
+			if got {
+				return v, true, ""
+			}
+			if ambig != "" {
+				return 0, false, ambig
 			}
 		}
 	}
-	return 0, false
+	return 0, false, ""
 }
 
 func isFiveHourWindow(name, kind string, mins int) bool {
@@ -440,8 +456,15 @@ func isFiveHourWindow(name, kind string, mins int) bool {
 }
 
 // readPercentFields 从节点里挖 utilization / used_percent / percent 字段。
-// 数值域自动归一：0-1 视为分数、乘 100；>1 视为百分比、原样取整（0-100 clamp 由外层做）。
-func readPercentFields(node map[string]any) (int, bool) {
+// 返回 (percent, ok, ambig)——ok=true 表示读到可信百分比;ok=false 且 ambig 非空:字段命中但值歧义/域外,
+// 上层应按"数据不足"披露 ambig 拒响应;ok=false 且 ambig 为空:字段全缺失(不构成异常,继续尝试兄弟节点)。
+//
+// 教训:老版做"0-1 视为分数×100、>1 视为百分比原样"的自动归一——在整数刻度上崩塌:
+//   * utilization:1 真实语义 1%,老版判为分数上限→100% 触发假红线锁队列;
+//   * used_percent:0.8 真实语义 0.8%,老版判为分数×100→80% 同样假触线。
+// 违背模块自身"数据不足不锁队列"的 fail-open 纪律。新语义按字段名硬分派、拒绝任何自动归一,
+// 任一歧义值一律"数据不足"拒响应(fail-open 方向,与其余异常路径一致)。
+func readPercentFields(node map[string]any) (int, bool, string) {
 	for _, key := range []string{"utilization", "used_percent", "usedPercent", "percent"} {
 		v, ok := node[key]
 		if !ok {
@@ -451,12 +474,25 @@ func readPercentFields(node map[string]any) (int, bool) {
 		if !ok {
 			continue
 		}
-		if num > 0 && num <= 1 {
-			num *= 100
+		if key == "utilization" {
+			// utilization 严格 0-1 分数域,不接受 0-100 混跑
+			switch {
+			case num < 0 || num > 1:
+				return 0, false, fmt.Sprintf("utilization=%.4g 超出 0-1 分数域", num)
+			case num == 1:
+				// 1 既可能是 1%(整数刻度)也可能是 100%(分数上限)——不猜,判"数据不足"
+				return 0, false, "utilization=1 落在 1%/100% 刻度歧义点(端点约定不明,拒判为数据不足)"
+			default:
+				return int(num*100 + 0.5), true, ""
+			}
 		}
-		return int(num + 0.5), true
+		// used_percent/usedPercent/percent 铁定 0-100 百分比域,原样取整,永不 ×100
+		if num < 0 || num > 100 {
+			return 0, false, fmt.Sprintf("%s=%.4g 超出 0-100 百分比域", key, num)
+		}
+		return int(num + 0.5), true, ""
 	}
-	return 0, false
+	return 0, false, ""
 }
 
 func toFloat(v any) (float64, bool) {
@@ -514,8 +550,15 @@ func readUsageFeedPercent(cfg *Config, now time.Time) percentRead {
 		return r
 	}
 	age := now.Sub(at)
+	// 教训:老版 maxAge>0 时才 check,导致 usage_feed_max_age_min:0 语义反转成
+	// "任意陈旧样本永远采信"——CodexBar 死在 99% 样本后队列被永久封锁
+	// (正是 CG-1 动机里的失效模式:桌面端消耗看不见+样本冻死→队列锁死)。
+	// 修法:maxAge<=0 归位默认 90 分钟,保证陈旧样本必过期→fail-open。
 	maxAge := time.Duration(cfg.UsageFeedMaxAgeMin) * time.Minute
-	if maxAge > 0 && age > maxAge {
+	if maxAge <= 0 {
+		maxAge = 90 * time.Minute
+	}
+	if age > maxAge {
 		r.Reason = fmt.Sprintf("样本已过期（%s 前）", age.Round(time.Minute))
 		return r
 	}
@@ -525,24 +568,96 @@ func readUsageFeedPercent(cfg *Config, now time.Time) percentRead {
 	return r
 }
 
+// oauthUsageCache 是进程级样本缓存:
+//  1. 拒 tick 15s 循环每次都打端点(macOS 无凭据文件会每次落 keychain 弹窗,quota 命令并行调用同理);
+//  2. 让 SampledAt/oauth_usage_max_age_min 真正有语义(过去 SampledAt=now→age 恒 0→配置形同虚设=P1-3 死配置)。
+// 复用窗口=oauth_usage_max_age_min(0 用默认 15 分钟,与 quota 展示层的"新鲜度"感知一致)。
+// 重抓失败时保留旧样本:让上层能披露"上一样本过期+重抓失败"而不是骤然回退到"完全无数据"。
+type oauthUsageCacheState struct {
+	mu        sync.Mutex
+	sample    *oauthUsageSample
+	fetchedAt time.Time
+	lastErr   error
+}
+
+var oauthUsageCache oauthUsageCacheState
+
+// resetOAuthUsageCache 仅供单元测试互不干扰用——生产代码不该调它。
+func resetOAuthUsageCache() {
+	oauthUsageCache.mu.Lock()
+	defer oauthUsageCache.mu.Unlock()
+	oauthUsageCache.sample = nil
+	oauthUsageCache.fetchedAt = time.Time{}
+	oauthUsageCache.lastErr = nil
+}
+
+// oauthUsageEffectiveMaxAge 是 max_age_min 的运行时值,0 用默认 15 分钟(fail-open 方向:"未配置"绝不"永远采信")。
+func oauthUsageEffectiveMaxAge(cfg *Config) time.Duration {
+	maxAge := time.Duration(cfg.OAuthUsageMaxAgeMin) * time.Minute
+	if maxAge <= 0 {
+		maxAge = 15 * time.Minute
+	}
+	return maxAge
+}
+
+// oauthUsageCachedRead 是读端口:进程级复用,过期才重抓;重抓失败保留旧样本供上层判过期。
+// 返回 (sample, err)——err 非 nil 且 sample 非 nil 表示"缓存里有旧样本但本次刷新失败";
+// err 非 nil 且 sample 为 nil 表示"从没抓成功过,现在也失败"(纯不可用)。
+func oauthUsageCachedRead(cfg *Config, now time.Time) (*oauthUsageSample, error) {
+	oauthUsageCache.mu.Lock()
+	defer oauthUsageCache.mu.Unlock()
+	maxAge := oauthUsageEffectiveMaxAge(cfg)
+	if oauthUsageCache.sample != nil && now.Sub(oauthUsageCache.fetchedAt) < maxAge {
+		return oauthUsageCache.sample, oauthUsageCache.lastErr
+	}
+	s, err := fetchOAuthUsage(cfg, now)
+	if err != nil {
+		oauthUsageCache.lastErr = err
+		if oauthUsageCache.sample != nil {
+			return oauthUsageCache.sample, err
+		}
+		return nil, err
+	}
+	oauthUsageCache.sample = s
+	oauthUsageCache.fetchedAt = now
+	oauthUsageCache.lastErr = nil
+	return s, nil
+}
+
 func readOAuthUsagePercent(cfg *Config, now time.Time) percentRead {
 	r := percentRead{Source: "oauth_usage"}
-	sample, err := fetchOAuthUsage(cfg, now)
-	if err != nil {
-		r.Reason = err.Error()
+	sample, err := oauthUsageCachedRead(cfg, now)
+	if sample == nil {
+		// 从未成功抓过样本 + 本次抓取失败——纯不可用
+		if err != nil {
+			r.Reason = err.Error()
+		} else {
+			r.Reason = "尚无有效样本"
+		}
 		return r
 	}
 	if !sample.PercentOK {
-		r.Reason = "响应缺 5h 窗口字段（端点可能已变更）"
+		if sample.Reason != "" {
+			r.Reason = sample.Reason
+		} else {
+			r.Reason = "响应缺 5h 窗口字段（端点可能已变更）"
+		}
 		return r
 	}
-	maxAge := time.Duration(cfg.OAuthUsageMaxAgeMin) * time.Minute
-	if maxAge > 0 && now.Sub(sample.SampledAt) > maxAge {
-		r.Reason = "样本已过期"
+	maxAge := oauthUsageEffectiveMaxAge(cfg)
+	age := now.Sub(sample.SampledAt)
+	if age > maxAge {
+		// 缓存样本已过期(通常发生在"上次重抓失败,保留旧样本"路径)
+		if err != nil {
+			r.Reason = fmt.Sprintf("样本已过期（%s 前），重抓失败：%s", age.Round(time.Minute), err.Error())
+		} else {
+			r.Reason = fmt.Sprintf("样本已过期（%s 前）", age.Round(time.Minute))
+		}
 		return r
 	}
 	r.Available = true
 	r.Percent = sample.Percent
+	r.AgeSuffix = fmt.Sprintf("，样本 %s 前", age.Round(time.Minute))
 	return r
 }
 

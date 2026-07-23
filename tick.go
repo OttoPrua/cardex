@@ -37,6 +37,9 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	activeDirs := map[string]bool{}
 	claimedDir := map[string]bool{}                  // 哪些在跑任务占用了目录互斥（只读类型不占用）
 	activeCancels := map[string]context.CancelFunc{} // 取消对账命中时击杀该任务的执行进程组
+	// CG-5 巡逻累积状态:同一 drain 周期内跨轮记住 pgSeenAlive/日志 size/上次 stall 时间。
+	// 生命周期 = 一次 drain(tick 函数体);任务离开 activeIDs 后由 patrolOnce 内部清理。
+	patrolStates := map[string]*patrolState{}
 	// 只读类型（审核/进度回收）不写文件：既不占用同目录互斥，也不被互斥挡住——
 	// 审核卡可与同仓下一批并行（依赖护栏在排批层：批内叶组互不依赖、不消费未过审契约）。
 	readOnly := func(t *Task) bool { return t.Type == typeReview || t.Type == typeProgressPull }
@@ -74,6 +77,15 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				cancelRun()
 			}
 		}
+		// CG-5 drain 内巡逻:与取消对账贴附同一循环节奏,不新增守护进程。两条信号(procgroup 存活
+		// + 日志心跳)任一命中即判卡死,先记 evStalled 再走 cancelRun(与人工 cancel 同一收尾管线,
+		// 不引入第二套击杀)。patrol 与 cancel 对账正交:cancel 反映"人工/盘上表态",patrol 反映
+		// "执行器真挂死"——两轴独立故拆两段。patrolCancels 是类型适配壳(context.CancelFunc → func())。
+		patrolCancels := make(map[string]func(), len(activeCancels))
+		for id, cancelRun := range activeCancels {
+			patrolCancels[id] = cancelRun
+		}
+		patrolOnce(root, activeIDs, patrolCancels, patrolStates, now)
 
 		blockReason := ""
 		if cd := loadCooldown(root); !force && cd.active(now) {

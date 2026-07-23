@@ -34,9 +34,73 @@ var (
 	killHandlerOnce sync.Once
 )
 
+// taskPGIDs 是"任务→当前活着的执行器 pid 集合"的映射,供 CG-5 巡逻查任务进程组存活。
+// 【为什么单独于 procGroups】procGroups 只保存 pid 集合供信号处理器连坐击杀,不知道 pid 属于哪张
+// 卡;巡逻需要"某张卡当前有没有活着的执行器"的问答,反向索引必须走独立结构。同一任务可能有多个
+// pid(理论极少,但 setupProcGroup 支持多次 invoke——如同 runTask 循环内多步)。
+var (
+	taskPGMu sync.Mutex
+	taskPG   = map[string]map[int]bool{}
+)
+
+func registerTaskInvoke(taskID string, pid int) {
+	if taskID == "" || pid <= 0 {
+		return
+	}
+	taskPGMu.Lock()
+	defer taskPGMu.Unlock()
+	m, ok := taskPG[taskID]
+	if !ok {
+		m = make(map[int]bool)
+		taskPG[taskID] = m
+	}
+	m[pid] = true
+}
+
+func unregisterTaskInvoke(taskID string, pid int) {
+	if taskID == "" || pid <= 0 {
+		return
+	}
+	taskPGMu.Lock()
+	defer taskPGMu.Unlock()
+	if m, ok := taskPG[taskID]; ok {
+		delete(m, pid)
+		if len(m) == 0 {
+			delete(taskPG, taskID)
+		}
+	}
+}
+
+// anyTaskProcAlive 报告该任务当前有没有活着的执行器进程组。
+// 【为什么按登记表 + processAlive 双查】仅看登记表存在,不足以判活:register 后进程若已死但
+// unregister 尚未跑到(defer 未执行),表里会残留死 pid;仅看 processAlive 不查登记,无法回答"这张
+// 卡的执行器"的定向问题(pid 属于任何卡都可能存在)。两者相与:登记为准找候选,processAlive 逐一
+// 核实,伪存活(表里死 pid)不会骗过巡逻——反例注入教训:巡逻的"存活"是授权凭证,登记≠存活。
+func anyTaskProcAlive(taskID string) bool {
+	taskPGMu.Lock()
+	pids := make([]int, 0, len(taskPG[taskID]))
+	for pid := range taskPG[taskID] {
+		pids = append(pids, pid)
+	}
+	taskPGMu.Unlock()
+	for _, pid := range pids {
+		if processAlive(pid) {
+			return true
+		}
+	}
+	return false
+}
+
 // runCmdRegistered 代替 cmd.Run：把子进程登记在册，供信号处理器连坐击杀。
 func runCmdRegistered(cmd *exec.Cmd) error {
 	return runCmdRegisteredHarvest(cmd, nil)
+}
+
+// runCmdRegisteredForTask 同 runCmdRegistered,额外把 pid 登记到 taskPG,供巡逻查任务进程组存活。
+// 【为什么单独一支而非改 runCmdRegistered 签名】改现有签名会打断 runReviewSync/tests 等大量调用
+// 点;新增函数只让 4 处 invoke(claude/codex/远端×2)接入巡逻,其它路径无需触巡逻不变。
+func runCmdRegisteredForTask(cmd *exec.Cmd, taskID string) error {
+	return runCmdRegisteredHarvestForTask(cmd, nil, taskID)
 }
 
 // remoteHarvestPoll 早收割看门狗的轮询间隔；两拍（发现结果+一拍宽限）后仍不退即击杀。
@@ -50,6 +114,11 @@ var remoteHarvestPoll = 15 * time.Second
 // 且进程仍在 → 整组击杀让 Wait 立刻返回，上层「结果在手即成功」救援把击杀退出码洗白。
 // 两拍宽限防结果行刚落缓冲、stdout 尾部仍在冲刷时误杀。
 func runCmdRegisteredHarvest(cmd *exec.Cmd, resultInBuf func() bool) error {
+	return runCmdRegisteredHarvestForTask(cmd, resultInBuf, "")
+}
+
+// runCmdRegisteredHarvestForTask 同 runCmdRegisteredHarvest,额外把 pid 登记到 taskPG(taskID 非空时)。
+func runCmdRegisteredHarvestForTask(cmd *exec.Cmd, resultInBuf func() bool, taskID string) error {
 	if err := cmd.Start(); err != nil {
 		return err
 	}
@@ -57,10 +126,12 @@ func runCmdRegisteredHarvest(cmd *exec.Cmd, resultInBuf func() bool) error {
 	procMu.Lock()
 	procGroups[pid] = true
 	procMu.Unlock()
+	registerTaskInvoke(taskID, pid)
 	defer func() {
 		procMu.Lock()
 		delete(procGroups, pid)
 		procMu.Unlock()
+		unregisterTaskInvoke(taskID, pid)
 	}()
 	if resultInBuf != nil {
 		poll := remoteHarvestPoll // 读一次到局部：看门狗 goroutine 内读全局会与测试 defer 改写并发竞态（-race）

@@ -376,6 +376,44 @@ func TestReviewDivertEscalationUsesOrigDir(t *testing.T) {
 	}
 }
 
+// P0 类闭合(CG-5 review sync 竞态根修):sync 主体在 ctx 预算内成功但派生孙进程吊住 stdout 管
+// 道时,marker 文件见证用户命令的真实退出码,把"完成判定"从 pipe 关闭/ctx 超时解耦。
+// 【旧路径病灶】ctx 到期→ctx.Err()=DeadlineExceeded→runReviewSync 返回"超时"错→上游收掉 divert
+// →每轮回退本机审、分流特性静默失效。窗口极窄但真实存在,长期以"回退无害"带病运行。
+// 【杀的突变】把 runReviewSync 回退到只看 ctx.Err()/rescueWaitDelay 的旧代码 → sh 主体成功但
+// 孙进程吊管 → 返回"同步命令超时"→本测试立刻红。
+func TestReviewSyncMarkerSavesSuccessDespitePipeHoldRace(t *testing.T) {
+	origTO := reviewSyncTimeout
+	origPoll := reviewSyncMarkerPoll
+	// ctx 800ms、sleep 100ms:主体在 ~200ms 完成 → marker 见证 ec=0 → watcher 立即整组击杀。
+	// 旧路径孙进程 sleep 5 吊管 → cmd.Wait 挂到 WaitDelay(10s) 或 ctx(800ms) → ctx.Err=超时→误报。
+	reviewSyncTimeout = 800 * time.Millisecond
+	reviewSyncMarkerPoll = 10 * time.Millisecond
+	defer func() {
+		reviewSyncTimeout = origTO
+		reviewSyncMarkerPoll = origPoll
+	}()
+
+	root := testRoot(t)
+	// sh 主体 sleep 100ms 后 exit 0(远早于 ctx 800ms),同时后台 sleep 5 吊住 stdout。
+	// 若 marker 见证机制生效:主体 exit 后 marker 立现 ec=0,watcher 击杀 → wait 立即收 → 返回 nil。
+	// 若 marker 缺失(比如实现回退到旧代码):等到 ctx 到期 → ctx.Err()=DeadlineExceeded → 报"超时"错。
+	impl := &Task{ID: "impl-race-marker", Dir: "/tmp", ReviewSync: "sleep 0.1; sleep 5 & exit 0"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	start := time.Now()
+	if err := runReviewSync(impl, lg); err != nil {
+		t.Fatalf("成功同步被误判失败(marker 见证机制失效): %v", err)
+	}
+	// marker watcher 命中后应立即整组击杀 → wait 立即返回;不应等到 ctx 到期。
+	if el := time.Since(start); el >= reviewSyncTimeout {
+		t.Fatalf("runReviewSync 耗时 %v ≥ 超时 %v,marker watcher 未及时收尾", el, reviewSyncTimeout)
+	}
+}
+
 // ⑤ -review-host 指向未配置主机 → add 报错。
 func TestAddReviewHostUnconfiguredErrors(t *testing.T) {
 	root := t.TempDir()

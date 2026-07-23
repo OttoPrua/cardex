@@ -96,7 +96,9 @@ func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*cl
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
-	runErr := runCmdRegistered(cmd)
+	// runCmdRegisteredForTask 额外把 pid 登记到 taskPG,让 CG-5 巡逻能查该任务进程组存活;
+	// 反例注入依赖此登记(登记 + processAlive 双查排除伪心跳)。
+	runErr := runCmdRegisteredForTask(cmd, t.ID)
 	// 本地 claude exit 0 但派生子进程（MCP server/hook/探针）吊住 stdout 管道触发 WaitDelay 时，
 	// 结果 JSON 已在 stdout 却被 ErrWaitDelay 误判失败、白白重试。远端两支已有"有结果即成功"救援。
 	runErr = rescueWaitDelay(runErr, cmd)
@@ -178,7 +180,8 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := runCmdRegistered(cmd)
+	// CG-5 巡逻登记:pid 落 taskPG,drain 内 patrolOnce 可查该任务进程组存活(见 patrol.go)。
+	runErr := runCmdRegisteredForTask(cmd, t.ID)
 	// codex exit 0 但派生子进程吊住 stdout 管道触发 WaitDelay 时，-o 结果文件已写好却因 ErrWaitDelay
 	// 被下方 `runErr != nil` 判定标 IsError、白白重试。同 runReviewSync/invokeClaude 的同类救援。
 	runErr = rescueWaitDelay(runErr, cmd)
@@ -263,9 +266,10 @@ func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string
 	cmd.Stderr = &stderr
 	// 早收割看门狗：结果 JSON 已完整落缓冲而 ssh 因远端孙进程吊管道不退时，
 	// 两拍后整组击杀（实测曾挂满 150 分钟：完成品不被收割 + 目录锁堵死串行队列）。
-	runErr := runCmdRegisteredHarvest(cmd, func() bool {
+	// CG-5 巡逻登记:pid 落 taskPG 供 patrol 查任务进程组存活(见 patrol.go)。
+	runErr := runCmdRegisteredHarvestForTask(cmd, func() bool {
 		return parseClaudeJSON(stdout.String()) != nil
-	})
+	}, t.ID)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("远程步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -344,7 +348,8 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	runErr := runCmdRegistered(cmd)
+	// CG-5 巡逻登记:同 invokeRemoteClaude,pid 落 taskPG 供 patrol 查任务进程组存活。
+	runErr := runCmdRegisteredForTask(cmd, t.ID)
 	if ctx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("远程步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
@@ -873,35 +878,116 @@ func finalizeCanceled(root string, t *Task, lg *os.File) error {
 	return nil
 }
 
+// reviewSyncTimeout 和 reviewSyncMarkerPoll 是包级可调参(测试用短值)。
+// 生产 120s ctx 超时够 rsync-over-ssh 中型仓;marker 轮询 500ms 权衡 CPU 与响应度。
+var (
+	reviewSyncTimeout    = 120 * time.Second
+	reviewSyncMarkerPoll = 500 * time.Millisecond
+)
+
 // runReviewSync 在本地以 sh -c 执行审核分流的同步命令（如把改动 rsync 到审核主机），
-// stdout/stderr 落任务日志，120s 超时。返回非 nil 即视为同步失败，调用方回退本地审核。
-// 已知竞态（记录不修）：同步在 ~110s+ 完成且孙进程仍吊住管道时，WaitDelay 的 10s 收尾会跨过
-// 120s deadline，成功的同步被误报为超时→回退本地审。窗口极窄且回退无害（多审一次本机），不值复杂化。
+// stdout/stderr 落任务日志。返回非 nil 即视为同步失败，调用方回退本地审核。
+//
+// 【CG-5 竞态根修】旧路径的"记录不修"：同步在 ~110s+ 完成且孙进程仍吊住管道时,WaitDelay 的 10s
+// 收尾会跨过 120s deadline,成功的同步被 ctx.Err()==DeadlineExceeded 误报为超时→回退本机审、分流
+// 静默失效。窗口极窄但真实存在(已独立探针复现),长期以"回退无害"带病运行。
+//
+// 【为什么用 marker 文件而非 pipe 关闭】cmd.Wait 是否返回受"stdout 管道何时关"影响,而管道关闭
+// 受孙进程行为影响(远端 ssh 孙进程吊住写端不关);把"用户命令跑完没"与"pipe 关没"解耦——用一个
+// shell wrapper 在用户命令末尾写 marker 文件,marker 存在即证明用户命令已 exit(退出码见证于文件)。
+// 判定源改用 marker 文件读到的退出码,不再看 ctx.Err()/cmd.Wait err(那是 pipe 行为的产物)。
+//
+// 【为什么用 (subshell) 包裹用户命令】用户命令可能显式 'exit N'(比如测试用的 'sleep 40 & exit 0');
+// 若不用 () 包裹,exit N 直接把 sh 主体退掉,后续 __ec=$? / 写 marker 就跑不到。() 让 exit N 只退子壳,
+// 再由 __ec 捕获退出码交给主体 sh 写 marker。
+//
+// 【为什么见到 marker 立刻整组击杀】用户命令跑完后,若孙进程仍吊管道,cmd.Wait 会一直挂到 WaitDelay
+// (10s)或 ctx 超时(120s)。marker 一见即 killProcGroup 让 wait 立刻收——上层从"我知道退出码但还得等
+// 10s"提速到"知道退出码且 wait 立刻返回"。killProcGroup 幂等,若 wait 已提前返回也无害。
 func runReviewSync(t *Task, lg *os.File) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	marker := filepath.Join(os.TempDir(), fmt.Sprintf("claudego-reviewsync-%s-%d.ec", t.ID, os.Getpid()))
+	_ = os.Remove(marker) // 前置清理:防同 ID 上次残留骗过 watcher 立即误杀
+	defer os.Remove(marker)
+
+	// wrap:用户命令走子壳,exit 只退子壳;之后主体 sh 用 $? 抓退出码写 marker 并把退出码传出。
+	// 用 '%s' 单引号包 marker 路径:sh 单引号内一切字面(marker 路径不含单引号,安全)。
+	wrapped := fmt.Sprintf("( %s )\n__ec=$?\nprintf %%d \"$__ec\" > '%s'\nexit $__ec", t.ReviewSync, marker)
+
+	ctx, cancel := context.WithTimeout(context.Background(), reviewSyncTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "sh", "-c", t.ReviewSync)
+	cmd := exec.CommandContext(ctx, "sh", "-c", wrapped)
 	// 同步命令以实现卡 Dir 为工作目录执行：本库本地执行器（invokeClaude/invokeCodex）均 cmd.Dir=t.Dir，
 	// 不钉的话命令在 daemon 进程 cwd 跑，用户写 'rsync -a --delete ./ hostb:/mirror/' 等相对路径命令时
 	// 会静默同步 daemon 启动目录、--delete 清空远端镜像，审核对错误代码出 verdict 喂进修复链且全程无报错。
 	cmd.Dir = t.Dir
 	// setupProcGroup 给 cmd 设 Setpgid + Cancel（超时整组击杀）+ WaitDelay=10s：
 	// rsync 派生的 ssh 孙进程握住 stdout 管道写端时，只 kill 直接子进程 Wait 永不返回，
-	// postComplete 卡死、并行槽位与 dir 互斥永久泄漏（同 b84de71 已踩过的坑）。用 buffer 而非
-	// CombinedOutput 内建管道，配合 WaitDelay 在超时/孙进程吊管道时强制收尾。runCmdRegistered
-	// 登记进程供 Ctrl-C/SIGTERM 连坐击杀。
+	// postComplete 卡死、并行槽位与 dir 互斥永久泄漏（同 b84de71 已踩过的坑）。marker watcher 是主拆卡
+	// 手段,setupProcGroup 是兜底(marker 未按预期写出时也能到期整组击杀)。
 	setupProcGroup(cmd)
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
-	err := runCmdRegistered(cmd)
-	// 救援：sync 命令 exit 0 但派生后台子进程握住 stdout 管道（ssh mux、rsync -e ssh）时，
-	// WaitDelay 到点 cmd.Wait 返回 ErrWaitDelay 而非 nil，但进程本身成功退出。不救则成功的同步
-	// 被误判失败→postComplete 收掉 divert、每轮回退本机审核，分流特性静默失效（已独立探针实测）。
+
+	// 手动 Start/Wait(不走 runCmdRegistered):让 watcher goroutine 在 Start 之后再启动,pid 捕获到
+	// 局部变量,避开"watcher 读 cmd.Process 而主 goroutine 的 cmd.Start 同时写"的 -race 竞态。
+	// register 到 procGroups 保留 Ctrl-C/SIGTERM 连坐击杀语义(等价 runCmdRegistered 的效果)。
+	if err := cmd.Start(); err != nil {
+		logBlock(lg, "REVIEW-SYNC", fmt.Sprintf("$ %s\nstart err: %v", t.ReviewSync, err))
+		return err
+	}
+	pid := cmd.Process.Pid
+	procMu.Lock()
+	procGroups[pid] = true
+	procMu.Unlock()
+	defer func() {
+		procMu.Lock()
+		delete(procGroups, pid)
+		procMu.Unlock()
+	}()
+
+	// marker 早收割看门狗:见到 marker 立刻整组击杀,让 wait 收尾不再等 WaitDelay/ctx 超时。
+	// poll 读一次到主体局部(不在 goroutine 内读全局):避免与测试 defer 改写发生 -race 竞态,
+	// 同 runCmdRegisteredHarvest 的 remoteHarvestPoll 做法。
+	poll := reviewSyncMarkerPoll
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		tk := time.NewTicker(poll)
+		defer tk.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-tk.C:
+				if _, err := os.Stat(marker); err != nil {
+					continue
+				}
+				_ = killProcGroup(pid)
+				return
+			}
+		}
+	}()
+
+	err := cmd.Wait()
+	// 救援保留:marker 未按预期写出的边角(sh -c 未启动、wrap 语法解析先失败等)下,仍需吞掉
+	// pipe hold 导致的 ErrWaitDelay/进程 Success() 假失败。marker 是主判据,救援是二道防线。
 	err = rescueWaitDelay(err, cmd)
 	logBlock(lg, "REVIEW-SYNC", fmt.Sprintf("$ %s\n%s", t.ReviewSync, strings.TrimSpace(buf.String())))
+
+	// 主判据:marker 见证用户命令已跑完 + 真实退出码。marker 存在 → 完全按 marker 记录判定,
+	// ctx.Err()/runErr 都是 pipe 行为的次生产物,不再作证。
+	if raw, statErr := os.ReadFile(marker); statErr == nil {
+		ec, _ := strconv.Atoi(strings.TrimSpace(string(raw)))
+		if ec == 0 {
+			return nil
+		}
+		return fmt.Errorf("同步命令退出码 %d", ec)
+	}
+
+	// marker 缺失才落到旧路径:真超时(sync 未在预算内完成)/wrap 未启动等异常。
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("同步命令超时（120s）")
+		return fmt.Errorf("同步命令超时（%s）", reviewSyncTimeout)
 	}
 	return err
 }

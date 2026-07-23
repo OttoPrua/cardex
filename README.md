@@ -257,6 +257,36 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 - 单实例锁（`.lock`）保证 launchd 的多次触发不会并发跑任务；持锁进程死掉会自动清锁。
 - 其他错误（网络、超时等）按 `retry_backoff_min` 退避重试，超过 `max_attempts_per_step` 次标记失败，`claudego retry <id>` 可带着会话与进度重新入队。
 
+## drain 内巡逻 + review sync 竞态根修（CG-5）
+
+两条独立卡死信号叠加事件账本，让"看得见的完成态"（harvest 早收割）与"什么都看不见"的僵态（patrol）
+都进内核处理，不新增守护进程。
+
+**drain 内巡逻（patrol）**——`tick` 循环里已经在跑的取消对账每 `drain_rescan_sec`（默认 15s）扫一轮；
+`patrolOnce` 贴附同一循环节奏，对每张在跑卡查两条独立信号：
+- **进程组存活**：`taskPG` 登记表 + `processAlive(pid)` 双查（伪存活/死 pid 残留不骗过巡逻）。
+- **心跳**：任务日志 `~/.claudego/logs/<id>.log` 文件 size 是否增长（执行器每步 `logBlock` 持续追加）。
+
+判据：`pgSeenAlive && !alive && dead-since ≥ 60s`（procgroup 死超 `patrolPGGrace`）或
+`log-no-grow ≥ 30min`（`patrolHeartbeatTimeout`）任一命中即判卡死。**心跳独立不足证明存活**：反例注入
+（测试脚本每 100ms 追加日志、真实执行器已死）不得骗过巡逻——procgroup 存活是**授权凭证**，心跳只是辅助
+信号。启动窗口保护：`pgSeenAlive` 前置守卫排除"任务刚进 activeIDs 但 invoke 尚未 register"的假阳性。
+
+触发后**先记 `evStalled` 事件再走 `cancel`**：`evStalled` 是"披露判定卡死"的诊断事件（状态仍 running）,
+随后 `cancelRun()` 走同一收尾管线（`cmd.Cancel = killProcGroup` → `ctx.Err()` → `finalizeCanceled` → emit
+`evCanceled`）——不引入第二套击杀路径。事件序列 `dispatched → stalled(诊断) → canceled(收尾)`保留完整因果。
+`patrolEventCooldown`（默认 5min）挡重复 `evStalled` 噪声。
+
+**review sync 竞态根修**（`runReviewSync` marker 文件）——旧路径"记录不修"：sync 在 ~110s+ 完成且孙进程
+（rsync-over-ssh 的 ssh mux 等）吊住 stdout 管道时，`WaitDelay` 10s 收尾跨过 120s deadline，成功同步被
+`ctx.Err()=DeadlineExceeded` 误报超时 → 收掉 divert、每轮回退本机审、分流特性静默失效。窗口极窄但真实
+存在，长期以"回退无害"带病运行。
+
+根修：包壳跑用户命令并写 marker 文件见证退出码——marker 存在 → 完全按 marker 记录判定，`ctx.Err()`/
+`cmd.Wait` 都是 pipe 行为的次生产物不再作证。见到 marker 立即整组击杀，让 `cmd.Wait` 从"知道退出码但还
+得等 WaitDelay/ctx 到期"提速到"知道退出码且 wait 立即返回"。用 `( ... )` 子壳包裹用户命令，防用户显式
+`exit N` 直接退外壳跳过写 marker 逻辑。`rescueWaitDelay` 保留作二道防线（marker 未按预期写出的边角）。
+
 ## 事件账本（per-task `events.jsonl`）
 
 看板"活动流"由每张卡的事件账本驱动，不再拿 `task.Status` 反推伪造历史（把

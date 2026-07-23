@@ -226,6 +226,47 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 - A single-instance lock (`.lock`) keeps launchd's repeated triggers from running tasks concurrently; the lock is cleared automatically if the holding process dies.
 - Other errors (network, timeout, etc.) back off and retry per `retry_backoff_min`; past `max_attempts_per_step` the task is marked failed, and `claudego retry <id>` re-enqueues it with session and progress intact.
 
+## In-drain patrol + review-sync race root fix (CG-5)
+
+Two independent stall-detection signals piggyback on the existing drain loop (no new daemon), covering
+the "invisible" hang axis that `harvest`'s early reap (visible-completion axis) can't address.
+
+**In-drain patrol**——`tick`'s cancel-reconciliation already rescans every `drain_rescan_sec` (default
+15s); `patrolOnce` rides the same tick. For each running card it checks two independent signals:
+- **Procgroup liveness**: `taskPG` registry + `processAlive(pid)` double-check (stale dead-pid entries
+  in the registry can't fake liveness — the double-check is the counter-example defense).
+- **Heartbeat**: whether the task log `~/.claudego/logs/<id>.log` file size is growing (executor's
+  per-step `logBlock` continuously appends).
+
+Verdict: `pgSeenAlive && !alive && dead-since ≥ 60s` (procgroup dead past `patrolPGGrace`) OR
+`log-no-grow ≥ 30min` (`patrolHeartbeatTimeout`), either matches → judged stalled. **Heartbeat alone
+does NOT prove liveness**: adversarial injection (test script appending log every 100ms while the
+executor is dead) must not defeat patrol — procgroup liveness is the **authorization credential**,
+heartbeat is merely an auxiliary signal. Startup-window protection: the `pgSeenAlive` guard excludes
+false positives when a task just entered `activeIDs` but its `invoke` hasn't reached `cmd.Start` yet.
+
+On match: **emit `evStalled` first, then `cancel`**. `evStalled` is a "disclosure of stall verdict"
+diagnostic event (status stays `running`); the subsequent `cancelRun()` goes through the same shutdown
+pipeline (`cmd.Cancel = killProcGroup` → `ctx.Err()` → `finalizeCanceled` → emit `evCanceled`) — no
+second kill path is introduced. The event sequence `dispatched → stalled(diagnostic) → canceled(shutdown)`
+preserves the full causal chain. `patrolEventCooldown` (default 5min) suppresses `evStalled` noise
+when the cancel signal is momentarily delayed.
+
+**Review-sync race root fix** (`runReviewSync` marker file)——the old path was "recorded but not fixed":
+when sync completes at ~110s+ and grandchildren (ssh mux from rsync-over-ssh, etc.) hold the stdout
+pipe, `WaitDelay`'s 10s finalization crosses the 120s deadline; a successful sync is misreported as
+timed out via `ctx.Err()=DeadlineExceeded` → divert is torn down → every round falls back to local
+review, silently defeating the divert feature. Window is narrow but real — long ran with the bug
+under "fallback is harmless" hand-wave.
+
+Root fix: wrap the user command and write a marker file that witnesses the real exit code. When the
+marker exists → decision is 100% by the marker's recorded exit code; `ctx.Err()`/`cmd.Wait` errors
+become derivatives of pipe behavior, no longer authoritative. On seeing the marker, immediately kill
+the process group so `cmd.Wait` returns quickly instead of waiting for `WaitDelay`/ctx. The user
+command runs inside a `( ... )` subshell so an explicit `exit N` in the user command exits only the
+subshell, letting the outer shell still reach the marker-writing line. `rescueWaitDelay` stays as a
+second-line defense for corner cases (marker not written as expected, e.g. wrap parse failure).
+
 ## Event ledger (per-task `events.jsonl`)
 
 The board's activity stream is driven by each card's event ledger; it no longer forges history by

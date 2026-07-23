@@ -58,6 +58,10 @@ const (
 	evDone        = "done"         // 完成
 	evFailed      = "failed"       // 失败（超 attempts / 交叉链断裂 / C 契约违规 / reconcile 判孤儿）
 	evCloseout    = "closeout"     // 完成后派生动作（下游审核/修复/交叉B或C/emit/收口）已入队
+	// CG-5:巡逻先记事件再击杀。evStalled 是"披露判定卡死于何时因何触发"的诊断事件,不代表状态迁移
+	// (状态仍是 running);随后的 evCanceled(由 finalizeCanceled 落)才是"被巡逻杀了"的真状态迁移。
+	// 两条事件的时间戳与 detail 组合出完整因果链:dispatched→stalled(诊断)→canceled(收尾)。
+	evStalled = "stalled"
 )
 
 // 缺口标记：不是被写入的事件，而是活动流读者见 seq 跳号时插入的显式披露。

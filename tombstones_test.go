@@ -1368,6 +1368,56 @@ func TestReconcileSkippedHeldEmitsBeforeSave(t *testing.T) {
 	}
 }
 
+// TestReconcileHeldDedupesOnPersistentSaveFailure (CG-R1 修复反例:emit 前账本去重)
+// 证伪场景直落: reconcile 的 skipped→held 分支若不做 emit 前去重, saveTask 持续失败(磁盘只读/
+// 卡文件被替成目录等)每 tick 都会重入并再 emit 一条 evHeld——一天 288 条淹活动流. 首次 emit
+// 是"事件重复优于永久缺失"的必要代价 (见 TestReconcileSkippedHeldEmitsBeforeSave 依然绿);
+// 之后重入应识别账本末条同因 evHeld 跳过 emit.
+//
+// 【为什么 saveTask 用替目录代理磁盘只读】跨 CI 平台 chmod 0o444 不总生效(macOS/Linux 差异),
+// 也可能被 root 绕过. 把 taskPath 替成目录让 atomicWrite 的 rename 稳定失败, 精确复现"卡态
+// 每次都写不下"的持续崩溃场景.
+//
+// 【反例】去掉 runner.go skipped 分支里的 loadTaskEvents 去重判据(直接 emit), 本测试会看到
+// 两条 evHeld → "恰 1 条" 断言直接报红.
+func TestReconcileHeldDedupesOnPersistentSaveFailure(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "CG-R1 held dedupe", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-cgr1-held-dedupe"
+	a.Status = statusDone
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 预置 reconcile:cross final 墓碑——skipped 分支必命中 (final 挡住 inject).
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return nil })
+	// 把任务文件替换为目录, 让 saveTask 的 atomicWrite rename 稳定失败——每次 reconcile 都触发
+	// "save 失败 continue" 路径, 精确复现持续 saveTask 崩溃.
+	tp := taskPath(root, a.ID)
+	if err := os.Remove(tp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 连调两次 reconcileCrossChains——第一次 emit(账本无同因末条), 第二次去重跳过 emit.
+	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+	events := readAllEventsRaw(t, root, a.ID)
+	held := 0
+	for _, ev := range events {
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			if reason, _ := ev.Detail["reason"].(string); reason == "reconcile_cross_tombstone_exhausted" {
+				held++
+			}
+		}
+	}
+	if held != 1 {
+		t.Fatalf("持续 saveTask 失败下两次 reconcile 应仅留 1 条 evHeld(去重), got %d, 事件序列=%v", held, eventTypes(events))
+	}
+}
+
 // TestReconcileFailedEmitsBeforeSave (R3 P1-1 类闭合反例: reconcile 内 injectAtMostOnce
 // 闭包侧的 failed 分支同样要求 emit 先于 save; 闭合审查 P2-2 提示的 pre-existing 同源缺陷)
 // 若闭包内 save 先于 emit, 崩溃/IO 错落两者之间时——pending 已 +1, saveTask(failed) 已落盘,

@@ -1920,20 +1920,41 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 			// 重入 → evHeld 披露事件永久丢失且无补发路径, 账本呈现 done→held 零事件跳变, 正是本轮
 			// 宣称消灭的"零披露"缺陷类. 新顺序 (emit 先 save 后) 与 runTask resume 侧 (runner.go:
 			// 688-691) 严格对齐——崩溃落中间时盘上仍 done, 下轮 tick 重入 skipped 分支, 再 emit+
-			// save 收敛; 代价至多一条重复 evHeld 事件, 优于永久静默. 事件重复优于事件永久缺失, 是
-			// 墓碑存在的第一性理由.
+			// save 收敛. 事件重复优于事件永久缺失, 是墓碑存在的第一性理由.
 			// 【反例】TestReconcileSkippedHeldEmitsBeforeSave 用 saveTask 失败代理"崩溃在 save 之后
 			// emit 之前"; 若把 emit 挪回 save 后, save 失败 continue 直接吞掉 emit → 账本无 evHeld
 			// → 断言报红.
+			//
+			// 【CG-R1 修复:emit 前账本去重】R3 老注释里"代价至多一条重复 evHeld"已被复审证伪:
+			// saveTask 持续失败(如磁盘只读、卡文件被替成目录)每 tick 都会重入本分支再 emit 一条,
+			// 一天 288 条 evHeld 淹没活动流。emit 前读事件账本, 末条若已是同因 evHeld(Type+Actor+
+			// Detail.reason 三项皆等)则跳过 emit 只重试 saveTask——同因判据严格钉住三项, 防其他
+			// 线索(resume_tombstone_exhausted 的 evHeld / cli:hold 触发的 evHeld / classifier 升级)
+			// 被误合并, 保留必要迁移事件。首次仍会 emit(见 TestReconcileSkippedHeldEmitsBeforeSave
+			// 依然绿), 后续重入不再重复。
+			// 【反例】TestReconcileHeldDedupesOnPersistentSaveFailure 连调两次 reconcileCrossChains
+			// 断言 evHeld 恰 1 条; 去掉本去重(直接 emit)即报红。
 			t.Status = statusHeld
 			t.LastError = fmt.Sprintf("CG-4 reconcile 墓碑至多一次已耗尽或已终态挡住(role=%s missing_next=%s),需人工核查后 retry 复活",
 				t.XRole, nextRole)
 			t.touch()
-			// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
-			emitTaskEvent(root, t.ID, evHeld, "runner:reconcile-tombstone", statusHeld, t.Step, map[string]any{
-				"reason": "reconcile_cross_tombstone_exhausted", "kind": reconcileCrossKind(),
-				"role": t.XRole, "missing_next": nextRole,
-			})
+			// 同因去重:末条同因 evHeld 时跳过 emit。loadTaskEvents 出错(账本不可读)时保守回退到 emit,
+			// 事件重复优于事件永久缺失(墓碑存在的第一性理由)。
+			shouldEmit := true
+			if events, _, err := loadTaskEvents(root, t.ID); err == nil && len(events) > 0 {
+				if last := events[len(events)-1]; last.Type == evHeld && last.Actor == "runner:reconcile-tombstone" {
+					if reason, _ := last.Detail["reason"].(string); reason == "reconcile_cross_tombstone_exhausted" {
+						shouldEmit = false
+					}
+				}
+			}
+			if shouldEmit {
+				// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
+				emitTaskEvent(root, t.ID, evHeld, "runner:reconcile-tombstone", statusHeld, t.Step, map[string]any{
+					"reason": "reconcile_cross_tombstone_exhausted", "kind": reconcileCrossKind(),
+					"role": t.XRole, "missing_next": nextRole,
+				})
+			}
 			if err := saveTask(root, t); err != nil {
 				fmt.Fprintf(os.Stderr, "警告: reconcile 挂 held 落盘失败 %s: %v\n", t.ID, err)
 				continue

@@ -17,4 +17,11 @@ install: build
 	cp $(BIN) $(PREFIX)/claudego
 	@echo "已安装到 $(PREFIX)/claudego（launchd 请在安装后重新运行 claudego install-launchd）"
 
-.PHONY: build test vet install
+# 【CG-R2 R2·P1-3】仓内验收入口:硬编码 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 下跑同步/指纹用例。
+# 缺省 go test 在未装机机器上会 Skip → 套件绿但对护栏部署状态零证明力(上一轮 P1 静默漂绿)。
+# 装机验收流水/收工汇报请引用 `make accept-sync` 的实跑输出而非 `go test ./...` 的绿。
+accept-sync:
+	@echo "==> accept-sync: CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify' -count=1 -v"
+	CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify' -count=1 -v ./...
+
+.PHONY: build test vet install accept-sync

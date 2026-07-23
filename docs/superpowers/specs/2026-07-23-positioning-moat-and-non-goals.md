@@ -4,6 +4,10 @@
 > 依据：2026-07-23 生态对标（同目录 `2026-07-23-agent-collab-landscape.md`，约 50 条主张独立核验）。
 > 裁决立据：PerlicaOptimize design-blueprint/_DECISIONS.md BD-39 及附记。
 
+## 重命名触发器（2026-07-23 委托人裁）
+
+开源决定落地 → 释放 held 卡 **CG-7 rename 设计卡（t0723-0304-c0d8）**：名字裁选材料（"Claude*" 品牌指引风险 + 现有名低售跨厂商护城河，perlicabridge 等 Perlica 家族名候选）+ appName 单点化 + 数据根迁移命令（在途任务零丢失，fail-closed）+ CLI 兼容 shim（保护 Hermes 卡等跨仓活调用方）+ 远端足迹迁移顺序 + 开源卫生扫描。释放前须先按当时现状更新卡 prompt。改名评估结论（2026-07-23）：代码层面小活，真实成本在活着的状态（~/.claudego 在途数据、launchd label、远端足迹）与调用方；单点化/迁移/shim 是改名的组成部分而非可选优化，但在改名需求证实前不预做。
+
 ## 定位一句话
 
 **ClaudeGo 是围绕订阅额度经济学设计的本地 coding-agent 编排器**：编排器本身纯本地零额度消耗，贵模型只出判断、便宜模型只出劳动，把每个 5 小时窗口榨干。

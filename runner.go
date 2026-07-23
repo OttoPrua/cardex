@@ -546,6 +546,13 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 	// 别把已取消的任务写回 tasks/ 复活成 running。
 	if diskCanceled(root, t.ID) {
 		t.Status = statusCanceled
+		// 事件账本自洽:盘上 canceled 但账本无 canceled 事件时(cli:cancel 后 emit 失败/崩溃),
+		// 入口守卫必须补一条,防止"取消事件永久缺失且无 seq 缺口可见"的最险恶回归.
+		if !hasCanceledEvent(root, t.ID) {
+			emitTaskEvent(root, t.ID, evCanceled, "runner:entry", statusCanceled, t.Step, map[string]any{
+				"reason": "backfill", "source": "entry_guard",
+			})
+		}
 		_ = archiveTask(root, t)
 		return nil
 	}
@@ -856,21 +863,33 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 // 归档盘上的任务文件——cancel 命令对 running 任务只写取消标记不归档（进程还活着），
 // 归档由这里补上；文件已被移走（非运行态 cancel 或人工删除）则忽略。
 //
-// 【为什么按 diskCanceled 做去重】cli:cancel(main.go:cmdSetStatus)对 running 卡的走位是"先写 canceled
-// 到盘 + emit evCanceled、进程留给 drain/tick 收尾"。drain 复扫见 diskCanceled 就把 ctx 撤了走这里,
-// 若在这里再 emit 一条 runner_cancel = 一次迁移双事件, 直接违背"每状态迁移恰一条事件"验收 + 活动流
-// 每次取消 running 卡刷两条"已取消"。而 ctx.Err()≠nil 又非 diskCanceled 的路径(进程组接 SIGTERM/父
-// 上下文超时等),盘上没有 cli:cancel 的记录,此时 runner 是"取消的第一手记录者",必须由这里 emit。
+// 【为什么按 hasCanceledEvent 做去重(不是 diskCanceled)】cli:cancel(main.go:cmdSetStatus)对 running
+// 卡的走位是"先 saveTask(cancel) + emit evCanceled(best-effort), 进程留给 drain/tick 收尾". drain 复
+// 扫见磁盘 canceled 就把 ctx 撤了走这里. 用 diskCanceled 代理"账本已有 canceled 事件"有致命裂缝:
+// saveTask 与 emit 之间若崩溃, 或 emit 因锁超时/磁盘满失败(events.go:emit 是 best-effort 只警告),
+// 盘=canceled 而账本=空——finalizeCanceled 与 runTask 入口守卫都被"diskCanceled=true"骗过去跳过 emit,
+// 取消事件永久缺失且无 seq 缺口可见(0 条与 2 条同样违背"恰一条", 但 0 条不可检测更糟, 是对旧代码
+// 保证≥1 条的直接回归). 只有账本自身才是"账本已有事件"的唯一真相源 → hasCanceledEvent 直接扫账本.
+// 而 ctx.Err()≠nil 又非 diskCanceled 的路径(进程组接 SIGTERM/父上下文超时等), 盘无 cli:cancel 记录,
+// 此时 runner 是"取消的第一手记录者", 由这里 emit 一条 runner_cancel(actor=runner, reason=runner_cancel).
 func finalizeCanceled(root string, t *Task, lg *os.File) error {
-	// 先探盘上是否已由 cli:cancel emit 过。要在改写 t.Status 前问,因为 diskCanceled 读的是磁盘态
-	// (cmdSetStatus 已 saveTask 到磁盘),内存里的 t.Status 尚未持久化,不代表事件账本已有一条 canceled。
-	cliAlreadyEmitted := diskCanceled(root, t.ID)
+	// 先探账本是否已有 canceled 事件. 要在改写 t.Status 前问, 因为 emit 是 best-effort, 磁盘状态
+	// 与账本内容可能不一致——只信账本本身.
+	alreadyEmitted := hasCanceledEvent(root, t.ID)
+	// 记录磁盘态供 detail 溯源:若盘=canceled 但账本无事件, 是"cli cancel 后 emit 失败"的补写场景.
+	cliRecordedOnDisk := diskCanceled(root, t.ID)
 	t.Status = statusCanceled
 	logBlock(lg, "CANCELED", "任务已取消：终止执行进程，丢弃本步产物并归档。")
-	if !cliAlreadyEmitted {
+	if !alreadyEmitted {
 		// 事件必须在 archiveTask 前落：archive 会把 events.jsonl 搬去 archive/events/，
 		// 先记事件再搬迁，保证"取消"事件既进账本又随卡归档一并留痕。
-		emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, map[string]any{"reason": "runner_cancel"})
+		detail := map[string]any{"reason": "runner_cancel"}
+		if cliRecordedOnDisk {
+			// 盘上已 canceled 但账本空:cli:cancel 已 saveTask 但 emit 未落, 现补一条溯源事件.
+			// 用 reason=backfill 让审计能与正规 runner_cancel/cli:cancel 分辨.
+			detail = map[string]any{"reason": "backfill", "source": "runner_finalize"}
+		}
+		emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, detail)
 	}
 	if err := archiveTask(root, t); err != nil && !os.IsNotExist(err) {
 		return err
@@ -1754,24 +1773,31 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 		if archived[t.XKey][next] {
 			continue
 		}
-		// CG-4:reconcile 裁决也是"至多一次注入"点——若崩溃落在 saveTask 与 emit 之间,下一轮 tick 复扫
-		// 会再撞一次,把一条 failed 事件放大成 N 条,污染诚实活动流。用墓碑护栏把整段"状态变更 + 侧车清理
-		// + 事件账本"包成幂等原子。bound=2 允许"崩一次+重试一次"共 2 次注入;更多次由 skipped 分支升级挂
-		// held+emit 披露(不再 stderr 刷屏,不再让单腿 done 卡永久冒充可采信结果)。
+		// CG-4:reconcile 裁决也是"至多一次注入"点——用墓碑护栏把整段"状态变更 + 侧车清理 + 事件账本"包
+		// 成幂等原子。bound=2 允许"崩一次+重试一次"共 2 次注入;更多次由 skipped 分支升级挂 held+emit 披
+		// 露(不再 stderr 刷屏,不再让单腿 done 卡永久冒充可采信结果)。
+		//
+		// 【R3 P1-1 修复:emit 必须先于 saveTask】审查证伪场景直落:R2 顺序 (save 先 emit 后) 让崩溃/
+		// saveTask IO 错误落在两者之间时——盘上已 failed → 孤儿谓词 status==done 永久排除该卡 → 下轮
+		// reconcile 不再进入 → evFailed 永久丢失且无补发路径, 账本呈现 done→failed 零事件跳变, 正是
+		// CG-4 宣称消灭的"零披露"缺陷类. 新顺序 (emit 先 save 后) 崩溃在两者之间时: 盘上仍 done →
+		// 下轮 tick 重入孤儿谓词 → 墓碑仍 pending(attempt=1) 且 <bound → 再走一次 inject → 再 emit+
+		// save 收敛; 代价至多重复一条 evFailed 事件 (bound=2 上限挡住无限重复), 优于永久静默. 与
+		// runTask resume 侧 (runner.go:688-691) 顺序对齐——事件重复优于事件永久缺失, 是墓碑存在的
+		// 第一性理由.
+		// 【反例】TestReconcileFailedEmitsBeforeSave 用 saveTask 失败代理"崩溃落在 save 后 emit 前":
+		// 若把 emit 挪回 save 后 (回到 R2 顺序), save 失败 return err 直接吞掉 emit, 事件账本无
+		// evFailed → 测试断言报红.
 		nextRole := next // 逃逸进闭包时避免引用循环变量的老坑
 		skipped, corrupted, tombErr := injectAtMostOnce(root, t.ID, reconcileCrossKind(), func() error {
 			t.Status = statusFailed
 			t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, nextRole)
 			_ = os.Remove(crossPeerPath(root, t.XKey))
-			if err := saveTask(root, t); err != nil {
-				return err
-			}
-			// reconcile 判孤儿：这是崩溃窄缝里被扫出的"事后判 failed"事件，需在账本留一条明确迁移，
-			// 否则活动流只见 done→failed 状态跳变而无对应事件，触发 seq 缺口误判。
+			// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
 			emitTaskEvent(root, t.ID, evFailed, "runner:reconcile", statusFailed, t.Step, map[string]any{
 				"reason": "cross_chain_orphan", "role": t.XRole, "missing_next": nextRole,
 			})
-			return nil
+			return saveTask(root, t)
 		})
 		if tombErr != nil {
 			fmt.Fprintf(os.Stderr, "警告: reconcile 墓碑写入失败 %s: %v\n", t.ID, tombErr)
@@ -1788,18 +1814,30 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 			// held 让 t.Status != statusDone 从而下一轮不再进本孤儿谓词,同时 emit 披露事件,活动流讲清
 			// "墓碑挡住不再裁决,已挂人工"。运维 release+retry 走 cmdSetStatus 的 reset 分支重新起 bound。
 			// 【反例】去掉本分支,TestReconcileCrossChainsHoldsOnTombstoneSkipped 报红——卡留 done、零披露。
+			//
+			// 【R3 P1-1 修复:emit 必须先于 saveTask】R2 顺序 (save 先 emit 后) 让崩溃/saveTask IO
+			// 错误落在两者之间时: 卡已落盘 held → 孤儿谓词 status==done 永久排除 → skipped 分支永不
+			// 重入 → evHeld 披露事件永久丢失且无补发路径, 账本呈现 done→held 零事件跳变, 正是本轮
+			// 宣称消灭的"零披露"缺陷类. 新顺序 (emit 先 save 后) 与 runTask resume 侧 (runner.go:
+			// 688-691) 严格对齐——崩溃落中间时盘上仍 done, 下轮 tick 重入 skipped 分支, 再 emit+
+			// save 收敛; 代价至多一条重复 evHeld 事件, 优于永久静默. 事件重复优于事件永久缺失, 是
+			// 墓碑存在的第一性理由.
+			// 【反例】TestReconcileSkippedHeldEmitsBeforeSave 用 saveTask 失败代理"崩溃在 save 之后
+			// emit 之前"; 若把 emit 挪回 save 后, save 失败 continue 直接吞掉 emit → 账本无 evHeld
+			// → 断言报红.
 			t.Status = statusHeld
 			t.LastError = fmt.Sprintf("CG-4 reconcile 墓碑至多一次已耗尽或已终态挡住(role=%s missing_next=%s),需人工核查后 retry 复活",
 				t.XRole, nextRole)
 			t.touch()
-			if err := saveTask(root, t); err != nil {
-				fmt.Fprintf(os.Stderr, "警告: reconcile 挂 held 落盘失败 %s: %v\n", t.ID, err)
-				continue
-			}
+			// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
 			emitTaskEvent(root, t.ID, evHeld, "runner:reconcile-tombstone", statusHeld, t.Step, map[string]any{
 				"reason": "reconcile_cross_tombstone_exhausted", "kind": reconcileCrossKind(),
 				"role": t.XRole, "missing_next": nextRole,
 			})
+			if err := saveTask(root, t); err != nil {
+				fmt.Fprintf(os.Stderr, "警告: reconcile 挂 held 落盘失败 %s: %v\n", t.ID, err)
+				continue
+			}
 		}
 	}
 }

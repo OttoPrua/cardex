@@ -336,6 +336,39 @@ Guard semantics (`tombstones.go`):
   lifted from `done` to `held` and an `evHeld(reason=reconcile_cross_tombstone_exhausted,
   actor=runner:reconcile-tombstone)` is emitted — no more single-leg `done` cards impersonating
   trustworthy results, no more infinite stderr spam masquerading as disclosure.
+- **Per-task tombstone lock + two-phase critical section (Round-2 addendum)**: Round-1's explicit
+  CLI reset introduced the first concurrent read-modify-write on the same tombstone ledger by
+  CLI vs. runner tick. Without a lock, `injectAtMostOnce`'s final writeback would silently
+  resurrect an entry that a concurrent `resetTombstoneKind` had just deleted — nullifying `retry`'s
+  promise of "clear the tombstone, let `bound=2` re-arm, let reconciliation try again." Root fix:
+  - `sync.Mutex` (in-process goroutines) + `tombstones/<id>.json.lock` (cross-process; tmp +
+    `os.Link` atomic rename, TTL 5s; stale judgment and PID-checked release both reuse the
+    isomorphic `staleEventLock`/`releaseEventLock` from `events.go`).
+  - `injectAtMostOnce` is two-phase: phase 1 holds the lock while reading the ledger and writing
+    `pending`, then releases; phase 2 runs `inject` unlocked (resume-side LLM subprocesses take
+    minutes and holding the lock across would trip stale eviction); phase 3 re-acquires the lock,
+    claims the entry, upgrades to `final`.
+  - **Entry-gone / nonce two-layer defense**: on phase 3's re-read, if the entry has been deleted
+    by a concurrent `reset`, or the nonce no longer matches our pending, we abandon the `final`
+    rebuild — even if lock semantics regress, `final` cannot silently resurrect a `reset` entry.
+  - **Class closure**: `resetTombstoneKind` (runTask fresh-entry / CLI `retry` / CLI `release`) and
+    `archiveTaskTombstones` (`clean` / `postComplete` archive paths) all serialize through the same
+    lock. Bare `os.Rename` in archive would otherwise race phase 3 into an "archived file + live
+    ledger with only one `final` row" audit-forgery scene.
+- **Emit must precede saveTask (Round-3 addendum)**: `reconcileCrossChains`'s skipped→held branch
+  and the failed branch inside the `injectAtMostOnce` closure both used the old order (save first,
+  emit after). If a crash or IO error lands between them, the card is persisted as `held/failed`
+  but the orphan predicate `status==done` permanently excludes it, and `evHeld/evFailed` is
+  permanently lost with no re-emit path — the ledger shows a `done→held/failed` zero-event jump,
+  exactly the "zero-disclosure" defect class tombstones exist to eliminate. Fix: move `emit` before
+  `saveTask`, aligning with `runTask`'s resume-side order — if the crash lands in the middle, disk
+  still says `done`, the next tick re-enters the orphan predicate, and re-emit+save self-heals.
+  The cost is at most one duplicate event (`bound=2` blocks unbounded repetition), preferable to
+  permanent silence. Event duplication over permanent event absence is the first-principles reason
+  tombstones exist. `TestReconcileSkippedHeldEmitsBeforeSave` / `TestReconcileFailedEmitsBeforeSave`
+  proxy "crash between save and emit" via a failing `saveTask`; any regression of the order fails
+  red. `TestResumeHeldSourceOrder` uses a static source-code guard to lock the resume-side contract
+  against future refactor inversions.
 - **Archived with the card**: the tombstone ledger is moved to `archive/tombstones/<id>.json`
   by `archiveTask`, so an audit can inspect exactly how many attempts each injection needed.
 

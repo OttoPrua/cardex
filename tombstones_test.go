@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mkTombRoot 只需保证 root 目录存在；tombstones/ 在 writeTombstoneJournal 内按需 mkdir。
@@ -908,5 +909,553 @@ func TestReconcileCrossChainsAfterRetryReAdjudicates(t *testing.T) {
 	}
 	if heldCnt != 0 {
 		t.Fatalf("端到端不应触发 tombstone-held(retry 已把墓碑清干净),got %d", heldCnt)
+	}
+}
+
+// ---------- Round-2 修复回红反例 (P1-1 CLI-vs-runner 同 kind 并发写) ----------
+
+// TestInjectAtMostOnceFinalYieldsToConcurrentReset (R2 P1-1 核心反例)
+// 证伪场景直接落地:模拟 CLI 侧 resetTombstoneKind 在 inject 回调运行到一半时执行——阶段 3 重读
+// 应发现条目已被删除,放弃 final 重建,让 reset 语义(重新起 bound=2)保持有效。
+//
+// 【为什么这条测试关键】审查证伪场景明写:自动化 ops 监听 saveTask(failed) 即 claudego retry,
+// reset 恰落在阶段 1 的 pending 写与阶段 3 的 final 回写之间;R1 的 final 回写走
+// "final.Attempt<newAttempt 分支以 final(attempt=newAttempt) 重建条目",把 reset 静默覆盖 →
+// retry 承诺的"清墓碑重新起 bound=2 自动再裁决"被作废. 本测试用 inject 回调内嵌 reset 精确复现
+// 该窗口——回退修复(去掉 final 回写侧的 !exists 分支)本测试直接报红。
+//
+// 【反例】把 injectAtMostOnce 阶段 3 的 "if !exists { return }" 删掉、回到 R1 的"attempt<newAttempt
+// 重建"路径,断言"reset 后墓碑清空"直接红——final 会以 attempt=newAttempt 重建条目.
+func TestInjectAtMostOnceFinalYieldsToConcurrentReset(t *testing.T) {
+	root := mkTombRoot(t)
+	calls := 0
+	inject := func() error {
+		calls++
+		// 模拟"CLI 侧 resetTombstoneKind 在阶段 2 无锁窗口内执行":inject 回调内直接调 reset,
+		// 与生产 ops 脚本"监听到卡转 failed 立即 claudego retry"的时序等价 (阶段 1 已释锁,
+		// reset 可拿到锁; inject 结束后阶段 3 重取锁重读).
+		if err := resetTombstoneKind(root, "task-race", reconcileCrossKind()); err != nil {
+			return err
+		}
+		return nil
+	}
+	skipped, corrupted, err := injectAtMostOnce(root, "task-race", reconcileCrossKind(), inject)
+	if err != nil || skipped || corrupted {
+		t.Fatalf("首轮应正常跑(inject 内 reset 应被吸收): skipped=%v corrupted=%v err=%v", skipped, corrupted, err)
+	}
+	if calls != 1 {
+		t.Fatalf("inject 应被调 1 次,got %d", calls)
+	}
+	// 核心断言:reset 后墓碑应清空. 若 final 回写重建了条目,该断言直接红——正是 R1 bug 的样貌.
+	j, corrupted, err := readTombstoneJournal(root, "task-race")
+	if err != nil || corrupted {
+		t.Fatalf("读账本失败: corrupted=%v err=%v", corrupted, err)
+	}
+	if entry, exists := j.Entries[reconcileCrossKind()]; exists {
+		t.Fatalf("并发 reset 后 final 不应重建条目(否则 retry 承诺的清墓碑被作废),got %+v", entry)
+	}
+	// 二次防御:reset 胜出后,下一轮 injectAtMostOnce 应能重新起 bound=2 (证明 reset 语义完整).
+	next := 0
+	skipped2, _, err2 := injectAtMostOnce(root, "task-race", reconcileCrossKind(), func() error { next++; return nil })
+	if err2 != nil || skipped2 {
+		t.Fatalf("reset 胜出后下一轮应能新开 bound: skipped=%v err=%v", skipped2, err2)
+	}
+	if next != 1 {
+		t.Fatalf("下一轮 inject 应被调 1 次(bound 从零起算),got %d", next)
+	}
+}
+
+// TestInjectAtMostOnceFinalYieldsOnNonceMismatch (R2 P1-1 防御纵深:nonce 校验)
+// 独立于 entry-gone 分支:若在阶段 2 窗口内另一写者写了 pending (nonce 不同), 阶段 3 的 final 不
+// 应覆盖别人的 pending. 【场景】reset+新 injectAtMostOnce 组合 (retry+紧接的下一轮 tick 再撞孤儿)
+// 就会构造这种局面: 我们的 nonce 已过期, 应把 final 让给对方那一轮承接.
+//
+// 【反例】把 injectAtMostOnce 阶段 3 的 "if existing.Nonce != pendingNonce { return }" 删掉,
+// final 会以我们的 nonce/phase 覆盖对方 pending, 对方后续的 final 认领会因 nonce 不匹配退让 →
+// 双方结局都被吞, "别人的 pending 被我们的 final 静默替换"的骗审现场重现. 本测试断言"nonce
+// 不匹配时不写 final", 回退即报红.
+func TestInjectAtMostOnceFinalYieldsOnNonceMismatch(t *testing.T) {
+	root := mkTombRoot(t)
+	otherInjectCalled := false
+	inject := func() error {
+		// 模拟阶段 2 窗口内: 先 reset (清我们的 pending), 再有另一次 injectAtMostOnce 写了新 pending.
+		if err := resetTombstoneKind(root, "task-nonce", reconcileCrossKind()); err != nil {
+			return err
+		}
+		// 另一次 injectAtMostOnce 是同步的独立调用, 直接嵌套即可: nonce 会不同 (time.Now 递增).
+		_, _, _ = injectAtMostOnce(root, "task-nonce", reconcileCrossKind(), func() error {
+			otherInjectCalled = true
+			return fmt.Errorf("模拟对方的 inject 崩溃, 留 pending 在盘上")
+		})
+		return nil
+	}
+	_, _, err := injectAtMostOnce(root, "task-nonce", reconcileCrossKind(), inject)
+	if err != nil {
+		t.Fatalf("外层 inject 应吸收内层错误(内层是嵌套调用): err=%v", err)
+	}
+	if !otherInjectCalled {
+		t.Fatal("内层 inject 应被调用一次")
+	}
+	// 关键断言: 账本应停在"对方的 pending", 不该被我们的 final 覆盖成 phase=final.
+	j, _, err := readTombstoneJournal(root, "task-nonce")
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, exists := j.Entries[reconcileCrossKind()]
+	if !exists {
+		t.Fatal("对方 pending 应保留在账本, got 条目已被清")
+	}
+	if entry.Phase != tombstonePhasePending {
+		t.Fatalf("nonce 不匹配时我们不能把对方 pending 升级 final, got phase=%q", entry.Phase)
+	}
+	if entry.Attempt != 1 {
+		t.Fatalf("对方 pending 应保持 attempt=1 (reset 后第一次), got %d", entry.Attempt)
+	}
+}
+
+// TestCmdRetryResetVsInjectAtMostOnceIsSerialized (R2 P1-1 端到端串行化)
+// 生产语义端到端: 在 injectAtMostOnce 的 inject 回调里模拟 CLI 侧 cmdSetStatus("retry") 调用,
+// 应能观察到 CLI 侧墓碑清空 + 阶段 3 让位, 卡状态由 retry 说了算 (queued).
+//
+// 【反例】任何一处锁/让位分支被回退, 本测试要么断言"墓碑清空"报红 (final 重建了条目),
+// 要么阶段 3 竞态死锁 (锁未释放). 是对锁/让位组合修复的端到端守卫.
+func TestCmdRetryResetVsInjectAtMostOnceIsSerialized(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "R2 P1-1 端到端", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-r2-race"
+	a.Status = statusFailed
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 造前置 final: 模拟 reconcile 上一轮判 failed 已落 final (bound 用尽的等价前置状态: 已 final).
+	// 本测试的重点不是 bound 触发, 而是"阶段 2 无锁窗口里 CLI retry reset 与阶段 3 final 争夺".
+	// 用一次成功的 inject 制备真实 final. 结束后手工把 phase 复位 pending(1), 让下一次 injectAtMostOnce
+	// 会走 inject 分支 (而非 final 直接跳过).
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return nil })
+	j0, _, _ := readTombstoneJournal(root, a.ID)
+	e0 := j0.Entries[reconcileCrossKind()]
+	e0.Phase = tombstonePhasePending
+	e0.Attempt = 1
+	j0.Entries[reconcileCrossKind()] = e0
+	if err := writeTombstoneJournal(root, a.ID, j0); err != nil {
+		t.Fatal(err)
+	}
+	// 本轮 injectAtMostOnce: 内嵌 CLI retry 调用 (会调 resetTombstoneKind).
+	_, _, err := injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error {
+		// 内嵌 cmdSetStatus retry: 走 CLI 全路径, 覆盖 main.go:1446 的 resetTombstoneKind.
+		return cmdSetStatus([]string{"-root", root, a.ID}, "retry")
+	})
+	if err != nil {
+		t.Fatalf("外层 inject 应吸收 retry: err=%v", err)
+	}
+	// 端到端断言 1: retry 已 reset, 墓碑清空 (不应有 final 重建).
+	j, _, err := readTombstoneJournal(root, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry, exists := j.Entries[reconcileCrossKind()]; exists {
+		t.Fatalf("retry reset 后墓碑不应有 reconcile:cross 条目 (final 让位失败): %+v", entry)
+	}
+	// 端到端断言 2: 卡态由 retry 说了算 (queued).
+	a1, _ := loadTask(root, a.ID)
+	if a1.Status != statusQueued {
+		t.Fatalf("retry 应把状态转 queued, got %s", a1.Status)
+	}
+}
+
+// TestArchiveTaskTombstonesSerializesAgainstWriters (R2 类闭合: archive 侧同类竞态)
+// 归档也是墓碑文件的写者 (os.Rename src→dst). 若不上锁, 与并发 injectAtMostOnce 阶段 3/
+// resetTombstoneKind 竞态: archive 恰在阶段 3 写 final 前把 src 搬走, writeTombstoneJournal 会
+// 新建一个只有 final 的活动墓碑, 与归档文件并列存在 → 后续读走活动路径看到"只剩一条 final"的
+// 骗审现场 (原始 attempt 历史被吞).
+//
+// 【反例】把 archiveTaskTombstones 里的锁去掉, 本测试通过嵌套 archive 调用触发竞态 → 断言
+// "活动路径应不再存在"报红 (会存在一个只带 final 的新建活动文件).
+func TestArchiveTaskTombstonesSerializesAgainstWriters(t *testing.T) {
+	root := mkTombRoot(t)
+	inject := func() error {
+		// 阶段 2 窗口内 archive: 拿墓碑锁 → rename src→dst → 释锁.
+		return archiveTaskTombstones(root, "task-arch-race")
+	}
+	_, _, err := injectAtMostOnce(root, "task-arch-race", reconcileCrossKind(), inject)
+	if err != nil {
+		t.Fatalf("inject 内 archive 应正常 (锁串行化): err=%v", err)
+	}
+	// 关键断言: 活动路径应不存在 (归档已搬走; 阶段 3 的 final 若无 nonce/entry 保护会新建活动).
+	if _, err := os.Stat(tombstonePath(root, "task-arch-race")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("archive 后活动路径应不存在, stat err=%v", err)
+	}
+	// 归档路径应存在.
+	if _, err := os.Stat(archivedTombstonePath(root, "task-arch-race")); err != nil {
+		t.Fatalf("归档路径应存在: %v", err)
+	}
+}
+
+// TestArchiveTaskTombstonesBlocksOnLock (R2 类闭合: archive 侧真正持锁的证据)
+// 直接持锁 → 启协程调 archive → 断言 archive 被阻塞. 若 archiveTaskTombstones 无锁, 会立即完成
+// (test 报红). 补 TestArchiveTaskTombstonesSerializesAgainstWriters 的不足: 该测试用 injectAtMostOnce
+// 内嵌 archive 的模式, 阶段 3 的 entry-gone 分支即可兜住, 不能证明 archive 侧的锁本身是必需的.
+// 本测试直接证伪"没有 archive 锁"这一假设——archive 若无锁则不等待, 立即完成 rename.
+//
+// 【反例】把 archiveTaskTombstones 里的锁去掉, 断言"持锁期间 archive 不完成"立即报红.
+func TestArchiveTaskTombstonesBlocksOnLock(t *testing.T) {
+	root := mkTombRoot(t)
+	if err := os.MkdirAll(tombstonesDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tombstonePath(root, "arch-block"), []byte(`{"version":1,"entries":{"resume:0":{"kind":"resume:0","attempt":1,"phase":"final","nonce":1,"ts":"x"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 手工持锁, 观察 archive 是否等待. 注意: 手动 acquire 只拿了文件锁, 未拿进程内 mutex ——
+	// archive 里 mu.Lock() 会与 mutex 无冲突 (mu 空闲) 然后卡在 acquireTombstoneLock (文件锁被占).
+	release, err := acquireTombstoneLock(root, "arch-block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = archiveTaskTombstones(root, "arch-block")
+		close(done)
+	}()
+	// 期望 archive 被文件锁挡住: 60ms 内不完成.
+	select {
+	case <-done:
+		t.Fatal("archive 应在持锁期间阻塞 (若立即完成说明 archive 无锁)")
+	case <-time.After(60 * time.Millisecond):
+		// pass: archive 被挡住
+	}
+	release()
+	// 释锁后 archive 应能在自旋周期 (5ms) 内完成. 500ms 给 CI 充足余量.
+	select {
+	case <-done:
+		// pass
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("释锁后 archive 应能在自旋周期内完成, 500ms 内未见完成")
+	}
+	if _, err := os.Stat(archivedTombstonePath(root, "arch-block")); err != nil {
+		t.Fatalf("archive 应成功搬到归档路径: %v", err)
+	}
+	if _, err := os.Stat(tombstonePath(root, "arch-block")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("活动路径应被搬走: %v", err)
+	}
+}
+
+// TestResetTombstoneKindBlocksOnLock (R2 类闭合: reset 侧真正持锁的证据)
+// 同样验证 reset 侧的锁存在——持锁期间 reset 应等待. 若 reset 无锁, IO 竞态可让 reset 读到 inject
+// 阶段 1 刚写的 pending, 但写回 delete 时把 pending 之后的其他 kind 变更覆盖.
+//
+// 【反例】把 resetTombstoneKind 里的锁去掉, 本测试立即报红——reset 不等待, 立即完成.
+func TestResetTombstoneKindBlocksOnLock(t *testing.T) {
+	root := mkTombRoot(t)
+	if err := os.MkdirAll(tombstonesDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tombstonePath(root, "reset-block"), []byte(`{"version":1,"entries":{"resume:0":{"kind":"resume:0","attempt":1,"phase":"final","nonce":1,"ts":"x"}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	release, err := acquireTombstoneLock(root, "reset-block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		_ = resetTombstoneKind(root, "reset-block", "resume:0")
+		close(done)
+	}()
+	select {
+	case <-done:
+		t.Fatal("reset 应在持锁期间阻塞 (若立即完成说明 reset 无锁)")
+	case <-time.After(60 * time.Millisecond):
+		// pass
+	}
+	release()
+	select {
+	case <-done:
+		// pass
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("释锁后 reset 应能在自旋周期内完成")
+	}
+}
+
+// TestInjectAtMostOnceBlocksOnLockPhase1 (R2 类闭合: injectAtMostOnce 阶段 1 持锁的证据)
+// 验证 injectAtMostOnce 阶段 1 (pending 写) 也被锁保护, 而不是仅阶段 3 的 final 回写.
+// 若阶段 1 无锁, 与 reset 并发时会撞车:
+// reset 读 → inject 阶段 1 读 → reset 写 → inject 阶段 1 写 pending → reset 的 delete 被 pending 覆盖.
+//
+// 关键判据: 外部持锁期间, 墓碑账本文件不应出现 pending 条目 —— 阶段 1 的 write 必须被阻塞.
+// 只测 goroutine 是否完成不够: 阶段 3 也持锁, 单看完成/阻塞会误把"阶段 3 挡住了"当成"阶段 1 挡住了".
+//
+// 【反例】把 injectAtMostOnce 阶段 1 的 acquireTombstoneLock 去掉 (仅留 mutex 或全去), 阶段 1 的
+// pending 写会在外部持锁窗口内落盘, 本测试即报红.
+func TestInjectAtMostOnceBlocksOnLockPhase1(t *testing.T) {
+	root := mkTombRoot(t)
+	if err := os.MkdirAll(tombstonesDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	release, err := acquireTombstoneLock(root, "inject-block")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// inject 用 slow callback: 若阶段 1 无锁, 无锁写 pending → 进入 inject 长睡 → 我们能在此窗口
+	// 观察到 pending 文件. 若阶段 1 有锁, 写 pending 被阻塞, 观察窗口内墓碑文件不存在.
+	injectStarted := make(chan struct{})
+	injectRelease := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		_, _, _ = injectAtMostOnce(root, "inject-block", "resume:0", func() error {
+			close(injectStarted)
+			<-injectRelease
+			return nil
+		})
+		close(done)
+	}()
+	// 在外部持锁 100ms 期间反复观察: 墓碑账本文件不应出现 (阶段 1 被锁阻塞在 pending 写之前).
+	deadline := time.Now().Add(100 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if _, statErr := os.Stat(tombstonePath(root, "inject-block")); statErr == nil {
+			t.Fatal("外部持锁期间墓碑账本不该被 inject 阶段 1 写入 (说明阶段 1 无锁: 已越过锁写了 pending)")
+		}
+		// inject callback 也不该被触发 (阶段 1 未过, 阶段 2 就不会开始).
+		select {
+		case <-injectStarted:
+			t.Fatal("外部持锁期间 inject callback 不该被触发 (说明阶段 1 无锁: 已越过锁进入 inject 长回调)")
+		default:
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	release()
+	// 释锁后阶段 1 应能推进, 进入 inject callback.
+	select {
+	case <-injectStarted:
+		// pass
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("释锁后阶段 1 应能推进到 inject callback, 500ms 内未见触发")
+	}
+	// 让 inject 回归, 收尾 goroutine.
+	close(injectRelease)
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("inject callback 返回后 injectAtMostOnce 应完成, 500ms 内未见退出")
+	}
+}
+
+// TestAcquireTombstoneLockExcludesConcurrent (R2 类闭合: 锁本身的互斥语义)
+// 直接验证锁的 exclusive 语义: 同一 task 的第一次 acquire 拿到锁后, 第二次并发 acquire 必须等待
+// 直到第一次 release. 是"tmp+os.Link+staleEventLock+PID 校验"组合正确性的最小验证.
+//
+// 【反例】任何一处组件 (Link 变 O_EXCL / stale 判据放宽 / release 不核 PID) 回退, 都会打破
+// exclusive 语义 → 本测试会看到并发 acquire 立即成功而非等待.
+func TestAcquireTombstoneLockExcludesConcurrent(t *testing.T) {
+	root := mkTombRoot(t)
+	if err := os.MkdirAll(tombstonesDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	release1, err := acquireTombstoneLock(root, "lock-excl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 第二次 acquire 应等待: 用一个短窗口内的并发调用观察其是否立即成功.
+	acquired2 := make(chan time.Time, 1)
+	go func() {
+		release2, err := acquireTombstoneLock(root, "lock-excl")
+		if err != nil {
+			return
+		}
+		acquired2 <- time.Now()
+		release2()
+	}()
+	// 持锁一小段时间, 观察并发 acquire 是否被阻塞.
+	holdUntil := time.Now().Add(80 * time.Millisecond)
+	select {
+	case at := <-acquired2:
+		t.Fatalf("第二次 acquire 不应在持锁期间成功, got at=%v (hold until %v)", at, holdUntil)
+	case <-time.After(60 * time.Millisecond):
+		// 期望: 60ms 内第二次 acquire 未成功.
+	}
+	release1()
+	// 释锁后, 第二次 acquire 应能在自旋周期 (5ms) 内成功.
+	select {
+	case <-acquired2:
+		// pass
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("释锁后第二次 acquire 应能在自旋周期内拿到, 500ms 内未见完成")
+	}
+}
+
+// TestReleaseTombstoneLockChecksPID (R2 类闭合: release 侧 PID 校验)
+// 若 release 无脑 Remove, 系统睡眠/挂起跨 5s TTL 唤醒后, 原持有者会误删强夺者的新锁 → 双持锁.
+// 手工制造"锁文件属于另一 PID"的场景, 断言 releaseTombstoneLock 不删.
+func TestReleaseTombstoneLockChecksPID(t *testing.T) {
+	root := mkTombRoot(t)
+	if err := os.MkdirAll(tombstonesDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := tombstoneLockPath(root, "pid-check")
+	// 造一份属于"其他 PID"的锁文件.
+	info, _ := json.Marshal(lockInfo{PID: os.Getpid() + 99999, At: time.Now().Format(time.RFC3339)})
+	if err := os.WriteFile(path, info, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	releaseTombstoneLock(path)
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		t.Fatal("PID 不匹配的锁不应被删除, 会误删强夺者新锁")
+	}
+	_ = os.Remove(path)
+}
+
+// ---------- Round-3 修复回红反例 (P1-1 emit 必须先于 saveTask) ----------
+
+// TestReconcileSkippedHeldEmitsBeforeSave (R3 P1-1 核心反例)
+// 证伪场景直接落地: reconcileCrossChains 的 skipped→held 分支若 saveTask 先于 emitTaskEvent,
+// 崩溃/IO 错落在两者之间时 saveTask 已落盘 held → 孤儿谓词 status==done 永久排除该卡 →
+// skipped 分支永不重入 → evHeld 披露事件永久丢失且无补发路径, 账本呈现 done→held 零事件跳变.
+// 正是本轮宣称消灭的"零披露"缺陷类——与 runTask resume 侧 (runner.go:688-691 emit 先 save 后,
+// 崩溃可自愈) 顺序相反的 R2 遗留.
+//
+// 【为什么用 saveTask 失败代理崩溃】真 kill -9 在单进程测试中无法复现; 从"evHeld 事件生死"
+// 视角, "save 成功但 emit 前崩溃" 与 "save 失败 continue 掉 emit" 造成的账本结果完全等价——
+// 都是"卡态可能变但 evHeld 永久缺失". 用 taskPath 建成目录让 atomicWrite 的 rename 失败,
+// 精确复现 R2 顺序下的账本静默.
+//
+// 【反例】把 runner.go 附近的 emitTaskEvent 挪回 saveTask 之后 (回到 R2 顺序), saveTask 失败
+// continue 直接吞掉 emit, 事件账本无 evHeld → 本测试断言报红.
+func TestReconcileSkippedHeldEmitsBeforeSave(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "R3 P1-1 held emit-first", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-r3-held-1"
+	a.Status = statusDone
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 预置 reconcile:cross final 墓碑——skipped 分支必命中 (final 挡住 inject).
+	_, _, _ = injectAtMostOnce(root, a.ID, reconcileCrossKind(), func() error { return nil })
+	preJ, _, _ := readTombstoneJournal(root, a.ID)
+	if preJ.Entries[reconcileCrossKind()].Phase != tombstonePhaseFinal {
+		t.Fatalf("前置应 reconcile:cross final, got %+v", preJ.Entries[reconcileCrossKind()])
+	}
+	// 把任务文件替换为目录, 让 saveTask 的 atomicWrite rename 失败——精确代理"崩溃在 save 后 emit 前".
+	tp := taskPath(root, a.ID)
+	if err := os.Remove(tp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// 触发 reconcile: skipped=true → 进 held 分支 → 新顺序应先 emit, 后 saveTask (失败 continue).
+	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+	// 关键断言: 即便 saveTask 失败, evHeld 已在事件账本. 若代码回退 R2 顺序 (save 先 emit 后),
+	// save 失败 continue 掉 emit 调用, 账本无 evHeld → 断言直接红.
+	events := readAllEventsRaw(t, root, a.ID)
+	sawHeld := false
+	for _, ev := range events {
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			sawHeld = true
+			if reason, _ := ev.Detail["reason"].(string); reason != "reconcile_cross_tombstone_exhausted" {
+				t.Fatalf("held.reason 应 reconcile_cross_tombstone_exhausted, got %q", reason)
+			}
+			if kind, _ := ev.Detail["kind"].(string); kind != reconcileCrossKind() {
+				t.Fatalf("held.kind 应 %s, got %q", reconcileCrossKind(), kind)
+			}
+		}
+	}
+	if !sawHeld {
+		t.Fatalf("emit 必须先于 saveTask, 使 save 失败也不吞事件, got 事件序列=%v", eventTypes(events))
+	}
+}
+
+// TestReconcileFailedEmitsBeforeSave (R3 P1-1 类闭合反例: reconcile 内 injectAtMostOnce
+// 闭包侧的 failed 分支同样要求 emit 先于 save; 闭合审查 P2-2 提示的 pre-existing 同源缺陷)
+// 若闭包内 save 先于 emit, 崩溃/IO 错落两者之间时——pending 已 +1, saveTask(failed) 已落盘,
+// 但 evFailed 永久丢失 (孤儿谓词 status==done 永久排除已 failed 卡, 无补发路径). 与本轮 P1-1
+// held 分支同构; 一并按类闭合. 用 saveTask 失败代理"崩溃在 save 后 emit 前".
+//
+// 【反例】把 runner.go 闭包内 emit 挪回 saveTask 之后 (R2 顺序), saveTask 失败 return err 前
+// emit 没机会调用, 事件账本无 evFailed → 本测试断言报红.
+func TestReconcileFailedEmitsBeforeSave(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	a := newTask(root, cfg, typeCrossCheck, "R3 P1-1 failed emit-first", "/tmp", []string{"p"}, 5)
+	a.XRole = "A"
+	a.XKey = "xkey-r3-fail-1"
+	a.Status = statusDone
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	// 无前置墓碑 → 闭包会真的走 inject: 修 t.Status=failed → emit evFailed → saveTask 失败 return err.
+	tp := taskPath(root, a.ID)
+	if err := os.Remove(tp); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(tp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+	// 关键断言: 即便 saveTask 失败, evFailed 已在事件账本 (证明 emit 先于 save 落).
+	events := readAllEventsRaw(t, root, a.ID)
+	sawFailed := false
+	for _, ev := range events {
+		if ev.Type == evFailed {
+			if r, _ := ev.Detail["reason"].(string); r == "cross_chain_orphan" {
+				sawFailed = true
+			}
+		}
+	}
+	if !sawFailed {
+		t.Fatalf("emit 必须先于 saveTask, 使 save 失败也不吞 evFailed, got 事件序列=%v", eventTypes(events))
+	}
+	// 二次防御: pending 已 +1 (证明 inject 被真的调过, 不是被墓碑挡在门外).
+	// saveTask 失败 → inject 返回 err → 阶段 3 未触发 → 墓碑停 pending(1), 未落 final.
+	j, _, err := readTombstoneJournal(root, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := j.Entries[reconcileCrossKind()]
+	if e.Phase != tombstonePhasePending || e.Attempt != 1 {
+		t.Fatalf("saveTask 失败应保留 pending 不落 final, got %+v", e)
+	}
+}
+
+// TestResumeHeldSourceOrder (R3 P1-1 类闭合: resume 侧源码顺序静态守卫)
+// resume 侧 (runner.go:685-691) 从 R1 起就是正确顺序 (emit 先, save 后); 单元/集成测试要跑到
+// 那段分支需要真起 fakeClaude+完整 runTask 环境, 成本高且脆弱. 更稳的守卫是: 读源码文件, 断言
+// resume held 分支里 emitTaskEvent 出现在 return saveTask 之前——保证未来任何一次重构不留神
+// 反转顺序会被本测试即刻抓住.
+//
+// 【反例】把 runner.go resume 侧的 emitTaskEvent 挪到 return saveTask 之后, 或者删掉 emit 直接
+// return saveTask, 本测试立即报红.
+func TestResumeHeldSourceOrder(t *testing.T) {
+	data, err := os.ReadFile("runner.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(data)
+	// resume 侧 held 分支的 emit actor "runner:tombstone" 全仓唯一 (grep 已验证):
+	// reconcile 侧用 "runner:reconcile-tombstone", 不冲突.
+	anchor := `evHeld, "runner:tombstone"`
+	idx := strings.Index(src, anchor)
+	if idx < 0 {
+		t.Fatalf("找不到 resume 侧 held emit 锚点 %q", anchor)
+	}
+	// 从 emit 之后往后扫首个 `return saveTask(root, t)` —— 属于同一段代码.
+	tail := src[idx:]
+	saveIdx := strings.Index(tail, "return saveTask(root, t)")
+	if saveIdx < 0 {
+		t.Fatalf("resume 侧 held emit 之后应有 return saveTask(root, t)")
+	}
+	// 关键断言: emit 与 return saveTask 之间不应再有 saveTask 调用——防"emit 在两次 save 之间"
+	// 的奇葩变体; 更本质是防 emit 被挪到 saveTask 之后 (那样 saveIdx 会指向 emit 之前另一处 save).
+	between := tail[:saveIdx]
+	if strings.Contains(between, "saveTask(root, t)") {
+		t.Fatalf("resume 侧 held 分支 emit 与 return saveTask 之间不应再有 saveTask, got between=%q", between)
+	}
+	// 二次防御: emit 锚点之后 300 字符内应命中 return saveTask —— 若代码回退把 emit 挪去分支
+	// 尾部 (emit 与 return saveTask 距离拉远/顺序颠倒), 此距离会显著变大或找不到.
+	if saveIdx > 300 {
+		t.Fatalf("resume 侧 held emit 与 return saveTask 距离异常 (%d 字符), 疑似顺序被挪, got tail head=%q", saveIdx, tail[:min(300, len(tail))])
 	}
 }

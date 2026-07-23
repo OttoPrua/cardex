@@ -335,6 +335,27 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
   时（final 已在 / bound 耗尽），把卡从 `done` 升级到 `held` 并 emit
   `evHeld(reason=reconcile_cross_tombstone_exhausted, actor=runner:reconcile-tombstone)`——不再让单腿
   `done` 卡永久冒充可采信结果，也不再靠每轮 drain 的 stderr 无限刷屏当披露。
+- **每任务墓碑锁 + 两阶段临界区（Round-2 追加）**：Round-1 的 cli 明示重置让 CLI 与 runner tick 首次
+  并发读-改-写同一墓碑账本。无锁下 `injectAtMostOnce` 的 final 回写会静默复活被并发 `resetTombstoneKind`
+  删除的条目——`retry` 承诺的"清墓碑重新起 bound=2 自动再裁决"被作废。根修：
+  - `sync.Mutex`（同进程 goroutine）+ `tombstones/<id>.json.lock`（跨进程；tmp+`os.Link` 原子挂名，TTL 5s，
+    stale 判据与 release 侧 PID 校验都复用 `staleEventLock`/`releaseEventLock` 同源实现）。
+  - `injectAtMostOnce` 两阶段：阶段 1 持锁读账本 + 写 pending → 释锁；阶段 2 无锁跑 `inject`
+    （resume 侧的 LLM 子进程单次可达数分钟，持锁横穿会被 stale 强夺）；阶段 3 再取锁认领并升级 final。
+  - **entry-gone / nonce 二层防御**：阶段 3 再读账本时若条目已被并发 `reset` 删掉，或 nonce 已不是我们写的
+    pending，一律放弃 final 重建——即便锁语义未来回归，final 也不会静默复活 reset。
+  - **类闭合**：`resetTombstoneKind`（`runTask` fresh-entry / cli `retry` / cli `release` 三处）与
+    `archiveTaskTombstones`（`clean` / `postComplete` 两条 archive 路径）都走同一把锁；`archive` 侧的
+    裸 `os.Rename` 与 `injectAtMostOnce` 阶段 3 竞态会造出"归档文件 + 只剩 final 一条的活动墓碑"骗审现场。
+- **emit 必须先于 saveTask（Round-3 追加）**：`reconcileCrossChains` 的 skipped→held 分支与
+  `injectAtMostOnce` 闭包的 failed 分支旧顺序（save 先 emit 后）在崩溃/IO 错落两者之间时——卡已落盘
+  `held/failed`，孤儿谓词 `status==done` 永久排除该卡，`evHeld/evFailed` 永久丢失且无补发路径，账本呈现
+  `done→held/failed` 零事件跳变，正是墓碑要消灭的"零披露"缺陷类。修复：把 emit 挪到 `saveTask` 之前，与
+  `runTask` resume 侧顺序对齐——崩溃落中间时盘上仍 `done`，下轮 tick 重入孤儿谓词，再 emit+save 自愈收敛；
+  代价至多一条重复事件（`bound=2` 挡住无限重复），优于永久静默。事件重复优于事件永久缺失，是墓碑存在的
+  第一性理由；`TestReconcileSkippedHeldEmitsBeforeSave` / `TestReconcileFailedEmitsBeforeSave` 用
+  `saveTask` 失败代理"崩溃在 save 后 emit 前"，任一处顺序回退即报红；`TestResumeHeldSourceOrder` 用源码
+  静态守卫锁死 resume 侧同一契约防未来重构反转。
 - **随卡归档**：墓碑账本随 `archiveTask` 移到 `archive/tombstones/<id>.json`，审计可看"这张卡的每次注入都尝试了几次"。
 
 数据模型（单 JSON 而非 JSONL）：`{"version": 1, "entries": {"resume:0": {kind, attempt, phase, nonce, ts}, "reconcile:cross": {...}}}`

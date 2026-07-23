@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -155,16 +156,42 @@ func writeTombstoneJournal(root, id string, j tombstoneJournal) error {
 // 已发生"→bound 保护形同虚设,同一注入无限重跑。pending 先落盘,即使 inject 未开始就崩溃,重启后账本
 // 也知道"曾试过一次",bound 计数是诚实的。
 //
-// 【为什么 final 写入前要再读一次账本】
-// 防御性:虽然本工程单 lock 单进程写墓碑,但如果未来放宽并发(如 cli 命令与 tick 同时改同一张卡的
-// 不同 kind),不重读会把并发写入的其他 kind 覆盖成旧值。重读只多一次 read,防坑成本低。
+// 【为什么临界区只覆盖账本读写、不覆盖 inject 长回调】
+// resume 侧 inject 会调 invokeClaude/invokeCodex/invokeRemoteClaude 派 LLM 子进程,单次可达数分钟。
+// 若持墓碑锁横穿整个 inject, 同卡 CLI 侧的 resetTombstoneKind(retry/release)会被卡到锁 TTL(5s)超
+// 后被 stale 强夺,得不偿失。分两阶段:pending 写完即释锁,inject 无锁跑;final 前再取锁重读账本。
+//
+// 【为什么 final 回写要"entry-gone/nonce-mismatch 即放弃"】
+// CG-4 R2 P1-1 审查证伪场景:CLI 侧 resetTombstoneKind(main.go retry/release)与 tick 的
+// injectAtMostOnce 首次并发读-改-写同一墓碑账本. 无该防御下,自动化 ops 监听 saveTask(failed) 即
+// claudego retry, reset 落在 pending 与 final 之间(inject 内 emitTaskEvent 取事件锁+fsync 隔出数十
+// ms 窗口), final 回写重读发现条目已被并发 reset 删除后会走"attempt<newAttempt 分支以 attempt=
+// newAttempt 重建条目",把 reset 静默覆盖——retry 承诺的"清墓碑重新起 bound=2 自动再裁决"被作废.
+// 视作并发 reset 胜出=不重建 final:业务已完成一次注入, bound 从零起算, 这才是 retry 语义的正确终态.
+// nonce 校验是同一防御的第二重: 若 reset 后另一次 injectAtMostOnce 又写了 pending, nonce 与我们本次
+// 不同, 我们的 final 不能覆盖别人的 pending(会丢别人的记录).
+//
+// 【为什么两层锁: sync.Mutex + tmp+os.Link 文件锁】
+// 与 events.go acquireEventLock 同源同构缺陷: 文件锁内容里带 PID, 同进程 goroutine pid 相同,
+// 不上 mutex 则后来者会读到"自己进程的 PID"→ 误以为是自己持锁 → 破坏"每任务墓碑严格串行"契约.
+// 组合: sync.Mutex 挡同进程 goroutine + 文件锁挡跨进程 = 每任务墓碑串行的完整闭环.
 func injectAtMostOnce(root, id, kind string, inject func() error) (skipped, corrupted bool, err error) {
 	if id == "" || kind == "" {
 		// 空 id/kind 是调用侧兜底不该出现,不阻断业务。
 		return false, false, nil
 	}
+	// 阶段 1: 临界区读账本 + 决策 + 写 pending. 锁只覆盖账本读写窗口, 不覆盖 inject 长回调.
+	mu := tombstoneLockForTask(id)
+	mu.Lock()
+	release, lockErr := acquireTombstoneLock(root, id)
+	if lockErr != nil {
+		mu.Unlock()
+		return false, false, lockErr
+	}
 	journal, corrupted, err := readTombstoneJournal(root, id)
 	if err != nil {
+		release()
+		mu.Unlock()
 		return false, false, err
 	}
 	if corrupted {
@@ -172,45 +199,71 @@ func injectAtMostOnce(root, id, kind string, inject func() error) (skipped, corr
 	}
 	if entry, ok := journal.Entries[kind]; ok {
 		if entry.Phase == tombstonePhaseFinal {
+			release()
+			mu.Unlock()
 			return true, corrupted, nil
 		}
 		if entry.Attempt >= tombstoneMaxAttempts {
 			fmt.Fprintf(os.Stderr, "警告: 墓碑至多一次已耗尽 %s(kind=%s,attempts=%d),不再注入\n", id, kind, entry.Attempt)
+			release()
+			mu.Unlock()
 			return true, corrupted, nil
 		}
 	}
 	prev := journal.Entries[kind]
 	newAttempt := prev.Attempt + 1
 	now := time.Now()
+	pendingNonce := now.UnixNano()
 	journal.Entries[kind] = Tombstone{
 		Kind:    kind,
 		Attempt: newAttempt,
 		Phase:   tombstonePhasePending,
-		Nonce:   now.UnixNano(),
+		Nonce:   pendingNonce,
 		TS:      now.Format(time.RFC3339Nano),
 	}
-	if err := writeTombstoneJournal(root, id, journal); err != nil {
-		return false, corrupted, err
+	if writeErr := writeTombstoneJournal(root, id, journal); writeErr != nil {
+		release()
+		mu.Unlock()
+		return false, corrupted, writeErr
 	}
+	release()
+	mu.Unlock()
+
+	// 阶段 2: inject 无锁跑. 若 CLI 侧 resetTombstoneKind 在此窗口执行,它会拿到锁、清掉本条 kind
+	// 条目——阶段 3 重读若发现条目已不存在或 nonce 不匹配,则视作 reset 胜出, 放弃 final 重建.
 	if injErr := inject(); injErr != nil {
 		return false, corrupted, injErr
 	}
-	// 再读一遍,只改本 kind,不覆盖并发写入的其他 kind。详见函数头【为什么 final 写入前要再读一次账本】。
+
+	// 阶段 3: 再取锁, 认领并升级为 final.
+	mu.Lock()
+	defer mu.Unlock()
+	release2, lockErr := acquireTombstoneLock(root, id)
+	if lockErr != nil {
+		return false, corrupted, lockErr
+	}
+	defer release2()
 	journal, _, err = readTombstoneJournal(root, id)
 	if err != nil {
 		return false, corrupted, err
 	}
-	final := journal.Entries[kind]
-	final.Kind = kind
-	if final.Attempt < newAttempt {
-		final.Attempt = newAttempt
+	existing, exists := journal.Entries[kind]
+	if !exists {
+		// 并发 reset 已删除本 kind 条目——reset 胜出. 详见函数头【为什么 final 回写要"entry-gone"即放弃】.
+		return false, corrupted, nil
 	}
-	final.Phase = tombstonePhaseFinal
-	final.Nonce = time.Now().UnixNano()
-	final.TS = time.Now().Format(time.RFC3339Nano)
-	journal.Entries[kind] = final
-	if err := writeTombstoneJournal(root, id, journal); err != nil {
-		return false, corrupted, err
+	if existing.Nonce != pendingNonce {
+		// 别人已推进本 kind 到新一轮 attempt (reset+新 injectAtMostOnce 或跨进程后来者):
+		// 不覆盖他们的记录, 我们的成功由他们那一轮的 pending/final 承接.
+		return false, corrupted, nil
+	}
+	// 认领: 本 kind 条目正是我们写的 pending, 升级为 final.
+	existing.Phase = tombstonePhaseFinal
+	existing.Nonce = time.Now().UnixNano()
+	existing.TS = time.Now().Format(time.RFC3339Nano)
+	journal.Entries[kind] = existing
+	if writeErr := writeTombstoneJournal(root, id, journal); writeErr != nil {
+		return false, corrupted, writeErr
 	}
 	return false, corrupted, nil
 }
@@ -219,10 +272,23 @@ func injectAtMostOnce(root, id, kind string, inject func() error) (skipped, corr
 // 多次重派(如反复撞限额)每次都要在新一轮 bound 上重新计数;详见文件头【为什么 reset-at-entry ...】。
 // 其他 kind 不受影响(reconcile:cross 与 resume 无关,不该被误清)。
 // 若清后账本为空则删除整个文件,避免空文件残留触发下次读的 corruption 误判(空字节 json.Unmarshal 会失败)。
+//
+// 【为什么必须与 injectAtMostOnce 走同一把锁】
+// 详见 injectAtMostOnce 函数头【为什么 final 回写要"entry-gone/nonce-mismatch 即放弃"】.
+// 加锁与 final 回写侧的 entry-gone 判据形成防御纵深: 锁保证 reset 与 pending/final 写不交错,
+// nonce 判据保证即便锁语义未来回归, final 也不会静默复活 reset.
 func resetTombstoneKind(root, id, kind string) error {
 	if id == "" || kind == "" {
 		return nil
 	}
+	mu := tombstoneLockForTask(id)
+	mu.Lock()
+	defer mu.Unlock()
+	release, err := acquireTombstoneLock(root, id)
+	if err != nil {
+		return err
+	}
+	defer release()
 	journal, _, err := readTombstoneJournal(root, id)
 	if err != nil {
 		return err
@@ -243,8 +309,29 @@ func resetTombstoneKind(root, id, kind string) error {
 // archiveTaskTombstones 随 archiveTask 把墓碑账本移到 archive/tombstones/。事件账本已在 archiveTaskEvents
 // 做同样的事——两者形成"卡+事件+墓碑"三件套的完整归档,让审计后能拿到"这张卡从生到死每一次注入都试过几次"的全景。
 // 文件不存在(旧卡从未触发过注入)不算错。
+//
+// 【为什么必须抢墓碑锁】与 archiveTaskEvents 同源同类缺陷: 不抢锁的裸 os.Rename 与并发
+// injectAtMostOnce 竞态——injectAtMostOnce 阶段 3 已重读账本、准备写 final; archive 恰好在此时把
+// src 移去 archived; 阶段 3 的 writeTombstoneJournal 会新建一个只有 final 一条的活动墓碑, 与归档文件
+// 并列存在, 后续读走 tombstonePath 会看到"注入尝试历史被吞、只剩一条 final"的骗审现场. 加锁保证
+// archive 与 injectAtMostOnce/resetTombstoneKind 严格串行.
 func archiveTaskTombstones(root, id string) error {
 	src := tombstonePath(root, id)
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	mu := tombstoneLockForTask(id)
+	mu.Lock()
+	defer mu.Unlock()
+	release, err := acquireTombstoneLock(root, id)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// 抢锁期间 src 可能已被其他归档流搬走(clean 与 postComplete 并发 archive 都走这里).
 	if _, err := os.Stat(src); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -255,4 +342,90 @@ func archiveTaskTombstones(root, id string) error {
 		return err
 	}
 	return os.Rename(src, archivedTombstonePath(root, id))
+}
+
+// tombstoneMuByTask 是每任务的进程内互斥锁——挡同进程内 goroutine 的并发 injectAtMostOnce/
+// resetTombstoneKind/archiveTaskTombstones. 与 events.lockForTask 严格同构:
+// 【为什么进程内锁不可省】文件锁内容里带 PID, 同进程 goroutine pid 相同, 若不上 mutex, 后来者
+// 会读到"自己进程的 PID"→ 误以为是自己持锁 → 破坏"每任务墓碑严格串行"契约. 组合 sync.Mutex +
+// tmp+os.Link 文件锁 = 每任务墓碑串行的完整闭环.
+var tombstoneMuByTask sync.Map // map[string]*sync.Mutex
+
+func tombstoneLockForTask(taskID string) *sync.Mutex {
+	if v, ok := tombstoneMuByTask.Load(taskID); ok {
+		return v.(*sync.Mutex)
+	}
+	mu := &sync.Mutex{}
+	actual, _ := tombstoneMuByTask.LoadOrStore(taskID, mu)
+	return actual.(*sync.Mutex)
+}
+
+// tombstoneLockPath 每任务一把锁——不用全局锁是因为不同任务的写入无冲突, 全局锁会把所有 CLI/tick
+// 串行化, 成本不值.
+func tombstoneLockPath(root, taskID string) string {
+	return tombstonePath(root, taskID) + ".lock"
+}
+
+// acquireTombstoneLock 抢占单任务墓碑写锁——语义与 events.go:acquireEventLock 严格同源:
+// tmp 先写完 lockInfo → os.Link 原子挂名 → 若目标已在则按 staleEventLock(mtime>TTL 或 PID 已死)
+// 判定强夺; 强夺用 os.Rename 独占, 消除"两方各以为夺权成功"的双持锁.
+//
+// 【为什么必须存在】详见 injectAtMostOnce 函数头【为什么 final 回写要"entry-gone/nonce-mismatch
+// 即放弃"】: CG-4 R1 补的 CLI 侧 resetTombstoneKind 让 CLI 与 runner tick 首次并发读-改-写同一
+// 墓碑账本, 无锁下 final 回写会静默复活被并发 reset 删除的条目, 作废本轮承诺的"retry 清墓碑重新起
+// bound=2 自动再裁决"契约. 加锁串行化两者是根修.
+//
+// 【为什么复用 staleEventLock 判据】墓碑锁与事件锁的 stale 语义严格同构: 都是 per-task 文件锁,
+// 都用 lockInfo 结构, TTL 都为 5s, 强夺允收边界都是"确定持有者已死"或"锁真的过期". 复用避免
+// 重复实现同类判据造成语义漂移.
+func acquireTombstoneLock(root, taskID string) (func(), error) {
+	if err := os.MkdirAll(tombstonesDir(root), 0o755); err != nil {
+		return nil, err
+	}
+	path := tombstoneLockPath(root, taskID)
+	for i := 0; i < 1000; i++ {
+		tmp := fmt.Sprintf("%s.acq-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+		info, _ := json.Marshal(lockInfo{PID: os.Getpid(), At: time.Now().Format(time.RFC3339)})
+		if err := os.WriteFile(tmp, info, 0o644); err != nil {
+			return nil, err
+		}
+		linkErr := os.Link(tmp, path)
+		_ = os.Remove(tmp)
+		if linkErr == nil {
+			return func() { releaseTombstoneLock(path) }, nil
+		}
+		if !os.IsExist(linkErr) {
+			return nil, linkErr
+		}
+		// 复用 events 锁的 stale 判据: 内容不可解析且 mtime<=TTL 一律等待不强夺, 只在(可解析&&!alive)
+		// 或 mtime>TTL 判 stale. 保持防御纵深, 消除"空文件窗口→立即强夺"的 bootstrap 竞态.
+		if staleEventLock(path, 5*time.Second) {
+			stale := fmt.Sprintf("%s.stale-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+			if renameErr := os.Rename(path, stale); renameErr == nil {
+				_ = os.Remove(stale)
+			}
+			continue
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return nil, fmt.Errorf("墓碑写锁抢占超时: %s", path)
+}
+
+// releaseTombstoneLock 只删属于本进程的锁文件: 核 PID 匹配才 Remove.
+// 【为什么核 PID】与 releaseEventLock 同源: staleEventLock 对 mtime>TTL 的锁判 stale 强夺, 系统睡眠/
+// 挂起跨 TTL 唤醒后原持有者的 defer release 无条件 Remove 会误删强夺者刚建的新锁, 让第三方进入临界
+// 区连环撞. 读文件失败/解析失败/PID 不匹配都不删, 让下一轮 staleEventLock 兜底.
+func releaseTombstoneLock(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var li lockInfo
+	if json.Unmarshal(data, &li) != nil {
+		return
+	}
+	if li.PID != os.Getpid() {
+		return
+	}
+	_ = os.Remove(path)
 }

@@ -313,16 +313,28 @@ the "invisible" hang axis that `harvest`'s early reap (visible-completion axis) 
 - **Heartbeat**: whether the task log `~/.claudego/logs/<id>.log` file size is growing (only crosses
   step boundaries — within a single step nothing appends).
 
-Verdict (CG-5 R2 revision, signals must combine): `pgSeenAlive && !alive && dead-since ≥ 60s`
-(`patrolPGGrace`) triggers `pgDeadTooLong` alone; OR `procgroup dead && log-no-grow ≥ patrolHeartbeatTimeout
-(default 70min)` triggers as a two-signal combo. **Heartbeat is no longer an independent trigger** —
-runner.go collects stdout into an in-memory buffer, `logBlock` only appends after `invoke` returns,
-so task logs have **zero growth during a single step**; if heartbeat triggered alone, `step_timeout_min`'s
-default 60 minutes of an opus heavy card would be permanently canceled-and-archived under normal load.
-"Alive but silent" is delegated to `invoke`'s built-in `WithTimeout(step_timeout_min)`; patrol no longer
-touches that axis. Procgroup liveness remains the **authorization credential**: adversarial injection
-(script fakes heartbeat while the real executor is dead) is still caught by the combo verdict. Startup
-protection: `pgSeenAlive` gate excludes false positives when `invoke` hasn't reached `cmd.Start` yet.
+Verdict (CG-5 R2.2 revision, single strict trigger face): **only** `pgDeadTooLong = pgSeenAlive && !alive
+&& dead-since ≥ patrolPGGrace` (default 60s) — patrol only handles "executor procgroup is dead-too-long"
+shutdown-hangs. Heartbeat (log-file-size stale ≥ `patrolHeartbeatTimeout`) is **no longer an independent
+trigger**; it only upgrades the reason field from `procgroup_dead` to `procgroup_dead_and_no_heartbeat`
+once `pgDeadTooLong` already holds. Rationale: runner.go collects stdout into an in-memory buffer,
+`logBlock` only appends after `invoke` returns, so task logs have **zero growth during a single step**;
+`step_timeout_min`'s default 60min covers healthy opus heavy cards running 30+ min single-steps that
+would be permanently canceled-and-archived under any heartbeat-only trigger. R2.1 used
+"heartbeat-stale + `pgDead` (raw)" as an independent trigger channel, which could **bypass pgGrace**
+and fire early (in step_timeout≥70min configurations, during the WaitDelay 10s window after
+step_timeout kill or the invoke-swap window between steps). R2.2 narrows the trigger face to
+`pgDeadTooLong` alone to eliminate this corridor. "Alive but silent" is delegated to `invoke`'s
+built-in `WithTimeout(step_timeout_min)`; patrol no longer touches that axis. Procgroup liveness
+remains the **sole authorization credential**: adversarial injection (script fakes heartbeat while
+the real executor is dead) is still caught by `pgDeadTooLong`. Startup protection: `pgSeenAlive`
+gate excludes false positives when `invoke` hasn't reached `cmd.Start` yet.
+
+`patrolHeartbeatTimeout` scales with `cfg.StepTimeoutMin` — `tick` entry sets it to
+`max(70min, step_timeout_min + 10min)` (default 60min → 70min; production has run at ~150min
+step_timeout → 160min). A hardcoded 70min would misclassify long-step tasks as `no_heartbeat`
+right after they die and cross pgGrace, polluting the audit view. After scaling, the threshold
+is always ≥ step_timeout + 10min.
 
 **Patrol compatibility for review-sync in postComplete** (CG-5 R2 P1-1 addendum): `runReviewSync` runs
 inside `postComplete` while the task is still in `activeIDs`, so the sync pid **must** register into

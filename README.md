@@ -326,13 +326,21 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 - **进程组存活**：`taskPG` 登记表 + `processAlive(pid)` 双查（伪存活/死 pid 残留不骗过巡逻）。
 - **心跳**：任务日志 `~/.claudego/logs/<id>.log` 文件 size 是否增长（多步任务的步骤边界才有增长）。
 
-判据（CG-5 R2 修订，两信号必须组合）：`pgSeenAlive && !alive && dead-since ≥ 60s`（`patrolPGGrace`）即
-`pgDeadTooLong` 单独触发；或 `procgroup 已死透 && 日志超 patrolHeartbeatTimeout(默认 70 分钟) 无增长`
-两信号叠加触发。**心跳不再作独立触发**——runner.go 里 stdout 收进内存 buffer，`logBlock` 只在 `invoke`
-返回后追加，单步执行期任务日志**天然零增长**，`step_timeout_min` 默认 60 分钟里 opus 重卡跑 30+ 分钟
-的健康态若被心跳独立触发就永久取消归档。"活但静默"场景交给 `invoke` 自带的 `WithTimeout(step_timeout_min)`
-兜底，巡逻不再插手。procgroup 存活是**授权凭证**：反例注入（脚本刷心跳、真实执行器已死）仍被两信号叠加
-判据揪出。启动窗口保护：`pgSeenAlive` 前置守卫排除"任务刚进 activeIDs 但 invoke 尚未 register"的假阳性。
+判据（CG-5 R2.2 修订，触发面严格单一条件）：**只**看 `pgDeadTooLong = pgSeenAlive && !alive && dead-since ≥
+`patrolPGGrace`（默认 60s）——`patrol` 只处理"执行器进程组已死透且死超 pgGrace"的收尾僵态。心跳
+（日志文件 size 静默 ≥ `patrolHeartbeatTimeout`）**不再作独立触发**，只在 `pgDeadTooLong` 成立时用于把事件
+从 `procgroup_dead` 升级为 `procgroup_dead_and_no_heartbeat` reason。原因：runner.go 里 stdout 收进内存
+buffer，`logBlock` 只在 `invoke` 返回后追加，单步执行期任务日志**天然零增长**；`step_timeout_min` 默认 60min
+里 opus 重卡跑单步 30+ 分钟是常态，若心跳独立触发会永久取消归档健康重卡。R2.1 曾把"心跳超阈值 + `pgDead`
+(raw)"作为独立触发通道，可绕过 pgGrace 保护窗提前开火（step_timeout≥70min 配置下 step_timeout 击杀后
+WaitDelay 10s 窗口或步间 invoke 切换窗口）——R2.2 收紧到 `pgDeadTooLong` 单一触发面消灭该走廊。"活但静默"
+场景交给 `invoke` 自带的 `WithTimeout(step_timeout_min)` 兜底。procgroup 存活是**唯一授权凭证**：反例注入
+（脚本刷心跳但真实执行器已死）仍被 `pgDeadTooLong` 揪出。启动窗口保护：`pgSeenAlive` 前置守卫排除"任务
+刚进 activeIDs 但 invoke 尚未 register"的假阳性。
+
+`patrolHeartbeatTimeout` 随 `cfg.StepTimeoutMin` 伸缩——`tick` 入口按 `max(70min, step_timeout_min + 10min)`
+设置（默认 60min → 70min；生产曾按 ~150min 步超时运行 → 160min）。硬编码 70min 会让长步任务死透后一进
+pgGrace 就被误归为 `no_heartbeat` 类污染审计视图。伸缩后阈值恒 ≥ step_timeout+10min。
 
 **review sync 从 postComplete 调用时的 patrol 兼容**（CG-5 R2 P1-1 补）：`runReviewSync` 在 `postComplete`
 里跑（此时任务仍在 `activeIDs`），必须把 sync pid 也登记进 `taskPG`（`registerTaskInvoke`/`unregisterTaskInvoke`

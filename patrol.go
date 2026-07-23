@@ -5,30 +5,37 @@ package main
 // 【为什么必须存在】
 // 已知竞态"记录不修":review sync ~110s+ 完成时,孙进程吊住 stdout 管道让 120s deadline 先到,
 // 成功同步被误判超时→分流每轮回退本机审;窗口极窄但真实存在,长期以"回退无害"带病运行。同时
-// 执行器真挂死(永不退出、无输出、被外部 SIGSTOP 挂起、silently 死等)的场景只有 step_timeout
-// (默认 60 分钟)兜底,期间目录锁与并行槽位死占。harvest 早收割处理"结果在手不退"(看得见的完
-// 成态),patrol 处理"什么都看不见"的僵态——两轴正交,同样都用整组击杀但触发条件不同。
+// runTask 收尾 goroutine 若在 Wait/事件锁 等地方阻塞,任务已死但仍占 activeIDs → 目录锁与并行
+// 槽位死占,step_timeout(默认 60 分钟)的 WithTimeout 只管击杀 invoke,不管收尾 goroutine 泄漏。
+// harvest 早收割处理"结果在手不退"(看得见的完成态),patrol 处理"执行器已死但 runTask 未收尾"的
+// 收尾僵态——两轴正交,同样都用整组击杀但触发条件不同。
+// 【R2.2 起触发面严格 = pgDeadTooLong】"活但静默"(如 SIGSTOP 挂起、silently 死等、长步无输出)
+// 交给 invoke 的 WithTimeout(StepTimeoutMin) 兜底,patrol 只处理 procgroup 已死透且死超 pgGrace 的
+// 收尾僵态;心跳降为已死后的 reason 分类信号,不再单独触发。理由见判据处注释。
 //
 // 【为什么不新增守护进程】
 // tick 的 drain 循环本身每 DrainRescanSec(默认 15s)重扫一次做取消对账,巡逻贴附在这一循环上零
 // 新增常驻进程;整组击杀沿用 activeCancels 的机制,不引入第二套击杀路径。
 //
-// 【心跳只作 procgroup 死透的确认信号——CG-5 R2 修的P0】
-// Round-1 把心跳当独立触发,踩了系统契约的雷:runner.go:95-97 stdout 收进内存 buffer,logBlock 只
-// 在 invoke 返回后追加,单步执行期任务日志**天然零增长**;而 step_timeout_min 默认 60 分钟(config.go:191),
-// opus 重卡跑单步 30+ 分钟是常态。旧判据 noHeartbeat 独立触发 → cancelRun → runner.go:702 ctx.Err()
-// → finalizeCanceled 永久取消归档且不重试——健康重卡必被误杀。修法:心跳只在 procgroup 也死透时
-// 视作**确认信号**,不再独立触发;"活但静默"场景交给 invoke 自带的 WithTimeout(StepTimeoutMin) 兜底。
-// procgroup 存活始终是**授权凭证**——伪心跳(测试脚本刷日志但进程组已死)不能骗过巡逻,反例仍报红。
+// 【心跳降为 reason 分类信号——CG-5 R2.2 修的 P1】
+// R2.1 把 noHeartbeat 触发条件叠加的是 pgDead(raw pgSeenAlive && !alive) 而非 pgDeadTooLong,
+// 可绕过 pgGrace 保护窗提前开火:step_timeout≥70min 时步超时击杀的 WaitDelay 10s 窗口或步间
+// invoke 切换 procgroup 短暂死透(<60s),patrol 15s 一轮约 2/3 概率落窗 → noHeartbeat 命中却
+// pgDeadTooLong 未成立 → 立即 evStalled + cancel → finalizeCanceled 永久取消归档健康 opus 重卡。
+// R2.2 修法:触发面严格 = pgDeadTooLong 单一条件——pgGrace 保护对心跳通道同样生效;心跳超阈值
+// 只在 pgDeadTooLong 已成立时用于把事件从 procgroup_dead 升级为 procgroup_dead_and_no_heartbeat,
+// 不再是独立触发。procgroup 存活始终是**授权凭证**——伪心跳(测试脚本刷日志但进程组已死)不能
+// 骗过巡逻,反例仍报红。
+// R2.1 的动机(单步执行期日志天然零增长会误杀健康 opus 重卡——runner.go:95-97 stdout 收进内存
+// buffer,logBlock 只在 invoke 返回后追加)仍然成立,只是当时的实现留了漏洞。
 //
-// 【两条信号如何组合判卡死】
+// 【两条信号如何组合】
 //   1) 进程组存活:anyTaskProcAlive 查该任务当前有无活着的执行器 pid(登记 + processAlive 双查)。
 //   2) 心跳:任务日志文件 size 增长(执行器每步的 logBlock 会持续追加输出——只在多步任务的步骤边界
 //      才有增长可查)。
-// 触发条件(任一命中):
-//   - pgDeadTooLong:曾活过 → 现死透 → 死超 pgGrace(允许步骤间隙 invoke 切换)。
-//   - noHeartbeatConfirmed:心跳超 heartbeatTimeout 无增长 且 procgroup 已死透——两条独立信号叠加
-//     才判卡死;心跳超时单独出现(procgroup 仍活)交给 step_timeout 兜底,不由巡逻处置。
+// 唯一触发条件:pgDeadTooLong——曾活过 → 现死透 → 死超 pgGrace(允许步骤间隙 invoke 切换)。
+// 心跳只在触发后区分 reason:staleness ≥ heartbeatTimeout 时报 procgroup_dead_and_no_heartbeat,
+// 否则报 procgroup_dead。
 // 心跳单独判据不足以证明存活——只能证明"有人在写日志",不能证明"执行器还在跑",且反过来"没人写
 // 日志"也不能证明"执行器已死"(单步内内存 buffer 不刷盘)。
 //
@@ -43,16 +50,18 @@ import (
 )
 
 // 巡逻可调参数——测试用短值(patrol_test.go override),生产用保守值。
-// heartbeatTimeout:允许任务日志多久没增长。CG-5 R2 改后仅作 procgroup 死透后的**确认信号**,
-// 不再独立触发击杀——单步执行期内 stdout 收进内存 buffer 天然零增长(见文件头注释),旧值 30min
-// 独立触发会误杀 opus 重卡。改为 step_timeout+10min(至少 30min),留额外余量兜底 step_timeout 内
-// 死于 pipe hold 的边角(现在仅在 procgroup 也死透时才作为 reason 分类,不改触发面)。
+// heartbeatTimeout:允许任务日志多久没增长。CG-5 R2.2 起仅作 procgroup 死透后的 reason 分类信号,
+// 不再独立触发击杀;默认 70min = step_timeout_min(60min 默认)+10min 余量。tick.go 入口按
+// max(70min, cfg.StepTimeoutMin+10min) 提升——生产曾按 ~150min 步超时运行(proc.go:113/runner.go:268
+// 注释证实),硬编码 70min 会让 step_timeout≥60min 的长步任务死透后一进 pgGrace 就被误归为
+// no_heartbeat 类,审计视图把健康长步的正常收尾误染成"卡死"证据。伸缩后阈值恒 ≥ step_timeout+10min。
 // pgGrace:进程组"暂空"允许多久——runTask 步骤间隙(saveTask + emit 事件之类)、invoke → invoke 切换,
-// 会有秒级窗口 procgroup 是空的。取 60s 覆盖极端慢机器上的多步切换。
+// 会有秒级窗口 procgroup 是空的。取 60s 覆盖极端慢机器上的多步切换。是触发面的关键防线——
+// 心跳通道也必须叠加 pgGrace(见 patrolOnce 判据处 R2.2 修正),否则 60s 内 pgDead 就能提前开火。
 // eventCooldown:同一任务重复记 evStalled 事件的最短间隔——巡逻每 15s 一轮,击杀信号若被处理不及时
 // (goroutine 阻塞在 Wait 内),下一轮又会 stalled;cooldown 挡重复事件把账本刷成噪声。
 var (
-	patrolHeartbeatTimeout = 70 * time.Minute // 生产:step_timeout_min(60min 默认)+10min 余量;测试用短值 override
+	patrolHeartbeatTimeout = 70 * time.Minute // 生产:tick.go 入口按 max(70min, cfg.StepTimeoutMin+10min) 提升;测试用短值 override
 	patrolPGGrace          = 60 * time.Second
 	patrolEventCooldown    = 5 * time.Minute
 )
@@ -109,22 +118,29 @@ func patrolOnce(root string, activeIDs map[string]bool, activeCancels map[string
 			}
 		}
 
-		// 判据:两条信号组合触发,单条不足。
-		// pgDeadTooLong:执行器进程组曾活过但现在死透且死超 60s——runTask 应当在 finalizeXxx 收尾把
-		// 任务从 activeIDs 拿走;若还在,说明 runTask 的 goroutine 卡在了什么地方(Wait 阻塞、事件锁抢占
-		// 超时等),巡逻替它推一把。
+		// 唯一触发面:pgDeadTooLong——执行器进程组曾活过但现在死透且死超 pgGrace——runTask 应当在
+		// finalizeXxx 收尾把任务从 activeIDs 拿走;若还在,说明 runTask 的 goroutine 卡在了什么地方
+		// (Wait 阻塞、事件锁抢占超时等),巡逻替它推一把。
+		// 【CG-5 R2 P1 收紧】R2 R1 曾把 noHeartbeat 触发条件叠加的是 pgDead(raw pgSeenAlive && !alive),
+		// 不是 pgDeadTooLong——可绕过 pgGrace 60s 保护窗提前开火:step_timeout≥70min 时步超时击杀的
+		// WaitDelay 10s 窗口 或 步间 invoke 切换 procgroup 短暂死透(<60s),patrol 15s 一轮约 2/3 概率落
+		// 窗 → noHeartbeat=true 而 pgDeadTooLong=false → 立即假 evStalled + cancel → runner.go ctx.Err()
+		// → finalizeCanceled 把健康重卡永久取消归档;非默认配置(仓内 proc.go:113/runner.go:268 注释证实
+		// 曾按 ~150min 步超时运行)下 P0-1 声称消灭的误杀走廊复活。修法:触发面严格 = pgDeadTooLong 单一
+		// 条件(pgGrace 保护对心跳通道同样生效),心跳降为 procgroup 已死后的 reason 升级信号,不再是
+		// 独立触发。"活但静默"场景交给 invoke 自带的 WithTimeout(StepTimeoutMin) 兜底,巡逻不插手。
 		pgDeadTooLong := st.pgSeenAlive && !alive && !st.pgDeadSince.IsZero() && now.Sub(st.pgDeadSince) >= patrolPGGrace
-		// noHeartbeat 必须叠加 procgroup 死透才算数——CG-5 R2 P0:单步执行期日志天然零增长(runner.go:95-97
-		// stdout 收进内存 buffer,logBlock 只在 invoke 返回后追加),独立触发会永久取消归档健康 opus 重卡。
-		// "活但静默"场景交给 invoke 自带的 WithTimeout(StepTimeoutMin) 兜底,巡逻不再插手。
-		pgDead := st.pgSeenAlive && !alive
-		noHeartbeat := now.Sub(st.lastLogGrow) >= patrolHeartbeatTimeout && pgDead
-		if !pgDeadTooLong && !noHeartbeat {
+		if !pgDeadTooLong {
 			continue
 		}
 
-		// reason 用于审计聚合:noHeartbeat 现在恒蕴含 pgDead(见判据构造),故任何 noHeartbeat 命中
-		// 都是两信号叠加;单纯 pgDeadTooLong 命中(心跳未到阈值)则只报 procgroup_dead。
+		// reason 分类:pgDeadTooLong 已成立(触发面),再看 heartbeat 是否也超阈值区分事件类型。
+		// 【为什么心跳阈值仍要随 cfg.StepTimeoutMin 伸缩】阈值本身不再影响触发,只影响 reason 分类;但
+		// 若阈值 < step_timeout,健康长步(单步内日志天然零增长——runner.go:95-97 stdout 收进内存 buffer)
+		// 死透后一进 pgGrace 就被误归为 no_heartbeat 类,审计视图会把健康长步的正常收尾误染成"卡死"证据。
+		// tick.go 在入口按 max(70min, StepTimeoutMin+10min) 提升,留 10min 余量兜底 step_timeout 内死于
+		// pipe hold 的边角(此时 heartbeat 才是真信号)。
+		noHeartbeat := now.Sub(st.lastLogGrow) >= patrolHeartbeatTimeout
 		reason := "procgroup_dead"
 		if noHeartbeat {
 			reason = "procgroup_dead_and_no_heartbeat"
@@ -164,4 +180,18 @@ func ifTimeStr(t time.Time) string {
 		return ""
 	}
 	return t.Format(time.RFC3339)
+}
+
+// updatePatrolHeartbeatTimeout 是 tick 入口调用的耦合 helper:让 patrolHeartbeatTimeout 与
+// cfg.StepTimeoutMin 同步扩张。默认 60min 步超时 → 阈值 70min(留 10min 余量);150min 步超时 →
+// 阈值 160min。取 max(70min, cfg+10min) 保底,不因 cfg 变小而降到 70min 以下——70min 是"心跳类
+// reason 的最小可信区间",低于此值心跳分类会把正常长步的收尾误染成 no_heartbeat 疑云。
+// 【为什么抽成 helper】tick 入口调用行简洁 + 单元测试可脱离 tick 完整环境直测(见 patrol_test.go
+// 的 TestUpdatePatrolHeartbeatTimeoutScalesWithStepTimeoutMin)。
+func updatePatrolHeartbeatTimeout(cfg *Config) {
+	target := 70 * time.Minute
+	if extended := time.Duration(cfg.StepTimeoutMin+10) * time.Minute; extended > target {
+		target = extended
+	}
+	patrolHeartbeatTimeout = target
 }

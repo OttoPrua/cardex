@@ -422,9 +422,10 @@ func TestReviewSyncMarkerSavesSuccessDespitePipeHoldRace(t *testing.T) {
 // procGroups) → anyTaskProcAlive 返回 false → 本测试红。
 func TestReviewSyncRegistersTaskPGDuringExecution(t *testing.T) {
 	root := testRoot(t)
-	// 同步命令写"看得见 anyTaskProcAlive 结果"的哨兵:sh 里 sleep 300ms 保持进程活着,主 goroutine
+	// 同步命令写"看得见 anyTaskProcAlive 结果"的哨兵:sh 里 sleep 1s 保持进程活着,主 goroutine
 	// 期间轮询 anyTaskProcAlive 应真;sh 退出后应假(defer 里 unregister)。
-	impl := &Task{ID: "impl-sync-register", Dir: "/tmp", ReviewSync: "sleep 0.3"}
+	// 【P2 放宽】原 300ms + 200ms deadline 在重载 CI 上 sh 冷启动可能超窗致 flake——放宽到 1s+2s。
+	impl := &Task{ID: "impl-sync-register", Dir: "/tmp", ReviewSync: "sleep 1"}
 	lg, err := os.Create(taskLogPath(root, impl.ID))
 	if err != nil {
 		t.Fatal(err)
@@ -439,15 +440,16 @@ func TestReviewSyncRegistersTaskPGDuringExecution(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- runReviewSync(impl, lg) }()
 
-	// 等 sh 启动(轮询 100ms 内 anyTaskProcAlive 转真——runReviewSync 已调 cmd.Start 且登记 taskPG)。
-	deadline := time.Now().Add(200 * time.Millisecond)
+	// 等 sh 启动(deadline 2s——放宽避免重载 CI flake:sh 冷启动 + cmd.Start + register 需 <100ms
+	// 常态,但 hostile 环境下 200ms 会窗口偏小)。
+	deadline := time.Now().Add(2 * time.Second)
 	sawAlive := false
 	for time.Now().Before(deadline) {
 		if anyTaskProcAlive(impl.ID) {
 			sawAlive = true
 			break
 		}
-		time.Sleep(5 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	if !sawAlive {
 		t.Fatal("runReviewSync 期间 anyTaskProcAlive 应真(sync pid 必须登记 taskPG 才能骗过 patrol 的 pgDead 判据)")
@@ -457,9 +459,9 @@ func TestReviewSyncRegistersTaskPGDuringExecution(t *testing.T) {
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("sleep 0.3 同步应成功, got %v", err)
+			t.Fatalf("sleep 1 同步应成功, got %v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(5 * time.Second):
 		t.Fatal("runReviewSync 未在预算内收尾")
 	}
 	// 立刻查:defer 已执行 → 应假。

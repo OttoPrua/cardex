@@ -6,15 +6,19 @@ package main
 // P0-1 修法(runner.go:95-97 stdout 收进内存 buffer,单步执行期任务日志天然零增长,独立触发会
 // 永久取消归档健康 opus 重卡)。
 //
-// 五条验收测试(A/B/C 为原 CG-5 卡验收,D/E 为 R2 P0-1 回归反例):
+// 七条验收测试(A/B/C 为原 CG-5 卡验收,D/E 为 R2.1 P0 回归反例,F/G 为 R2.2 P1 回归反例):
 //   A. 真僵态复现:执行器进程组死透后 patrol 判卡 → cancel 整组击杀 → 子进程真死并被回收
 //   B. 反例注入:伪心跳(procgroup 死透 + 日志假装继续增长)不得骗过 patrol
 //      —— 教训:procgroup 存活是唯一的授权凭证,心跳只是辅助信号
 //   C. 启动窗口保护:任务刚进 activeIDs 但 invoke 未 register,patrol 不误杀
-//   D. R2 P0-1 回归反例:procgroup 活着但心跳超阈值(模拟 opus 重卡单步无日志增长)——绝不触发,
+//   D. R2.1 P0 回归反例:procgroup 活着但心跳超阈值(模拟 opus 重卡单步无日志增长)——绝不触发,
 //      否则 60min 单步的健康重卡被误杀成永久归档。
-//   E. R2 P0-1 保底:心跳只在 procgroup 也死透时确认为 reason,配置里若把心跳阈值调低成毫秒级,
+//   E. R2.1 P0 保底:心跳只在 procgroup 也死透时确认为 reason,配置里若把心跳阈值调低成毫秒级,
 //      仅 alive 场景仍无触发——防"某人重新把心跳当独立触发"回退。
+//   F. R2.2 P1 回归反例:pgGrace 保护窗内(procgroup 刚死透 <60s) + 心跳超阈值——绝不触发,
+//      否则 step_timeout≥70min 的长步配置下 WaitDelay/invoke 切换窗口内健康长步被永久归档。
+//   G. R2.2 P1 耦合:patrolHeartbeatTimeout 必须随 cfg.StepTimeoutMin 伸缩(max(70min, cfg+10min)),
+//      硬编码 70min 会污染长步任务的 reason 分类。
 
 import (
 	"context"
@@ -61,7 +65,11 @@ func TestPatrolFlagsSilentlyHungTaskAndKillsProcgroup(t *testing.T) {
 	// cmd.Wait 反证进程被真正回收(不再 zombie);跑在 goroutine 里,主体在 patrol 触发击杀后 select 等它收。
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- cmd.Wait() }()
-	defer unregisterTaskInvoke(taskID, pid)
+	// P2 兜底:任何 t.Fatal 早退时 sleep 60 泄漏至多 60s——killProcGroup 幂等,与主体 kill 无冲突。
+	defer func() {
+		_ = killProcGroup(pid)
+		unregisterTaskInvoke(taskID, pid)
+	}()
 
 	activeIDs := map[string]bool{taskID: true}
 	cancelHits := 0
@@ -307,5 +315,85 @@ func TestPatrolReasonReflectsBothSignalsCombination(t *testing.T) {
 	reason, _ := stall.Detail["reason"].(string)
 	if reason != "procgroup_dead" {
 		t.Fatalf("单独 pgDeadTooLong 命中,reason 应为 procgroup_dead(不叠加心跳);got=%q", reason)
+	}
+}
+
+// F. R2.2 P1 回归反例:pgGrace 保护窗内(procgroup 刚死透 <60s,还没跨过 pgGrace)+ 心跳超阈值,
+// 绝不得触发。
+// 【为什么这是 R2.2 P1 而非 P0】默认档 step_timeout=60min,阈值 70min,pgGrace 60s,余量 ~9.7min
+// 够挡步超时击杀后的 WaitDelay 10s 窗口;但仓内 proc.go:113/runner.go:268 注释证实生产曾按 ~150min
+// 步超时运行,step_timeout≥70min 时步超时击杀后 WaitDelay 10s 窗口或步间 invoke 切换 procgroup
+// 短暂死透(<60s pgGrace),patrol 15s 一轮约 2/3 概率落窗 → R2.1 判据 noHeartbeat=(staleness>=70min
+// && pgDead) 立即命中而 pgDeadTooLong=false → 假 evStalled + cancel → finalizeCanceled 永久取消
+// 归档健康长步任务。R2.2 修法:noHeartbeat 触发面必须叠加 pgDeadTooLong(非 raw pgDead),让
+// pgGrace 保护对心跳通道同样生效。此测试直接构造该窗口,断言不触发。
+// 【杀的突变】把 patrol.go 里 noHeartbeat 判据里的 && pgDeadTooLong 换回 && pgDead(R2.1 缺陷回退)
+// → 本测试立刻红——pgDead=true 且 staleness≥heartbeat → cancel 被调用。
+func TestPatrolHeartbeatStalledWithinPgGraceMustNotTrigger(t *testing.T) {
+	defer patrolShort()()
+	// patrolShort:heartbeat=30ms,pgGrace=20ms。要构造"心跳超阈值 + 死亡<pgGrace"格子,需:
+	//   staleness = now - lastLogGrow >= 30ms (远古 1s 稳超)
+	//   deadElapsed = now - pgDeadSince < 20ms (置 10ms 前,稳在窗口内)
+
+	root := testRoot(t)
+	taskID := "patrol-hb-stalled-in-grace"
+
+	activeIDs := map[string]bool{taskID: true}
+	cancelled := false
+	activeCancels := map[string]func(){
+		taskID: func() { cancelled = true },
+	}
+	states := map[string]*patrolState{}
+
+	// 首轮建 state(procgroup 未 register → alive=false,pgSeenAlive 初值 false)。
+	patrolOnce(root, activeIDs, activeCancels, states, time.Now())
+
+	// 手工置:pgSeenAlive=true(曾观察到活过) + pgDeadSince=10ms 前(死透但 <20ms pgGrace 保护窗内)
+	//       + lastLogGrow=1s 前(staleness=1s 远超 30ms heartbeat 阈值)。
+	states[taskID].pgSeenAlive = true
+	states[taskID].pgDeadSince = time.Now().Add(-10 * time.Millisecond)
+	states[taskID].lastLogGrow = time.Now().Add(-1 * time.Second)
+
+	// 第二轮:pgDeadTooLong 应为 false(死亡仍在 pgGrace 20ms 内);noHeartbeat 触发已依赖
+	// pgDeadTooLong,故整体不触发。
+	patrolOnce(root, activeIDs, activeCancels, states, time.Now())
+	if cancelled {
+		t.Fatal("procgroup 死透但仍在 pgGrace 保护窗内(<60s)时,心跳 stale 不得触发—— pgGrace 是步骤间隙 invoke 切换窗口,此期任何击杀都是误伤(R2.1 曾漏此格子把健康长步永久归档)")
+	}
+	events, _, _ := loadTaskEvents(root, taskID)
+	for _, e := range events {
+		if e.Type == evStalled {
+			t.Fatalf("pgGrace 保护窗内不得落 evStalled 事件(污染活动流,让审计误以为真出过卡死)")
+		}
+	}
+}
+
+// G. R2.2 P1 耦合:patrolHeartbeatTimeout 必须随 cfg.StepTimeoutMin 伸缩。
+// 【为什么需要此测试】R2.1 硬编码 70min,在 step_timeout≥70min 配置下阈值反而低于步超时,长步任务
+// 死透后一进 pgGrace 就被 reason 归为 no_heartbeat 类污染审计视图。R2.2 抽 updatePatrolHeartbeatTimeout
+// 让阈值 = max(70min, cfg.StepTimeoutMin+10min),此测试守卫该契约。
+// 【杀的突变】把 helper 里的 max 逻辑改为固定 70min → 150min 步超时用例断言失败。
+func TestUpdatePatrolHeartbeatTimeoutScalesWithStepTimeoutMin(t *testing.T) {
+	orig := patrolHeartbeatTimeout
+	defer func() { patrolHeartbeatTimeout = orig }()
+
+	cases := []struct {
+		name           string
+		stepTimeoutMin int
+		want           time.Duration
+	}{
+		{"default 60min → 70min 下限", 60, 70 * time.Minute},
+		{"150min 生产曾用值 → 160min", 150, 160 * time.Minute},
+		{"120min 中位 → 130min", 120, 130 * time.Minute},
+		{"30min 低配 → 仍取 70min 下限(保 reason 类可信区间)", 30, 70 * time.Minute},
+		{"1min 测试值 → 仍取 70min 下限", 1, 70 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			updatePatrolHeartbeatTimeout(&Config{StepTimeoutMin: tc.stepTimeoutMin})
+			if patrolHeartbeatTimeout != tc.want {
+				t.Fatalf("step_timeout=%dmin → patrolHeartbeatTimeout want %v, got %v", tc.stepTimeoutMin, tc.want, patrolHeartbeatTimeout)
+			}
+		})
 	}
 }

@@ -30,6 +30,10 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	if rescan <= 0 {
 		rescan = 15 * time.Second
 	}
+	// CG-5 R2.2 P1 补:patrolHeartbeatTimeout 与 cfg 耦合——生产曾按 ~150min 步超时运行时,硬编码
+	// 70min 会让长步任务死透后一进 pgGrace 就被误归为 no_heartbeat 类污染审计视图。触发面已在
+	// patrol.go 收敛到 pgDeadTooLong,阈值现仅影响 reason 分类。抽成 helper 以便直测。
+	updatePatrolHeartbeatTimeout(cfg)
 
 	type doneMsg struct{ t *Task }
 	ch := make(chan doneMsg)
@@ -77,10 +81,11 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				cancelRun()
 			}
 		}
-		// CG-5 drain 内巡逻:与取消对账贴附同一循环节奏,不新增守护进程。两条信号(procgroup 存活
-		// + 日志心跳)任一命中即判卡死,先记 evStalled 再走 cancelRun(与人工 cancel 同一收尾管线,
-		// 不引入第二套击杀)。patrol 与 cancel 对账正交:cancel 反映"人工/盘上表态",patrol 反映
-		// "执行器真挂死"——两轴独立故拆两段。patrolCancels 是类型适配壳(context.CancelFunc → func())。
+		// CG-5 drain 内巡逻:与取消对账贴附同一循环节奏,不新增守护进程。R2.2 起触发面严格 = pgDeadTooLong
+		// (曾活过→现死透→死超 pgGrace),心跳降为已死后的 reason 分类信号,不再独立触发。先记 evStalled 再
+		// 走 cancelRun(与人工 cancel 同一收尾管线,不引入第二套击杀)。patrol 与 cancel 对账正交:
+		// cancel 反映"人工/盘上表态",patrol 反映"执行器真死透但 runTask 收尾 goroutine 卡住"——两轴独立
+		// 故拆两段。patrolCancels 是类型适配壳(context.CancelFunc → func())。
 		patrolCancels := make(map[string]func(), len(activeCancels))
 		for id, cancelRun := range activeCancels {
 			patrolCancels[id] = cancelRun

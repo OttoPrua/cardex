@@ -169,6 +169,12 @@ type Project struct {
 	Models          []BoardModelStat `json:"models"`
 	LastActivity    string           `json:"last_activity"`
 	Phases          []Phase          `json:"phases"`
+	// Goal 是「离项目目标多远」的落地进度视图（CG-8）。为什么用指针+omitempty：
+	// board.json 未配置 goal 块时，前端契约要求「完全不显示该区块」，用 nil 让 JSON
+	// 里彻底不出现该键；如果给零值 struct，前端会把「无目标」误画成「目标 0% 完成」，
+	// 那就是编造。ProgressPercent 是「派出的活干完多少」，Goal 是「离目标多远」，
+	// 两条并列而非替换——参见 boardgoal.go 顶部注释。
+	Goal *ProjectGoal `json:"goal,omitempty"`
 }
 
 // ---- 快照与缓存 ----
@@ -760,11 +766,17 @@ func round1(f float64) float64 { return float64(int64(f*10+0.5)) / 10 }
 // 自动推导的项目/阶段介绍难免干瘪，允许人工写一份更准的；文件不存在就全部走推导。
 // 看板只读它，永不写它。
 type boardOverride struct {
-	Projects map[string]struct {
-		Name   string            `json:"name"`
-		Desc   string            `json:"desc"`
-		Phases map[string]string `json:"phases"`
-	} `json:"projects"`
+	Projects map[string]boardOverrideProject `json:"projects"`
+}
+
+// boardOverrideProject 是 board.json 里单个项目的覆盖块。
+// 拆成命名类型是为了容纳 CG-8 的 goal 字段——原先内联匿名 struct 无法从别的文件
+// （boardgoal.go）引用，加字段就要动这里的 shape，索性一次拆干净。
+type boardOverrideProject struct {
+	Name   string                `json:"name"`
+	Desc   string                `json:"desc"`
+	Phases map[string]string     `json:"phases"`
+	Goal   *boardOverrideGoal    `json:"goal,omitempty"`
 }
 
 func loadBoardOverride(root string) *boardOverride {
@@ -1020,6 +1032,9 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 		if o.Desc != "" {
 			p.Desc, p.DescSource = o.Desc, "override"
 		}
+		// 目标锚定进度（CG-8）：goal 块缺失时 buildProjectGoal 返回 nil，
+		// Project.Goal 的 omitempty 保证 JSON 里不出现该键——前端"不显示"契约成立。
+		p.Goal = buildProjectGoal(o.Goal, now)
 	}
 
 	// 注意：这里**不**截断 phases[].tasks——/api/project 契约要求完整清单。

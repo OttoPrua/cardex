@@ -247,6 +247,74 @@ function descBlock(text, source) {
     }));
 }
 
+/**
+ * 落地进度块（CG-8）：与"卡片进度"**并列**，不替换。
+ * 契约与后端约定：
+ *   - goal == null 或未定义 → 完全不渲染（后端已 omitempty，前端再兜一层）；
+ *   - goal.insufficient === true → 只显示"数据不足"+原因，禁止画百分数；
+ *   - goal.landed_percent 数值有效但 goal.partial===true → 数值旁标 "partial"；
+ *   - 每个 milestone 同理：insufficient→"数据不足"，stale→额外标 stale 徽标。
+ * 这些"不显示"分支不是可选优化，是 fail-honest 承重防线——写死在这里。
+ */
+function goalBlock(goal) {
+  if (!goal) return null;
+  const head = h('div', { class: 'goal-head' },
+    h('span', { class: 'goal-label', title: '离项目目标多远（人工/机械里程碑合成），与上方的完成占比并列而非替换', text: '落地进度' }));
+  const pctNum = isNum(goal.landed_percent) ? goal.landed_percent : null;
+  if (goal.insufficient || pctNum === null) {
+    head.append(h('span', {
+      class: 'goal-na', title: goal.insufficient_reason || '合成所需数据不足', text: '数据不足',
+    }));
+  } else {
+    head.append(h('span', { class: 'goal-pct', text: `${pctNum}%` }));
+    if (goal.partial) {
+      head.append(h('span', {
+        class: 'goal-partial',
+        title: '部分里程碑数据不足，此值仅基于可用里程碑合成',
+        text: 'partial',
+      }));
+    }
+  }
+  if (goal.goal_source) {
+    head.append(h('span', {
+      class: 'goal-src', title: '数据来源：manual=人工评估@as_of；evidence=机械化取数@文件mtime；mixed=混合',
+      text: goal.goal_source,
+    }));
+  }
+  const wrap = h('div', { class: 'goal-wrap' }, head);
+  if (goal.statement) {
+    wrap.append(h('p', { class: 'goal-stmt', text: goal.statement }));
+  }
+  const ms = goal.milestones || [];
+  if (!ms.length) return wrap;
+  const det = h('details', { class: 'goal-details' },
+    h('summary', { class: 'goal-summary', text: `里程碑 ${ms.length} 条（点开）` }));
+  for (const m of ms) {
+    const row = h('div', { class: 'goal-ms' });
+    row.append(h('span', { class: 'goal-ms-title', text: `${m.id ? m.id + ' ' : ''}${m.title || ''}` }));
+    row.append(h('span', { class: 'goal-ms-weight', text: `权重 ${m.weight}` }));
+    if (m.insufficient || !isNum(m.done_percent)) {
+      row.append(h('span', {
+        class: 'goal-ms-na', title: m.insufficient_reason || '此里程碑数据不足', text: '数据不足',
+      }));
+    } else {
+      row.append(h('span', { class: 'goal-ms-pct', text: `${m.done_percent}%` }));
+    }
+    if (m.stale) {
+      row.append(h('span', {
+        class: 'goal-ms-stale', title: 'evidence 已超过 max_age_hours', text: 'stale',
+      }));
+    }
+    if (m.basis) row.append(h('span', { class: 'goal-ms-basis', text: m.basis }));
+    if (m.source) {
+      row.append(h('span', { class: 'goal-ms-src', title: '数据来源', text: m.source }));
+    }
+    det.append(row);
+  }
+  wrap.append(det);
+  return wrap;
+}
+
 function callout(kind, mark, ...body) {
   return h('div', { class: `callout callout-${kind}` },
     h('span', { class: 'co-mark', 'aria-hidden': 'true', text: mark }),
@@ -489,6 +557,7 @@ function projectCard(p) {
         : null,
       relTime(p.last_activity) ? metaChip(`活动 ${relTime(p.last_activity)}`) : null),
     progressBar(p.stats, p.progress_percent),
+    goalBlock(p.goal),
     statusLegend(p.stats),
     etaLine(p.eta));
 
@@ -598,6 +667,7 @@ async function viewProject(id) {
 
   frag.append(h('div', { class: 'card', style: 'padding:13px 17px;margin-bottom:16px' },
     progressBar(p.stats, p.progress_percent),
+    goalBlock(p.goal),
     etaLine(p.eta),
     p.dirs.length
       ? h('div', { class: 'proj-metarow', style: 'margin-top:9px' },

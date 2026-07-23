@@ -216,6 +216,37 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 - **只听 127.0.0.1**：响应含 prompt 全文、目录路径、账号额度，不应出本机。`-addr` 可显式覆盖，但默认永远是回环，非回环地址会打印警告——不建议外放。
 - **TTL 缓存**：任务快照与燃尽视图各有独立 TTL（燃尽 TTL = 任务快照 TTL × 3，至少 30s），防止每次请求全盘扫 tasks/ + transcript。`/api/*` 带 gzip 压缩（实测单次响应 2.5MB → 320KB）。
 
+**项目覆盖块 `~/.claudego/board.json`**：项目/阶段自动推导的介绍难免干瘪，可人工写一份更准的；文件缺失就全部走自动推导。允许字段：`name` / `desc` / `phases.<name>` / `goal`。
+
+**`goal` 字段（CG-8「落地进度」）**：项目"离目标多远"的机械化视图，与卡片进度**并列**呈现（不替换）。V1 只做合成，不做历史/趋势。
+
+```jsonc
+"goal": {
+  "statement": "落地实际使用",
+  "as_of": "2026-07-23",              // 人工评估日期；驱动 goal_source=manual@as_of
+  "milestones": [
+    {"id":"M1","title":"设计收口","weight":1,"done_percent":100,"basis":"REVIEW Go"},
+    {"id":"M4","title":"test-ready gates","weight":1,
+     "evidence": {                     // 有 evidence 就用它覆盖人工 done_percent
+       "path":"/abs/path/to/check.json",
+       "numerator":"gate_counts.pass",         // 点分路径，取到的必须是 JSON 数值
+       "denominator":["gate_counts.pass","gate_counts.blocked"],
+       "max_age_hours": 24              // 超龄→里程碑标 stale + 数据不足
+     },
+     "basis":"ops/test-ready/check"}
+  ]
+}
+```
+
+合成：`landed_percent = Σ(weight × done_percent) / Σweight`，与 `progress_percent` 并列展示，来源披露 `goal_source=manual@as_of` 或 `mixed@as_of` 或 `evidence`。
+
+**fail-honest 兜底**（不可绕）：
+- goal 缺失 → 前端**完全不显示**该区块（不猜）；
+- 权重和 ≤ 0 或任一 weight<0 → 整块标"数据不足"，`landed_percent` 为 `null`（不出 NaN/Inf/任何数字）；
+- evidence 文件缺失 / 超 `max_age_hours` / pointer 取不到 **JSON 数值类型**（如字段是字符串 `"9/21"`）→ 该里程碑标"数据不足"，合成值仅基于可用里程碑并标 `partial`——**不回退到旧值或人工值**（读数含义漂移就是造假）。
+
+**看板只读 evidence 文件、绝不执行命令**：落盘取数由编排 session / 卡（如 `ops/test-ready/check`）负责，看板只读它们的产出。
+
 **燃尽视图三源**（`/api/burn`）：三源中 `usage-history.jsonl`（即 `usage_feed`）与 `claudego quota` 共用同源；`claude.json` 与 transcript 扫描为 board 独有读数，`claudego quota` 不读这两源：
 1. **CodexBar `claude.json`**：claude 侧各账号 session / weekly / opus 窗口的百分比时间序列；
 2. **CodexBar `usage-history.jsonl`**（= `usage_feed`）：codex 侧 primary（5h）/ secondary（周）百分比时间序列；

@@ -197,6 +197,37 @@ Three inviolable rules:
 - **127.0.0.1 only**: responses contain full prompt text, directory paths, and quota data. `-addr` can override the bind address, but the default is always the loopback; binding to a non-loopback address prints a warning — not recommended.
 - **TTL cache**: task snapshots and the burndown view each have their own TTL (burndown TTL = task TTL × 3, minimum 30 s), preventing a full disk scan of tasks/ and transcripts on every request. `/api/*` endpoints are gzip-compressed (2.5 MB → 320 KB in practice).
 
+**Project override `~/.claudego/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Allowed fields: `name` / `desc` / `phases.<name>` / `goal`.
+
+**`goal` field (CG-8 "landed progress")**: a mechanized "how far from the project goal" view, displayed **alongside** the card-based `progress_percent` (never replacing it). V1 does synthesis only — no history/trend.
+
+```jsonc
+"goal": {
+  "statement": "Ship real usage",
+  "as_of": "2026-07-23",              // human-anchored eval date; drives goal_source=manual@as_of
+  "milestones": [
+    {"id":"M1","title":"Design freeze","weight":1,"done_percent":100,"basis":"REVIEW Go"},
+    {"id":"M4","title":"test-ready gates","weight":1,
+     "evidence": {                     // if present, overrides manual done_percent
+       "path":"/abs/path/to/check.json",
+       "numerator":"gate_counts.pass",         // dotted path; must resolve to a JSON number
+       "denominator":["gate_counts.pass","gate_counts.blocked"],
+       "max_age_hours": 24              // stale → milestone marked stale + insufficient
+     },
+     "basis":"ops/test-ready/check"}
+  ]
+}
+```
+
+Synthesis: `landed_percent = Σ(weight × done_percent) / Σweight`, shown next to `progress_percent`, with source disclosure `goal_source = manual@as_of` / `mixed@as_of` / `evidence`.
+
+**Fail-honest guarantees** (non-negotiable):
+- goal missing → the frontend **hides the whole block** (no guessing);
+- weight sum ≤ 0 or any weight < 0 → the whole block is marked "insufficient data", `landed_percent` is `null` (never NaN / Inf / any number);
+- evidence file missing / older than `max_age_hours` / pointer does not resolve to a **JSON numeric** (e.g. the field is a string like `"9/21"`) → that milestone is marked "insufficient data"; the composite is computed from remaining milestones only and flagged `partial` — **it never falls back to the stale value or the manual value** (silently swapping data provenance is a form of fabrication).
+
+**The board only reads evidence files, never executes commands**: producing that JSON is the job of the orchestration session/card (e.g. `ops/test-ready/check`); the board only consumes what has been written to disk.
+
 **Burndown view — three sources** (`/api/burn`): of these, `usage-history.jsonl` (= `usage_feed`) is the only source shared with `claudego quota`; `claude.json` and transcript scanning are board-exclusive — `claudego quota` does not read those two sources:
 1. **CodexBar `claude.json`**: per-account session / weekly / opus window percentage time-series for the claude side;
 2. **CodexBar `usage-history.jsonl`** (= `usage_feed`): primary (5 h) / secondary (weekly) percentage time-series for the codex side;

@@ -960,7 +960,11 @@ func runReviewSync(t *Task, lg *os.File) error {
 
 	// wrap:用户命令走子壳,exit 只退子壳;之后主体 sh 用 $? 抓退出码写 marker 并把退出码传出。
 	// 用 '%s' 单引号包 marker 路径:sh 单引号内一切字面(marker 路径不含单引号,安全)。
-	wrapped := fmt.Sprintf("( %s )\n__ec=$?\nprintf %%d \"$__ec\" > '%s'\nexit $__ec", t.ReviewSync, marker)
+	// 【CG-5 R2 P1-2】闭括号必须独立成行:旧写法 "( %s )" 把 ')' 与用户命令放同一行,若用户命令以
+	// '#' 尾注释结尾(rsync ... # notes)或含 heredoc,'#' 会吞掉 ')' → sh 语法错误 exit 2 → marker
+	// 不写 → 每次同步必失败 → divert 永久静默回退本机审,恰是本卡立项要救的故障被另一形态重新引入。
+	// 修法:'\n)' 让 '#' 的注释效应止于换行,')' 独立成行安全闭壳。
+	wrapped := fmt.Sprintf("( %s\n)\n__ec=$?\nprintf %%d \"$__ec\" > '%s'\nexit $__ec", t.ReviewSync, marker)
 
 	ctx, cancel := context.WithTimeout(context.Background(), reviewSyncTimeout)
 	defer cancel()
@@ -989,10 +993,18 @@ func runReviewSync(t *Task, lg *os.File) error {
 	procMu.Lock()
 	procGroups[pid] = true
 	procMu.Unlock()
+	// CG-5 R2 P1-1:同步 pid 必须登记 taskPG——runReviewSync 从 postComplete 里调(runner.go:1125),
+	// 此时 invoke pid 已 unregister 但任务仍在 activeIDs(runTask goroutine 尚未发 doneMsg)。若不登
+	// 记,taskPG 里该任务无活 pid → anyTaskProcAlive 假 → pgSeenAlive 早已 true → pgDeadSince 计时
+	// 开始 → 同步跑 >75s(尤其修好后可支持 ~110s 的长 sync)必被 patrol 误判 procgroup_dead → 落
+	// 假 evStalled(running 状态标 stalled 实际同步中) → 对已进 postComplete 的任务空放 cancel,
+	// 事件链呈 done→stalled 无 canceled,违背 CG-5 声明的因果契约("dispatched→stalled→canceled")。
+	registerTaskInvoke(t.ID, pid)
 	defer func() {
 		procMu.Lock()
 		delete(procGroups, pid)
 		procMu.Unlock()
+		unregisterTaskInvoke(t.ID, pid)
 	}()
 
 	// marker 早收割看门狗:见到 marker 立刻整组击杀,让 wait 收尾不再等 WaitDelay/ctx 超时。

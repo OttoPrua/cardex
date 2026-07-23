@@ -414,6 +414,105 @@ func TestReviewSyncMarkerSavesSuccessDespitePipeHoldRace(t *testing.T) {
 	}
 }
 
+// CG-5 R2 P1-1 类闭合:runReviewSync 从 postComplete 调用时任务仍在 activeIDs,同步 pid 必须
+// 登记 taskPG——否则 anyTaskProcAlive 假 → patrol 在 sync 跑 >75s 时误判 procgroup_dead → 落假
+// evStalled(status=running 实际 sync 中)+ 对已完成任务空放 cancel,事件链呈 done→stalled 无 canceled,
+// 违背 CG-5 声明的"dispatched→stalled→canceled"因果契约。
+// 【杀的突变】把 runReviewSync 里的 registerTaskInvoke/unregisterTaskInvoke 移除(回退到只登记
+// procGroups) → anyTaskProcAlive 返回 false → 本测试红。
+func TestReviewSyncRegistersTaskPGDuringExecution(t *testing.T) {
+	root := testRoot(t)
+	// 同步命令写"看得见 anyTaskProcAlive 结果"的哨兵:sh 里 sleep 300ms 保持进程活着,主 goroutine
+	// 期间轮询 anyTaskProcAlive 应真;sh 退出后应假(defer 里 unregister)。
+	impl := &Task{ID: "impl-sync-register", Dir: "/tmp", ReviewSync: "sleep 0.3"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	// 前提:runReviewSync 未跑前 anyTaskProcAlive 必假(没有登记)。
+	if anyTaskProcAlive(impl.ID) {
+		t.Fatal("前提:runReviewSync 未启动前不应有 taskPG 登记")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runReviewSync(impl, lg) }()
+
+	// 等 sh 启动(轮询 100ms 内 anyTaskProcAlive 转真——runReviewSync 已调 cmd.Start 且登记 taskPG)。
+	deadline := time.Now().Add(200 * time.Millisecond)
+	sawAlive := false
+	for time.Now().Before(deadline) {
+		if anyTaskProcAlive(impl.ID) {
+			sawAlive = true
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !sawAlive {
+		t.Fatal("runReviewSync 期间 anyTaskProcAlive 应真(sync pid 必须登记 taskPG 才能骗过 patrol 的 pgDead 判据)")
+	}
+
+	// 等 sync 收尾,taskPG 应 unregister → anyTaskProcAlive 转假。
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("sleep 0.3 同步应成功, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("runReviewSync 未在预算内收尾")
+	}
+	// 立刻查:defer 已执行 → 应假。
+	if anyTaskProcAlive(impl.ID) {
+		t.Fatal("runReviewSync 返回后 defer 应 unregisterTaskInvoke,anyTaskProcAlive 转假")
+	}
+}
+
+// CG-5 R2 P1-2 类闭合:runReviewSync 包壳的闭括号必须独立成行,否则用户命令以 '#' 尾注释结尾
+// (rsync ... # notes)时,'#' 会吞掉同一行 ')' → sh 语法错误 exit 2 → marker 不写 → divert
+// 永久静默回退本机审,恰是本卡立项要救的故障被另一形态重新引入。
+// 【杀的突变】把 wrapped 改回旧的 "( %s )" 单行 → 本测试 sh 报语法错、runReviewSync 返回非 nil → 红。
+func TestReviewSyncSupportsCommandWithTrailingComment(t *testing.T) {
+	root := testRoot(t)
+	// 命令以 '#' 注释结尾——生产里 rsync 命令带尾注释是常见写法。
+	impl := &Task{ID: "impl-sync-trailing-comment", Dir: "/tmp", ReviewSync: "true # trailing comment note"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	if err := runReviewSync(impl, lg); err != nil {
+		t.Fatalf("尾注释命令应正常 exit 0(闭括号独立成行), got err=%v", err)
+	}
+}
+
+// CG-5 R2 P1-2 反例守卫:heredoc/多行命令同样不得被"闭括号并行"吞坏。用户命令自身含换行时,
+// 若 wrapped 仍是 "( %s )" 单行,heredoc 内部第一行会把 ')' 挡到 heredoc 定界符外之外的诸多副作用
+// (最典型:heredoc 未闭合前 ')' 位置错乱)。用最简 heredoc 触发同类风险面。
+func TestReviewSyncSupportsHeredocCommand(t *testing.T) {
+	root := testRoot(t)
+	// heredoc:cat 读取 <<EOF...EOF,输出"ok",exit 0。
+	impl := &Task{ID: "impl-sync-heredoc", Dir: "/tmp", ReviewSync: "cat <<EOF\nok\nEOF"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	if err := runReviewSync(impl, lg); err != nil {
+		t.Fatalf("heredoc 多行命令应 exit 0(闭括号独立成行),got err=%v", err)
+	}
+	// 二次验证:日志应含 heredoc 输出 "ok"(排除命令根本没跑到)。
+	logData, err := os.ReadFile(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "ok") {
+		t.Fatalf("heredoc 应执行并输出 ok,日志未见\n----\n%s", logData)
+	}
+}
+
 // ⑤ -review-host 指向未配置主机 → add 报错。
 func TestAddReviewHostUnconfiguredErrors(t *testing.T) {
 	root := t.TempDir()

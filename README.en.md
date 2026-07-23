@@ -181,16 +181,17 @@ To leave headroom for bursty/interactive work: when the redline is active the qu
 "queue_budget_tokens": 2000000,  // ① local ledger: max weighted tokens the queue may spend in the sliding 5h window; 0 disables
 "redline_percent": 85,           // ②③ shared redline for percentage channels: stop when any source's usedPercent hits the line; 0 disables
 "usage_feed": "/Users/you/Library/Application Support/CodexBar/usage-history.jsonl",
-"usage_feed_max_age_min": 90,    // ②   a stale sample is treated as unavailable → dispatch allowed (fail-open)
+"usage_feed_max_age_min": 90,    // ②   a stale sample is treated as unavailable → dispatch allowed (fail-open); **0/negative reverts to default 90 min, never "trust forever"**
 "oauth_usage": true,             // ③   subscription usage endpoint (third source), off by default; endpoint is undocumented
-"oauth_usage_max_age_min": 15,   // ③   how long the endpoint response is considered fresh (minutes)
+"oauth_usage_max_age_min": 15,   // ③   also acts as the **process-level cache TTL**: reused inside the 15s tick loop; 0/negative reverts to default 15 min
 "oauth_usage_timeout_sec": 6,    // ③   HTTP timeout (seconds)
+"oauth_usage_creds_path": "",    // ③   when set it is **hard-isolated** — only this file is trusted, no fallback to ~/.claude/keychain (for tests / custom deployments; empty = default lookup order)
 "model_weights": {"default":1,"opus":5,"sonnet":1,"haiku":0.2}   // per-model weighting for the ledger
 ```
 
 - ① counts **only claudego's own calls** (desktop consumption is invisible to it); its semantics are a "queue budget ceiling" — your reserve = total quota − queue budget. Run `claudego quota` for a few days to see typical consumption before setting a value.
 - ② is the global view; its sample format is compatible with CodexBar's usage-history.jsonl (enable the Claude-usage probe in CodexBar). Any tool that appends one JSONL line in the same format works too.
-- ③ reads `api.anthropic.com/api/oauth/usage` directly (`anthropic-beta: oauth-2025-04-20` header + reusing the OAuth access token from `~/.claude/.credentials.json` or the macOS keychain), pulling 5h-window utilization. **The endpoint is undocumented and can change without notice** — any anomaly (network / creds / HTTP 4xx-5xx / missing field / format drift) is treated as "insufficient data" → fail-open. The implementation trusts **response body only** and never parses response headers (headers are trivially forged/overwritten by intermediaries, and verification has refuted the "response headers carry unified ratelimit numbers" claim). Override `oauth_usage_creds_path` / `oauth_usage_url` for tests or custom deployments.
+- ③ reads `api.anthropic.com/api/oauth/usage` directly (`anthropic-beta: oauth-2025-04-20` header + reusing the OAuth access token from `~/.claude/.credentials.json` or the macOS keychain), pulling 5h-window utilization. **The endpoint is undocumented and can change without notice** — any anomaly (network / creds / HTTP 4xx-5xx / missing field / ambiguous field value / format drift) is treated as "insufficient data" → fail-open. The implementation trusts **response body only** and never parses response headers (headers are trivially forged/overwritten by intermediaries, and verification has refuted the "response headers carry unified ratelimit numbers" claim). `utilization` is a strict 0-1 fractional domain (value `1` is rejected as scale-ambiguous), `used_percent`/`percent` is a strict 0-100 percentage domain taken as-is — **any auto-normalization is a false-trigger breeding ground** (lesson: the old heuristic turned `utilization:1`→100% and `used_percent:0.8`→80%, both locking the queue). When `oauth_usage_creds_path` is non-empty it is **hard-isolated** — only that file is trusted, no fallback to `~/.claude`/keychain (which avoids Windows `UserHomeDir` sneaking real credentials into what should be an isolated test/deployment). Endpoint results carry a **process-level cache** (TTL = `oauth_usage_max_age_min` or default 15 min): the 15s tick loop reuses it instead of hammering the endpoint (and, on macOS, instead of repeatedly triggering keychain prompts); if a refresh after expiry fails, the stale sample is retained and disclosed as "expired + refresh failed" so `quota` can report honestly.
 - ②③ merge rule = **worst-value-wins** (redline is judged against the highest available percent) — when observations disagree, the worst-case assumption wins over voting or averaging. `claudego quota` prints all three sources side-by-side and flags any spread ≥5%.
 - Genuine exhaustion still has the limit cooldown as a backstop (parse the reset time, resume when it arrives); the redline only yields *early*.
 
@@ -270,18 +271,30 @@ Two independent stall-detection signals piggyback on the existing drain loop (no
 the "invisible" hang axis that `harvest`'s early reap (visible-completion axis) can't address.
 
 **In-drain patrol**——`tick`'s cancel-reconciliation already rescans every `drain_rescan_sec` (default
-15s); `patrolOnce` rides the same tick. For each running card it checks two independent signals:
+15s); `patrolOnce` rides the same tick. For each running card it checks two signals:
 - **Procgroup liveness**: `taskPG` registry + `processAlive(pid)` double-check (stale dead-pid entries
   in the registry can't fake liveness — the double-check is the counter-example defense).
-- **Heartbeat**: whether the task log `~/.claudego/logs/<id>.log` file size is growing (executor's
-  per-step `logBlock` continuously appends).
+- **Heartbeat**: whether the task log `~/.claudego/logs/<id>.log` file size is growing (only crosses
+  step boundaries — within a single step nothing appends).
 
-Verdict: `pgSeenAlive && !alive && dead-since ≥ 60s` (procgroup dead past `patrolPGGrace`) OR
-`log-no-grow ≥ 30min` (`patrolHeartbeatTimeout`), either matches → judged stalled. **Heartbeat alone
-does NOT prove liveness**: adversarial injection (test script appending log every 100ms while the
-executor is dead) must not defeat patrol — procgroup liveness is the **authorization credential**,
-heartbeat is merely an auxiliary signal. Startup-window protection: the `pgSeenAlive` guard excludes
-false positives when a task just entered `activeIDs` but its `invoke` hasn't reached `cmd.Start` yet.
+Verdict (CG-5 R2 revision, signals must combine): `pgSeenAlive && !alive && dead-since ≥ 60s`
+(`patrolPGGrace`) triggers `pgDeadTooLong` alone; OR `procgroup dead && log-no-grow ≥ patrolHeartbeatTimeout
+(default 70min)` triggers as a two-signal combo. **Heartbeat is no longer an independent trigger** —
+runner.go collects stdout into an in-memory buffer, `logBlock` only appends after `invoke` returns,
+so task logs have **zero growth during a single step**; if heartbeat triggered alone, `step_timeout_min`'s
+default 60 minutes of an opus heavy card would be permanently canceled-and-archived under normal load.
+"Alive but silent" is delegated to `invoke`'s built-in `WithTimeout(step_timeout_min)`; patrol no longer
+touches that axis. Procgroup liveness remains the **authorization credential**: adversarial injection
+(script fakes heartbeat while the real executor is dead) is still caught by the combo verdict. Startup
+protection: `pgSeenAlive` gate excludes false positives when `invoke` hasn't reached `cmd.Start` yet.
+
+**Patrol compatibility for review-sync in postComplete** (CG-5 R2 P1-1 addendum): `runReviewSync` runs
+inside `postComplete` while the task is still in `activeIDs`, so the sync pid **must** register into
+`taskPG` too (paired `registerTaskInvoke`/`unregisterTaskInvoke`). Otherwise `anyTaskProcAlive` returns
+false → `pgSeenAlive && !alive` timer starts → any sync running longer than `patrolPGGrace` gets
+misclassified as `procgroup_dead`, emitting a fake `evStalled` (status=`running` while sync is in
+progress) and firing a no-op cancel against an already-done task — the event chain becomes
+`done→stalled with no canceled`, violating the `dispatched→stalled→canceled` causal contract.
 
 On match: **emit `evStalled` first, then `cancel`**. `evStalled` is a "disclosure of stall verdict"
 diagnostic event (status stays `running`); the subsequent `cancelRun()` goes through the same shutdown
@@ -302,8 +315,12 @@ marker exists → decision is 100% by the marker's recorded exit code; `ctx.Err(
 become derivatives of pipe behavior, no longer authoritative. On seeing the marker, immediately kill
 the process group so `cmd.Wait` returns quickly instead of waiting for `WaitDelay`/ctx. The user
 command runs inside a `( ... )` subshell so an explicit `exit N` in the user command exits only the
-subshell, letting the outer shell still reach the marker-writing line. `rescueWaitDelay` stays as a
-second-line defense for corner cases (marker not written as expected, e.g. wrap parse failure).
+subshell, letting the outer shell still reach the marker-writing line. **The closing `)` must live on
+its own line** (CG-5 R2 P1-2 addendum) — if collapsed inline as `( <cmd> )`, a user command ending in
+a `#` trailing comment (`rsync ... # notes`) or containing a heredoc lets the `#` swallow the `)` →
+sh syntax error exit 2 → marker never written → every sync fails → divert silently falls back to local
+review forever, i.e., the very failure this card was created to fix reappears in a different form.
+`rescueWaitDelay` stays as a second-line defense for corner cases (marker not written as expected).
 
 ## Event ledger (per-task `events.jsonl`)
 

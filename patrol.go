@@ -13,14 +13,24 @@ package main
 // tick 的 drain 循环本身每 DrainRescanSec(默认 15s)重扫一次做取消对账,巡逻贴附在这一循环上零
 // 新增常驻进程;整组击杀沿用 activeCancels 的机制,不引入第二套击杀路径。
 //
-// 【两条独立信号 + 反例注入教训】
-//   1) 进程组存活:anyTaskProcAlive 查该任务当前有无活着的执行器 pid;
-//   2) 心跳:任务日志文件 size 增长(执行器每步的 logBlock 会持续追加输出)。
-// 反例注入:伪造心跳(测试脚本每 100ms 追加日志,但真正执行器已死)不得骗过巡逻——所以 procgroup
-// 存活是**授权凭证**,心跳只是辅助信号。判据:
-//   - procgroup 曾活过且现死透且死超 pgGrace(允许步骤间隙的 invoke 切换)→ 判卡死;
-//   - 心跳超 heartbeatTimeout 无增长(执行器可能在长思考,但超阈值则疑挂)→ 判卡死。
-// 心跳单独判据不足以证明存活——只能证明"有人在写日志",不能证明"执行器还在跑"。
+// 【心跳只作 procgroup 死透的确认信号——CG-5 R2 修的P0】
+// Round-1 把心跳当独立触发,踩了系统契约的雷:runner.go:95-97 stdout 收进内存 buffer,logBlock 只
+// 在 invoke 返回后追加,单步执行期任务日志**天然零增长**;而 step_timeout_min 默认 60 分钟(config.go:191),
+// opus 重卡跑单步 30+ 分钟是常态。旧判据 noHeartbeat 独立触发 → cancelRun → runner.go:702 ctx.Err()
+// → finalizeCanceled 永久取消归档且不重试——健康重卡必被误杀。修法:心跳只在 procgroup 也死透时
+// 视作**确认信号**,不再独立触发;"活但静默"场景交给 invoke 自带的 WithTimeout(StepTimeoutMin) 兜底。
+// procgroup 存活始终是**授权凭证**——伪心跳(测试脚本刷日志但进程组已死)不能骗过巡逻,反例仍报红。
+//
+// 【两条信号如何组合判卡死】
+//   1) 进程组存活:anyTaskProcAlive 查该任务当前有无活着的执行器 pid(登记 + processAlive 双查)。
+//   2) 心跳:任务日志文件 size 增长(执行器每步的 logBlock 会持续追加输出——只在多步任务的步骤边界
+//      才有增长可查)。
+// 触发条件(任一命中):
+//   - pgDeadTooLong:曾活过 → 现死透 → 死超 pgGrace(允许步骤间隙 invoke 切换)。
+//   - noHeartbeatConfirmed:心跳超 heartbeatTimeout 无增长 且 procgroup 已死透——两条独立信号叠加
+//     才判卡死;心跳超时单独出现(procgroup 仍活)交给 step_timeout 兜底,不由巡逻处置。
+// 心跳单独判据不足以证明存活——只能证明"有人在写日志",不能证明"执行器还在跑",且反过来"没人写
+// 日志"也不能证明"执行器已死"(单步内内存 buffer 不刷盘)。
 //
 // 【为什么触发时先记事件再击杀】
 // 击杀路径可能挂(cancelRun 竞态、goroutine 卡死),事件账本先落让审计凭据留痕;patrol 记 evStalled
@@ -33,14 +43,16 @@ import (
 )
 
 // 巡逻可调参数——测试用短值(patrol_test.go override),生产用保守值。
-// heartbeatTimeout:允许任务日志多久没增长。太短会误杀正常长思考(claude opus 一次思考可能 5-10 分钟),
-// 太长则真僵死拖长同目录锁占。取 30 分钟:半个默认 step_timeout(60 分钟),仍留 step_timeout 兜底。
+// heartbeatTimeout:允许任务日志多久没增长。CG-5 R2 改后仅作 procgroup 死透后的**确认信号**,
+// 不再独立触发击杀——单步执行期内 stdout 收进内存 buffer 天然零增长(见文件头注释),旧值 30min
+// 独立触发会误杀 opus 重卡。改为 step_timeout+10min(至少 30min),留额外余量兜底 step_timeout 内
+// 死于 pipe hold 的边角(现在仅在 procgroup 也死透时才作为 reason 分类,不改触发面)。
 // pgGrace:进程组"暂空"允许多久——runTask 步骤间隙(saveTask + emit 事件之类)、invoke → invoke 切换,
 // 会有秒级窗口 procgroup 是空的。取 60s 覆盖极端慢机器上的多步切换。
 // eventCooldown:同一任务重复记 evStalled 事件的最短间隔——巡逻每 15s 一轮,击杀信号若被处理不及时
 // (goroutine 阻塞在 Wait 内),下一轮又会 stalled;cooldown 挡重复事件把账本刷成噪声。
 var (
-	patrolHeartbeatTimeout = 30 * time.Minute
+	patrolHeartbeatTimeout = 70 * time.Minute // 生产:step_timeout_min(60min 默认)+10min 余量;测试用短值 override
 	patrolPGGrace          = 60 * time.Second
 	patrolEventCooldown    = 5 * time.Minute
 )
@@ -97,22 +109,24 @@ func patrolOnce(root string, activeIDs map[string]bool, activeCancels map[string
 			}
 		}
 
-		// 判据:两条互相独立,任意一条命中即判卡死。
-		// procgroup 死过 pgGrace: 执行器进程组曾活过但现在死透且死超 60s——runTask 应当在 finalizeXxx
-		// 收尾把任务从 activeIDs 拿走;若还在,说明 runTask 的 goroutine 卡在了什么地方(Wait 阻塞、
-		// 事件锁抢占超时等),巡逻替它推一把。
+		// 判据:两条信号组合触发,单条不足。
+		// pgDeadTooLong:执行器进程组曾活过但现在死透且死超 60s——runTask 应当在 finalizeXxx 收尾把
+		// 任务从 activeIDs 拿走;若还在,说明 runTask 的 goroutine 卡在了什么地方(Wait 阻塞、事件锁抢占
+		// 超时等),巡逻替它推一把。
 		pgDeadTooLong := st.pgSeenAlive && !alive && !st.pgDeadSince.IsZero() && now.Sub(st.pgDeadSince) >= patrolPGGrace
-		// 心跳超时:日志 size 长时间无增长。alive 与否都算——执行器进程活着但一动不动
-		// (被 SIGSTOP 挂起/死锁),日志不会长,同样判卡死。
-		noHeartbeat := now.Sub(st.lastLogGrow) >= patrolHeartbeatTimeout
+		// noHeartbeat 必须叠加 procgroup 死透才算数——CG-5 R2 P0:单步执行期日志天然零增长(runner.go:95-97
+		// stdout 收进内存 buffer,logBlock 只在 invoke 返回后追加),独立触发会永久取消归档健康 opus 重卡。
+		// "活但静默"场景交给 invoke 自带的 WithTimeout(StepTimeoutMin) 兜底,巡逻不再插手。
+		pgDead := st.pgSeenAlive && !alive
+		noHeartbeat := now.Sub(st.lastLogGrow) >= patrolHeartbeatTimeout && pgDead
 		if !pgDeadTooLong && !noHeartbeat {
 			continue
 		}
 
+		// reason 用于审计聚合:noHeartbeat 现在恒蕴含 pgDead(见判据构造),故任何 noHeartbeat 命中
+		// 都是两信号叠加;单纯 pgDeadTooLong 命中(心跳未到阈值)则只报 procgroup_dead。
 		reason := "procgroup_dead"
-		if noHeartbeat && !pgDeadTooLong {
-			reason = "no_heartbeat"
-		} else if noHeartbeat && pgDeadTooLong {
+		if noHeartbeat {
 			reason = "procgroup_dead_and_no_heartbeat"
 		}
 

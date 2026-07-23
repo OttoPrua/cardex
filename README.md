@@ -208,16 +208,17 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 "queue_budget_tokens": 2000000,  // ① 本地账本：滑动 5h 窗口内队列最多消耗的加权 token，0 关
 "redline_percent": 85,           // ②③ 百分比通道共享红线：任一源 usedPercent 达线即停，0 关
 "usage_feed": "/Users/you/Library/Application Support/CodexBar/usage-history.jsonl",
-"usage_feed_max_age_min": 90,    // ②   样本过期视为不可用→放行（fail-open）
+"usage_feed_max_age_min": 90,    // ②   样本过期视为不可用→放行（fail-open）；**0/负值归位默认 90 min，不接受"永远采信"**
 "oauth_usage": true,             // ③   订阅端点直读（第三用量源），默认关；端点未文档化
-"oauth_usage_max_age_min": 15,   // ③   端点响应可用期（分钟）
+"oauth_usage_max_age_min": 15,   // ③   兼作**端点结果的进程级缓存 TTL**：tick 15s 循环内复用不重打；0/负值归位默认 15 min
 "oauth_usage_timeout_sec": 6,    // ③   HTTP 超时（秒）
+"oauth_usage_creds_path": "",    // ③   显式指定即**硬隔离**——只信该文件,不再兜底 ~/.claude/keychain（测试/自定义部署用；空=按默认顺序找）
 "model_weights": {"default":1,"opus":5,"sonnet":1,"haiku":0.2}   // 账本的模型加权
 ```
 
 - ① 只统计 claudego 自己的调用（桌面端消耗不可见），语义是"队列预算上限"——保底 = 总额度 − 队列预算。先跑几天 `claudego quota` 看典型消耗再定值。
 - ② 是全局视角，样本格式兼容 CodexBar 的 usage-history.jsonl（需在 CodexBar 里开启 Claude 用量探测）；任何工具按同格式落一行 JSONL 都能接。
-- ③ 直读 `api.anthropic.com/api/oauth/usage`（`anthropic-beta: oauth-2025-04-20` 头 + 复用 `~/.claude/.credentials.json` 或 macOS keychain 的 OAuth accessToken），取 5h 窗口 utilization。**端点未文档化、可随时变更**——任何异常（网络/凭据/HTTP 4xx-5xx/字段缺失/格式漂移）一律按"数据不足"→ fail-open 放行；实现只信响应 body，绝不解析响应头（响应头容易被中间层伪造/覆盖，且核验已推翻"响应头带 unified 限流数值"之说）。可用 `oauth_usage_creds_path` / `oauth_usage_url` 覆盖凭据文件路径/端点（测试或自定义部署用）。
+- ③ 直读 `api.anthropic.com/api/oauth/usage`（`anthropic-beta: oauth-2025-04-20` 头 + 复用 `~/.claude/.credentials.json` 或 macOS keychain 的 OAuth accessToken），取 5h 窗口 utilization。**端点未文档化、可随时变更**——任何异常（网络/凭据/HTTP 4xx-5xx/字段缺失/字段值歧义/格式漂移）一律按"数据不足"→ fail-open 放行；实现只信响应 body，绝不解析响应头（响应头容易被中间层伪造/覆盖，且核验已推翻"响应头带 unified 限流数值"之说）。`utilization` 严格 0-1 分数域（1 判刻度歧义拒判）、`used_percent/percent` 铁定 0-100 域原样取，**任一自动归一都是假触线温床**（教训：老版 `utilization:1`→100%、`used_percent:0.8`→80% 都能锁死队列）。`oauth_usage_creds_path` 非空即**硬隔离**——只读该文件，不再兜底 `~/.claude`/keychain（避免 Windows `UserHomeDir` 兜底摸真实凭据造成测试隔离失效或权限漂移）。端点结果自带**进程级缓存**（TTL=`oauth_usage_max_age_min` 或默认 15 min），tick 每 15s 重扫不会每次都打端点、也不会重复触发 macOS keychain 弹窗；缓存过期后重抓失败会保留旧样本并披露"已过期+重抓失败"两要素，让 `quota` 能诚实展示。
 - ②③ 合并规则=**最保守值优先**（可用样本里 percent 最大者判线）——观测口径不一致时,最坏假设兜住,而不是投票或平均。`claudego quota` 会并列展示三源读数并在分歧 ≥5% 时明确披露区间。
 - 真正耗尽时仍有限额冷却兜底（解析重置时间、到点续跑），红线只是提前让路。
 
@@ -293,14 +294,23 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 都进内核处理，不新增守护进程。
 
 **drain 内巡逻（patrol）**——`tick` 循环里已经在跑的取消对账每 `drain_rescan_sec`（默认 15s）扫一轮；
-`patrolOnce` 贴附同一循环节奏，对每张在跑卡查两条独立信号：
+`patrolOnce` 贴附同一循环节奏，对每张在跑卡查两条信号：
 - **进程组存活**：`taskPG` 登记表 + `processAlive(pid)` 双查（伪存活/死 pid 残留不骗过巡逻）。
-- **心跳**：任务日志 `~/.claudego/logs/<id>.log` 文件 size 是否增长（执行器每步 `logBlock` 持续追加）。
+- **心跳**：任务日志 `~/.claudego/logs/<id>.log` 文件 size 是否增长（多步任务的步骤边界才有增长）。
 
-判据：`pgSeenAlive && !alive && dead-since ≥ 60s`（procgroup 死超 `patrolPGGrace`）或
-`log-no-grow ≥ 30min`（`patrolHeartbeatTimeout`）任一命中即判卡死。**心跳独立不足证明存活**：反例注入
-（测试脚本每 100ms 追加日志、真实执行器已死）不得骗过巡逻——procgroup 存活是**授权凭证**，心跳只是辅助
-信号。启动窗口保护：`pgSeenAlive` 前置守卫排除"任务刚进 activeIDs 但 invoke 尚未 register"的假阳性。
+判据（CG-5 R2 修订，两信号必须组合）：`pgSeenAlive && !alive && dead-since ≥ 60s`（`patrolPGGrace`）即
+`pgDeadTooLong` 单独触发；或 `procgroup 已死透 && 日志超 patrolHeartbeatTimeout(默认 70 分钟) 无增长`
+两信号叠加触发。**心跳不再作独立触发**——runner.go 里 stdout 收进内存 buffer，`logBlock` 只在 `invoke`
+返回后追加，单步执行期任务日志**天然零增长**，`step_timeout_min` 默认 60 分钟里 opus 重卡跑 30+ 分钟
+的健康态若被心跳独立触发就永久取消归档。"活但静默"场景交给 `invoke` 自带的 `WithTimeout(step_timeout_min)`
+兜底，巡逻不再插手。procgroup 存活是**授权凭证**：反例注入（脚本刷心跳、真实执行器已死）仍被两信号叠加
+判据揪出。启动窗口保护：`pgSeenAlive` 前置守卫排除"任务刚进 activeIDs 但 invoke 尚未 register"的假阳性。
+
+**review sync 从 postComplete 调用时的 patrol 兼容**（CG-5 R2 P1-1 补）：`runReviewSync` 在 `postComplete`
+里跑（此时任务仍在 `activeIDs`），必须把 sync pid 也登记进 `taskPG`（`registerTaskInvoke`/`unregisterTaskInvoke`
+配对），否则 `anyTaskProcAlive` 假 → `pgSeenAlive && !alive` 计时 → sync 跑 >`patrolPGGrace` 就会被 patrol
+误判 `procgroup_dead`，落假 `evStalled`（状态 running 实际 sync 中）+ 对已完成任务空放 cancel，事件链呈
+`done→stalled 无 canceled`，违背 `dispatched→stalled→canceled` 因果契约。
 
 触发后**先记 `evStalled` 事件再走 `cancel`**：`evStalled` 是"披露判定卡死"的诊断事件（状态仍 running）,
 随后 `cancelRun()` 走同一收尾管线（`cmd.Cancel = killProcGroup` → `ctx.Err()` → `finalizeCanceled` → emit
@@ -315,7 +325,10 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 根修：包壳跑用户命令并写 marker 文件见证退出码——marker 存在 → 完全按 marker 记录判定，`ctx.Err()`/
 `cmd.Wait` 都是 pipe 行为的次生产物不再作证。见到 marker 立即整组击杀，让 `cmd.Wait` 从"知道退出码但还
 得等 WaitDelay/ctx 到期"提速到"知道退出码且 wait 立即返回"。用 `( ... )` 子壳包裹用户命令，防用户显式
-`exit N` 直接退外壳跳过写 marker 逻辑。`rescueWaitDelay` 保留作二道防线（marker 未按预期写出的边角）。
+`exit N` 直接退外壳跳过写 marker 逻辑。**闭括号必须独立成行**（CG-5 R2 P1-2 补）——若与用户命令并行成
+`( <cmd> )`，用户命令以 `#` 尾注释结尾（`rsync ... # notes`）或含 heredoc 时 `#` 会吞掉 `)` → sh 语法错误
+exit 2 → marker 不写 → 每次同步必失败 → divert 永久静默回退本机审，即本卡立项要救的故障被另一形态重新
+引入。`rescueWaitDelay` 保留作二道防线（marker 未按预期写出的边角）。
 
 ## 事件账本（per-task `events.jsonl`）
 

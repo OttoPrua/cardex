@@ -226,6 +226,44 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 - A single-instance lock (`.lock`) keeps launchd's repeated triggers from running tasks concurrently; the lock is cleared automatically if the holding process dies.
 - Other errors (network, timeout, etc.) back off and retry per `retry_backoff_min`; past `max_attempts_per_step` the task is marked failed, and `claudego retry <id>` re-enqueues it with session and progress intact.
 
+## Failure classification triage (CG-3)
+
+A single `retry_backoff` still burns `max_attempts_per_step` on obviously non-retryable errors (expired
+credentials / permission denied / prompt too long) — i.e. spending subscription quota on retries that are
+guaranteed to fail. CG-3 introduces a finite-enum failure classifier; each class maps to an independent policy:
+
+| Class | Detector | Policy | Event |
+|---|---|---|---|
+| `auth` | 401 / invalid api key / oauth expired / please re-login | Directly `held`, **does NOT burn attempts**; wait for human `release` after relogin | `evHeld` actor=`runner:classifier` |
+| `permission` | 403 / policy denied / blocked by policy/admin | Directly `held`, no attempts burnt; waits for policy/permission adjustment | `evHeld` |
+| `input_too_long` | prompt too long / context length exceeded | Directly `failed`, no attempts burnt (same prompt will overflow again) | `evFailed` |
+| `timeout` | `步骤超时(N 分钟)` / context deadline exceeded | Falls back to `retry_backoff` (retryable; class only used for audit rollups) | `evRetry`/`evFailed` |
+| `executor_crash` | signal killed/aborted / executable not found | Falls back to `retry_backoff` | `evRetry`/`evFailed` |
+| `unknown` | Everything the classifier can't identify | **Fallback to existing `retry_backoff`**, behavior byte-identical to the pre-CG-3 code (no class prefix) | `evRetry`/`evFailed` |
+
+**Limits and the classifier are strictly disjoint**: `usage limit / limit reached / hit your limit /
+session limit` is owned by `isLimitHit` (writes global cooldown + `limit_paused`); the classifier NEVER
+takes the `limit` class. Counter-example injection is the core acceptance test: text that looks limit-like
+but has no `limitRe` signature (e.g. `quota nearly consumed with 5% remaining`) **must** fall through to
+`unknown` and **must not** write the global cooldown — a written `cooldown.json` immediately fails the test.
+
+**Unknown-class fallback discipline**: the classifier is an "overreach burns quota" component — detectors
+use strict enum regex against explicit server/executor phrasing (broad terms like `error`/`failed` are
+banned); anything unclassified falls to `unknown` and takes the existing `retry_backoff` path. This is
+the hard boundary that "the new classifier must not change validated behavior"; the regression-baseline
+assertion (`TestRunTaskUnknownClass_RegressionBaseline`) pins it down.
+
+**Event ledger**: the classification lands in `events.jsonl` `detail.failure_class`; combined with the
+CG-2 event stream you can roll up "which class is burning attempts" and "how many of the `held` cards
+are auth failures". `auth`/`permission`/`input_too_long` tasks carry `[<class>]` prefix in `LastError`
+so CLI/board can identify them at a glance; `unknown` intentionally keeps the raw message to preserve
+the regression baseline.
+
+**Not doing**: no automatic replan/decompose — a CAMEL-style retry→decompose→replan is validated in
+other work but ClaudeGo's `held`-to-human path is sufficient today; automatic replan on misclassification
+means "the AI silently rewrote the task", which conflicts with the "complete task lineage must be
+auditable" honesty discipline. If it's ever needed, a separate card.
+
 ## In-drain patrol + review-sync race root fix (CG-5)
 
 Two independent stall-detection signals piggyback on the existing drain loop (no new daemon), covering

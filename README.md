@@ -257,6 +257,36 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 - 单实例锁（`.lock`）保证 launchd 的多次触发不会并发跑任务；持锁进程死掉会自动清锁。
 - 其他错误（网络、超时等）按 `retry_backoff_min` 退避重试，超过 `max_attempts_per_step` 次标记失败，`claudego retry <id>` 可带着会话与进度重新入队。
 
+## 失败分类分流（CG-3）
+
+单一 `retry_backoff` 遇到明显不可重试的错误（凭据失效/权限拒绝/输入超长）仍在盲目烧 `max_attempts_per_step`，
+是把订阅额度打进注定失败的重试里。CG-3 引入有限枚举的失败分类器，每类映射独立策略：
+
+| 类别 | 判据 | 策略 | 事件 |
+|---|---|---|---|
+| `auth` | 401 / invalid api key / oauth expired / 请重新登录 | 直接 `held`，**不烧 attempts**，等人工 relogin 后 `release` | `evHeld` actor=`runner:classifier` |
+| `permission` | 403 / policy 拒绝 / policy/admin blocked | 直接 `held`，不烧 attempts，等 policy/授权调整 | `evHeld` |
+| `input_too_long` | prompt too long / context length exceeded / 上下文超长 | 直接 `failed`，不烧 attempts（同 prompt 再送必然再超长） | `evFailed` |
+| `timeout` | 步骤超时(N 分钟) / context deadline exceeded | 沿用退避重试（可重试类，只是审计聚合上标类别） | `evRetry`/`evFailed` |
+| `executor_crash` | signal killed/aborted / executable not found | 沿用退避重试 | `evRetry`/`evFailed` |
+| `unknown` | 判不出来的一切 | **兜底为现行 `retry_backoff`**，行为与旧版逐字节一致（不加类别前缀） | `evRetry`/`evFailed` |
+
+**限额与分类器严格互斥**：`usage limit / limit reached / hit your limit / session limit` 由 `isLimitHit` 独占
+（写全局冷却+`limit_paused`），分类器绝不吃 `limit` 类。反例注入的核心验收：与限额相似但无 `limitRe` 特征
+的文本（如 `quota nearly consumed with 5% remaining`）**必须**走 `unknown`、不写全局冷却——若被误分类为限额，
+`cooldown.json` 一被写测试立即报红。
+
+**未知类兜底纪律**：分类器是"越权就烧钱"的组件——判据用严格枚举正则，只认服务端与执行器明确措辞
+（`error`/`failed` 这类广谱词禁用）；判不出来一律 `unknown`，让调用方走现行 `retry_backoff`。这是"新分类器
+不能改动已验证行为"的硬边界，回归基线断言（`TestRunTaskUnknownClass_RegressionBaseline`）把它钉死。
+
+**事件账本**：分类结果写入 `events.jsonl` 的 `detail.failure_class` 字段，配合 CG-2 事件流可按类别聚合
+"哪种失败在烧 attempts"、"held 里几张是认证问题"。auth/permission/input_too_long 的 `LastError` 带
+`[<class>]` 前缀让 CLI/看板一眼可辨；unknown 保持不加前缀以维持回归基线。
+
+**不做**：不做自动 replan/decompose——已被 CAMEL 类工作验证但 ClaudeGo 现状 held 升级人工的路径已够用，
+自动 replan 一旦误判等于"任务被 AI 悄悄改写"，与"完整任务血缘可审计"的诚实性纪律冲突。真需要时单独立卡。
+
 ## drain 内巡逻 + review sync 竞态根修（CG-5）
 
 两条独立卡死信号叠加事件账本，让"看得见的完成态"（harvest 早收割）与"什么都看不见"的僵态（patrol）

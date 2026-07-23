@@ -758,29 +758,59 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			return saveTask(root, t)
 		}
 
-		// 2) 其他失败：退避重试，超过次数则失败
+		// 2) 其他失败：CG-3 分类分流决定策略——认证/权限直接 held 升级人工；输入超长直接 failed
+		// 不重试；超时/执行器崩溃/未知类沿用现行 retry_backoff（回归基线：未知类的 last_error/事件
+		// 字段与旧版逐字节一致，只多一个 detail.failure_class 供审计聚合）。
+		// 【为什么分类走独立分支】认证/权限重试无益（凭据不刷、policy 不改），盲目烧 attempts 是把
+		// 订阅额度打进注定失败的重试里；输入超长同理，同样 prompt 再送必然再失败。这些"不可重试"
+		// 的判定与限额特判同宗——现状限额已被特判（写全局冷却），CG-3 把这套雏形扩到有限枚举。
 		if runErr != nil || res == nil || res.IsError {
 			msg := errorSummary(res, combined, runErr)
-			t.Attempts++
-			t.LastError = msg
-			logBlock(lg, "ERROR", fmt.Sprintf("第 %d 次失败: %s", t.Attempts, msg))
-			if t.Attempts >= cfg.MaxAttempts {
+			cls := classifyFailure(msg, combined, res, runErr)
+			policy := policyFor(cls)
+			switch policy.Terminal {
+			case statusHeld:
+				// 认证/权限：不烧 attempts，直接挂 held 等人工 relogin/授权后 release。
+				t.Status = statusHeld
+				t.LastError = annotatedError(cls, msg)
+				logBlock(lg, "CLASS_HELD", fmt.Sprintf("[%s] 不烧 attempts 直接挂 held(升级人工): %s", cls, msg))
+				emitTaskEvent(root, t.ID, evHeld, "runner:classifier", statusHeld, t.Step, map[string]any{
+					"err": msg, "failure_class": string(cls), "reason": policy.Reason,
+				})
+			case statusFailed:
+				// 输入超长：同样 prompt 再送必然再超长，直接 failed 不烧 attempts；人工按 retry 时
+				// 可裁剪 prompt 或换更大窗口的模型。
 				t.Status = statusFailed
-				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, map[string]any{
-					"err": msg, "attempts": t.Attempts,
+				t.LastError = annotatedError(cls, msg)
+				logBlock(lg, "CLASS_FAILED", fmt.Sprintf("[%s] 不可重试类直接 failed: %s", cls, msg))
+				emitTaskEvent(root, t.ID, evFailed, "runner:classifier", statusFailed, t.Step, map[string]any{
+					"err": msg, "failure_class": string(cls), "reason": policy.Reason,
 				})
-			} else {
-				t.Status = statusQueued
-				backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
-				if transientRe.MatchString(msg) {
-					backoff = time.Duration(cfg.RetryBackoffMin) * time.Minute
+			default:
+				// 现行 retry_backoff：超时/执行器崩溃/未知类。回归基线纪律——未知类的 LastError 与
+				// 事件字段结构与旧版逐字节一致（annotatedError 对 unknown 返回原 msg，不加前缀）；
+				// 只多一个 detail.failure_class 供审计聚合。
+				t.Attempts++
+				t.LastError = annotatedError(cls, msg)
+				logBlock(lg, "ERROR", fmt.Sprintf("第 %d 次失败[%s]: %s", t.Attempts, cls, msg))
+				if t.Attempts >= cfg.MaxAttempts {
+					t.Status = statusFailed
+					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, map[string]any{
+						"err": msg, "attempts": t.Attempts, "failure_class": string(cls),
+					})
 				} else {
-					backoff *= time.Duration(t.Attempts)
+					t.Status = statusQueued
+					backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
+					if transientRe.MatchString(msg) {
+						backoff = time.Duration(cfg.RetryBackoffMin) * time.Minute
+					} else {
+						backoff *= time.Duration(t.Attempts)
+					}
+					t.NotBeforeEpoch = now.Add(backoff).Unix()
+					emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, map[string]any{
+						"err": msg, "attempts": t.Attempts, "not_before": t.NotBeforeEpoch, "failure_class": string(cls),
+					})
 				}
-				t.NotBeforeEpoch = now.Add(backoff).Unix()
-				emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, map[string]any{
-					"err": msg, "attempts": t.Attempts, "not_before": t.NotBeforeEpoch,
-				})
 			}
 			t.touch()
 			return saveTask(root, t)

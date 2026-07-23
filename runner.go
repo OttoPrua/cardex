@@ -442,15 +442,59 @@ func parseClaudeJSON(out string) *claudeResult {
 	return nil
 }
 
+// isLimitHit 是限额扫描原语——按传入 text 匹配 limitRe。
+// 【CG-R1 修复 · 治 (a)】ResultFromTranscript=true 时**不拼 res.Result**:
+// codex/远端 claude 失败路径会把 codexErrorLine 挑走的行或 firstLine(combined) 直接塞进 res.Result
+// 并打此标——那是 transcript prose(审查引用/工具输出/正常叙述),含 "usage limit" 字面量的散文段
+// 拼进扫描串会让 limitRe 误命中: 卡被误挂 limit_paused 26h 静默、本地 claude 径还写全局冷却停摆
+// 全部 claude 泳道。此项治 res 侧污染;combined 侧的收敛见 isLimitHitClaude/isLimitHitCodex。
+// 保留 isLimitHit(res, combined) 签名不变以兼容既有测试(limit_test.go / codex_limit_test.go)——
+// 引擎特定路径请用 wrapper, 别直接扫 combined 全量。
 func isLimitHit(res *claudeResult, combined string) bool {
 	if res != nil && !res.IsError {
 		return false
 	}
 	text := combined
-	if res != nil {
+	if res != nil && !res.ResultFromTranscript {
 		text += "\n" + res.Result
 	}
 	return limitRe.MatchString(text)
+}
+
+// isLimitHitClaude 是本地/远端 claude 分支的限额判据——只扫 combined 里的 stderr 尾段与结构化
+// res.Result(非 transcript 来源时),不扫全量 stdout transcript。
+// 【为什么必须收敛】自审本仓等场景下 claude --output-format json 的 stdout 会把审查正文(含
+// "usage limit" 字面量)嵌进 JSON result 字段;若上层 parseClaudeJSON 未解出 res(超时/半截 JSON),
+// combined 全量扫会命中 → 卡被误挂 limit_paused 26h,本地 claude 径还会写全局 claude 冷却停摆
+// 全部 claude 泳道。真限额措辞几乎恒在 stderr(CLI 打的辅助提示)或 res.Result(--output-format
+// json 的 result 字段)——不在 stdout 的 tool_use prose 里。
+// 【剥 stdout 的启发式】combined = stdout(单个 JSON 对象,以 `}` 收尾) + "\n" + stderr。取最后
+// 一个 `}` 之后的段作 stderr 段;无 `}`(如超时 kill 前未成型 JSON) 保守回退整体扫描——事件
+// 重复命中比永久漏识别真限额更可接受。
+func isLimitHitClaude(res *claudeResult, combined string) bool {
+	scan := stderrTailFromClaudeCombined(combined)
+	return isLimitHit(res, scan)
+}
+
+// isLimitHitCodex 是本地/远端 codex 分支的限额判据——用 codexErrorLine 挑出的错误行判定,
+// 避免全量 transcript prose(自审本仓引用 "usage limit" 字面量) 误命中。codexHardErrRe 已含
+// "usage limit"、"quota exceeded" 等真限额措辞——真 codex 限额行(如 "ERROR: You've hit your
+// usage limit") 会被挑出,limitRe 命中,保护不丢。
+// 残余风险:codexHardErrRe 是 substring 匹配,transcript prose 里的"usage limit"字面量也会
+// 被挑走。相较全量扫描已收敛到 ~1 行数量级,可接受(委托人裁定);彻底根治需从 codex CLI 侧
+// 结构化错误上报,不是 isLimitHit 层的事。
+func isLimitHitCodex(res *claudeResult, combined string) bool {
+	return isLimitHit(res, codexErrorLine(combined))
+}
+
+// stderrTailFromClaudeCombined 从 claude 的 combined(stdout+"\n"+stderr) 里剥出 stderr 尾段。
+// 判据:最后一个 `}` 之后到末尾(stdout 是 --output-format json 的单个 JSON 对象,以 `}` 结束)。
+// 无 `}` 时(claude CLI 崩溃前 stdout 未输出 JSON)整体视为 stderr——事件重复胜过真限额永久漏识别。
+func stderrTailFromClaudeCombined(combined string) string {
+	if i := strings.LastIndex(combined, "}"); i >= 0 && i+1 < len(combined) {
+		return combined[i+1:]
+	}
+	return combined
 }
 
 // parseResetEpoch 从错误输出中解析限额重置时间；解析不到则用配置的回退等待。
@@ -727,7 +771,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		}
 
 		// 1) 限额：记录恢复时间，全局冷却，等 tick 到点自动续跑
-		if !useCodex && !remote && isLimitHit(res, combined) {
+		// 【CG-R1 修复】用 isLimitHitClaude 收敛扫描面到 stderr 尾段 + res.Result(非 transcript),
+		// 挡"自审本仓 transcript 含 usage limit 字面量 + 超时→误挂 limit_paused/写全局冷却"回归。
+		if !useCodex && !remote && isLimitHitClaude(res, combined) {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			setCooldown(root, until, firstLine(combined))
 			t.Status = statusLimitPaused
@@ -749,7 +795,8 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 
 		// 1a) 本机 codex 撞自己的 ChatGPT 用量限额：按本任务 resume_at 挂起，绝不写全局
 		// claude 冷却（两边账号额度独立）；eligible() 到滚动窗恢复时会重派并重发本步。
-		if useCodex && !remote && isLimitHit(res, combined) {
+		// 【CG-R1 修复】用 isLimitHitCodex 走 codexErrorLine 挑出的错误行判定,避免 transcript prose 误命中。
+		if useCodex && !remote && isLimitHitCodex(res, combined) {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			t.Status = statusLimitPaused
 			t.ResumeAtEpoch = until
@@ -766,7 +813,17 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 
 		// 1b) 远端撞该主机账号限额（远端机器自己的 claude/GPT 账号）：按本任务 resume_at 挂起，
 		// 不写全局冷却（远端账号与本机独立）；eligible() 到刷新时刻才再派 → 无损接力自动续跑。
-		if remote && isLimitHit(res, combined) {
+		// 【CG-R1 修复】远端按引擎分派:远端 claude 走 isLimitHitClaude(剥 stdout 骨架),远端 codex 走
+		// isLimitHitCodex(codexErrorLine 挑行),不再全量扫 combined transcript。
+		remoteHit := false
+		if remote {
+			if remoteUsesClaude(t) {
+				remoteHit = isLimitHitClaude(res, combined)
+			} else {
+				remoteHit = isLimitHitCodex(res, combined)
+			}
+		}
+		if remoteHit {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			t.Status = statusLimitPaused
 			t.ResumeAtEpoch = until

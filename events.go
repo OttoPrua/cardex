@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -75,21 +76,11 @@ func archivedEventsPath(root, id string) string {
 	return filepath.Join(archivedEventsDir(root), id+".jsonl")
 }
 
-// eventsPathAnywhere 返回该任务的事件流位置（活动/归档二处，任一存在优先返回）。
-// 活动流可能读到已被 clean 归档的卡——保留 archive/events/ 检索路径以免历史断线。
-func eventsPathAnywhere(root, id string) string {
-	live := eventsPath(root, id)
-	if _, err := os.Stat(live); err == nil {
-		return live
-	}
-	return archivedEventsPath(root, id)
-}
-
 // eventMuByTask 是每任务的进程内互斥锁——挡同进程内 goroutine 的并发 emit。
-// 【为什么进程内锁不可省】staleLock 有 bootstrap 竞态:文件锁"创建 lockfile"与"写 PID"两步之间,
-// 若第二个 goroutine 在 A 写 PID 前读 lockfile 得空内容,Unmarshal 失败被判 stale 强夺——两个
-// goroutine 同时进入临界区,seq 计算错位撞车。文件锁只挡跨进程,进程内的强序由 sync.Mutex 兜底,
-// 组合起来才既挡跨进程又挡同进程 goroutine,seq 单调契约才不漏。
+// 【为什么进程内锁不可省】即便 acquireEventLock 已用 tmp+os.Link 消除跨进程 bootstrap 竞态,
+// 文件锁仍属"进程级"资源(内容里带 PID), 同进程内多个 goroutine 的 pid 相同, 若不上 mutex,
+// 后来者会读到"自己进程的 PID"→ 误以为是自己持锁 → 破坏"每任务事件写严格串行"契约.
+// 组合:sync.Mutex 挡同进程 goroutine + tmp+Link 挡跨进程 = seq 单调递增无缝隙.
 var eventMuByTask sync.Map // map[string]*sync.Mutex
 
 func lockForTask(taskID string) *sync.Mutex {
@@ -109,8 +100,9 @@ func lockForTask(taskID string) *sync.Mutex {
 // "多个 runner 同时开跑"，不挡 cli:cancel / cli:release / cli:hold 与 runner 并发写同一卡的事件。
 // 若不加锁,两个写者各读到 max=N、各写 seq=N+1——两条事件同 seq,"卡内 seq 单调递增"契约破,
 // 重复 seq 中删一条事件也不可检测(seq 序列仍显完整),"事件缺口显式披露"这道墙被绕过。O_APPEND
-// 只保证 write 定位原子,不解决 read-compute-write 的组合竞态。用 O_EXCL 短自旋锁挡跨进程,再叠
-// 一层进程内 sync.Mutex 挡 staleLock bootstrap 竞态(空 lockfile 被 unmarshal 判 stale 强夺)。
+// 只保证 write 定位原子,不解决 read-compute-write 的组合竞态。tmp+os.Link 原子挂名的文件锁挡跨
+// 进程, 内层 sync.Mutex 挡同进程 goroutine——两层缺一不可: 缺文件锁则 CLI 与 daemon 撞 seq,
+// 缺 mutex 则同进程 goroutine 因共享 pid 会误信自己是持锁者.
 func recordEvent(root, taskID string, ev TaskEvent) error {
 	if taskID == "" {
 		return nil // 任务尚未分配 ID：极少见的兜底，静默跳过
@@ -149,7 +141,15 @@ func recordEvent(root, taskID string, ev TaskEvent) error {
 	// 排后面，绝不会写进对方的字节中间。跨进程"读-算-写"竞态由上面的 acquireEventLock 挡住。
 	// O_RDWR 而非 O_WRONLY：ensureTrailingNewline 要 ReadAt 检末字节；write-only 描述符 ReadAt 报
 	// "bad file descriptor"（macOS/BSD 尤为严格），会让首次写入之后每次追加都失败。
-	f, err := os.OpenFile(eventsPath(root, taskID), os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
+	// 写路径由 pickEventsWritePath 决定:归档后补写走归档文件, 保持写点唯一, 让历史不断线.
+	writePath := pickEventsWritePath(root, taskID)
+	// 若目标是归档文件, 确保归档目录存在(recordEvent 头部只 MkdirAll 了活动目录).
+	if writePath == archivedEventsPath(root, taskID) {
+		if err := os.MkdirAll(archivedEventsDir(root), 0o755); err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(writePath, os.O_APPEND|os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return err
 	}
@@ -177,31 +177,105 @@ func eventLockPath(root, taskID string) string {
 	return eventsPath(root, taskID) + ".lock"
 }
 
-// acquireEventLock 用 O_CREATE|O_EXCL 抢占单任务事件写锁；持锁进程已死或锁超龄视为陈旧强夺。
-// 复用 state.go:acquireLock 的语义但作用域为单任务：写事件的临界区极短(几毫秒)，TTL 5s 足够，
-// 极端崩溃(kill -9 于 nextSeq..fsync 之间)按陈旧锁清除，不会永久卡死后续写入。
+// acquireEventLock 抢占单任务事件写锁；持锁进程已死或锁超龄视为陈旧强夺。
+// 【为什么用 tmp+os.Link 原子挂名而非 O_CREATE|O_EXCL 直接建空文件后写 PID】
+// 旧法两步不原子:另一进程在"文件已建但 PID 未写"的空文件窗口读到空内容, staleLock(state.go:79)
+// Unmarshal 失败即刻判 stale 强夺 → Remove 掉本进程正在写的锁 → 双持锁 seq 撞车. tmp 里先写完
+// lockInfo, 再 os.Link(tmp,path) 把带完整内容的 inode 原子挂到目标名字上——path 一旦存在,
+// 内容就是完整的,再也没有空文件窗口. 强夺权用 os.Rename(path→path.stale-*) 独占, 让多方竞
+// 争强夺只能一方成功, 消除"Remove→create 交错双持锁"的第二重放大器.
+// 释放前核 PID:TTL 强夺后原持有者的 defer release 无条件 Remove 会误删强夺者的新锁, 让第三写
+// 者进入临界区连环撞 seq——releaseEventLock 读锁文件核 PID==自身才删.
 func acquireEventLock(root, taskID string) (func(), error) {
 	path := eventLockPath(root, taskID)
 	// 自旋：短临界区场景下自旋比 fsnotify/inotify 简单可靠。最多等 5s（1000×5ms），
 	// 覆盖单个写者的完整临界区仍抢不到就报错让 emitTaskEvent 打警告——绝不静默漏事件。
 	for i := 0; i < 1000; i++ {
-		f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-		if err == nil {
-			data, _ := json.Marshal(lockInfo{PID: os.Getpid(), At: time.Now().Format(time.RFC3339)})
-			_, _ = f.Write(data)
-			_ = f.Close()
-			return func() { _ = os.Remove(path) }, nil
-		}
-		if !os.IsExist(err) {
+		// tmp 名带 pid+纳秒时钟避免同进程/跨进程重名; 与 path 同目录以让 os.Link 跨文件系统亦可
+		// (POSIX 硬链接要求同 mount, 同目录必然满足).
+		tmp := fmt.Sprintf("%s.acq-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+		info, _ := json.Marshal(lockInfo{PID: os.Getpid(), At: time.Now().Format(time.RFC3339)})
+		if err := os.WriteFile(tmp, info, 0o644); err != nil {
 			return nil, err
 		}
-		if staleLock(path, 5*time.Second) {
-			_ = os.Remove(path)
+		linkErr := os.Link(tmp, path)
+		// tmp 无论 Link 成败都得清:成功后 tmp 已是 path 的第二个硬链接, 保留会让 release 侧无法
+		// 从 path 名字断言 inode 独占; 失败保留 tmp 是漏文件.
+		_ = os.Remove(tmp)
+		if linkErr == nil {
+			return func() { releaseEventLock(path) }, nil
+		}
+		if !os.IsExist(linkErr) {
+			return nil, linkErr
+		}
+		// path 已被别人占. 用本地 staleEventLock:除 state.go:staleLock 的 mtime/PID 判据外多一条
+		// "内容不可解析且 mtime<1s 不判 stale"的短暂空窗豁免——防"另一进程刚 WriteFile(tmp) 未及
+		// Link"这种极窄窗口内被误判为 stale. 保持防御纵深, 即便日后有人把 tmp+Link 改回 O_EXCL,
+		// 空文件窗口也不会被强夺.
+		if staleEventLock(path, 5*time.Second) {
+			// 强夺唯一化:os.Rename 是 POSIX 原子操作, path 只能被一方成功搬走. 失败者(路径已被他人
+			// 搬走)本轮 sleep 后自然重试, 不会再 Remove 一次导致"两方各以为夺权成功".
+			stale := fmt.Sprintf("%s.stale-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+			if renameErr := os.Rename(path, stale); renameErr == nil {
+				_ = os.Remove(stale)
+			}
 			continue
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	return nil, fmt.Errorf("事件写锁抢占超时: %s", path)
+}
+
+// releaseEventLock 只删属于本进程的锁文件:核 PID 匹配才 Remove.
+// 【为什么核 PID】staleEventLock(与 state.go:staleLock)对 mtime>5s 的锁直接判 stale 强夺——
+// 系统睡眠/挂起跨 5s 唤醒后, 原持有者的 defer release 无条件 Remove 会删掉强夺者刚建的新锁,
+// 让第三写者进临界区连环撞 seq. 读文件失败/解析失败/PID 不匹配都不删——留给真正的持有者
+// (若真是我们的锁, Unmarshal 必成; 若不是, 让下一轮 staleEventLock 兜底).
+func releaseEventLock(path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var li lockInfo
+	if json.Unmarshal(data, &li) != nil {
+		return
+	}
+	if li.PID != os.Getpid() {
+		return
+	}
+	_ = os.Remove(path)
+}
+
+// staleEventLock 是事件锁本地的更保守判据:严格执行"仅当(可解析&&!processAlive)或 mtime>TTL 才判 stale".
+// 【为什么内容空/不可解析且 mtime 未超 TTL 一律不判 stale】审查(CG-2 R2 concerns P1-1):即便 tmp+os.Link
+// 已消除空文件窗口, 仍必须在 TTL 全窗口豁免"内容尚不完整"的锁——理由有二:
+//   (1) 防御纵深:未来维护若把 tmp+Link 改回 O_EXCL, 空文件窗口重现, 只要 mtime<=TTL 就不强夺,
+//       就能挡"读到空内容→立即强夺"的 bootstrap 竞态回归; 1s 阈值太窄, GC/swap/系统忙时
+//       合法写者可能超 1s 才补上内容, 被误判 stale;
+//   (2) 强夺允收边界收窄至"确定持有者已死"或"锁真的过期"两条:内容可解析但 PID 进程不在,
+//       是明确的进程已死; mtime>TTL 是"任何持有者都不可能占这么久"的硬边界. 两条之外
+//       (含内容尚不完整但 mtime<=TTL 的所有情况)一律等待, 不强夺.
+// 反例注入:把此处的"mtime<=TTL 不 stale"改回 1s 阈值或直接判 stale,
+// TestAcquireEventLockWaitsOnFreshEmptyLock 会报红——预置空锁+新鲜 mtime 场景会被误判强夺.
+func staleEventLock(path string, ttl time.Duration) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return true
+	}
+	if time.Since(fi.ModTime()) > ttl {
+		return true
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var li lockInfo
+	if json.Unmarshal(data, &li) != nil || li.PID <= 0 {
+		// 内容空/不可解析但 mtime 未超 TTL:视为合法写者尚未收尾的短暂空窗,一律等待不强夺.
+		// 达到 TTL 仍不可解析才判 stale (走上面 mtime>ttl 分支, 这里不重复判).
+		return false
+	}
+	return !processAlive(li.PID)
 }
 
 // ensureTrailingNewline 若文件末尾不是 \n 就补一个。为空文件是 no-op。
@@ -227,23 +301,47 @@ func ensureTrailingNewline(f *os.File) error {
 	return err
 }
 
-// nextSeq 读该任务的事件流算下一个 seq。文件不存在返回 1。
+// nextSeq 读该任务事件流算下一个 seq. 活动+归档两处都扫,取合法事件最大 seq——
+// 【为什么必须双读】archiveTaskEvents 会把 events.jsonl 搬去 archive/events/. 若只看活动路径,
+// clean 与 postComplete 并发时(runReviewSync 最长 120s 的宽窗口内, closeout 补写在归档搬完后
+// 发生), nextSeq 见活动路径不存在 → 返回 1 → 新建 seq=1 起算的活动文件. 完整历史被隐匿且
+// 绕过 board.go:390-393 的头部缺口守卫(seq 从 1 起算, events[0].Seq>1 条件不满足). 双读取
+// max 让归档后的补写继承旧 seq 序号, 缺口披露与"每状态迁移恰一条事件"验收在归档并发下仍成立.
+// 文件不存在(两处都无)返回 1——首次入队场景.
 func nextSeq(root, taskID string) (int64, error) {
-	events, hadCorruption, err := readEvents(eventsPath(root, taskID))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return 1, nil
+	var maxSeq int64
+	for _, path := range []string{eventsPath(root, taskID), archivedEventsPath(root, taskID)} {
+		events, _, err := readEvents(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return 0, err
 		}
-		return 0, err
-	}
-	_ = hadCorruption // seq 不受损坏行影响：只看合法事件里的最大 seq。
-	var max int64
-	for _, ev := range events {
-		if ev.Seq > max {
-			max = ev.Seq
+		// 损坏行不影响 seq 推算:readEvents 已丢弃, 只看合法事件里的最大 seq.
+		for _, ev := range events {
+			if ev.Seq > maxSeq {
+				maxSeq = ev.Seq
+			}
 		}
 	}
-	return max + 1, nil
+	return maxSeq + 1, nil
+}
+
+// pickEventsWritePath 决定 recordEvent 应把新事件追加到哪个文件.
+// 【为什么归档后写归档】archiveTaskEvents 已把活动搬去归档, 若 recordEvent 见活动缺失就新建
+// seq=1 起算的活动, 会造成"两个文件, 各自 seq 从 1 起, 历史断线". 保持写点唯一 → 归档独在
+// 时追加归档; 活动独在或两者并存时优先写活动(与既有 emit 流一致, 让活动 → 归档的归档流可控).
+func pickEventsWritePath(root, taskID string) string {
+	live := eventsPath(root, taskID)
+	if _, err := os.Stat(live); err == nil {
+		return live
+	}
+	arch := archivedEventsPath(root, taskID)
+	if _, err := os.Stat(arch); err == nil {
+		return arch
+	}
+	return live
 }
 
 // readEvents 按行解析事件流。返回 (合法事件, 是否遇到崩溃残尾/损坏行, err)。
@@ -283,23 +381,83 @@ func readEvents(path string) ([]TaskEvent, bool, error) {
 	return out, hadCorruption, nil
 }
 
-// loadTaskEvents 是"从任一位置（活动/归档）读事件"的对外入口。文件不存在返回空列表且无错——
-// 事件账本尚未生成的旧卡也能被活动流正确忽略（活动流禁止用状态反推补齐）。
+// loadTaskEvents 是"从活动+归档合并读事件"的对外入口. 文件不存在返回空列表且无错——
+// 事件账本尚未生成的旧卡也能被活动流正确忽略(活动流禁止用状态反推补齐).
+// 【为什么合并双读】即便 pickEventsWritePath 已收敛写点(归档独在时写归档), 极窄迁移窗口内
+// 仍可能两处都有事件(如 archive 前后夹了 emit). 合并 + 按 seq 去重, 让读侧看到完整历史,
+// 避免"看板只见一处、seq 断线冒充完整"的死角. 单侧存在的常规场景仍返回该侧原样(不排序保序).
 func loadTaskEvents(root, taskID string) ([]TaskEvent, bool, error) {
-	events, hadCorruption, err := readEvents(eventsPathAnywhere(root, taskID))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, err
+	live := eventsPath(root, taskID)
+	arch := archivedEventsPath(root, taskID)
+	liveEvents, liveCorrupt, liveErr := readEvents(live)
+	if liveErr != nil && !os.IsNotExist(liveErr) {
+		return nil, false, liveErr
 	}
-	return events, hadCorruption, nil
+	archEvents, archCorrupt, archErr := readEvents(arch)
+	if archErr != nil && !os.IsNotExist(archErr) {
+		return nil, false, archErr
+	}
+	liveMissing := os.IsNotExist(liveErr)
+	archMissing := os.IsNotExist(archErr)
+	if liveMissing && archMissing {
+		return nil, false, nil
+	}
+	if liveMissing {
+		return archEvents, archCorrupt, nil
+	}
+	if archMissing {
+		return liveEvents, liveCorrupt, nil
+	}
+	// 两处并存的极少见迁移窗口:按 seq 合并去重, 再按 seq 升序排,让读侧仍看到完整单调历史.
+	merged := mergeEventsBySeq(archEvents, liveEvents)
+	return merged, liveCorrupt || archCorrupt, nil
 }
 
-// archiveTaskEvents 随 archiveTask 把事件账本移到 archive/events/。事件账本不存在（旧卡/无事件）
-// 不算错——archive 是"随卡"归档，卡有事件才有账本，反之空账本无需强行创建。
+// mergeEventsBySeq 按 seq 合并两份事件流并去重, 结果按 seq 升序.
+// 冲突时(同 seq 两处都有)保留归档侧——归档更接近"历史底本", 活动侧更可能是补写的近事件.
+func mergeEventsBySeq(archEvents, liveEvents []TaskEvent) []TaskEvent {
+	seen := make(map[int64]bool, len(archEvents)+len(liveEvents))
+	out := make([]TaskEvent, 0, len(archEvents)+len(liveEvents))
+	for _, ev := range archEvents {
+		if seen[ev.Seq] {
+			continue
+		}
+		seen[ev.Seq] = true
+		out = append(out, ev)
+	}
+	for _, ev := range liveEvents {
+		if seen[ev.Seq] {
+			continue
+		}
+		seen[ev.Seq] = true
+		out = append(out, ev)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out
+}
+
+// archiveTaskEvents 随 archiveTask 把事件账本移到 archive/events/. 事件账本不存在(旧卡/无事件)
+// 不算错——archive 是"随卡"归档, 卡有事件才有账本, 反之空账本无需强行创建.
+// 【为什么必须抢事件锁】不抢锁的裸 os.Rename 与并发 recordEvent 竞态: recordEvent 已进临界区
+// 读到 events 内容、计出 nextSeq, archive 恰好在此时 rename src → archived. recordEvent 的
+// OpenFile(O_APPEND|O_CREATE) 会新建一个 seq 从 next 开始的活动文件, 造成"活动文件突然只有
+// 若干后续事件, 历史整体隐匿"——头部缺口守卫失效. 用事件锁包住 rename, 让 recordEvent 要么
+// 在 rename 前完成、要么在 rename 后看到"活动不存在但归档存在" → 走 pickEventsWritePath 追
+// 加到归档文件, 保持写点唯一, 历史不断线.
 func archiveTaskEvents(root, taskID string) error {
 	src := eventsPath(root, taskID)
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	release, err := acquireEventLock(root, taskID)
+	if err != nil {
+		return err
+	}
+	defer release()
+	// 抢锁期间 src 可能已被其他归档流搬走(clean 与 postComplete 并发 archive 都走这里).
 	if _, err := os.Stat(src); err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -309,7 +467,72 @@ func archiveTaskEvents(root, taskID string) error {
 	if err := os.MkdirAll(archivedEventsDir(root), 0o755); err != nil {
 		return err
 	}
-	return os.Rename(src, archivedEventsPath(root, taskID))
+	// 若归档路径已存在(极少见, 同 ID 归档文件曾被写过): 必须合并 src+dst 到 dst 并删除 src.
+	// 【为什么必须合并而非跳过】跳过策略会让 src 遗留在活动路径 → 后续 emit 走 pickEventsWritePath
+	// 见活动存在则继续写活动, 形成"活动/归档两处长期并存"的迁移态:
+	//   (1) loadTaskEvents 合并读能兜住展示层, 但把 seq 冲突消解的复杂性推给读者;
+	//   (2) 归档流的语义是"卡已到终态, 后续不再写", 保留活动路径违背意图;
+	//   (3) 万一读者只走单一路径(如未来某个 CLI 工具直接读 archive/), 会漏活动侧事件.
+	// 合并策略:读双侧事件按 seq 合并去重, atomicWrite 覆盖 dst, 删除 src——写点收敛回单一归档.
+	// 覆盖旧归档不算"毁历史"因为合并已保留其全部事件(mergeEventsBySeq 冲突时保留归档侧).
+	dst := archivedEventsPath(root, taskID)
+	if _, err := os.Stat(dst); err == nil {
+		return mergeIntoArchivedEvents(src, dst)
+	}
+	return os.Rename(src, dst)
+}
+
+// mergeIntoArchivedEvents 把 src 的事件合并进已存在的 dst, 然后删除 src.
+// 【为什么先合并再删】不用简单 append:src/dst 各自可能有 seq 相同的事件(如极端情况下的双写残留),
+// mergeEventsBySeq 会去重, append 会重复 seq 破坏"卡内 seq 单调递增"契约. 用 atomicWrite 保证
+// 崩溃安全:合并写 tmp+Rename 挂 dst, 崩溃在合并中间不会污染旧 dst; 崩溃在 Remove(src) 前不会
+// 丢事件(src 仍在, 下一次 archive 会再走一次合并——去重把重复消掉).
+func mergeIntoArchivedEvents(src, dst string) error {
+	srcEvents, _, srcErr := readEvents(src)
+	if srcErr != nil && !os.IsNotExist(srcErr) {
+		return srcErr
+	}
+	dstEvents, _, dstErr := readEvents(dst)
+	if dstErr != nil && !os.IsNotExist(dstErr) {
+		return dstErr
+	}
+	merged := mergeEventsBySeq(dstEvents, srcEvents)
+	var buf bytes.Buffer
+	for _, ev := range merged {
+		data, err := json.Marshal(ev)
+		if err != nil {
+			return err
+		}
+		buf.Write(data)
+		buf.WriteByte('\n')
+	}
+	if err := atomicWrite(dst, buf.Bytes()); err != nil {
+		return err
+	}
+	return os.Remove(src)
+}
+
+// hasCanceledEvent 扫账本判断是否已有 evCanceled 事件——取消去重的**唯一**可靠真相源.
+// 【为什么不用 diskCanceled】cmdSetStatus 的走位是"先 saveTask(cancel) 再 emit(canceled)":
+// 若在两步之间崩溃/断电, 或 emit 因 best-effort 失败(锁超时/磁盘满), 盘上 status=canceled
+// 但账本无事件. 用磁盘态代理"账本已有事件"会让 finalizeCanceled 与 runTask 入口守卫都跳过
+// emit——取消事件永久缺失且无 seq 缺口可见(0 条与 2 条同样违背"恰一条", 但 0 条不可检测更
+// 糟, 是对旧代码保证≥1 条的直接回归). 用账本本身作为去重键:盘上 canceled 但账本无事件时
+// 必须补一条(detail 标 reason=backfill 溯源, 让审计能区分正规取消与补写).
+func hasCanceledEvent(root, taskID string) bool {
+	if taskID == "" {
+		return false
+	}
+	events, _, err := loadTaskEvents(root, taskID)
+	if err != nil || len(events) == 0 {
+		return false
+	}
+	for _, ev := range events {
+		if ev.Type == evCanceled {
+			return true
+		}
+	}
+	return false
 }
 
 // emitTaskEvent 是 recordEvent 的便捷封装：状态机侧点用它记录事件，写入失败只打警告不阻断。

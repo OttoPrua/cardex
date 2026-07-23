@@ -13,7 +13,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -321,7 +324,7 @@ func TestCliSetStatusHoldReleaseCancelEvents(t *testing.T) {
 	if err := cmdSetStatus([]string{"-root", root, tk.ID}, "cancel"); err != nil {
 		t.Fatal(err)
 	}
-	// 归档后：eventsPathAnywhere 优先归档路径。
+	// 归档后：loadTaskEvents 会从 archive/events/ 合并读取，历史不断线。
 	events, _, err := loadTaskEvents(root, tk.ID)
 	if err != nil {
 		t.Fatalf("归档事件应可读: %v", err)
@@ -636,9 +639,10 @@ func TestBoardActivityShowsGapWhenHeadEventDeleted(t *testing.T) {
 	}
 }
 
-// TestRecordEventConcurrentWritesNoSeqCollision (P1-5) 验证:同一任务的并发 emit 全都唯一 seq。
-// 反例注入:去掉 events.go:101 的 acquireEventLock,多个 goroutine 会 read-compute-write 竞态,
-// 两条事件同 seq——"seq 单调递增"契约破,seq 序列表面完整但存在重复,反例注入删中间事件也测不出来。
+// TestRecordEventConcurrentWritesNoSeqCollision (P1-5, 进程内) 验证:同一进程内并发 emit 全都唯一 seq.
+// 【测试范围诚实声明】本测试只钉住 sync.Mutex 的进程内互斥——去掉 lockForTask 会报红, 但去掉
+// acquireEventLock 因 mutex 仍串行化本测试**不会**报红. 跨进程正确性(文件锁真正的用武之地)由
+// TestRecordEventCrossProcessNoSeqCollision 用 helper-process 子进程模式钉住.
 func TestRecordEventConcurrentWritesNoSeqCollision(t *testing.T) {
 	root := testRoot(t)
 	const workers = 20
@@ -772,4 +776,558 @@ func TestFinalizeCanceledSkipsEmitAfterCliCancel(t *testing.T) {
 			t.Fatalf("detail.reason 应为 runner_cancel,got %q", reason)
 		}
 	})
+}
+
+// ---------- Round-2 修复回红反例 ----------
+
+// TestHelperProcessEmit 是 helper-process 模式的子进程入口——受 GO_TEST_HELPER_EMIT=1 门控.
+// 无环境变量时直接返回, 让主 test 二进制也能把它当普通空测试跑过. 有环境变量时按参数并发 emit
+// 若干条事件, 借主测试(TestRecordEventCrossProcessNoSeqCollision)fork 多个子进程验证文件锁跨进程互斥.
+func TestHelperProcessEmit(t *testing.T) {
+	if os.Getenv("GO_TEST_HELPER_EMIT") != "1" {
+		return
+	}
+	root := os.Getenv("HELPER_ROOT")
+	id := os.Getenv("HELPER_TASK_ID")
+	n, err := strconv.Atoi(os.Getenv("HELPER_N"))
+	if err != nil || n <= 0 {
+		t.Fatalf("HELPER_N 无效: %q", os.Getenv("HELPER_N"))
+	}
+	for j := 0; j < n; j++ {
+		emitTaskEvent(root, id, evStepOK, fmt.Sprintf("child-%d", os.Getpid()), statusRunning, j, map[string]any{
+			"pid": os.Getpid(), "j": j,
+		})
+	}
+	// 子进程主动 exit, 避免 -test.run=^TestHelperProcessEmit$ 之外的其他匹配跑起来影响并发计数.
+	os.Exit(0)
+}
+
+// TestRecordEventCrossProcessNoSeqCollision (P1-1/P1-5 跨进程回红反例) fork 3 个子进程各写 15 条,
+// 断言 seq 密集 1..45 无重复. 这是 acquireEventLock 文件锁真正被使用的场景——反例注入:去掉
+// events.go 里 acquireEventLock 或把 tmp+os.Link 改回 O_EXCL 两步式(bootstrap 竞态复现), 子进程
+// 会撞 seq → 本测试报红. 注:helper-process 依赖 os/exec fork 自身, POSIX 才可靠, Windows 跳过.
+func TestRecordEventCrossProcessNoSeqCollision(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("helper-process fork 依赖 POSIX; Windows 上 acquireEventLock 走 processAlive 分支不同, 单独覆盖")
+	}
+	if testing.Short() {
+		t.Skip("跨进程 fork 较慢, -short 模式跳过")
+	}
+	root := testRoot(t)
+	const workers = 3
+	const perWorker = 15
+	cmds := make([]*exec.Cmd, 0, workers)
+	for i := 0; i < workers; i++ {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessEmit$")
+		cmd.Env = append(os.Environ(),
+			"GO_TEST_HELPER_EMIT=1",
+			"HELPER_ROOT="+root,
+			"HELPER_TASK_ID=xproc",
+			"HELPER_N="+strconv.Itoa(perWorker),
+		)
+		// stdout/stderr 直连便于定位子进程 panic;不介意小噪声, 目标是"seq 撞车必红".
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("helper 子进程 %d Start 失败: %v", i, err)
+		}
+		cmds = append(cmds, cmd)
+	}
+	for i, cmd := range cmds {
+		if err := cmd.Wait(); err != nil {
+			t.Fatalf("helper 子进程 %d 退出错: %v", i, err)
+		}
+	}
+	events := readAllEventsRaw(t, root, "xproc")
+	want := workers * perWorker
+	if len(events) != want {
+		t.Fatalf("跨进程并发写入应留 %d 条, got %d", want, len(events))
+	}
+	seen := make(map[int64]bool, want)
+	var maxSeq int64
+	for _, ev := range events {
+		if seen[ev.Seq] {
+			t.Fatalf("跨进程 seq 撞车 seq=%d(文件锁失效!): %+v", ev.Seq, ev)
+		}
+		seen[ev.Seq] = true
+		if ev.Seq > maxSeq {
+			maxSeq = ev.Seq
+		}
+	}
+	for s := int64(1); s <= int64(want); s++ {
+		if !seen[s] {
+			t.Fatalf("跨进程 seq 应密集 1..%d, 缺 seq=%d(max=%d)——nextSeq 计算与文件锁未同步", want, s, maxSeq)
+		}
+	}
+}
+
+// TestFinalizeCanceledBackfillsWhenLedgerEmpty (P1-3 回红反例) 验证:cli:cancel 已 saveTask 到盘但
+// emit 因某故障(best-effort 失败/两步之间崩溃)没落, 此时账本无 canceled 事件——finalizeCanceled
+// **必须**补一条(reason=backfill 溯源), 而不是被 diskCanceled=true 骗过去跳过 emit.
+// 反例注入:把 finalizeCanceled 里的 hasCanceledEvent 换回 diskCanceled(旧法), 盘 canceled+账本空
+// 会命中 alreadyEmitted=true → 跳过 emit → cancelCount=0 → 本测试报红.
+func TestFinalizeCanceledBackfillsWhenLedgerEmpty(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	tk := newTask(root, cfg, typeSequence, "cli-cancel-emit-lost", "/tmp", []string{"p"}, 5)
+	tk.Status = statusRunning
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	// 只模拟 cli:cancel 落盘, 不 emit 事件——等价 main.go:1451 saveTask 与 1455 emit 之间崩溃,
+	// 或 emit 因锁超时/磁盘满 best-effort 失败(events.go:emitTaskEvent 失败只打警告不阻断).
+	tk.Status = statusCanceled
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	// 关键前置:账本此时无任何 canceled 事件, 但 diskCanceled(root,id) 会返回 true.
+	if hasCanceledEvent(root, tk.ID) {
+		t.Fatal("前置错误:账本本应为空, 无 canceled 事件")
+	}
+	if !diskCanceled(root, tk.ID) {
+		t.Fatal("前置错误:磁盘态应为 canceled")
+	}
+
+	lg, err := os.CreateTemp(t.TempDir(), "log-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	if err := finalizeCanceled(root, tk, lg); err != nil {
+		t.Fatal(err)
+	}
+
+	events, _, err := loadTaskEvents(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelCount := 0
+	var backfill *TaskEvent
+	for i := range events {
+		if events[i].Type == evCanceled {
+			cancelCount++
+			backfill = &events[i]
+		}
+	}
+	if cancelCount != 1 {
+		t.Fatalf("cli 已 cancel 但账本空时, runner 必须补一条 canceled 事件, got %d 条: %v", cancelCount, eventTypes(events))
+	}
+	if reason, _ := backfill.Detail["reason"].(string); reason != "backfill" {
+		t.Fatalf("补写的 canceled detail.reason 应为 backfill(与正规 runner_cancel 区分溯源), got %q", reason)
+	}
+	if source, _ := backfill.Detail["source"].(string); source != "runner_finalize" {
+		t.Fatalf("backfill.source 应为 runner_finalize(区分 entry_guard), got %q", source)
+	}
+}
+
+// TestRunTaskEntryGuardBackfillsCanceledEvent (P1-3 同类闭合回红反例) 验证:runTask 入口守卫遇
+// 盘上 canceled+账本无事件时**也**必须补一条(不只在 finalizeCanceled 补). 这条路径覆盖"cli:cancel
+// 后 daemon 重启, 新一轮 tick pick 到这张卡走 runTask 顶部 diskCanceled 分支归档"的场景.
+// 反例注入:去掉 runner.go 入口守卫的 hasCanceledEvent 检查+补 emit, 入口归档路径下账本永久空.
+func TestRunTaskEntryGuardBackfillsCanceledEvent(t *testing.T) {
+	root := testRoot(t)
+	// 用最小 config——入口守卫在 fake bin 被调用前就命中, 不需要 fakeClaudeBin.
+	cfg := runTaskCfg(t, "/nonexistent")
+	work := t.TempDir()
+	tk := newTask(root, cfg, typeSequence, "entry-guard-backfill", work, []string{"p"}, 5)
+	// 盘上 canceled 但账本无事件——完全模拟 cli:cancel 后 emit 失败, 再一轮 tick pick 到这卡.
+	tk.Status = statusCanceled
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if hasCanceledEvent(root, tk.ID) {
+		t.Fatal("前置错误:账本本应为空")
+	}
+
+	if err := runTask(context.Background(), root, cfg, tk, false); err != nil {
+		t.Fatal(err)
+	}
+
+	events, _, err := loadTaskEvents(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("入口守卫必须补且仅补 1 条 canceled, got %d: %v", len(events), eventTypes(events))
+	}
+	ev := events[0]
+	if ev.Type != evCanceled {
+		t.Fatalf("补写的事件类型应为 canceled, got %q", ev.Type)
+	}
+	if ev.Actor != "runner:entry" {
+		t.Fatalf("入口守卫补写的 actor 应为 runner:entry(与 runner_finalize 区分), got %q", ev.Actor)
+	}
+	if reason, _ := ev.Detail["reason"].(string); reason != "backfill" {
+		t.Fatalf("入口守卫补写 detail.reason 应为 backfill, got %q", reason)
+	}
+	if source, _ := ev.Detail["source"].(string); source != "entry_guard" {
+		t.Fatalf("入口守卫补写 detail.source 应为 entry_guard, got %q", source)
+	}
+}
+
+// TestRecordEventAfterArchivePreservesSeqAndHistory (P1-4 回红反例) 验证:活动文件归档后补写事件
+// 必须继承旧 seq(不能从 1 重启), 且 loadTaskEvents 能读到完整历史.
+// 反例注入:把 nextSeq 改回只读 eventsPath(不看 archivedEventsPath), closeout 事件会 seq=1 重启, 而
+// 头部缺口守卫因 seq 从 1 起算不触发——本测试断言"seq 1..4 密集"会红.
+func TestRecordEventAfterArchivePreservesSeqAndHistory(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	tk := newTask(root, cfg, typeSequence, "archive-then-emit", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	// 先写 3 条事件, 模拟卡跑完前的历史.
+	emitTaskEvent(root, tk.ID, evQueued, "cli:add", statusQueued, 0, nil)
+	emitTaskEvent(root, tk.ID, evDispatched, "runner", statusRunning, 0, nil)
+	emitTaskEvent(root, tk.ID, evStepOK, "runner", statusRunning, 1, nil)
+	// 归档——clean 或 archiveTask 收口路径.
+	if err := archiveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	// 归档后补写 closeout(postComplete 期间 clean 抢跑, 或 runReviewSync 结束后 emit).
+	emitTaskEvent(root, tk.ID, evCloseout, "runner:review", statusDone, 1, map[string]any{"kind": "review_after"})
+
+	events, _, err := loadTaskEvents(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("归档后补写应保留完整 4 条(旧 3 + closeout 1), got %d: %v", len(events), eventTypes(events))
+	}
+	// seq 必须 1..4 密集连续, 不能从 1 重启造成 [1,2,3, 1] 或 [1] 隐藏 [1,2,3].
+	for i, ev := range events {
+		if ev.Seq != int64(i+1) {
+			t.Fatalf("归档后补写 seq 应密集 1..4, 第 %d 条 seq=%d 应 %d(全序列=%v)", i, ev.Seq, i+1, seqs(events))
+		}
+	}
+	if events[3].Type != evCloseout {
+		t.Fatalf("末条应为 closeout(归档后补写的事件), got %v", eventTypes(events))
+	}
+	// 活动流不应显缺口——完整历史 1..4, 无跳号.
+	items := buildActivity(root, []*Task{tk})
+	for _, it := range items {
+		if strings.Contains(it.Event, "事件缺口") {
+			t.Fatalf("归档后补写不应触发'事件缺口'披露(反例:seq 从 1 重启会假装完整历史,现在不再假装了): %+v", items)
+		}
+	}
+}
+
+// TestArchiveConcurrentWithEmitPreservesAllEvents (P1-4 同类闭合并发反例) 验证:多个 goroutine 并
+// 发 emit 时穿插一个 archive, 所有事件的 seq 仍唯一且密集, 无一丢失.
+// 反例注入:archiveTaskEvents 改回不抢事件锁的裸 os.Rename, recordEvent 与 archive 交错时会新建
+// 一份 seq=1 起算的活动文件, 与旧账本 seq 重叠 → seen[seq] 撞车报红.
+func TestArchiveConcurrentWithEmitPreservesAllEvents(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	tk := newTask(root, cfg, typeSequence, "archive-race", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	emitTaskEvent(root, tk.ID, evQueued, "cli:add", statusQueued, 0, nil)
+
+	const workers = 10
+	const perWorker = 5
+	var wg sync.WaitGroup
+	wg.Add(workers + 1)
+	// archive goroutine——短睡后跑, 让部分 emit 先入队, 制造"归档穿插并发写入"的交错.
+	go func() {
+		defer wg.Done()
+		time.Sleep(2 * time.Millisecond)
+		_ = archiveTask(root, tk)
+	}()
+	for i := 0; i < workers; i++ {
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < perWorker; j++ {
+				emitTaskEvent(root, tk.ID, evStepOK, fmt.Sprintf("w-%d", i), statusRunning, j, map[string]any{"i": i, "j": j})
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	events, _, err := loadTaskEvents(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := 1 + workers*perWorker // queued + step_ok*(workers*perWorker)
+	if len(events) != want {
+		t.Fatalf("并发归档+emit 事件总数应 %d, got %d(丢事件!): 序列=%v", want, len(events), eventTypes(events))
+	}
+	seen := make(map[int64]bool, want)
+	var maxSeq int64
+	for _, ev := range events {
+		if seen[ev.Seq] {
+			t.Fatalf("并发归档+emit seq 撞车 seq=%d: %+v(锁失效:archive 未抢事件锁, seq 从 1 重启造成重叠)", ev.Seq, ev)
+		}
+		seen[ev.Seq] = true
+		if ev.Seq > maxSeq {
+			maxSeq = ev.Seq
+		}
+	}
+	for s := int64(1); s <= int64(want); s++ {
+		if !seen[s] {
+			t.Fatalf("seq 应密集 1..%d, 缺 seq=%d(max=%d)", want, s, maxSeq)
+		}
+	}
+}
+
+// TestLoadTaskEventsMergesLiveAndArchived (P1-4 合并读回红反例) 验证:活动+归档两处并存时,
+// loadTaskEvents 按 seq 合并去重, 返回完整历史. 极少见的迁移中间态, 但读侧不能因两处并存而漏.
+// 反例注入:把 loadTaskEvents 改回只读 eventsPathAnywhere(活动优先), 归档里的旧历史会被隐匿.
+func TestLoadTaskEventsMergesLiveAndArchived(t *testing.T) {
+	root := testRoot(t)
+	// 手工造并存态:归档 [1,2], 活动 [3,4]. 正常流程不会到此(归档后写归档), 但读侧必须兜住.
+	id := "merge-both"
+	if err := os.MkdirAll(archivedEventsDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(eventsDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mkEv := func(seq int64, typ string) string {
+		ev := TaskEvent{Seq: seq, TS: time.Now().Format(time.RFC3339Nano), Type: typ, Actor: "test", Status: statusRunning, Step: int(seq)}
+		b, _ := json.Marshal(ev)
+		return string(b) + "\n"
+	}
+	if err := os.WriteFile(archivedEventsPath(root, id), []byte(mkEv(1, evQueued)+mkEv(2, evDispatched)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(eventsPath(root, id), []byte(mkEv(3, evStepOK)+mkEv(4, evDone)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	events, _, err := loadTaskEvents(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("合并读应返回 4 条, got %d: %v", len(events), eventTypes(events))
+	}
+	for i, ev := range events {
+		if ev.Seq != int64(i+1) {
+			t.Fatalf("合并后 seq 应 1..4 升序, 第 %d 条 seq=%d 应 %d", i, ev.Seq, i+1)
+		}
+	}
+	wantTypes := []string{evQueued, evDispatched, evStepOK, evDone}
+	if !equalStringSlices(eventTypes(events), wantTypes) {
+		t.Fatalf("合并后类型序列错乱, got %v want %v", eventTypes(events), wantTypes)
+	}
+}
+
+// seqs 提取事件的 seq 序列供错误信息展示.
+func seqs(events []TaskEvent) []int64 {
+	out := make([]int64, 0, len(events))
+	for _, e := range events {
+		out = append(out, e.Seq)
+	}
+	return out
+}
+
+// ---------- Round-3 修复回红反例 ----------
+
+// TestStaleEventLockRefusesStealOnFreshUnparseable (P1-1 Round-3 单元断言) 覆盖
+// staleEventLock 的判定契约:内容空/不可解析且 mtime 未超 TTL 一律返回 false(不 stale, 只等待).
+// 反例注入:把 events.go:staleEventLock 里"Unmarshal 失败 || PID<=0 返回 false"改回旧
+// "mtime<=1s 才返回 false, 否则 true"或"直接 return true", 本测试的中间/近 TTL 上限场景会红.
+// 用途:防守 bootstrap 竞态回归——即使日后有人把 tmp+Link 改回 O_EXCL 两步式,此判据仍能挡
+// "读到空内容→立即强夺"路径.
+func TestStaleEventLockRefusesStealOnFreshUnparseable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "l.lock")
+	ttl := 5 * time.Second
+
+	// 场景 A:空内容+刚落盘(mtime≈now) → 不判 stale.
+	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if staleEventLock(path, ttl) {
+		t.Fatal("场景A: 空锁+新鲜 mtime 不应判 stale(bootstrap 竞态回归风险!)")
+	}
+
+	// 场景 B:内容不可解析+新鲜 mtime → 不判 stale.
+	if err := os.WriteFile(path, []byte("{invalid json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if staleEventLock(path, ttl) {
+		t.Fatal("场景B: 不可解析内容+新鲜 mtime 不应判 stale")
+	}
+
+	// 场景 C:PID=0 的合法 JSON+新鲜 mtime → 不判 stale.
+	if err := os.WriteFile(path, []byte(`{"pid":0,"at":"now"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if staleEventLock(path, ttl) {
+		t.Fatal("场景C: PID=0+新鲜 mtime 不应判 stale")
+	}
+
+	// 场景 D:内容不可解析+mtime 超 TTL → 判 stale(边界:mtime>TTL 是硬夺权条件).
+	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 直接把 mtime 拨回 TTL+2s 前,免得测试真等 5s.
+	past := time.Now().Add(-(ttl + 2*time.Second))
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if !staleEventLock(path, ttl) {
+		t.Fatal("场景D: mtime>TTL 的空锁必须判 stale(否则死锁不可解)")
+	}
+}
+
+// TestStaleLockRefusesStealOnFreshUnparseable (P1-1 Round-3 同类闭合) 覆盖 state.go:staleLock
+// 与 events.go:staleEventLock 同类同源:仅当(可解析&&!processAlive)或 mtime>TTL 判 stale, 内容
+// 空/不可解析 + mtime 未超 TTL 一律等待. 反例注入:把 state.go:staleLock 的 Unmarshal 失败分支
+// 改回 return true, 本测试报红. 单实例锁的 bootstrap 竞态窗口比事件锁窄(两个 daemon 同时起概率极低),
+// 但缺陷同类必须一并闭合——留一个兄弟洞下一轮就会被复审续猎.
+func TestStaleLockRefusesStealOnFreshUnparseable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "l.lock")
+	ttl := 5 * time.Second
+
+	// 空内容 + 新鲜 mtime → 不判 stale (与 staleEventLock 场景 A 对齐).
+	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if staleLock(path, ttl) {
+		t.Fatal("state.go:staleLock 同类闭合: 空锁+新鲜 mtime 不应判 stale")
+	}
+	// 不可解析内容 + 新鲜 mtime → 不判 stale.
+	if err := os.WriteFile(path, []byte("{invalid"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if staleLock(path, ttl) {
+		t.Fatal("state.go:staleLock 同类闭合: 不可解析+新鲜 mtime 不应判 stale")
+	}
+	// mtime>TTL 边界仍必须判 stale (硬夺权条件).
+	if err := os.WriteFile(path, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	past := time.Now().Add(-(ttl + 2*time.Second))
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if !staleLock(path, ttl) {
+		t.Fatal("state.go:staleLock: mtime>TTL 的空锁必须判 stale(否则死锁不可解)")
+	}
+}
+
+// TestAcquireEventLockWaitsOnFreshEmptyLock (P1-1/P1-2 Round-3 集成断言) 验证:
+// 预置一个"空内容+新鲜 mtime"的锁文件时,acquireEventLock 必须持续等待, 绝不在 TTL 内强夺.
+// 【为什么这条测试直接钉住 bootstrap 竞态回归】前一条 TestStaleEventLockRefuses 只钉判据函数,
+// 这条钉真实的 acquireEventLock 循环——反例注入:把 staleEventLock 的 mtime<=TTL 豁免改回
+// 旧的 mtime<=1s 阈值或直接判 stale, acquireEventLock 会立即走 Rename 强夺路径→本测试报红.
+// 组合:两条测试覆盖判据函数+调用者行为,任一层改弱都必红.
+func TestAcquireEventLockWaitsOnFreshEmptyLock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("包含 500ms 等待, -short 模式跳过")
+	}
+	root := testRoot(t)
+	id := "wait-on-empty"
+	if err := os.MkdirAll(eventsDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := eventLockPath(root, id)
+	// 预置空锁模拟"另一进程刚 WriteFile(tmp) 未及 Link"的极窄空窗
+	// (虽然当前 tmp+Link 已消除此窗口,但审查要求防御纵深:即便日后回退到 O_EXCL 也要挡).
+	if err := os.WriteFile(lockPath, []byte{}, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// acquireEventLock 在独立 goroutine 里跑, 主 goroutine 等 500ms 判断它是否被卡在自旋中.
+	// 500ms 远小于 TTL 5s——若被误判 stale 会立即 Rename 抢走并成功返回, done chan 会收到 nil err.
+	done := make(chan error, 1)
+	go func() {
+		release, err := acquireEventLock(root, id)
+		if err == nil {
+			release()
+		}
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		t.Fatalf("acquireEventLock 提前返回(强夺了空锁!): err=%v — 应等到空锁被清才成功", err)
+	case <-time.After(500 * time.Millisecond):
+		// 500ms 内它仍在等待, 符合预期.
+	}
+
+	// 人工 rm 空锁, 让后续自旋能 Link 成功.
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("空锁清除后 acquireEventLock 仍失败: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("空锁清除后 acquireEventLock 未能在 2s 内获取")
+	}
+}
+
+// TestArchiveMergesWhenDstExists (P1-3 Round-3 回红反例) 验证:archiveTaskEvents 遇 src+dst 双侧
+// 并存时(极少见残留态:archive 一半崩溃 / 外部工具误建 src / 同 ID 归档文件曾被写过)必须合并
+// src 到 dst 并删除 src——旧法"跳过, 留 src 在活动路径"会让后续 emit 走 pickEventsWritePath 见
+// 活动存在则继续写活动, 形成"活动/归档两处长期并存"的迁移态:loadTaskEvents 合并读能兜住展示层,
+// 但把 seq 冲突消解推给读者, 且直接读单一路径的 CLI 工具会漏事件. 归档流的语义是"卡已到终态,
+// 后续不再写"——src 必须被清才符合意图.
+// 反例注入:把 archiveTaskEvents 的 dst 已存在分支改回 return nil(跳过), src 会遗留 → 本测试
+// 的"src 必须被删"或"dst 含 4 条"断言报红.
+//
+// 【为什么直接手写 src, 不走 emit】emit 首次调用时 pickEventsWritePath 会因活动不存在而直接写
+// 归档路径(避免旧代码"影子账本"), src 永远不会被 emit 自然创建. 要制造"两处并存"的残留态只能
+// 用手写模拟.
+func TestArchiveMergesWhenDstExists(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	tk := newTask(root, cfg, typeSequence, "archive-dst-exists", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+
+	// 预置双侧账本:归档已含 [1,2], 活动已含 [3,4]——极端残留态.
+	if err := os.MkdirAll(archivedEventsDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(eventsDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mkEv := func(seq int64, typ string) string {
+		ev := TaskEvent{Seq: seq, TS: time.Now().Format(time.RFC3339Nano), Type: typ, Actor: "old", Status: statusRunning, Step: int(seq)}
+		b, _ := json.Marshal(ev)
+		return string(b) + "\n"
+	}
+	if err := os.WriteFile(archivedEventsPath(root, tk.ID), []byte(mkEv(1, evQueued)+mkEv(2, evDispatched)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(eventsPath(root, tk.ID), []byte(mkEv(3, evStepOK)+mkEv(4, evDone)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 归档:src+dst 都存在 → 必须合并 src 到 dst, 删除 src.
+	if err := archiveTaskEvents(root, tk.ID); err != nil {
+		t.Fatalf("归档失败: %v", err)
+	}
+
+	// 断言 src 已被删——反例注入(跳过)会让此断言报红(src 仍在).
+	if _, err := os.Stat(eventsPath(root, tk.ID)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("dst 已存在合并策略下 src 必须被删, stat err=%v", err)
+	}
+	// dst 应含合并后的全部 4 条事件——反例注入会让 dst 仍只有 2 条, 长度断言报红.
+	dstEvents, _, err := readEvents(archivedEventsPath(root, tk.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dstEvents) != 4 {
+		t.Fatalf("合并后 dst 应含 4 条(旧 2+新 2), got %d: %v", len(dstEvents), eventTypes(dstEvents))
+	}
+	for i, ev := range dstEvents {
+		if ev.Seq != int64(i+1) {
+			t.Fatalf("合并后 dst seq 应密集 1..4 升序, 第 %d 条 seq=%d 应 %d", i, ev.Seq, i+1)
+		}
+	}
+	wantTypes := []string{evQueued, evDispatched, evStepOK, evDone}
+	if !equalStringSlices(eventTypes(dstEvents), wantTypes) {
+		t.Fatalf("合并后 dst 类型序列错乱, got %v want %v", eventTypes(dstEvents), wantTypes)
+	}
 }

@@ -104,6 +104,8 @@ sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-mode
   故命令里的相对路径（如 `rsync -a ./ hostb:/mirror/`）以实现卡目录为基准，而非 daemon 启动目录。
   同步命令须**前台执行完毕**（勿用 `&` 后台化），exit 0 即视为同步完成——后台化会让审核开跑时镜像尚未就绪。
 
+**全局默认分流**（config 三件套，省去每张卡手动指定）：三键 `default_review_host` / `remote_mirror_root` / `default_review_sync` 齐备时，本地实现卡（`RemoteHost` 空）且未显式声明 `ReviewHost` 的 `review_after` 自动审核，一律分流到 `default_review_host`，审核目录自动推导为 `<remote_mirror_root>/<实现卡目录名>`，同步命令继承 `default_review_sync`。三键**缺任一则不套默认**；任务级 `-review-host` / `-review-dir` / `-review-sync` 显式值恒优先；远端实现卡（`RemoteHost` 非空）不受此默认影响（已在远端审）。
+
 ### 交叉验证（fable 顶替：双引擎独立作答 + 对抗式交叉查漏）
 
 设计档模型（fable）撞周限额时，用两个**不同**引擎对同一 fable 级任务（设计/审核/裁决/追认）各自独立作答，再让第二个引擎拿第一个的结论对抗式查漏——两份独立视角比一个更难被同一盲点带偏：
@@ -199,6 +201,28 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 
 **跨平台**：核心是纯 Go，macOS / Linux / Windows 都能编译运行（`go build` 出对应平台二进制）。`install-launchd`（开机自启 + 每 5 分钟自动 tick）只对接 macOS 的 launchd；其他平台用 `claudego daemon` 前台常驻，或让系统定时器每 5 分钟拉一次 `claudego run`——Linux 用 systemd timer / cron，**Windows 用任务计划程序（Task Scheduler）**。单实例锁已跨平台（Windows 走 `OpenProcess` 探活），定时并发不会撞车。
 
+## Web 看板（board 命令）
+
+实时只读 kanban，本机浏览器访问。
+
+```bash
+claudego board               # 默认 http://127.0.0.1:8787
+claudego board -port 9000    # 自定义端口
+claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
+```
+
+三条纪律（不可破）：
+- **只读**：所有接口仅经 `os.ReadFile` / `os.ReadDir` 读文件，绝不写任何任务状态，无 write endpoint。看板挂在生产队列数据上，误写会污染真实队列。
+- **只听 127.0.0.1**：响应含 prompt 全文、目录路径、账号额度，不应出本机。`-addr` 可显式覆盖，但默认永远是回环，非回环地址会打印警告——不建议外放。
+- **TTL 缓存**：任务快照与燃尽视图各有独立 TTL（燃尽 TTL = 任务快照 TTL × 3，至少 30s），防止每次请求全盘扫 tasks/ + transcript。`/api/*` 带 gzip 压缩（实测单次响应 2.5MB → 320KB）。
+
+**燃尽视图三源**（`/api/burn`，`claudego quota` 同源读数）：
+1. **CodexBar `claude.json`**：claude 侧各账号 session / weekly / opus 窗口的百分比时间序列；
+2. **CodexBar `usage-history.jsonl`**（= `usage_feed`）：codex 侧 primary（5h）/ secondary（周）百分比时间序列；
+3. **`~/.claude/projects/*/*.jsonl` transcript**：每条 assistant 消息的绝对 token 用量（四类等权相加，附额度口径折算）。
+
+**"数据不足"语义**：只有一个样本点时没有速率可算；样本比它所描述的窗口还老（如 5h 窗口配一条 14 小时前的样本）；或重置时刻已过——三种情况一律 `verdict="数据不足"`，`burn_rate` / `exhaust_at` 保持 null，绝不编造估算值。只在当前窗口周期内（与最新样本同属同一 resetsAt 边界，容差 90s）的点才参与速率拟合。
+
 ## 5 小时额度红线（保底额度）
 
 给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。三条通道，`claudego quota` 随时查看：
@@ -250,6 +274,10 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 - codex 走自己的额度：不记 claude 账本、其错误不写全局冷却、成功也不清冷却；
 - 沙箱按类型收窄：只读类任务 `--sandbox read-only`，sequence 用 `workspace-write`；
 - 看板与日志标注 `[codex]` / `runner=codex`，emit/进度解析管线照常工作（协调分工在冷却期也能继续入队）。
+
+**降级专用模型与档位对等规则（`codex_fallback_model`）**：`codex_fallback` 生效时若 claude 卡被改道 codex，优先用 `codex_fallback_model`，而非全局 `codex_model`。档位对等映射：**opus 档降级首选同档的 terra（o3），不降设计档的 sol（GPT-5）**——设计档不去干实现档的活。空值回退 `codex_model`；此键仅对降级径（任务 `runner_pref≠codex` 且非远端）生效，codex 主跑卡与远端 codex 不受影响。
+
+**钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
 
 ## 限额中断与自动恢复的细节
 
@@ -433,9 +461,13 @@ exit 2 → marker 不写 → 每次同步必失败 → divert 永久静默回退
 | `oauth_usage` / `oauth_usage_*` | false | 订阅端点直读（第三用量源），端点未文档化——异常按数据不足处理 |
 | `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行；design-review/progress-pull 只读类型豁免，可同仓并发） |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见上文专节 |
+| `codex_fallback_model` | "" | claude 卡降级到 codex 时用此模型（档位对等：opus→terra，不降 sol）；空回退 `codex_model` |
 | `codex_reasoning` | "" | 全局 codex 推理档（minimal/low/medium/high/xhigh/max/ultra）→ `-c model_reasoning_effort=…`；任务级 effort 可覆盖 |
 | `cross_profiles` | {opus-codex} | 交叉验证引擎对（`claudego cross`），见上文专节 |
 | `default_cross_profile` | "opus-codex" | `cross` 未指定 `-profile` 时用的引擎对 |
+| `default_review_host` | "" | 全局默认审核主机（`remote_hosts` 的键）；三键齐备时本地实现卡自动分流，见上文专节 |
+| `remote_mirror_root` | "" | 远端镜像根；与 `default_review_host` 成对，审核目录自动推导为 `<root>/<worktree名>` |
+| `default_review_sync` | "" | 全局默认分流前同步命令（sh -c，cwd=实现卡目录）；三键缺一不套默认 |
 
 提示词模板在 `~/.claudego/templates/*.md`，可直接修改（`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` 会被替换；
 `coordinate.md` 里的 `{{QUEUE}}` `{{PROGRESS}}` 在**派发时**替换为实时快照）。

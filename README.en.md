@@ -79,6 +79,16 @@ Keeping project state in **files** (state.md / TASKS.md, etc.) is recommended so
 - Benefits: you never hit the session-context ceiling ("Prompt is too long" failures vanish), a limit interruption simply re-sends the current step in a fresh session (no resume prompt needed), the codex backup executor can take over **any** step (no longer limited to single-step tasks), and it's audit-friendly (all state changes live in git).
 - `plan -hold` / `assemble -hold`: the split tasks are parked (held) first; after a human review, `claudego release <id>` lets them proceed — the full loop of "split → gate → advance → review → update state".
 
+### Review divert (offload read-only review to a second machine)
+
+Run implementation locally while routing the adversarial review to another `remote_hosts` machine, balancing quota across both sides (review is read-only and therefore freely diverted):
+
+- `add -review-host <host>`: the auto-queued review card after completion runs on this remote host (`remote_hosts` key). The fix chain inherits the declaration — subsequent review rounds keep diverting. If the **sync command fails**, it falls back to local review (the loop stays intact); if the remote review execution itself fails it is treated as an ordinary task failure (retried/backed off), not pulled back locally.
+- `add -review-dir <mirror-path>`: the working directory for the review card on the review host (the directory the review template renders against). Used together with `-review-host`.
+- `add -review-sync <command>`: before dispatching the review card, run this command locally via `sh -c` (e.g. rsync the changes to the review host; 120 s timeout); a non-zero exit code triggers the local-review fallback. Can be used alone (sync only, no divert). **The sync command runs with the implementation card's `dir` as cwd**, so relative paths (e.g. `rsync -a ./ hostb:/mirror/`) are relative to the implementation directory, not the daemon's start directory. The command must **complete in the foreground** (no `&` backgrounding); a zero exit code means sync is done — backgrounding would let the review start before the mirror is ready.
+
+**Global default divert** (config trio — avoids per-card manual specification): when all three keys `default_review_host` / `remote_mirror_root` / `default_review_sync` are set, any local implementation card (`RemoteHost` empty) whose `review_after` review has no explicit `ReviewHost` is automatically diverted to `default_review_host`, with the review directory auto-derived as `<remote_mirror_root>/<impl-card-dirname>` and the sync command inherited from `default_review_sync`. **All three must be set** for the default to apply (any missing key disables it); per-card `-review-host` / `-review-dir` / `-review-sync` explicit values always take precedence; remote implementation cards (`RemoteHost` non-empty) are excluded (they are already reviewed remotely).
+
 ### Cross-verification (fable stand-in: two independent engines + adversarial cross-check)
 
 When a design-tier model (fable) hits its weekly limit, have two **different** engines each answer the same fable-tier task (design / review / ruling / ratification) independently, then let the second engine take the first's conclusion and adversarially hunt for gaps — two independent perspectives are far harder to lead astray with the same blind spot than one:
@@ -172,6 +182,28 @@ If you'd rather not install launchd, just run `claudego daemon` as a foreground 
 
 **Cross-platform**: the core is pure Go and builds/runs on macOS, Linux, and Windows (`go build` yields a per-platform binary). `install-launchd` (login autostart + a tick every 5 min) only wires up macOS's launchd; on other platforms run `claudego daemon` as a foreground resident, or have the OS scheduler run `claudego run` every 5 minutes — systemd timers / cron on Linux, **Task Scheduler on Windows**. The single-instance lock is cross-platform (Windows uses `OpenProcess` for liveness), so scheduled runs won't collide.
 
+## Web board (`board` command)
+
+A live read-only kanban in your local browser.
+
+```bash
+claudego board               # default http://127.0.0.1:8787
+claudego board -port 9000    # custom port
+claudego board -ttl 30       # task-snapshot cache TTL in seconds (default 10)
+```
+
+Three inviolable rules:
+- **Read-only**: every handler uses only `os.ReadFile` / `os.ReadDir` — no writes to task state, no write endpoints. The board sits on top of live queue data; any write would corrupt the real queue.
+- **127.0.0.1 only**: responses contain full prompt text, directory paths, and quota data. `-addr` can override the bind address, but the default is always the loopback; binding to a non-loopback address prints a warning — not recommended.
+- **TTL cache**: task snapshots and the burndown view each have their own TTL (burndown TTL = task TTL × 3, minimum 30 s), preventing a full disk scan of tasks/ and transcripts on every request. `/api/*` endpoints are gzip-compressed (2.5 MB → 320 KB in practice).
+
+**Burndown view — three sources** (`/api/burn`, same underlying data as `claudego quota`):
+1. **CodexBar `claude.json`**: per-account session / weekly / opus window percentage time-series for the claude side;
+2. **CodexBar `usage-history.jsonl`** (= `usage_feed`): primary (5 h) / secondary (weekly) percentage time-series for the codex side;
+3. **`~/.claude/projects/*/*.jsonl` transcripts**: absolute token usage from each assistant message (four components summed equally, plus quota-weighted totals).
+
+**"Insufficient data" semantics**: a single sample point has no computable rate; a sample older than the window it describes (e.g. a 5 h window with a 14-hour-old sample); or a reset time that has already passed — all three cases produce `verdict="insufficient data"`, and `burn_rate` / `exhaust_at` remain null. Only points within the current window period (sharing the same `resetsAt` boundary as the latest sample, with a 90 s tolerance) participate in rate fitting; no values are fabricated.
+
 ## 5-hour quota redline (reserve headroom)
 
 To leave headroom for bursty/interactive work: when the redline is active the queue stops dispatching (multi-step tasks also yield between steps), and `-force` crosses it. Three channels, inspectable anytime with `claudego quota`:
@@ -219,6 +251,10 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 - Sandboxing narrows by type: read-only tasks run `--sandbox read-only`, `sequence` uses `workspace-write`;
 - The board and logs label `[codex]` / `runner=codex`, and the emit/progress-parsing pipeline works as usual (coordinate can keep enqueuing splits even during a cooldown);
 - Reasoning effort is tunable via `codex_reasoning` (minimal/low/medium/high/xhigh), passed as `-c model_reasoning_effort=…`.
+
+**Downgrade-specific model and tier-parity rule (`codex_fallback_model`)**: when `codex_fallback` is active and a claude card is rerouted to codex, `codex_fallback_model` takes priority over the global `codex_model`. Tier-parity mapping: **opus-tier cards downgrade to the same-tier terra (o3), not the design-tier sol (GPT-5)** — design-tier doesn't go fill implementation-tier roles. Empty falls back to `codex_model`; this key only applies to the downgrade path (task `runner_pref≠codex` and not remote) — codex-primary cards and remote codex are unaffected.
+
+**Pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
 
 ## Limit interruption and auto-recovery details
 
@@ -461,9 +497,13 @@ For full autonomy on a single task, add `-skip-permissions`, or set `skip_permis
 | `oauth_usage` / `oauth_usage_*` | false | subscription endpoint (third source); undocumented endpoint — anomalies treated as insufficient data |
 | `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types like design-review / progress-pull are exempt and may run concurrently in the same repo) |
 | `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the dedicated section |
+| `codex_fallback_model` | "" | model used when a claude card downgrades to codex (tier-parity: opus→terra, not sol); empty falls back to `codex_model` |
 | `codex_reasoning` | "" | global codex reasoning effort (minimal/low/medium/high/xhigh/max/ultra) → `-c model_reasoning_effort=…`; a per-task effort overrides it |
 | `cross_profiles` | {opus-codex} | cross-verification engine pairs (`claudego cross`) — see the dedicated section |
 | `default_cross_profile` | "opus-codex" | engine pair used when `cross` gets no `-profile` |
+| `default_review_host` | "" | global default review host (`remote_hosts` key); auto-diverts local impl cards when the trio is set — see the dedicated section |
+| `remote_mirror_root` | "" | remote mirror root; paired with `default_review_host`; ReviewDir auto-derived as `<root>/<worktree-name>` |
+| `default_review_sync` | "" | global default pre-divert sync command (sh -c, cwd=impl card dir); all three keys must be set for the default to apply |
 
 Prompt templates live in `~/.claudego/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).
 

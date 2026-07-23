@@ -819,7 +819,7 @@ function activitySection(items) {
       h('h2', { class: 'section-title', text: '最近活动' }),
       h('span', {
         class: 'section-note',
-        text: '任务卡只存 updated_at 一个时间戳，事件由当前状态反推，不是完整历史',
+        text: '活动流读 per-task events.jsonl 事件账本；seq 跳号处显式标注「事件缺口」，绝不用状态反推补齐',
       })));
   if (!items || !items.length) {
     sec.append(emptyState('没有活动记录。'));

@@ -96,9 +96,18 @@ func TestReadmeConfigKeys(t *testing.T) {
 		}
 
 		// 2. Config-section keys ⊆ config.go key set.
-		for _, k := range readmeConfigSectionKeys(content) {
-			if !cfgKeys[k] {
-				t.Errorf("%s: config section references key %q which is not in config.go", name, k)
+		// Guard first: a nil return means the section header is missing or renamed — the
+		// range below would silently zero-iterate, making the whole check a no-op.
+		sectionKeys := readmeConfigSectionKeys(content)
+		if sectionKeys == nil {
+			t.Errorf("%s: config quick-reference section not found (header missing or renamed) — key validation is a no-op", name)
+		} else if len(sectionKeys) < 10 {
+			t.Errorf("%s: config quick-reference section returned only %d keys (expected ≥10) — section may be empty or table format changed", name, len(sectionKeys))
+		} else {
+			for _, k := range sectionKeys {
+				if !cfgKeys[k] {
+					t.Errorf("%s: config section references key %q which is not in config.go", name, k)
+				}
 			}
 		}
 	}

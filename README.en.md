@@ -197,7 +197,7 @@ Three inviolable rules:
 - **127.0.0.1 only**: responses contain full prompt text, directory paths, and quota data. `-addr` can override the bind address, but the default is always the loopback; binding to a non-loopback address prints a warning — not recommended.
 - **TTL cache**: task snapshots and the burndown view each have their own TTL (burndown TTL = task TTL × 3, minimum 30 s), preventing a full disk scan of tasks/ and transcripts on every request. `/api/*` endpoints are gzip-compressed (2.5 MB → 320 KB in practice).
 
-**Burndown view — three sources** (`/api/burn`, same underlying data as `claudego quota`):
+**Burndown view — three sources** (`/api/burn`): of these, `usage-history.jsonl` (= `usage_feed`) is the only source shared with `claudego quota`; `claude.json` and transcript scanning are board-exclusive — `claudego quota` does not read those two sources:
 1. **CodexBar `claude.json`**: per-account session / weekly / opus window percentage time-series for the claude side;
 2. **CodexBar `usage-history.jsonl`** (= `usage_feed`): primary (5 h) / secondary (weekly) percentage time-series for the codex side;
 3. **`~/.claude/projects/*/*.jsonl` transcripts**: absolute token usage from each assistant message (four components summed equally, plus quota-weighted totals).
@@ -295,6 +295,22 @@ CG-2 event stream you can roll up "which class is burning attempts" and "how man
 are auth failures". `auth`/`permission`/`input_too_long` tasks carry `[<class>]` prefix in `LastError`
 so CLI/board can identify them at a glance; `unknown` intentionally keeps the raw message to preserve
 the regression baseline.
+
+**Transcript-derived signals never land terminal (Round-3 audit P1)**: `classifyFailure` consuming only
+`errorSummary`'s `msg` is the **first line of defense**, but `msg` may itself be a transcript-picked
+line — `invokeCodex`/`invokeRemoteCodex` route `codexErrorLine`'s hit (which matches naked
+`401 unauthorized`/`403 forbidden`/`invalid api key` etc.) into `res.Result`, and `invokeRemoteClaude`'s
+`parseClaudeJSON=nil` fallback takes `firstLine(combined)`. Those quoted lines flow through `msg` and
+get classified as auth/permission → held, silently parking retries that would have self-healed under
+back-off. **Second line of defense**: `claudeResult` grew a `ResultFromTranscript` flag; `runTask` calls
+`classificationFromTranscript(res, runErr)` after classifying — if true, terminal classes are **softened**
+back to `retry_backoff` (`failure_class` still recorded for audit, plus
+`detail.softened_from_terminal=true` and `reason=softened_transcript_derived`). `LastError` reverts to
+the unprefixed form, byte-identical to the legacy retry path. Regression tests
+`TestRunTaskCodexTranscriptDerivedAuth_SoftenedToRetry` and `..._Permission_..._SoftenedToRetry` pin
+the softening; the reverse control `TestRunTaskClaudeStructuredAuth_StillHeld` proves genuine 401 from
+claude's structured JSON (with `ResultFromTranscript=false`) still lands `held` — no false-positive
+softening.
 
 **Not doing**: no automatic replan/decompose — a CAMEL-style retry→decompose→replan is validated in
 other work but ClaudeGo's `held`-to-human path is sufficient today; automatic replan on misclassification

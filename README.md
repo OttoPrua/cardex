@@ -216,7 +216,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 - **只听 127.0.0.1**：响应含 prompt 全文、目录路径、账号额度，不应出本机。`-addr` 可显式覆盖，但默认永远是回环，非回环地址会打印警告——不建议外放。
 - **TTL 缓存**：任务快照与燃尽视图各有独立 TTL（燃尽 TTL = 任务快照 TTL × 3，至少 30s），防止每次请求全盘扫 tasks/ + transcript。`/api/*` 带 gzip 压缩（实测单次响应 2.5MB → 320KB）。
 
-**燃尽视图三源**（`/api/burn`，`claudego quota` 同源读数）：
+**燃尽视图三源**（`/api/burn`）：三源中 `usage-history.jsonl`（即 `usage_feed`）与 `claudego quota` 共用同源；`claude.json` 与 transcript 扫描为 board 独有读数，`claudego quota` 不读这两源：
 1. **CodexBar `claude.json`**：claude 侧各账号 session / weekly / opus 窗口的百分比时间序列；
 2. **CodexBar `usage-history.jsonl`**（= `usage_feed`）：codex 侧 primary（5h）/ secondary（周）百分比时间序列；
 3. **`~/.claude/projects/*/*.jsonl` transcript**：每条 assistant 消息的绝对 token 用量（四类等权相加，附额度口径折算）。
@@ -312,6 +312,20 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 **事件账本**：分类结果写入 `events.jsonl` 的 `detail.failure_class` 字段，配合 CG-2 事件流可按类别聚合
 "哪种失败在烧 attempts"、"held 里几张是认证问题"。auth/permission/input_too_long 的 `LastError` 带
 `[<class>]` 前缀让 CLI/看板一眼可辨；unknown 保持不加前缀以维持回归基线。
+
+**transcript 来源判据不落终态（Round-3 复审 P1）**：`classifyFailure` 只吃 `errorSummary` 提炼的
+`msg` 是**第一道防线**，但 `msg` 可能是 `invokeCodex/invokeRemoteCodex/invokeRemoteClaude` 从
+`combined`（stdout+stderr transcript）挑出的行——`codexErrorLine` 会命中 codex 硬错误正则挑走裸
+`401 unauthorized`/`403 forbidden`/`invalid api key` 等字面量，`invokeRemoteClaude` 的
+`parseClaudeJSON=nil` 分支会取 `firstLine(combined)`。这些引用行进 `res.Result` 后经 `msg` 被
+`classifyFailure` 判成 auth/permission 直接落 held，等价于让基线本会退避自愈的超时/瞬时抖动被无人
+值守静默停摆。**第二道防线**：在 `res` 增加 `ResultFromTranscript` 标记，`runTask` 分类后调
+`classificationFromTranscript(res, runErr)`——命中即把终态分类**降级** `retry_backoff`
+（`failure_class` 事件仍写供审计，`detail.softened_from_terminal=true`+`reason=softened_transcript_derived`
+标注"原本会落 held/failed 被降级"）。`LastError` 按 `unknown` 语义不加前缀，与旧版逐字节一致。
+反例注入：`TestRunTaskCodexTranscriptDerivedAuth_SoftenedToRetry` 与 `..._Permission_..._SoftenedToRetry`
+两测试锁定该分流；反向对照 `TestRunTaskClaudeStructuredAuth_StillHeld` 证明 claude 结构化 JSON 的
+真 401（`ResultFromTranscript=false`）仍走 held 不误伤。
 
 **不做**：不做自动 replan/decompose——已被 CAMEL 类工作验证但 ClaudeGo 现状 held 升级人工的路径已够用，
 自动 replan 一旦误判等于"任务被 AI 悄悄改写"，与"完整任务血缘可审计"的诚实性纪律冲突。真需要时单独立卡。

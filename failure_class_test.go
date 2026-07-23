@@ -78,27 +78,57 @@ func TestClassifyFailure_Enumerations(t *testing.T) {
 	}
 }
 
-// TestClassifyFailure_TailWindow 长文本只扫末段 8KB——推理正文里的巧合关键词(如引用文档提到
-// "invalid api key"作为示例)在超出 8KB 窗口时不能触发误分类;真错误行在末尾则必被命中。
-// 【为什么必要】codex/claude 的 combined 常达几十 KB(整段推理都在 stderr);若全量扫,推理正文里
-// 讨论"invalid api key 意味着什么"的解释会被误命中,把普通超时错误当认证类挂 held。窗口收窄
-// 到末段 8KB(真错误行几乎都在末尾几百字节)是本工程实证下的稳妥折中。
-func TestClassifyFailure_TailWindow(t *testing.T) {
-	// 头部一次"invalid api key"作为推理正文引用;中间 30KB 无关填充把它推出末段 8KB 窗口;
-	// 末尾贴上真错误行"步骤超时"——必判 timeout,不受头部误伤。
-	prose := "some reasoning that references invalid api key concept in prose. "
-	filler := strings.Repeat("filler content without any classification keyword. ", 700) // ≈ 33KB 无关内容
-	combined := prose + filler + "\n\n步骤超时(60 分钟)"
-	msg := "codex_error: 步骤超时(60 分钟)" // errorSummary 拼的摘要
-	got := classifyFailure(msg, combined, nil, nil)
-	if got != failureTimeout {
-		t.Fatalf("超时行在末尾时应判 timeout, got=%q (末段 8KB 窗口机制失效)", got)
+// TestClassifyFailure_CombinedIgnored_TranscriptDoesNotPoisonMsg 【P0 Round-2 反例注入】
+// combined 全量不影响分类判据,只吃 msg。codex exec 天然把整段 agent 推理/工具输出 transcript
+// 写进 stderr——里面必然出现 permission denied / no such file or directory / token expired /
+// context length exceeded 这类字面量(grep 受限目录、审查引用文档、审查改动 failure_class.go
+// 本身时引用正则字面量)。早期版本把 combined 末段 8KB 一并扔进正则,任意一条无害字面量落进窗口
+// 就把超时/正常错误误判成不可重试终态(permission→held 静默停摆;input_too_long→failed 永久终态)。
+// 根修:classifyFailure 只吃 msg;分类特征不在 msg 就 unknown → retry_backoff(旧版基线,安全)。
+//
+// 【这条测试就是复审要求的证伪场景】:msg='codex_error: 步骤超时(60 分钟)' + combined 尾部含
+// 无害 "Permission denied" 工具输出 → 修前会命中 permissionClassRe(判据顺序:permission 早于
+// timeout)误判 permission → 直接 held;修后命中 msg 里的 timeoutClassRe → 判 timeout → 走
+// retry_backoff。旧版跑此测试必红,新版必绿。
+func TestClassifyFailure_CombinedIgnored_TranscriptDoesNotPoisonMsg(t *testing.T) {
+	// 用户要求的核心证伪:超时 + transcript 尾部裸 Permission denied。
+	msgTimeout := "codex_error: 步骤超时(60 分钟)"
+	transcriptWithPermDenied := strings.Repeat("some agent reasoning line noise. ", 100) +
+		"\n[tool:grep] /etc/shadow: Permission denied\n" +
+		"[tool:cat] failed with error\n"
+	if got := classifyFailure(msgTimeout, transcriptWithPermDenied, nil, nil); got != failureTimeout {
+		t.Fatalf("超时+transcript 含 'Permission denied' 工具输出:必判 timeout(msg 主导),got=%q\n"+
+			"(旧版扫 combined 尾窗会命中 permissionClassRe 误判 permission→held 静默停摆;根修后此测试转绿)", got)
 	}
-	// 反向对照:同样构造但不加末尾超时行——头部 auth 被推出窗口,末段无任何分类特征,应回 unknown。
-	// (msg 里也不含分类词,避免 msg 走位干扰验证。)
-	noTail := prose + filler
-	if got := classifyFailure("some non-classifying summary", noTail, nil, nil); got != failureUnknown {
-		t.Fatalf("末段 8KB 无分类特征时应 unknown(证明头部 auth 已被窗口切掉), got=%q", got)
+
+	// 同类反例——每个都覆盖一条裸短语正则(permission / auth / input_too_long / executor_crash),
+	// 全部走同一形态:msg 是无分类特征的中性摘要 + combined 尾部埋一条 transcript 里常见的字面量。
+	// 所有用例都必须回落 unknown(msg 无特征),证明 combined 完全不再喂给分类器。
+	sameShapeCases := []struct {
+		name       string
+		transcript string
+	}{
+		{"perm_in_prose", "audit review discussing when 'Permission denied' errors are safe."},
+		{"nsfoud_in_prose", "grep of a missing path returned 'no such file or directory' — expected."},
+		{"token_expired_in_prose", "docs sample: server may respond 'token expired' after 1h — informational."},
+		{"context_len_in_prose", "we noted 'context length exceeded' as a known llm error type in the review."},
+		{"input_too_long_in_prose", "the report says 'input too long' should be handled by chunking."},
+	}
+	msgNeutral := "codex_error: something went wrong" // 无任何分类特征
+	for _, tc := range sameShapeCases {
+		t.Run(tc.name, func(t *testing.T) {
+			// combined 尾部即含裸短语(位于末段 8KB 内),旧版必定命中对应终态类。
+			got := classifyFailure(msgNeutral, tc.transcript, nil, nil)
+			if got != failureUnknown {
+				t.Fatalf("中性 msg + transcript 含裸 %q:必回落 unknown(combined 已不再喂给分类器),got=%q\n"+
+					"(旧版会误判对应终态类→held/failed;根修后此测试转绿)", tc.name, got)
+			}
+		})
+	}
+
+	// 反向对照:msg 里含真正的分类特征时,必被正确识别——证明"只吃 msg"路径本身没坏。
+	if got := classifyFailure("codex_error: 401 Unauthorized from api", "no transcript noise", nil, nil); got != failureAuth {
+		t.Fatalf("msg 含真 401 特征应判 auth,got=%q", got)
 	}
 }
 
@@ -372,13 +402,43 @@ func TestClassifyFailure_AuthNotShadowLimit(t *testing.T) {
 	}
 }
 
-// TestAnnotatedError_UnknownNoPrefix 回归基线要求:未知类的 last_error 与旧版逐字节一致(不加前缀)。
-func TestAnnotatedError_UnknownNoPrefix(t *testing.T) {
+// TestAnnotatedError_PrefixOnlyForTerminalClasses 【P1 Round-2】双语 README 承诺契约"仅 auth/
+// permission/input_too_long 带 [<class>] 前缀"——即**仅终态类**加前缀。早期版本只豁免 unknown,
+// timeout/executor_crash 也加前缀→与文档矛盾且重试类的 LastError 呈现偏离旧版。根修判据挂到
+// policyFor(cls).Terminal:终态类(Terminal!="")加前缀,重试类(Terminal="")不加。本测试同时锁定
+// mutation-kill——若未来有人把"回归基线仅止 unknown"的旧逻辑反悔改回来,timeout/executor_crash
+// 分支即报红。
+func TestAnnotatedError_PrefixOnlyForTerminalClasses(t *testing.T) {
 	raw := "some random error message"
-	if got := annotatedError(failureUnknown, raw); got != raw {
-		t.Fatalf("未知类不该加前缀(回归基线),got=%q want=%q", got, raw)
+
+	// 终态类:必须加前缀(README 契约的三类)
+	terminalCases := []struct {
+		cls  failureClass
+		want string
+	}{
+		{failureAuth, fmt.Sprintf("[%s] %s", failureAuth, raw)},
+		{failurePermission, fmt.Sprintf("[%s] %s", failurePermission, raw)},
+		{failureInputTooLong, fmt.Sprintf("[%s] %s", failureInputTooLong, raw)},
 	}
-	if got := annotatedError(failureAuth, raw); got != fmt.Sprintf("[auth] %s", raw) {
-		t.Fatalf("auth 类应加 [auth] 前缀,got=%q", got)
+	for _, tc := range terminalCases {
+		t.Run("terminal_"+string(tc.cls), func(t *testing.T) {
+			if got := annotatedError(tc.cls, raw); got != tc.want {
+				t.Fatalf("%s 类应加前缀,got=%q want=%q", tc.cls, got, tc.want)
+			}
+		})
 	}
+
+	// 可重试类:必须不加前缀(与旧版逐字节一致——回归基线要求覆盖 unknown/timeout/executor_crash 全部)
+	// 【P1 mutation-kill】这三条断言就是根修凭据:若 annotatedError 回退到"只豁免 unknown",
+	// timeout/executor_crash 会拿到带前缀返回值,本测试即报红。
+	retryableCases := []failureClass{failureUnknown, failureTimeout, failureExecutorCrash}
+	for _, cls := range retryableCases {
+		t.Run("retryable_"+string(cls), func(t *testing.T) {
+			if got := annotatedError(cls, raw); got != raw {
+				t.Fatalf("%s 类不该加前缀(README 契约仅终态类带前缀;重试类需与旧版逐字节一致),got=%q want=%q",
+					cls, got, raw)
+			}
+		})
+	}
+
 }

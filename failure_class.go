@@ -31,6 +31,22 @@ import (
 	"strings"
 )
 
+// 【P0 教训 · Round-2 复审】早期版本把扫描窗口拼成 msg + tailWindow(combined, 8192)——想的是
+// 「真错误行几乎都在末尾几百字节」，末段窗口比全量安全。但复审用真实自举负载证伪：codex exec 把
+// 整段 agent 推理/工具输出 transcript 直接写进 stderr（runner.go:191 拼进 combined，runner.go:2066
+// 附近注释也承认 transcript 天然充斥无害的 error 措辞），而分类正则里含裸短语——permission denied、
+// no such file or directory、token expired、context length exceeded、input too long、prompt too
+// long——这些字面量在正常 transcript 里频繁出现（grep 受限目录、审查引用文档、审查改动 failure_class.go
+// 本身时引用正则字面量……）。一旦落进末段 8KB，就会把毫不相干的超时/正常错误误判成 permission 直接
+// held（无人值守静默停摆，基线本会退避重试自愈）或 auth 直接 held（同样静默）或 input_too_long
+// 直接 failed（永久终态）。这与文件顶部"越权就烧钱"的硬纪律直接冲突。
+//
+// 【根修】classifyFailure 只吃 msg——errorSummary 已把 res.Subtype/首行 result 或 runErr+首行
+// combined 提炼成 msg（"分类信号本该在的地方"），是执行结果里最集中且没有 transcript 噪声的一层。
+// combined 完全不看：分类特征若没进 msg，就让分类器坦然回落 unknown → 走 retry_backoff，即旧版
+// 基线行为，安全；宁可漏分类走退避，也不能凭 transcript 尾窗的裸短语误判成不可重试终态。tailWindow
+// 辅助函数一并删除，杜绝未来"再把 combined 拼回扫描串"的复辟诱惑。
+
 // failureClass 是失败分类的有限枚举。
 // 命名遵守"名词短语，语义与执行结果强绑定"，写进 events.jsonl 的 detail.failure_class 里做审计。
 type failureClass string
@@ -87,7 +103,8 @@ var (
 // classifyFailure 判定失败类别。
 // 参数：
 //   msg      errorSummary 拼好的一行摘要（含 res.Subtype/首行 result 或 runErr+首行 combined）
-//   combined stdout+stderr 合并串（长文本，含真错误行）
+//   combined stdout+stderr 合并串（长文本，含 codex 天然 transcript 噪声，**不作为分类依据**，
+//            仍保留在签名里是给未来可能"锚定错误行框架"式判据留手，不改上层调用点）
 //   res      claudeResult（可能为 nil，如 parseClaudeJSON 失败）
 //   runErr   进程层错误（可能为 nil，如 res.IsError=true 但进程正常退出）
 //
@@ -97,11 +114,13 @@ var (
 //      文本恰巧含 "limit-like" 词而无 limitRe 特征，也必须回落 unknown、绝不写全局冷却。
 //   2. 判据顺序：auth → permission → input_too_long → timeout → executor_crash → unknown。
 //      有交叉措辞（如 "401 unauthorized (forbidden)"）以更精确的 auth 优先，与 held 升级方向一致。
-//   3. 只扫 combined + msg 前 8KB——真错误行几乎都在末尾几百字节，超长文本扫全量既慢又易被推理
-//      正文里的巧合词命中。用 tailWindow 取合并串末段扫描。
+//   3. **只扫 msg**——见文件顶部 P0 教训。combined 全量丢弃：分类信号本该在 msg（errorSummary 的
+//      产物），若不在则宁可 unknown 走 retry_backoff，也不能用裸短语正则去 transcript 尾窗里碰运气。
 func classifyFailure(msg, combined string, res *claudeResult, runErr error) failureClass {
-	// 取扫描窗口：msg 一定看（它是摘要，最集中）；combined 只看末段 8KB（真错误几乎都在末尾）。
-	scan := msg + "\n" + tailWindow(combined, 8192)
+	// combined/res/runErr 有意不看：msg 已经是 errorSummary 提炼的摘要，是执行结果里最集中且无
+	// transcript 噪声的一层；参数保留仅为签名向后兼容，避免打散上层 3 个调用点。Go 未用形参
+	// 不报错——若未来加"锚定错误行框架"式判据可以直接用这些字段，无需再改函数签名。
+	scan := msg
 	if authClassRe.MatchString(scan) {
 		return failureAuth
 	}
@@ -118,20 +137,6 @@ func classifyFailure(msg, combined string, res *claudeResult, runErr error) fail
 		return failureExecutorCrash
 	}
 	return failureUnknown
-}
-
-// tailWindow 取字符串末段 n 字节（rune 边界不切）。长文本扫描窗口，避免推理正文里的巧合词命中。
-func tailWindow(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	// 从 n 字节前找一个 rune 起点（找不到就直接切；rune 切错顶多让首字符成半个 utf8，
-	// 正则匹配上不会命中假类别——真错误行仍在末段完整存在）。
-	start := len(s) - n
-	for start < len(s) && (s[start]&0xC0) == 0x80 { // utf8 continuation byte
-		start++
-	}
-	return s[start:]
 }
 
 // failurePolicy 是分类到策略的映射结果。
@@ -166,11 +171,19 @@ func policyFor(cls failureClass) failurePolicy {
 	return failurePolicy{Class: failureUnknown, Terminal: "", ConsumesAttempt: true}
 }
 
-// annotatedError 给 LastError 加上 [class] 前缀，人工/审计能一眼看清分类。
-// 保留原始 msg 全文，方便定位真因。
+// annotatedError 给 LastError 加上 [class] 前缀，让 CLI/看板/人工审计一眼可辨。保留原始 msg 全文
+// 方便定位真因。
+//
+// 【P1 教训 · Round-2 复审】早期版本仅豁免 unknown 不加前缀，其它类（含可重试的 timeout/
+// executor_crash）也加前缀。但双语 README 同 commit 承诺的契约是"仅 auth/permission/input_too_long
+// 带 [<class>] 前缀"——契约文档与代码直接矛盾；且回归基线要求"重试类的错误呈现与旧版逐字节一致"
+// 并不仅止于 unknown（timeout/executor_crash 同属重试类，旧版 LastError 无前缀，加前缀就是行为
+// 漂移）。修法：以策略表 policyFor(cls).Terminal 为判据——仅**终态类**（auth/permission → held；
+// input_too_long → failed）加前缀，重试类（timeout/executor_crash/unknown/未来新增的可重试类）
+// 一律不加。判据挂在策略表上：README 契约与策略表同源，未来若新增终态类，前缀自动跟随策略扩展，
+// 不必手动同步这里。
 func annotatedError(cls failureClass, msg string) string {
-	if cls == failureUnknown {
-		// 未知类不加前缀——回归基线要求"错误呈现与旧版逐字节一致"，加前缀会污染 last_error。
+	if policyFor(cls).Terminal == "" {
 		return msg
 	}
 	// 极端长的 msg 也不截断：last_error 供人工诊断，宁可长也别丢关键上下文。

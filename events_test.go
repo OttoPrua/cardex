@@ -805,10 +805,11 @@ func TestHelperProcessEmit(t *testing.T) {
 // TestRecordEventCrossProcessNoSeqCollision (P1-1/P1-5 跨进程回红反例) fork 3 个子进程各写 15 条,
 // 断言 seq 密集 1..45 无重复. 这是 acquireEventLock 文件锁真正被使用的场景——反例注入:去掉
 // events.go 里 acquireEventLock 或把 tmp+os.Link 改回 O_EXCL 两步式(bootstrap 竞态复现), 子进程
-// 会撞 seq → 本测试报红. 注:helper-process 依赖 os/exec fork 自身, POSIX 才可靠, Windows 跳过.
+// 会撞 seq → 本测试报红. 注:helper-process 用 os/exec 起自身二进制(POSIX 是 fork+exec,Windows 是
+// CreateProcess/spawn),锁语义在 Windows 上未验证——平台纳入与否待裁(01-BACKLOG §3 #61 委托人复审后决).
 func TestRecordEventCrossProcessNoSeqCollision(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("helper-process fork 依赖 POSIX; Windows 上 acquireEventLock 走 processAlive 分支不同, 单独覆盖")
+		t.Skip("Windows 行为未验证, 平台纳入与否待裁(01-BACKLOG §3 #61);当前 CI 只跑 POSIX")
 	}
 	if testing.Short() {
 		t.Skip("跨进程 fork 较慢, -short 模式跳过")

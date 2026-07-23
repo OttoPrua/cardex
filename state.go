@@ -50,6 +50,12 @@ type lockInfo struct {
 // 内 staleLock 读到空 Unmarshal 失败即判 stale 强夺, 双持锁. 单实例锁虽然被两个 runner
 // 同时启动的概率极低, 但缺陷同类, 一并按类闭合. tmp 里先写完 lockInfo 再 os.Link 到
 // 目标路径, 保证 path 一旦存在即内容完整; 单实例锁的非阻塞语义(2 次重试后放弃)不变.
+//
+// 【CG-R1 修复:强夺唯一化用 os.Rename 原子搬走, 不再裸 os.Remove】旧法在判 staleLock 后
+// 直接 os.Remove(path) — 若 A、B 都撞 stale 判据同时进入强夺分支: A 先 Remove、A 走下一轮
+// os.Link 挂新锁成功、随即 B 也 Remove 却删掉了 A 刚挂的新锁 → 双持锁。改用 os.Rename
+// 是 POSIX 原子操作, path 只能被一方成功搬走; 失败方(路径已被他人搬走)本轮直接进入下一次
+// for 迭代重试 os.Link, 不会再动到已被夺权者挂上的新锁。与 events.go:216-221 同源同法。
 func acquireLock(root string, ttl time.Duration) bool {
 	path := lockPath(root)
 	for i := 0; i < 2; i++ {
@@ -66,7 +72,12 @@ func acquireLock(root string, ttl time.Duration) bool {
 		if !staleLock(path, ttl) {
 			return false
 		}
-		_ = os.Remove(path)
+		// 强夺唯一化:os.Rename 是 POSIX 原子操作, path 只能被一方成功搬走。失败者(路径已被他人
+		// 搬走)本轮直接进入下一次 for 迭代, 不会再 Remove 一次导致"两方各以为夺权成功"删掉新锁。
+		stale := fmt.Sprintf("%s.stale-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+		if renameErr := os.Rename(path, stale); renameErr == nil {
+			_ = os.Remove(stale)
+		}
 	}
 	return false
 }
@@ -97,7 +108,27 @@ func staleLock(path string, ttl time.Duration) bool {
 	return !processAlive(li.PID)
 }
 
-func releaseLock(root string) { _ = os.Remove(lockPath(root)) }
+// releaseLock 只删属于本进程的锁文件:核 PID 匹配才 Remove。
+// 【CG-R1 修复】旧法裸 os.Remove(path) 与 events.go:releaseEventLock 同类缺陷:staleLock
+// 判 mtime>TTL 直接判 stale 强夺——系统睡眠/挂起跨 TTL 唤醒后,原持有者 A 的 defer release
+// 无条件 Remove 会删掉强夺者 B 刚建的新锁,让第三写者 C 进临界区双持。核 PID 匹配才 Remove
+// 是"只删自己名下的"最小契约,读文件失败/解析失败/PID 不匹配都不删——留给真正的持有者。
+// 与 events.go:234-247 同源同法。
+func releaseLock(root string) {
+	path := lockPath(root)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return
+	}
+	var li lockInfo
+	if json.Unmarshal(data, &li) != nil {
+		return
+	}
+	if li.PID != os.Getpid() {
+		return
+	}
+	_ = os.Remove(path)
+}
 
 func lockTTL(cfg *Config) time.Duration {
 	ttl := time.Duration(cfg.StepTimeoutMin*3) * time.Minute

@@ -446,41 +446,54 @@ func TestAnnotatedError_PrefixOnlyForTerminalClasses(t *testing.T) {
 
 // ---------- classificationFromTranscript 单元 & 反例注入(P1 · Round-3) ----------
 
-// TestClassificationFromTranscript_TwoChannels 断言 classificationFromTranscript 的两条判据通道:
-//  1) res.ResultFromTranscript=true (invokeCodex/invokeRemoteCodex/invokeRemoteClaude 挑行时打的标)
-//  2) (res==nil || !res.IsError) && runErr!=nil (errorSummary fallback 分支拼 combined 首行进 msg)
+// TestClassificationFromTranscript_ByErrorSummaryPath 断言判据与 errorSummary 三条 msg 构造路径一一对齐:
+//  1) path 1 (res != nil && res.IsError, res.Result 拼 msg) → 由 invoke 侧的 ResultFromTranscript 标决定;
+//     标 true(codexErrorLine/agent -o 终稿/invokeRemoteClaude 挑行) → true;
+//     标 false(claude 结构化 JSON 的 API 错误) → false。
+//  2) path 2 (runErr != nil 且 !path1) → msg 恒含 firstLine(combined) → true。
+//  3) path 3 (res==nil && runErr==nil) → msg 恒含 firstLine(combined) → true。
 //
-// 【mutation-kill】把 classificationFromTranscript 改成永远返回 false→本函数任一 want=true 分支即红;
-// 把改成永远返回 true→反例分支 (无信号却报 transcript 来源) 即红。
-func TestClassificationFromTranscript_TwoChannels(t *testing.T) {
+// 【为什么覆盖 path 3】invokeClaude 在 claude CLI 退出 0 但 stdout 非 JSON 时返回 (nil, combined, nil);
+// errorSummary 走 path 3 拼 firstLine(combined) 进 msg,若 combined 首行含 "permission denied"/
+// "401 unauthorized" 等字面量会误判 held——早期实现漏此分支,本轮补齐。
+//
+// 【mutation-kill】把 classificationFromTranscript 改成永远返回 false → 任一 want=true 分支即红;
+// 改成永远返回 true → path 1 未打标(claude 结构化 JSON)分支即红。
+func TestClassificationFromTranscript_ByErrorSummaryPath(t *testing.T) {
 	cases := []struct {
 		name   string
 		res    *claudeResult
 		runErr error
 		want   bool
+		why    string
 	}{
-		// 通道1: res.ResultFromTranscript 显式打标
-		{"channel1_transcript_marked", &claudeResult{IsError: true, ResultFromTranscript: true}, nil, true},
-		{"channel1_marked_with_runErr", &claudeResult{IsError: true, ResultFromTranscript: true},
-			errors.New("步骤超时"), true},
-		// 通道1 反例: res.IsError=true 但未打标(claude 结构化 JSON 的 API 错误)——
-		// 应视作非 transcript,可信作终态判据。
-		{"channel1_unmarked_structured_error", &claudeResult{IsError: true, ResultFromTranscript: false}, nil, false},
+		// path 1 · ResultFromTranscript=true:codex/remote 挑行 / agent -o 终稿 → transcript 来源
+		{"path1_transcript_marked", &claudeResult{IsError: true, ResultFromTranscript: true}, nil, true,
+			"invoke 侧挑行/agent 终稿打标"},
+		{"path1_marked_with_runErr", &claudeResult{IsError: true, ResultFromTranscript: true},
+			errors.New("步骤超时"), true, "打标优先,runErr 冗余"},
+		// path 1 · ResultFromTranscript=false:claude 结构化 JSON 的 API 错误 → 非 transcript,保留终态语义
+		{"path1_structured_claude_error", &claudeResult{IsError: true, ResultFromTranscript: false}, nil, false,
+			"claude 结构化 JSON 的 is_error=true(如 401 Unauthorized)属 API 侧判定,可信作终态"},
+		{"path1_structured_with_runErr", &claudeResult{IsError: true, ResultFromTranscript: false},
+			errors.New("非致命 wrapper"), false, "path 1 优先(res.IsError=true),runErr 不覆盖"},
 
-		// 通道2: (res==nil || !res.IsError) + runErr!=nil (errorSummary fallback)
-		{"channel2_nil_res_with_runErr", nil, errors.New("步骤超时(60 分钟)"), true},
-		{"channel2_non_error_res_with_runErr", &claudeResult{IsError: false},
-			errors.New("步骤超时"), true},
+		// path 2:runErr != nil 且 !res.IsError → errorSummary 拼 firstLine(combined)
+		{"path2_nil_res_with_runErr", nil, errors.New("步骤超时(60 分钟)"), true, "res=nil+runErr → path 2"},
+		{"path2_non_error_res_with_runErr", &claudeResult{IsError: false},
+			errors.New("步骤超时"), true, "非 IsError res+runErr → path 2"},
 
-		// 反例: 完全无信号
-		{"no_signal_nil_all", nil, nil, false},
-		{"no_signal_error_res_no_runErr", &claudeResult{IsError: true}, nil, false},
+		// path 3:res==nil && runErr==nil → errorSummary "无法解析 claude 输出 | firstLine(combined)"
+		// 【关键】早期实现漏此分支返回 false → 边缘案例(claude CLI 退出 0 但非 JSON 输出含
+		// 'permission denied')会误判 held。本轮补齐必须返回 true。
+		{"path3_nil_all_still_transcript", nil, nil, true,
+			"invokeClaude 退 0+非 JSON stdout → errorSummary path 3 拼 firstLine(combined)"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := classificationFromTranscript(tc.res, tc.runErr); got != tc.want {
-				t.Fatalf("%s: got=%v want=%v (mutation-kill:任一通道去掉判据即报红)",
-					tc.name, got, tc.want)
+				t.Fatalf("%s: got=%v want=%v (%s;mutation-kill:去掉对应分支即报红)",
+					tc.name, got, tc.want, tc.why)
 			}
 		})
 	}
@@ -675,5 +688,168 @@ func TestRunTaskClaudeStructuredAuth_StillHeld(t *testing.T) {
 	}
 	if !strings.HasPrefix(got.LastError, "[auth]") {
 		t.Fatalf("结构化 auth 类应保留 [auth] 前缀,got=%q", got.LastError)
+	}
+}
+
+// ---------- runTask 集成 · P1 Round-3 补齐(按类闭合的两处漏网) ----------
+
+// fakeCodexTerminalMessageWithAuthRef 造一个假 codex:找到 -o 参数,把 agent 终稿(含引用
+// authClassRe 字面量的 "401 unauthorized" 叙述)写进去,退出 1 模拟 codex 进程写完终稿后
+// 因非致命告警退出非零(或步骤超时/子进程崩溃等)。invokeCodex 因 runErr!=nil 且 res.Result!=""
+// 走"保留 -o 内容"分支——这是 R3 复审枚举但未修补的同构漏网:agent 终稿是任意生成内容,不属结
+// 构化错误信息,应打 ResultFromTranscript 标由 classificationFromTranscript 承接降级。
+func fakeCodexTerminalMessageWithAuthRef(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codex")
+	// 注:script 用 shell parameter expansion 找到紧跟 "-o" 的下一个位置参数;写入含 "401
+	// unauthorized" 字面量的一行(命中 authClassRe),然后退出 1。
+	script := "#!/bin/sh\n" +
+		"cat >/dev/null\n" + // 吸掉 stdin(prompt+preamble)
+		"prev=\"\"\n" +
+		"for a in \"$@\"; do\n" +
+		"  if [ \"$prev\" = \"-o\" ]; then\n" +
+		"    printf '%s\\n' 'agent 审查报告: 401 unauthorized 错误在 authClassRe 里被识别为认证类' > \"$a\"\n" +
+		"    break\n" +
+		"  fi\n" +
+		"  prev=\"$a\"\n" +
+		"done\n" +
+		"exit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestRunTaskCodexAgentTerminalMessageWithAuthRef_SoftenedToRetry 【P1 Round-3 补齐 · 漏网 1】
+// mock codex:agent 已把终稿写进 -o 文件(含引用 "401 unauthorized" 字面量),但进程退出非零
+// (模拟 codex 收尾竞态/非致命告警/超时后仍有终稿的场景)。invokeCodex 走
+// "runErr!=nil AND res.Result!=""" 分支保留 -o 内容作 res.Result。
+//
+// 【为什么这条是必修漏网】早期 R3 修复只在 res.Result=="" 且 codexErrorLine 挑到行时打
+// ResultFromTranscript 标——保留 -o 内容的分支被漏。agent 终稿可任意引用分类正则字面量
+// (审查/工具输出/正常叙述),不打标会导致误判 auth/permission→held 静默停摆。
+//
+// 修法:在 case runErr!=nil 里给 res.Result != "" 的 else 分支同样打
+// ResultFromTranscript=true。回退验证:去掉该 else 分支即分类走 auth→held,本测试即红。
+func TestRunTaskCodexAgentTerminalMessageWithAuthRef_SoftenedToRetry(t *testing.T) {
+	root := testRoot(t)
+	work := t.TempDir()
+
+	cfg := defaultConfig("")
+	cfg.CodexBin = fakeCodexTerminalMessageWithAuthRef(t)
+	cfg.StepTimeoutMin = 1
+	cfg.MaxAttempts = 3
+	cfg.RetryBackoffMin = 1
+	cfg.LimitFallbackMin = 30
+	cfg.CooldownMarginSec = 0
+
+	tk := newTask(root, cfg, typeSequence, "codex agent 终稿含 auth 引用", work, []string{"审核"}, 1)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTask(context.Background(), root, cfg, tk, true); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got.Status != statusQueued {
+		t.Fatalf("codex agent 终稿含 '401 unauthorized' 引用不该落 held(agent 任意内容不作终态判据),\n"+
+			"got status=%q last_error=%q\n"+
+			"(回退验证:去掉 invokeCodex `case runErr!=nil` 里 else 分支的 res.ResultFromTranscript=true → \n"+
+			" 分类走 auth → held,本断言即红)",
+			got.Status, got.LastError)
+	}
+	if got.Attempts != 1 {
+		t.Fatalf("attempts 应递增到 1(retry_backoff 分支), got=%d", got.Attempts)
+	}
+	if strings.HasPrefix(got.LastError, "[auth]") {
+		t.Fatalf("softened 场景 LastError 不该带 [auth] 前缀,got=%q", got.LastError)
+	}
+	events := readAllEventsRaw(t, root, tk.ID)
+	if len(events) < 2 {
+		t.Fatalf("至少 dispatched+retry 两条,got=%v", eventTypes(events))
+	}
+	ev := events[len(events)-1]
+	if ev.Type != evRetry {
+		t.Fatalf("末条事件应为 retry(softened 走 retry_backoff),got type=%q", ev.Type)
+	}
+	if fc, _ := ev.Detail["failure_class"].(string); fc != "auth" {
+		t.Fatalf("failure_class 审计信号应保留=auth,got=%q", fc)
+	}
+	if softened, _ := ev.Detail["softened_from_terminal"].(bool); !softened {
+		t.Fatalf("softened_from_terminal 应=true,detail=%+v", ev.Detail)
+	}
+	if reason, _ := ev.Detail["reason"].(string); reason != "softened_transcript_derived" {
+		t.Fatalf("reason 应=softened_transcript_derived,got=%q", reason)
+	}
+}
+
+// TestRunTaskClaudeParseFailNonJSONWithPermissionRef_SoftenedToRetry 【P1 Round-3 补齐 · 漏网 2】
+// mock claude:退出 0 但 stdout 非 JSON(含 "permission denied" 首行)。invokeClaude 因
+// parseClaudeJSON 返回 nil 且 runErr==nil,返回 (nil, combined, nil)——errorSummary 走 path 3
+// (无 res 无 runErr)恒拼 firstLine(combined) 进 msg,命中 permissionClassRe → policy=held。
+//
+// 【为什么这条是必修漏网】早期 classificationFromTranscript 判据只覆盖两条通道
+// (ResultFromTranscript 打标 + runErr!=nil),漏了 res==nil && runErr==nil 情形。虽然罕见
+// (需 claude CLI 退 0 且 stdout 无有效 JSON——如输出格式漂移/异常退出/CLI bug),但一旦发生
+// 首行含 permission denied/401 unauthorized 就会误判 held 静默停摆。
+//
+// 修法:classificationFromTranscript 与 errorSummary 三条 path 一一对齐——path 1(res.IsError)
+// 由 ResultFromTranscript 决定,path 2/3 恒 true。回退验证:把 path 3 分支(res==nil 时的
+// return true)去掉则重现 held,本测试即红。
+func TestRunTaskClaudeParseFailNonJSONWithPermissionRef_SoftenedToRetry(t *testing.T) {
+	root := testRoot(t)
+	// 非 JSON 首行含 "permission denied"——parseClaudeJSON 会返回 nil。**不含** limitRe 特征词
+	// 避免走限额分支。
+	nonJSONStdout := "permission denied by tool wrapper — retry with correct scope"
+	claudeBin := fakeClaudeBin(t, nonJSONStdout, "", 0)
+	cfg := runTaskCfg(t, claudeBin)
+	cfg.MaxAttempts = 3
+
+	work := t.TempDir()
+	tk := newTask(root, cfg, typeSequence, "claude 非 JSON 含 permission denied", work, []string{"p"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTask(context.Background(), root, cfg, tk, false); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != statusQueued {
+		t.Fatalf("claude 非 JSON 输出 firstLine 含 'permission denied' 不该落 held(path 3 恒 transcript 来源),\n"+
+			"got status=%q last_error=%q\n"+
+			"(回退验证:把 classificationFromTranscript 的 res==nil 分支删掉 → 走 permission → held,\n"+
+			" 本断言即红)",
+			got.Status, got.LastError)
+	}
+	if got.Attempts != 1 {
+		t.Fatalf("attempts 应递增到 1,got=%d", got.Attempts)
+	}
+	if strings.HasPrefix(got.LastError, "[permission]") {
+		t.Fatalf("softened 场景 LastError 不该带 [permission] 前缀,got=%q", got.LastError)
+	}
+	events := readAllEventsRaw(t, root, tk.ID)
+	if len(events) < 2 {
+		t.Fatalf("至少 dispatched+retry 两条,got=%v", eventTypes(events))
+	}
+	ev := events[len(events)-1]
+	if ev.Type != evRetry {
+		t.Fatalf("末条事件应为 retry,got=%q", ev.Type)
+	}
+	if fc, _ := ev.Detail["failure_class"].(string); fc != "permission" {
+		t.Fatalf("failure_class 审计信号应保留=permission,got=%q", fc)
+	}
+	if softened, _ := ev.Detail["softened_from_terminal"].(bool); !softened {
+		t.Fatalf("softened_from_terminal 应=true,detail=%+v", ev.Detail)
+	}
+	if reason, _ := ev.Detail["reason"].(string); reason != "softened_transcript_derived" {
+		t.Fatalf("reason 应=softened_transcript_derived,got=%q", reason)
 	}
 }

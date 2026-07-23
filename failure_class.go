@@ -206,39 +206,53 @@ func policyFor(cls failureClass) failurePolicy {
 // input_too_long → failed）加前缀，重试类（timeout/executor_crash/unknown/未来新增的可重试类）
 // 一律不加。判据挂在策略表上：README 契约与策略表同源，未来若新增终态类，前缀自动跟随策略扩展，
 // 不必手动同步这里。
-// classificationFromTranscript 判断 classifyFailure 用的 msg 是否源自 combined(transcript)。
-// 是则 runTask 侧必须把终态分类(held/failed) **降级** retry_backoff——transcript 天然充斥
-// permission denied / 401 unauthorized / context length exceeded 等分类正则字面量(审查引用/
-// 工具错误输出),不能作为不可重试终态的判据(基线本会退避自愈的超时/瞬时抖动会被误判静默停摆)。
+// classificationFromTranscript 判断 classifyFailure 用的 msg 是否源自 combined(transcript)/agent
+// 任意生成内容。是则 runTask 侧必须把终态分类(held/failed) **降级** retry_backoff——transcript/
+// agent 终稿天然充斥 permission denied / 401 unauthorized / context length exceeded 等分类正则
+// 字面量(审查引用/工具错误输出/正常叙述),不能作为不可重试终态的判据(基线本会退避自愈的超时/
+// 瞬时抖动会被误判静默停摆)。
 //
 // 【为什么这条判据挂在 failure_class.go】它与 classifyFailure/policyFor 是**同一条策略链**的
 // 三段——归类(classifyFailure)→策略(policyFor)→降级(classificationFromTranscript)。放这里
 // 便于把"transcript 来源不落终态"这个第二道防线与文件顶部的第一道防线(msg-only)成对阅读、
 // 成对维护。runTask 只做调用与事件写入,不掺策略逻辑。
 //
-// 判据（两条通道，任一命中即视为 transcript 来源）：
-//  1. res != nil && res.ResultFromTranscript ——invokeCodex/invokeRemoteCodex/invokeRemoteClaude
-//     从 combined 挑行(codexErrorLine)或取首行(firstLine)填入 res.Result 时打的标；errorSummary
-//     的 res.IsError 分支会把 firstLine(res.Result) 拼进 msg，分类信号即从 transcript 溢出。
-//  2. (res == nil || !res.IsError) && runErr != nil ——errorSummary 的 fallback 分支
-//     (`runErr.Error() + " | " + firstLine(combined)`) 会把 combined 首行直接拼进 msg；主要
-//     覆盖 invokeClaude 中 parseClaudeJSON 返回 nil 但 runErr!=nil 的场景（claude CLI 非 JSON 输出）。
+// 【判据 · 与 errorSummary 三条分支一一对齐】
+// errorSummary(res, combined, runErr) 有三条 msg 构造路径:
 //
-// 非 transcript 来源（保持终态语义）：
-//   - claude 结构化 JSON 的 res.IsError=true 分支：res.Result 由 claude CLI 定义（如 "401
-//     Unauthorized: invalid api key"），不属 transcript，可信作终态判据。
-//   - runErr 里的错误措辞（如 "步骤超时(60 分钟)"、"signal: killed"）由 Go 侧构造，非 transcript；
-//     但会走通道 2（因 runErr!=nil 且 res 常为 nil/非 IsError），故也被视为 transcript 来源——
-//     这符合分类语义：真实 timeout/executor_crash 属可重试类，policy.Terminal="" 本就不受降级影响，
-//     误伤面为零。
+//	path 1: res != nil && res.IsError   → msg = res.Subtype + ": " + firstLine(res.Result)
+//	path 2: runErr != nil               → msg = runErr.Error() + " | " + firstLine(combined)
+//	path 3: 其它(res==nil && runErr==nil) → msg = "无法解析 claude 输出 | " + firstLine(combined)
+//
+// path 1 的 res.Result 来源分两种:
+//   - claude 结构化 JSON 的 API 错误(parseClaudeJSON 产物)——**非 transcript**,可信作终态判据;
+//   - invokeCodex/invokeRemoteCodex/invokeRemoteClaude 从 combined 挑行(codexErrorLine)、取首行
+//     (firstLine(combined)) 或 codex -o 文件的 agent 终稿——**是 transcript/agent 任意内容**,
+//     不应作终态判据。invoke 侧在这些路径上会给 res.ResultFromTranscript 打标以区分二者。
+//
+// path 2 与 path 3 均直接把 firstLine(combined) 拼进 msg——**恒 transcript 来源**,永不作终态判据。
+//
+// 故判据:
+//   - path 1 命中(res != nil && res.IsError)时,回 res.ResultFromTranscript(true=transcript,
+//     false=结构化);
+//   - 其它情形(path 2/3)恒回 true。
+//
+// 【为什么允许把 runErr!=nil 的 Go 侧措辞也视为 transcript 来源】"步骤超时(60 分钟)"/"signal:
+// killed" 由 Go 侧构造非 transcript,但走 path 2 也被本函数判 true——这符合分类语义:此类真错误
+// 属可重试类(timeout/executor_crash),policy.Terminal="" 本就不受降级影响,误伤面为零;宁可宽容
+// 也不能漏放 transcript 来源。
+//
+// 【为什么 res==nil && runErr==nil 也要判 true】invokeClaude 在 claude CLI 退出 0 但 stdout 非
+// JSON 时会返回 (nil, combined, nil);errorSummary 走 path 3 拼 firstLine(combined) 进 msg,分类
+// 信号完全来自 transcript。早期版本漏该分支导致纯 CLI 无解析输出的边缘案例可被误判 held——本轮
+// 补齐。
 func classificationFromTranscript(res *claudeResult, runErr error) bool {
-	if res != nil && res.ResultFromTranscript {
-		return true
+	// path 1: res 有结构化 IsError → 由 invoke 侧打的 ResultFromTranscript 标决定。
+	if res != nil && res.IsError {
+		return res.ResultFromTranscript
 	}
-	if (res == nil || !res.IsError) && runErr != nil {
-		return true
-	}
-	return false
+	// path 2/3: msg 恒含 firstLine(combined),视为 transcript 来源。
+	return true
 }
 
 func annotatedError(cls failureClass, msg string) string {

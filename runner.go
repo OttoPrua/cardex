@@ -214,6 +214,13 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 			} else {
 				res.Result = firstLine(runErr.Error())
 			}
+		} else {
+			// 【P1 · Round-3 补丁】-o 文件已写好但 runErr!=nil(超时/非零退出):res.Result 是 agent
+			// 终稿全文,首行经 errorSummary 拼进 msg 参与 classifyFailure。agent 终稿是任意生成内容,
+			// 可能包含 "401 unauthorized"/"permission denied"/"context length exceeded" 等分类正则
+			// 字面量(审查引用/工具输出/正常叙述),不属结构化错误信息——同 codexErrorLine 挑行一样打
+			// ResultFromTranscript 标,由 runTask 侧 classificationFromTranscript 承接降级 retry_backoff。
+			res.ResultFromTranscript = true
 		}
 	case res.Result == "":
 		// 进程正常退出(task_complete)但 -o 终稿为空：codex 回合末尾停在工具调用/推理，没落最终消息。

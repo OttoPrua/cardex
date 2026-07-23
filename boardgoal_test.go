@@ -21,6 +21,8 @@ package main
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -837,7 +839,9 @@ func TestGoalEvidenceDoubleNegativeSneakThroughRejected(t *testing.T) {
 
 // TestGoalEvidenceZeroNumeratorNegativeDenominatorRejected 反例：{pass:0, blocked:-5}，
 // den=-5（不是 0，绕过 den==0）；num=0/den=-5 → -0.0（Go 里 -0.0 == 0.0，绕过 pct<0）。
-// round-3 前会渗出 0% 读数；round-3 起 den<=0 单挡此路。
+// round-3 前会渗出 0% 读数；round-3 起 den<=0 单挡；R2 起进一步在分量级 v<0 拦截,
+// 命中路径变为分量级"为负值"(blocked=-5),但 sum-level 兜底仍在——双层防线都在。
+// 断言接受任一命中(分量级"为负值" 或 求和级"≤ 0"),都不许下沉到 pct<0 兜底。
 func TestGoalEvidenceZeroNumeratorNegativeDenominatorRejected(t *testing.T) {
 	dir := t.TempDir()
 	fx := filepath.Join(dir, "zero-num-neg-den.json")
@@ -862,8 +866,11 @@ func TestGoalEvidenceZeroNumeratorNegativeDenominatorRejected(t *testing.T) {
 	if !m.Insufficient || m.DonePercent != nil {
 		t.Fatalf("num=0/den=-5 (-0 相消) 必须 insufficient，绝不得静默 0%%，got=%+v", m)
 	}
-	if !strings.Contains(m.InsufficientReason, "≤ 0") {
-		t.Fatalf("原因应指明 denominator ≤ 0，got %q", m.InsufficientReason)
+	if !strings.Contains(m.InsufficientReason, "denominator") {
+		t.Fatalf("原因应指向 denominator，got %q", m.InsufficientReason)
+	}
+	if !strings.Contains(m.InsufficientReason, "为负值") && !strings.Contains(m.InsufficientReason, "≤ 0") {
+		t.Fatalf("原因应指出 denominator 分量为负 或 denominator ≤ 0，got %q", m.InsufficientReason)
 	}
 }
 
@@ -899,12 +906,14 @@ func TestGoalEvidenceNegativeNumeratorRejected(t *testing.T) {
 	}
 }
 
-// TestGoalEvidenceNegativeDenominatorSumRejected 反例：den<0（分母求和为负），num>0 且合理。
-// pct 结果是负数（num/负=负），pct<0 兜底也能拦；但按分类闭合，den<=0 应在自己的检查点上报出。
+// TestGoalEvidenceNegativeDenominatorSumRejected 反例：分母求和为负,单分量也为负 → 应在分量级拦下。
+// 【R2·P1-1】按分类闭合改造:R1 前只有 sum-level den<=0 挡,fixture {a:3,b:-8} 走到 sum-check
+//   拦下报"≤ 0"；R2 起加了分量级 v<0 挡(见 boardgoal.go 分母循环),先命中报"为负值"。
+// 双层防线都在 → 断言接受任一命中路径(避免下沉到 pct<0 兜底就算过关的坏消息)。
 func TestGoalEvidenceNegativeDenominatorSumRejected(t *testing.T) {
 	dir := t.TempDir()
 	fx := filepath.Join(dir, "neg-den.json")
-	// den = a + b = 3 + (-8) = -5
+	// den = a + b = 3 + (-8) = -5,单分量 b 也为负
 	writeJSONFile(t, fx, map[string]any{"num": 2, "a": 3, "b": -8})
 	ov := &boardOverrideGoal{
 		Milestones: []boardOverrideMilestone{
@@ -924,8 +933,93 @@ func TestGoalEvidenceNegativeDenominatorSumRejected(t *testing.T) {
 	if !m.Insufficient || m.DonePercent != nil {
 		t.Fatalf("den 求和 <0 必须 insufficient，got=%+v", m)
 	}
+	if !strings.Contains(m.InsufficientReason, "denominator") {
+		t.Fatalf("原因应指向 denominator，got %q", m.InsufficientReason)
+	}
+	// 分量级挡("为负值")或求和级挡("≤ 0"）任一命中即可——都不许下沉到 pct<0 兜底。
+	if !strings.Contains(m.InsufficientReason, "为负值") && !strings.Contains(m.InsufficientReason, "≤ 0") {
+		t.Fatalf("原因应指出 denominator 分量为负 或 denominator ≤ 0，got %q", m.InsufficientReason)
+	}
+}
+
+// TestGoalEvidenceNegativeDenominatorComponentRejectedSumPositive 反例:分母单分量为负,
+// 但**求和为正**——sum-level den<=0 挡不住,pct<0 兜底也挡不住,只能靠分量级 v<0 挡。
+// 【R2·P1-1】按分类闭合关键测:
+//   fixture {pass:5, blocked:10, adjustment:-3} 配 denominator:[pass,blocked,adjustment]
+//   → den=5+10-3=12>0、num=5≥0、pct=5/12*100=41.667%∈[0,100]
+//   三闸(num、den-sum、pct)全过,零告警渗出 41.7%(真值 5/(5+10)=33.3%,adjustment 是坏配置)。
+// 若删掉分母循环内的 v<0 挡(boardgoal.go 分量级守护),此测试必须报红——这是本按类闭合的杀手证据。
+func TestGoalEvidenceNegativeDenominatorComponentRejectedSumPositive(t *testing.T) {
+	dir := t.TempDir()
+	fx := filepath.Join(dir, "component-neg-den.json")
+	// den = 5 + 10 + (-3) = 12 > 0——sum-level 挡不住
+	writeJSONFile(t, fx, map[string]any{
+		"pass":       5,
+		"blocked":    10,
+		"adjustment": -3, // pointer 配错的偏移量,不该被当计数字段
+	})
+	ov := &boardOverrideGoal{
+		Milestones: []boardOverrideMilestone{
+			{
+				ID: "M4", Title: "gates", Weight: 1,
+				Evidence: &boardOverrideEvidence{
+					Path:        fx,
+					Numerator:   "pass",
+					Denominator: []string{"pass", "blocked", "adjustment"},
+					MaxAgeHours: 24,
+				},
+			},
+		},
+	}
+	pg := buildProjectGoal(ov, "", fixedTime())
+	m := pg.Milestones[0]
+	if !m.Insufficient || m.DonePercent != nil {
+		t.Fatalf("单分量负、求和为正 必须在分量级 insufficient(不得渗出 41.7%%)，got=%+v", m)
+	}
+	if !strings.Contains(m.InsufficientReason, "denominator") {
+		t.Fatalf("原因应指向 denominator，got %q", m.InsufficientReason)
+	}
+	if !strings.Contains(m.InsufficientReason, "为负值") {
+		t.Fatalf("原因应指出 denominator 分量为负值(按类闭合的分量级守护),got %q", m.InsufficientReason)
+	}
+	// 强证据:原因串中必须点名出错的 pointer(adjustment),让委托人一眼看出坏配置来源
+	if !strings.Contains(m.InsufficientReason, "adjustment") {
+		t.Fatalf("原因应点名出错的 pointer(adjustment)，got %q", m.InsufficientReason)
+	}
+	// 反证:合成层不得渗出 41.7%(即使里程碑不足,项目级也不能靠人工填充造读数)
+	if pg.LandedPercent != nil {
+		t.Fatalf("单分量负攻击不得渗出 landed_percent=+41.7%%，got=%v", *pg.LandedPercent)
+	}
+}
+
+// TestGoalEvidenceZeroSumAllNonNegativeDenominatorRejected 反例:所有分量非负但求和为 0
+// (如 {a:0,b:0})——分量级 v<0 挡不到,只能靠 sum-level den<=0 挡。这是双层防线中
+// sum-level 闸门独占的攻击面,证明求和级检查在分量级基础上仍是必需(不是冗余)。
+func TestGoalEvidenceZeroSumAllNonNegativeDenominatorRejected(t *testing.T) {
+	dir := t.TempDir()
+	fx := filepath.Join(dir, "zero-sum-den.json")
+	// 所有分量均 0 → sum=0,分量级 v<0 挡不到,必须由 sum-level 挡
+	writeJSONFile(t, fx, map[string]any{"num": 0, "a": 0, "b": 0})
+	ov := &boardOverrideGoal{
+		Milestones: []boardOverrideMilestone{
+			{
+				ID: "M4", Title: "gates", Weight: 1,
+				Evidence: &boardOverrideEvidence{
+					Path:        fx,
+					Numerator:   "num",
+					Denominator: []string{"a", "b"},
+					MaxAgeHours: 24,
+				},
+			},
+		},
+	}
+	pg := buildProjectGoal(ov, "", fixedTime())
+	m := pg.Milestones[0]
+	if !m.Insufficient || m.DonePercent != nil {
+		t.Fatalf("全零分量求和=0 必须由 sum-level 挡 insufficient(除零守护),got=%+v", m)
+	}
 	if !strings.Contains(m.InsufficientReason, "denominator") || !strings.Contains(m.InsufficientReason, "≤ 0") {
-		t.Fatalf("原因应指向 denominator ≤ 0，got %q", m.InsufficientReason)
+		t.Fatalf("原因应指向 denominator ≤ 0(求和级独占的攻击面),got %q", m.InsufficientReason)
 	}
 }
 
@@ -1358,4 +1452,187 @@ func TestLoadBoardOverrideCommentErrorDropsAll(t *testing.T) {
 	if errKind != overrideErrKindSyntax {
 		t.Fatalf("注释 → 语法错,应归类 syntax，got kind=%q", errKind)
 	}
+}
+
+// ================== Round-2 P1-2 加固: msg 自描述前缀 + handler JSON 契约 ==================
+//
+// 教训:R3 首轮加了 error_kind 首选信道,但 msg 两分支前缀仍相同——若前端旧版未升级、或
+// 日志/告警管道只透原始 error 串(如 grep log、监控告警),用户仍会看到「board.json 解析失败」
+// 一句话,认不出「type=部分生效」还是「syntax=全部失效」。R2 起 msg 前缀自描述:
+//   type   → "board.json 部分字段类型手误(...其余覆盖仍生效)"
+//   syntax → "board.json 整块 JSON 语法错(...整个 override 失效...)"
+// 加上原有 error_kind 首选信道,两条独立信道并行,任一遗失都仍有另一条自证。
+
+// TestLoadBoardOverrideTypeErrorMsgSelfDescribes 类型错 msg 必须自描述"部分生效",
+// 让绕过 error_kind 的消费方(日志 grep、监控告警等)仍可辨识两态。
+// 反例:若某次误改删掉「部分生效」前缀,前端在旧版不识 error_kind 时会误报"全部失效"。
+func TestLoadBoardOverrideTypeErrorMsgSelfDescribes(t *testing.T) {
+	root := t.TempDir()
+	bad := `{
+  "projects": {
+    "typo": {"name": "T", "goal": {"milestones": [{"id":"M1","title":"x","weight":"1"}]}}
+  }
+}`
+	if err := os.WriteFile(filepath.Join(root, "board.json"), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, errMsg, errKind := loadBoardOverride(root)
+	if errKind != overrideErrKindType {
+		t.Fatalf("weight 类型错必须归类 type，got kind=%q", errKind)
+	}
+	// 强证据 1:msg 必须含"部分"或"仍生效"字样(自描述"部分保留"语义)
+	if !strings.Contains(errMsg, "部分") && !strings.Contains(errMsg, "仍生效") {
+		t.Fatalf("类型错 msg 须自描述'部分生效',让绕过 error_kind 的消费方仍能辨识,got %q", errMsg)
+	}
+	// 强证据 2:msg 不得混入"整块"/"全部失效"字样(否则两态自描述冲突)
+	if strings.Contains(errMsg, "整块") || strings.Contains(errMsg, "全部失效") {
+		t.Fatalf("类型错 msg 不得混入语法错的'整块/全部失效'描述,防两态自描述互撞,got %q", errMsg)
+	}
+	// 强证据 3:仍保留"board.json"来源(现存测试的最小契约)
+	if !strings.Contains(errMsg, "board.json") {
+		t.Fatalf("msg 须指明来源 board.json，got %q", errMsg)
+	}
+}
+
+// TestLoadBoardOverrideSyntaxErrorMsgSelfDescribes 语法错 msg 必须自描述"整块失效"。
+// 反证:若误改让语法错 msg 也混入"部分生效",委托人会误以为部分覆盖生效,查错方向反了。
+func TestLoadBoardOverrideSyntaxErrorMsgSelfDescribes(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "board.json"), []byte(`{"projects": {`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, errMsg, errKind := loadBoardOverride(root)
+	if errKind != overrideErrKindSyntax {
+		t.Fatalf("断裂 JSON 必须归类 syntax，got kind=%q", errKind)
+	}
+	// 强证据 1:msg 必须含"整块"/"整个 override"字样(自描述"整块失效"语义)
+	if !strings.Contains(errMsg, "整块") && !strings.Contains(errMsg, "整个") {
+		t.Fatalf("语法错 msg 须自描述'整块失效',got %q", errMsg)
+	}
+	// 强证据 2:msg 不得混入"仍生效"(否则两态自描述冲突,委托人查错方向反)
+	if strings.Contains(errMsg, "仍生效") {
+		t.Fatalf("语法错 msg 不得混入'仍生效'描述,防两态自描述互撞,got %q", errMsg)
+	}
+	// 强证据 3:保留"注释/尾逗号"提示(帮助抄 jsonc 示例的委托人自诊)
+	if !strings.Contains(errMsg, "注释") {
+		t.Fatalf("语法错 msg 须保留'注释/尾逗号'诊断提示,got %q", errMsg)
+	}
+}
+
+// TestOverviewHandlerBoardOverrideErrorKindJSONContract handler 层契约:
+// /api/overview 响应 JSON 必须携带 board_override_error 与 board_override_error_kind 两字段,
+// 且键名字面必须精确匹配前端 app.js 的 grep 依赖("board_override_error"/"..._kind")。
+// 【R2·P1-2】补 handler 层契约测试——上一轮 review 抓的正是「前端无从区分两态」;
+// 若键名 typo、字段被移除、omitempty 逻辑错(如空 kind 仍序列化),前端 fork 逻辑会静默失效。
+// 反证:把 board.go 里 BoardOverrideErrorKind 的 JSON tag 从 board_override_error_kind
+// 改成任何别名,此测试立即报红。
+func TestOverviewHandlerBoardOverrideErrorKindJSONContract(t *testing.T) {
+	t.Run("type_error_surfaces_kind_type_in_json", func(t *testing.T) {
+		// 类型错场景 board.json
+		bad := `{"projects": {"goalproj": {"name":"N","goal":{"milestones":[{"id":"M1","title":"x","weight":"1"}]}}}}`
+		root := bootBoardRoot(t, bad)
+		srv := newBoardServer(root, time.Second)
+		req := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+		rr := httptest.NewRecorder()
+		srv.handleOverview(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expect 200, got %d body=%s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("响应 JSON 解析失败: %v body=%s", err, rr.Body.String())
+		}
+		// 强证据 1:契约字段名精确匹配(前端 grep 依赖)
+		errStr, hasErr := resp["board_override_error"].(string)
+		if !hasErr || errStr == "" {
+			t.Fatalf("响应必须携带 board_override_error(前端顶部横幅依赖),got=%v", resp["board_override_error"])
+		}
+		kindStr, hasKind := resp["board_override_error_kind"].(string)
+		if !hasKind {
+			t.Fatalf("响应必须携带 board_override_error_kind 键(前端 fork 依赖),got resp=%+v", resp)
+		}
+		// 强证据 2:类型错必须 kind=type
+		if kindStr != "type" {
+			t.Fatalf("类型错必须序列化 kind=\"type\"(前端 subText 分叉基点),got %q", kindStr)
+		}
+		// 强证据 3:msg 自描述前缀(与前端 error_kind 独立的备份信道)
+		if !strings.Contains(errStr, "部分") && !strings.Contains(errStr, "仍生效") {
+			t.Fatalf("响应 msg 须自描述'部分生效',got %q", errStr)
+		}
+	})
+
+	t.Run("syntax_error_surfaces_kind_syntax_in_json", func(t *testing.T) {
+		root := bootBoardRoot(t, `{"projects": {`) // 断裂 JSON,语法错
+		srv := newBoardServer(root, time.Second)
+		req := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+		rr := httptest.NewRecorder()
+		srv.handleOverview(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expect 200, got %d body=%s", rr.Code, rr.Body.String())
+		}
+		var resp map[string]any
+		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("响应 JSON 解析失败: %v body=%s", err, rr.Body.String())
+		}
+		errStr, _ := resp["board_override_error"].(string)
+		if errStr == "" {
+			t.Fatalf("语法错时响应必须携带 board_override_error,got=%v", resp["board_override_error"])
+		}
+		kindStr, hasKind := resp["board_override_error_kind"].(string)
+		if !hasKind {
+			t.Fatalf("响应必须携带 board_override_error_kind 键,got resp=%+v", resp)
+		}
+		if kindStr != "syntax" {
+			t.Fatalf("语法错必须序列化 kind=\"syntax\",got %q", kindStr)
+		}
+		// msg 自描述"整块失效"
+		if !strings.Contains(errStr, "整块") && !strings.Contains(errStr, "整个") {
+			t.Fatalf("响应 msg 须自描述'整块失效',got %q", errStr)
+		}
+	})
+
+	t.Run("no_error_omits_kind_key_via_omitempty", func(t *testing.T) {
+		// 正常 board.json → error 与 kind 均应 omit(前端不显示告警横幅)
+		root := bootBoardRoot(t, `{"projects": {"goalproj": {"name": "Ok"}}}`)
+		srv := newBoardServer(root, time.Second)
+		req := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+		rr := httptest.NewRecorder()
+		srv.handleOverview(rr, req)
+		if rr.Code != http.StatusOK {
+			t.Fatalf("expect 200, got %d body=%s", rr.Code, rr.Body.String())
+		}
+		body := rr.Body.String()
+		// omitempty:正常场景两字段都应从 JSON 里消失(前端 `if (d.board_override_error)` 依赖)
+		if strings.Contains(body, `"board_override_error"`) {
+			t.Fatalf("正常场景 board_override_error 键应 omitempty,got body=%s", body)
+		}
+		if strings.Contains(body, `"board_override_error_kind"`) {
+			t.Fatalf("正常场景 board_override_error_kind 键应 omitempty,got body=%s", body)
+		}
+	})
+
+	t.Run("two_states_produce_distinguishable_json", func(t *testing.T) {
+		// 双向对照:类型错与语法错必须序列化出不同 kind——防止某次误改让两态归到同一 kind。
+		typeRoot := bootBoardRoot(t, `{"projects": {"a": {"goal":{"milestones":[{"id":"M","title":"x","weight":"1"}]}}}}`)
+		syntaxRoot := bootBoardRoot(t, `{"projects": {`)
+
+		callKind := func(root string) string {
+			srv := newBoardServer(root, time.Second)
+			req := httptest.NewRequest(http.MethodGet, "/api/overview", nil)
+			rr := httptest.NewRecorder()
+			srv.handleOverview(rr, req)
+			var resp map[string]any
+			_ = json.Unmarshal(rr.Body.Bytes(), &resp)
+			k, _ := resp["board_override_error_kind"].(string)
+			return k
+		}
+		typeKind := callKind(typeRoot)
+		syntaxKind := callKind(syntaxRoot)
+		if typeKind == syntaxKind {
+			t.Fatalf("两态 kind 必须不同(前端 fork 的基点),got type=%q syntax=%q", typeKind, syntaxKind)
+		}
+		if typeKind != "type" || syntaxKind != "syntax" {
+			t.Fatalf("kind 值必须精确为 {type, syntax},got type=%q syntax=%q", typeKind, syntaxKind)
+		}
+	})
 }

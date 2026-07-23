@@ -246,7 +246,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 - goal 缺失 → 前端**完全不显示**该区块（不猜）；
 - 权重和 ≤ 0 或任一 weight<0 → 整块标"数据不足"，`landed_percent` 为 `null`（不出 NaN/Inf/任何数字）；
 - 人工 `done_percent` 越界（<0 或 >100）→ 里程碑判"数据不足"，不得直出负数百分数或 250%（教训：round1 的 int64 截断会把 -50 算成 -49.9，直渲成"-49.9%"是造读数）；
-- evidence 折算结果超 100%（如 pointer 配错让 `num=30, den=[10]` 算出 300%）或折算为负（分子/分母有一个是负）→ 同样"数据不足"，不直出 300% 或 -30%；防线放在 `num` 与 `den` 各自的绝对值上（`num<0` 拒、`den≤0` 拒），只挡 `pct<0` 会被"双负相消"绕过（如 `{pass:-9, blocked:-2}` 会算出 +81.8%）；
+- evidence 折算结果超 100%（如 pointer 配错让 `num=30, den=[10]` 算出 300%）或折算为负（分子/分母有一个是负）→ 同样"数据不足"，不直出 300% 或 -30%；防线放在 `num` 与 `den` 各自的绝对值上——`num<0` 拒、`den` **分量级 `v<0` 拒**（`{pass:5, blocked:10, adjustment:-3}` 求和为 12>0 但 adjustment 分量为负，若只挡求和会零告警渗出 41.7%）、`den` 求和 `≤0` 拒（除零守护 + 全零分量兜底）；只挡 `pct<0` 会被"双负相消"绕过（如 `{pass:-9, blocked:-2}` 会算出 +81.8%）；
 - **evidence.path 强制绝对路径**：相对路径无论解析到进程 CWD 还是 `board.json` 所在目录，都存在"同名文件静默兜底"的兜底路径（`~/.claudego` 里常有同名脚手架/临时文件），配错时零告警读错——直接判"数据不足"是唯一让读数出处可追溯的做法；
 - evidence 文件缺失 / 超 `max_age_hours` / pointer 取不到 **JSON 数值类型**（如字段是字符串 `"9/21"`）→ 该里程碑标"数据不足"，合成值仅基于可用里程碑并标 `partial`——**evidence 存在即独占**，失败/超龄一律"数据不足"，**绝不回退到人工值**（读数含义漂移就是造假）；
 - `board.json` 存在但 JSON 语法非法（含 jsonc 注释、尾逗号、括号不闭合等）→ `OverviewResp.board_override_error` 挂出错误，前端顶部红色告警常驻，**整个 override 块**全部失效并回落自动推导；**字段类型手误**（`"weight":"1"`、`"done_percent":"50%"` 等 `*json.UnmarshalTypeError`）→ 同样挂 `board_override_error` 披露，但 **保留 Unmarshal 已尽力填充的其它字段**（其它无手误项目的 name/desc/phases/goal 仍生效）——一处手误不连坐吃掉整个覆盖块。两种降级都**不静默吞**。

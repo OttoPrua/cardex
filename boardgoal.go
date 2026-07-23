@@ -331,13 +331,22 @@ func readEvidencePercent(ev *boardOverrideEvidence, boardRoot string, now time.T
 		if !ok {
 			return 0, src, false, fmt.Sprintf("evidence denominator %q 取不到数值", p)
 		}
+		if v < 0 {
+			// 【R2·P1-1】分量级符号相消守护:sum-level 的 den<=0 挡不住「一正一负相加得正」——
+			// 反例:fixture {pass:5, blocked:10, adjustment:-3} 配 denominator:[pass,blocked,adjustment]
+			// → den=5+10-3=12>0、num=5≥0、pct=41.7%∈[0,100]——三闸全过零告警渗出错读数(真值 33.3%)。
+			// 威胁模型与 num<0 单挡对称(计数字段被误配成 offset、pointer 指错到 delta 字段等),
+			// 与 boardgoal.go:340 注释及 README「防线放在 num 与 den 各自绝对值上」的按类闭合声称一致——
+			// den 是分量求和,「各自绝对值」必须逐分量守护,不是仅守和。
+			return 0, src, false, fmt.Sprintf("evidence denominator %q 为负值 (%v)", p, v)
+		}
 		den += v
 	}
 	if den <= 0 {
-		// 除零 + 负分母守护。落地进度是决策读数，NaN/Inf 一旦渗出会污染合成值。
-		// den<0 单独挡：num=0/den<0 会算出 -0（== 0，不 < 0），会绕过下方 pct<0；
-		// 更狡诈：num<0/den<0 会算出正数（见 num<0 注释）——两条都堵才是完备。
-		// 「符号相消」是一整类攻击面，闸门必须放在 den 与 num 各自的绝对值上，不是 pct 上。
+		// 除零 + 全零分母守护。落地进度是决策读数，NaN/Inf 一旦渗出会污染合成值。
+		// 单分量负值已在循环内单挡(上方 v<0)——本闸门专治「所有分量非负但求和为 0」(如 {a:0,b:0}),
+		// 与 num=0/den=0 = NaN 一起兜底。历史上 den<0 曾靠此关口挡(-0.0 == 0.0 陷阱),
+		// 现改为分量级 + 求和级双层防线,「符号相消」类攻击面完备闭合。
 		return 0, src, false, fmt.Sprintf("evidence denominator 求和 ≤ 0 (%v)", den)
 	}
 	pct := num / den * 100

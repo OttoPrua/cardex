@@ -507,6 +507,9 @@ async function viewOverview() {
   // 其他字段（json 反序列化在 UnmarshalTypeError 后仍继续填充其余字段）；syntax 错时全丢。
   // 前端旧文案一律说"全部失效"→ 与后端"type 错保留部分"的实际行为对不上,委托人按告警去找
   // 名称/阶段"没生效"实则在生效,误导排障。
+  // 【R2·P1-2 加固】error_kind 是首选信道;后端 msg 前缀 也自描述("部分字段类型手误..." vs
+  // "整块 JSON 语法错...") 是 belt-and-suspenders 备份信道。若某次前后端契约漂移
+  // (如 kind 键 typo/被移除),裸 msg 里的自描述前缀仍可让用户识别两态,不至于错读全部失效。
   if (d.board_override_error) {
     const subText = d.board_override_error_kind === 'type'
       ? '出错字段已按类型不匹配跳过，其余 name/desc/phases/goal 覆盖仍生效。'

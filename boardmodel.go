@@ -842,16 +842,23 @@ func loadBoardOverride(root string) (*boardOverride, string, string) {
 	}
 	var o boardOverride
 	if jerr := json.Unmarshal(data, &o); jerr != nil {
-		msg := "board.json 解析失败（提示：board.json 是严格 JSON，不接受注释/尾逗号）: " + jerr.Error()
-		log.Printf("[board] %s", msg)
-		// *UnmarshalTypeError：字段类型不匹配，Unmarshal 已 skip 该字段并继续填充其它字段——
-		// 保留部分结果 + 挂错披露 + kind=type,前端渲染"部分覆盖仍生效"文案。
-		// 语法错走 else 分支整块丢 + kind=syntax。
+		// 【R2·P1-2】msg 加自描述前缀,让两态从错误串本身可辨识——belt-and-suspenders:
+		// error_kind 是首选信道,前缀是备份信道。若前端旧版未升级仍看错误串、或日志/告警
+		// 通道只透原始错误串(如 log grep、监控告警),用户仍能从前缀立即认出降级形态。
+		// 上一轮 review 抓的正是「后端两分支错误串前缀相同,前端无从区分」——加自描述前缀,
+		// 让分类信号在 error_kind 之外多一条独立通道,防止未来某处消费方遗漏 kind 字段时又静默。
 		var typeErr *json.UnmarshalTypeError
 		if errors.As(jerr, &typeErr) {
+			// 字段类型手误:Unmarshal skip 出错字段但继续填充其余——保留部分结果 + 披露 + kind=type。
+			msg := "board.json 部分字段类型手误(出错字段已按 *UnmarshalTypeError 跳过,其余 name/desc/phases/goal 覆盖仍生效): " + jerr.Error()
+			log.Printf("[board] %s", msg)
 			o.root = root
 			return &o, msg, overrideErrKindType
 		}
+		// 语法错(注释/尾逗号/括号不闭合等)无法部分解析:整块丢 + 披露 + kind=syntax。
+		// 保留"注释/尾逗号"帮助自诊,委托人抄 README jsonc 示例是高频坑。
+		msg := "board.json 整块 JSON 语法错(整个 override 失效,回落自动推导；提示：board.json 是严格 JSON,不接受注释/尾逗号): " + jerr.Error()
+		log.Printf("[board] %s", msg)
 		return &boardOverride{root: root}, msg, overrideErrKindSyntax
 	}
 	o.root = root

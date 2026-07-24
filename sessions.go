@@ -68,7 +68,10 @@ func listSessions(dir string) ([]sessionInfo, string, error) {
 
 // sessionTitle 取会话里第一条用户文本消息当标题（跳过工具结果等非文本行）。
 func sessionTitle(path string) string {
-	f, err := os.Open(path)
+	// 【CG-R3b R1 类闭合】path 来自 ~/.claude/projects/<proj>/ 的目录枚举(claude CLI 的地盘,
+	// 属域外):listSessions 只滤了 IsDir + .jsonl 后缀,而 DirEntry.IsDir() 对 symlink 恒为 false
+	// ——一条 <id>.jsonl → FIFO 的链接就能让 os.Open 永久阻塞,`claudego sessions` 整条命令挂死。
+	f, _, err := openRegularFileNoBlock(path)
 	if err != nil {
 		return "-"
 	}

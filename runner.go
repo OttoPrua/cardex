@@ -1629,10 +1629,15 @@ func extractEmitTasks(result, dir string) ([]emitTask, error) {
 				continue
 			}
 			seen[p] = true
-			if fi, err := os.Stat(p); err != nil || fi.IsDir() || fi.Size() > 2<<20 {
+			// 【CG-R3b R1 类闭合】p 是**业务仓工作目录内、由模型输出指名**的路径——与 codex 副本的
+			// untracked 面同属域外输入。旧闸门只判 IsDir/Size:os.Stat 跟随链接,symlink→FIFO 的
+			// stat 结果是"非目录、size=0",能过闸,随后 os.ReadFile 在纯 Go syscall 里永久阻塞,
+			// runTask 泳道与 copyFile 那条腿一样被占死(ctx/进程组击杀/patrol 都解不开)。
+			// 改判 IsRegular(stat 跟随链接,故 symlink→普通文件仍照收)并走不阻塞的读法。
+			if fi, err := os.Stat(p); err != nil || !fi.Mode().IsRegular() || fi.Size() > 2<<20 {
 				continue
 			}
-			b, err := os.ReadFile(p)
+			b, err := readRegularFileNoBlock(p)
 			if err != nil {
 				continue
 			}

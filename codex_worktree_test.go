@@ -21,6 +21,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -803,6 +804,176 @@ func TestCodexReviewPrepareKilledOnHangingGit(t *testing.T) {
 			names = append(names, e.Name())
 		}
 		t.Fatalf("建副本被击杀后不应残留副本目录, got: %v", names)
+	}
+}
+
+// TestReadmeCopyPhaseContractMatchesImplementation 绑定 P1-1③:双语契约句必须与实现同步且不超卖。
+//
+// 【修的病】上一轮 README 双语契约句把"拷贝"写进 min(step_timeout,10min) 的子预算承诺,而拷贝腿
+// 当时压根不查 ctx、还会跟随链接打开无写端 FIFO——契约句超卖,消费方(委托人/复审)据此以为
+// "泳道不会被建副本堵死",实际堵得死死的。契约句是对外承诺,必须有测试钉住。
+//
+// 【锚三件事】
+//   ① 两份 README 都得有这句 —— 只改中文不改英文照样过 = 双语漂移的假绿;
+//   ② 句子里必须出现本轮新增的两条硬约束(逐文件边界查预算 / 从不打开非常规文件),
+//      防止有人把句子改回旧版超卖措辞;
+//   ③ 实现侧**剥掉注释后**必须真有这两条的代码痕迹 —— 否则 README 可以单方面写得漂亮而代码回退,
+//      注释里的漂亮话也不算数(承 CG-R2c"剥注释后做 must[] 断言"的既定纪律)。
+// 【杀的突变】把任一 README 的契约句改回旧版 → ① 或 ② 红;把 copyUntrackedPath 的 os.Lstat 换回
+// os.Open、或删掉循环里的 ctx.Err() → ③ 红(即便注释还写着也照红)。
+func TestReadmeCopyPhaseContractMatchesImplementation(t *testing.T) {
+	docs := []struct {
+		file   string
+		anchor string
+		must   []string
+	}{
+		{"README.md", "建副本阶段(探测/clone/apply/拷贝)", []string{
+			"min(step_timeout, 10min)", "每个文件边界", "从不打开非常规文件",
+			"symlink", "codex_review_prepare_timeout",
+		}},
+		{"README.en.md", "The copy-build phase (probe/clone/apply/copy)", []string{
+			"min(step_timeout, 10min)", "at every file boundary", "never opens a non-regular file",
+			"symlink", "codex_review_prepare_timeout",
+		}},
+	}
+	for _, d := range docs {
+		data, err := os.ReadFile(d.file)
+		if err != nil {
+			t.Fatalf("read %s: %v", d.file, err)
+		}
+		idx := strings.Index(string(data), d.anchor)
+		if idx < 0 {
+			t.Fatalf("%s: 找不到建副本子预算契约句锚点 %q(句子被删/改写 → 契约无处可核)", d.file, d.anchor)
+		}
+		// 只在该句所在的这一段里核 —— 换成全文 Contains 会被文档别处的同名词汇满足,变成恒真。
+		para := string(data)[idx:]
+		if end := strings.Index(para, "\n"); end >= 0 {
+			para = para[:end]
+		}
+		for _, m := range d.must {
+			if !strings.Contains(para, m) {
+				t.Errorf("%s: 契约句缺少 %q —— 承诺与实现不符(上一轮 concerns 正是此病)\n段落: %s", d.file, m, para)
+			}
+		}
+	}
+
+	// ③ 实现侧痕迹:剥注释后再核,防"注释里写了就算数"。
+	code := stripGoLineComments(t, "codex_worktree.go")
+	for _, m := range []string{"ctx.Err()", "os.Lstat(", "os.Readlink(", "os.Symlink("} {
+		if !strings.Contains(code, m) {
+			t.Errorf("codex_worktree.go(剥注释后)缺少 %q —— README 的承诺在代码里没有对应实现", m)
+		}
+	}
+}
+
+// stripGoLineComments 去掉 Go 源码里的 `//` 行注释,只留可执行代码。
+// 【为什么必须剥】本仓注释密度极高,直接对源文件做 Contains 会被注释里的同名词汇满足——
+// 代码回退了、注释还在,断言照样绿(CG-R2c 已就同类恒真化立过规矩)。
+func stripGoLineComments(t *testing.T, file string) string {
+	t.Helper()
+	data, err := os.ReadFile(file)
+	if err != nil {
+		t.Fatalf("read %s: %v", file, err)
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		if i := strings.Index(line, "//"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	return b.String()
+}
+
+// ---- CG-R3b R1·P1-1①:拷贝腿必须真的吃子预算(纯 Go 循环,没人替它查 ctx)----
+
+// TestCopyUntrackedListChecksCtxBeforeFirstCopy 绑定"查在迭代**前**":ctx 已死时一条都不许搬。
+//
+// 【修的病】copyUntracked 的循环签名里收了 ctx,循环体一次不查——README 承诺"拷贝跑在
+// min(step_timeout,10min) 子预算内",实现里却没有任何一处会因子预算到期而停手。超大 untracked 面
+// (未忽略的 node_modules 之流)让这条承诺静默作废。
+// 【杀的突变】删掉 copyUntrackedList 里的 `if err := ctx.Err(); err != nil` → 第一段两条断言全红
+// (err 变 nil、a.txt 被搬进 dst)。
+// 【为什么带正向对照】只断"死 ctx 报错"会被"函数恒报错"这种废实现满足;第二段用活 ctx 跑同一张表,
+// 要求文件确实落地,把恒真解排除掉。
+func TestCopyUntrackedListChecksCtxBeforeFirstCopy(t *testing.T) {
+	src := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte("A"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rels := []string{"a.txt"}
+
+	dead := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := copyUntrackedList(ctx, src, dead, rels)
+	if err == nil {
+		t.Fatal("ctx 已取消时拷贝腿必须立即中止并报错(否则子预算对这条腿形同虚设)")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("错误须 %%w 包装 ctx 错,调用侧才能落 codex_review_prepare_canceled/timeout, got %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dead, "a.txt")); statErr == nil {
+		t.Fatal("ctx 已死却仍搬了第一条——检查点必须在每次迭代**之前**,不是之后")
+	}
+
+	// 正向对照:活 ctx 下同一张表必须照常搬完(排除"恒报错"的废实现满足上面的断言)。
+	live := t.TempDir()
+	if err := copyUntrackedList(context.Background(), src, live, rels); err != nil {
+		t.Fatalf("活 ctx 下拷贝不应失败: %v", err)
+	}
+	if data, err := os.ReadFile(filepath.Join(live, "a.txt")); err != nil || string(data) != "A" {
+		t.Fatalf("活 ctx 下 a.txt 应被原样搬过去, got data=%q err=%v", data, err)
+	}
+}
+
+// TestCopyUntrackedListStopsMidLoop 绑定"**每次**迭代都查",而不是进循环前查一次就完事。
+//
+// 【为什么单独一条】只查一次的实现能让上面那条测试全绿,但真实病灶——"子预算在搬到一半时到期"
+// (大仓/NFS 停顿/超大 untracked 面)——原样存活:循环照样一路搬到底。
+// 【构造为什么是确定的】第一条故意做成 32MiB:watcher 一看到目标文件**被创建**就 cancel,此刻
+// io.Copy 才刚开始搬这 32MiB(毫秒级),ctx 因此必定在"第一条搬完、第二条开搬之前"就已死透。
+// 检测延迟是微秒级、拷贝是毫秒级,量级差三个数量级,不是靠竞速取胜。
+// 【杀的突变】把 ctx 检查从循环体内挪到循环外(只查一次)→ b/c 照样被搬完,末条断言红。
+func TestCopyUntrackedListStopsMidLoop(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	if err := os.WriteFile(filepath.Join(src, "a-big.bin"), make([]byte, 32<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range []string{"b.txt", "c.txt"} {
+		if err := os.WriteFile(filepath.Join(src, n), []byte(n), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rels := []string{"a-big.bin", "b.txt", "c.txt"} // git ls-files 输出有序,此处同序
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := os.Stat(filepath.Join(dst, "a-big.bin")); err == nil {
+				cancel() // 第一条刚开搬就掐掉子预算
+				return
+			}
+			runtime.Gosched()
+		}
+	}()
+
+	err := copyUntrackedList(ctx, src, dst, rels)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("子预算中途死掉,拷贝腿应报 ctx 错, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "c.txt")); err == nil {
+		t.Fatal("子预算中途死掉后仍把整张表搬完——ctx 只在进循环前查了一次,大仓/NFS 场景照旧失控")
 	}
 }
 

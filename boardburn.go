@@ -691,7 +691,11 @@ func buildTokenSeries(cfg *Config, now time.Time) TokenSeries {
 		if budget <= 0 {
 			break
 		}
-		f, err := os.Open(p)
+		// 【CG-R3b R1 类闭合】p 来自 ~/.claude/projects 的目录遍历——那是 claude CLI 自己写的目录,
+		// 属 ClaudeGo 控制域之外:WalkDir 的 d.IsDir() 对 symlink 恒为 false,一条名为 *.jsonl 的
+		// symlink→FIFO 就能让 os.Open 永久阻塞,把 board 的燃尽采样 goroutine 占死(web handler
+		// 再不返回)。openRegularFileNoBlock 保证 open 不挂、拿到的必是普通文件。
+		f, _, err := openRegularFileNoBlock(p)
 		if err != nil {
 			continue
 		}

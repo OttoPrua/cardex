@@ -21,6 +21,8 @@ package main
 // verdict,复现的正是 CG-1 修复链三轮空转的原病。故 clone 完必再:
 //   ① `git diff --binary --no-renames HEAD` → 副本 `git apply --binary`(dirty tracked)
 //   ② `git ls-files --others --exclude-standard -z` → 逐一 cp 到副本(真正 untracked,尊重 .gitignore)
+//      —— untracked 面是**域外输入**:symlink 按链接本体复制不跟随,非常规文件(FIFO/socket/设备)
+//      一律跳过,每条之前查子预算。理由见 copyUntrackedList / copyUntrackedPath 的成因注释(CG-R3b R1)。
 // .DS_Store / AppleDouble 等平台伪影不特殊处理:副本一次性存在,伪影随删,不像 CG-R2 那样两侧
 // 对称落 fingerprint,无对称问题。
 //
@@ -47,6 +49,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -333,8 +336,37 @@ func copyUntracked(ctx context.Context, taskID, src, copyDir string) error {
 	if len(out) == 0 {
 		return nil
 	}
-	for _, rel := range strings.Split(strings.TrimRight(string(out), "\x00"), "\x00") {
+	return copyUntrackedList(ctx, src, copyDir, strings.Split(strings.TrimRight(string(out), "\x00"), "\x00"))
+}
+
+// copyUntrackedList 把 rels(相对 src 的 untracked 路径表)逐条投影到副本。
+//
+// 【为什么从 copyUntracked 里抽出来】拷贝腿是建副本阶段唯一的**纯 Go 循环**:git 腿靠
+// exec.CommandContext 吃 ctx,循环靠自己查。抽成独立函数后测试能直接喂"路径表 + 受控 ctx",
+// 精确绑定"每次迭代前查、到期即止"这条契约,而不必依赖 git 子进程的时序去逼出中断点。
+//
+// 【为什么每次迭代前查 ctx.Err()(CG-R3b R1·P1-1①)】旧实现签名里收了 ctx、循环体一次不查:
+//   - 超大 untracked 面(未忽略的 node_modules 之流)会让 min(step_timeout,10min) 子预算**静默失效**
+//     ——循环照跑到底,谁也不喊停,README 承诺的"拷贝跑在子预算内"当场作废;
+//   - NFS 停顿等慢 IO 场景同理:父 ctx 早死透了,拷贝腿还在一条一条搬。
+// 查在**迭代前**而非迭代后:ctx 已死时一条都不该再搬(多搬一条就是多一份无谓 IO 与磁盘占用)。
+// 【粒度的诚实边界】Go 的文件 IO 不接 ctx,故中止粒度是**单文件边界**:正在 io.Copy 的那一条会
+// 读完才停。真正会永久挂住的非常规文件已在 copyUntrackedPath 里被挡在 open 之外,剩下的普通文件
+// 即便在慢盘上也是有限时间收敛——README 契约句按这个粒度写,不超卖。
+func copyUntrackedList(ctx context.Context, src, copyDir string, rels []string) error {
+	for i, rel := range rels {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("拷贝 untracked 面被超时/取消中止(已处理 %d/%d 条): %w", i, len(rels), err)
+		}
 		if rel == "" {
+			continue
+		}
+		// marker 命名空间归 ClaudeGo:副本根下的 .claudego-codex-work.json(及 atomicWrite 的 .tmp
+		// 中间文件)是崩溃对账的凭据,不接受来自业务仓 untracked 面的同名投影。不跳的话,一个名叫
+		// `.claudego-codex-work.json.tmp` 的 symlink→FIFO 会让随后 writeCodexWorkMarker 的
+		// os.WriteFile **以写端打开无读端 FIFO**——同样永久阻塞,与本卡要闭的病同类只是换了个方向;
+		// 且该名字的普通文件会在崩溃残留里冒充 marker 干扰孤儿判据。反正它下一步就会被真 marker 覆盖。
+		if rel == codexWorkMarkerName || rel == codexWorkMarkerName+".tmp" {
 			continue
 		}
 		srcPath := filepath.Join(src, rel)
@@ -342,29 +374,60 @@ func copyUntracked(ctx context.Context, taskID, src, copyDir string) error {
 		if err := os.MkdirAll(filepath.Dir(dstPath), 0o755); err != nil {
 			return fmt.Errorf("mkdir dst dir for %s: %w", rel, err)
 		}
-		if err := copyFile(srcPath, dstPath); err != nil {
+		if err := copyUntrackedPath(srcPath, dstPath); err != nil {
 			return fmt.Errorf("cp untracked %s: %w", rel, err)
 		}
 	}
 	return nil
 }
 
-// copyFile 是保留文件权限的普通 IO 拷贝——untracked 里可能含 shell 脚本,复审若要跑需保留 +x。
-// 不做 chown(源与目标同 uid,不需要)。
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
+// copyUntrackedPath 把一条 untracked 路径投影到副本,保留权限位(untracked 里可能是 shell 脚本,
+// 复审要跑得留 +x);不做 chown(源与目标同 uid)。三条硬约束:
+//
+//	① **先 Lstat 判型,绝不先开**(CG-R3b R1·P1-1②)。旧实现 os.Open 在前、IsRegular 在后:
+//	   实测 `git ls-files --others --exclude-standard` 会把 untracked **symlink** 列出来
+//	   (dangling / 指向 FIFO 的都列;裸 FIFO 反而不列),而 os.Open 跟随链接打开无写端 FIFO
+//	   按 POSIX 永久阻塞——阻塞发生在 IsRegular 防御**之前**,且是纯 Go syscall,ctx/进程组击杀/
+//	   patrol 全都解不开,runTask goroutine 与泳道槽位就此占死。Lstat 不跟随链接,判型不碰 open。
+//	② **symlink 复制链接本体**(os.Readlink + os.Symlink,不跟随)。这与 git clone --local 对
+//	   tracked symlink 的处理同构(实测:clone 原样重建链接,含指向仓外的绝对链接),副本因此在
+//	   "链接"这件事上 tracked/untracked 两侧语义一致;顺带闭合"dangling symlink → open 报 ENOENT
+//	   → 整个 prepare 必败 → 该仓每次复审都无谓降级 read-only"的兄弟洞。
+//	③ **open 后 fstat 复核**(openRegularFileNoBlock 内):Lstat 判型到 open 之间的 TOCTOU 缝由
+//	   O_NONBLOCK + fstat 收口,两道互不依赖。
+//
+// 【留档·非本卡裁量】链接本体复制意味着副本内可能存在指向原仓的 symlink。这不是本修法引入的新面:
+// tracked symlink 早已由 clone 原样带过去(已实测),写穿与否的实际闸门在 codex 沙箱侧
+// (workspace-write 按真实路径授权 writable_roots)。若要在 ClaudeGo 侧再加一道"越界链接过滤",
+// 必须 tracked/untracked 一视同仁,属独立设计决策,不在本卡私自扩围。
+func copyUntrackedPath(src, dst string) error {
+	fi, err := os.Lstat(src)
 	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		target, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		// 副本是全新目录,dst 冲突理论上不发生(tracked 与 untracked 路径互斥);删一次让重建幂等。
+		// os.Remove 删的是链接本身,不跟随,不会误删链接目标。
+		_ = os.Remove(dst)
+		return os.Symlink(target, dst)
+	}
+	if !fi.Mode().IsRegular() {
+		// FIFO/socket/设备/目录:git 不会列出裸 FIFO,但 untracked 面是域外输入,硬防御一下。
+		// 跳过而非报错——为一条不该存在的特殊文件让整个 prepare 失败,只会换来无谓的全局降级。
+		return nil
+	}
+	in, _, err := openRegularFileNoBlock(src)
+	if err != nil {
+		if errors.Is(err, errNotRegularFile) {
+			return nil // TOCTOU:Lstat 之后被换成非常规文件,与 ② 同样跳过
+		}
 		return err
 	}
 	defer in.Close()
-	fi, err := in.Stat()
-	if err != nil {
-		return err
-	}
-	// 目录 / socket 等非普通文件:untracked 里不该出现,但硬防御一下,skip 不报错。
-	if !fi.Mode().IsRegular() {
-		return nil
-	}
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, fi.Mode().Perm())
 	if err != nil {
 		return err
@@ -378,19 +441,31 @@ func copyFile(src, dst string) error {
 
 // writeCodexWorkMarker 落 marker 到副本内 <copyDir>/.claudego-codex-work.json。
 // 原子写(tmp+rename)避免半截 marker 骗过对账。
+//
+// 【为什么先 Remove 两条路径(CG-R3b R1 类闭合)】副本内容部分来自业务仓 untracked 面,是域外输入。
+// 若那边有个同名的 symlink→FIFO 被投影进来,atomicWrite 的 os.WriteFile 会**以写端打开无读端 FIFO**
+// ——同样按 POSIX 永久阻塞,只是方向从读换成了写。copyUntrackedList 已在源头跳过该命名空间;这里再
+// 删一次是第二道:os.Remove 删链接本身不跟随,对正常路径(文件本不存在)是无副作用的 no-op。
 func writeCodexWorkMarker(copyDir string, m codexWorkMarker) error {
 	data, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err
 	}
 	path := filepath.Join(copyDir, codexWorkMarkerName)
+	_ = os.Remove(path)
+	_ = os.Remove(path + ".tmp") // atomicWrite 的中间文件名,同样不能是别人留下的管道
 	return atomicWrite(path, append(data, '\n'))
 }
 
-// readCodexWorkMarker 读副本目录内的 marker;文件不存在/损坏视作"半成品",返回 (nil,false)。
+// readCodexWorkMarker 读副本目录内的 marker;文件不存在/损坏/非普通文件视作"半成品",返回 (nil,false)。
 // 对账侧据此把无 marker 的目录也当孤儿清(clone 中崩溃/apply 中崩溃的残留兜底)。
+//
+// 【为什么走 readRegularFileNoBlock(CG-R3b R1 类闭合)】本函数由 tick 的孤儿对账调用,读的是
+// **副本目录**——其内容部分来自业务仓 untracked 面(域外)。崩溃点若落在"拷贝完成、marker 未写"之间,
+// 残留里就可能有个名叫 .claudego-codex-work.json 的 symlink→FIFO:os.ReadFile 会在此永久阻塞,
+// 把 tick 整条对账线程占死。改用不阻塞的读法后,它被判成"损坏 marker"→ 按半成品清掉,正是我们要的。
 func readCodexWorkMarker(copyDir string) (*codexWorkMarker, bool) {
-	data, err := os.ReadFile(filepath.Join(copyDir, codexWorkMarkerName))
+	data, err := readRegularFileNoBlock(filepath.Join(copyDir, codexWorkMarkerName))
 	if err != nil {
 		return nil, false
 	}

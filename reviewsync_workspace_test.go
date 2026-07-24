@@ -787,6 +787,16 @@ func TestSyncDistributesPowerShellVerifyScript(t *testing.T) {
 		t.Fatal(err)
 	}
 	// PowerShell 良构基线:必须能解析 Mirror 参数 + 用 Get-FileHash 计算逐文件哈希 + 有 exit 码路径。
+	// 【CG-R2c·2026-07-25】先剥掉行首 # 注释行，在代码执行位做断言；
+	// 防"注释里有相同字面 → 删真代码测试仍绿"恒真化（与 TestPowerShellVerifyScriptContainsR3Fixes 同类闭合）。
+	var ps1CodeLines []string
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		ps1CodeLines = append(ps1CodeLines, line)
+	}
+	codeBody := strings.Join(ps1CodeLines, "\n")
 	must := []string{
 		"param(",                     // 参数定义
 		"Mirror",                     // 契约参数名
@@ -799,12 +809,12 @@ func TestSyncDistributesPowerShellVerifyScript(t *testing.T) {
 		"exit 3",                     // 环境缺陷退出
 	}
 	for _, kw := range must {
-		if !strings.Contains(string(body), kw) {
+		if !strings.Contains(codeBody, kw) {
 			preview := string(body)
 			if len(preview) > 400 {
 				preview = preview[:400]
 			}
-			t.Fatalf(".ps1 缺关键片段 %q(结构或契约漂),body 前 400 字节:\n%s", kw, preview)
+			t.Fatalf(".ps1 代码执行位缺关键片段 %q(CG-R2c 剥注释断言,防注释满足恒真),body 前 400 字节:\n%s", kw, preview)
 		}
 	}
 }

@@ -829,12 +829,23 @@ func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Makefile 应存在于仓根: %v", err)
 	}
-	// 【CG-R2b R2·2026-07-24 类闭合】护栏关键字必须落在代码执行位,不是 Makefile 注释——
-// 同 ps1 侧"注释可满足护栏"病类的兄弟洞:上一轮 R1 已为 ps1 侧剥 `#` 注释再断言(第 875 行),
-// Makefile 侧同理必须剥掉 `#` 起头的注释行,再对 codeBody 断言 "DesignReview" 等 pattern 关键片段。
+	// 【CG-R2b R3·2026-07-24 类闭合续】"非执行位满足护栏"病类第二级兄弟洞:
+	// R2 已剥 `#` 注释,但 Makefile recipe 中还有一类"显示位":`@echo "..."` / `@printf "..."`——
+	// 是消息展示指令(其参数是文本消息串,不是被断言的执行体如 `go test -run '...'`)。
+	// 首证 t0724-2104-c2a0 P1-1 复审:accept-sync:26 的 @echo 展示行字面含 "Sync|Verify|DesignReview",
+	// 仅漂 :27 exec 行的 pattern → codeBody 里 "DesignReview" 依然由 :26 @echo 提供 → 突变逃逸。
+	// 系统性修法:除 `#` 起头的注释行外,同步剔除 recipe 显示行(命令位为 echo/printf,@ 前缀可选)。
+	// 类闭合命令位识别:剥掉 tab 与可选 `@` 后,首 token 为 echo/printf 即视为显示行。
 	var codeLines []string
 	for _, line := range strings.Split(string(body), "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		// Makefile recipe 显示行剔除:剥 `@` 前缀后,首命令位是 echo/printf → 展示指令。
+		cmd := strings.TrimLeft(trimmed, "@")
+		if strings.HasPrefix(cmd, "echo ") || strings.HasPrefix(cmd, "printf ") ||
+			cmd == "echo" || cmd == "printf" {
 			continue
 		}
 		codeLines = append(codeLines, line)
@@ -858,13 +869,20 @@ func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 	}
 }
 
-// ⑯ 【CG-R2b R2·2026-07-24】accept-sync 的 -run pattern 必须覆盖所有 env=1-gated 测试名——类闭合。
+// ⑯ 【CG-R2b R2·2026-07-24 / R3·2026-07-24 类闭合升级】accept-sync 的 -run pattern 必须
+// 覆盖所有 env=1-gated 测试名;且 Makefile 中所有 `-run '...'` 出现位 pattern 必须彼此一致
+// (消灭"@echo 展示行 pattern 与 exec 执行行 pattern 分裂"的 R3 兄弟洞)。
 //
 // 【为什么单独立测】TestVerifyAcceptSyncMakefileTargetExists 只锁"pattern 里含 DesignReview 字面",
 // 未来若新增第 4/5 个 env=1-gated 测试(名字不带 Sync/Verify/DesignReview),仍会静默漂绿
 // (复刻本轮 P1-1 病类)。本挡动态枚举文件里所有 Test* 函数,只要函数体或其传递依赖的助手
 // (syncScriptsRoot/runSyncLocal/runVerify)引用了 CLAUDEGO_REQUIRE_SYNC_SCRIPTS,就必须能被
 // Makefile 的 -run pattern 匹上;匹不上 → 红。加装机测试却忘同步 pattern → 本挡红。
+//
+// 【R3 兄弟洞闭合】旧版 FindStringSubmatch 只取第一处出现位——若 accept-sync:26 是 @echo 展示行
+// 先出现,:27 是真 exec 行后出现,只漂 :27 pattern → 首位匹到的仍是 :26 的旧串,本挡逃逸(首证
+// t0724-2104-c2a0 P1-1)。修法:FindAllStringSubmatch 全量提取,断言所有出现位 pattern 一致;
+// 分裂即红。逻辑上把 @echo 展示行 pattern 与 exec 行 pattern 锁死同源,任一侧漂另一侧未同步必红。
 //
 // 【类闭合枚举】既有 env=1-gated 测试(书面盘点,用于 sanity 检查):
 //   - Test*Sync* / Test*Verify* 系(经由 syncScriptsRoot/runSyncLocal/runVerify);
@@ -873,7 +891,8 @@ func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 //
 // 【杀的突变】
 //   ① 把 Makefile pattern 改回 'Sync|Verify' → TestDesignReviewAnd... 匹不上 → 本挡红;
-//   ② 新增一个 TestPrepFooEnvGated 但忘同步 pattern → 本挡红(pattern 覆盖度不足)。
+//   ② 新增一个 TestPrepFooEnvGated 但忘同步 pattern → 本挡红(pattern 覆盖度不足);
+//   ③ 只漂 exec 行 pattern(:27)不动 @echo 展示行(:26) → 两处不一致 → 本挡红(R3 兄弟洞闭合)。
 func TestAcceptSyncMakefilePatternCoversAllEnvGatedTests(t *testing.T) {
 	repoRoot, err := os.Getwd()
 	if err != nil {
@@ -884,13 +903,24 @@ func TestAcceptSyncMakefilePatternCoversAllEnvGatedTests(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read Makefile: %v", err)
 	}
-	// -run '...' 里的内容;正则匹到第一处即用(accept-sync 目标唯一 -run 出现位)。
+	// 【R3 类闭合】-run '...' 全量提取——不只取第一处,消灭 @echo 展示行与 exec 行 pattern 分裂的兄弟洞。
 	runRe := regexp.MustCompile(`-run '([^']+)'`)
-	m := runRe.FindStringSubmatch(string(mkBody))
-	if len(m) < 2 {
+	ms := runRe.FindAllStringSubmatch(string(mkBody), -1)
+	if len(ms) == 0 {
 		t.Fatalf("Makefile 里未找到 `-run '...'`(accept-sync 目标) —— body:\n%s", string(mkBody))
 	}
-	pattern := m[1]
+	// 所有 -run 出现位 pattern 必须一致:分裂即红(@echo 展示与 exec 执行同源锁,R3 类闭合)。
+	firstPat := ms[0][1]
+	for i, m := range ms {
+		if m[1] != firstPat {
+			t.Fatalf("Makefile 出现多个不一致的 -run pattern(@echo 展示行与 exec 执行行 pattern 分裂):\n"+
+				"  第 1 处=%q\n  第 %d 处=%q\n"+
+				"漂移复刻:t0724-2104-c2a0 P1-1(只漂 exec 行 pattern 不漂 @echo 展示行则 codeBody\n"+
+				"positive 断言与 FindString 首匹配双双逃逸)。修法:所有 -run 出现位两侧同步改。",
+				firstPat, i+1, m[1])
+		}
+	}
+	pattern := firstPat
 	patRe, err := regexp.Compile(pattern)
 	if err != nil {
 		t.Fatalf("Makefile -run pattern %q 编译为正则失败: %v", pattern, err)
@@ -969,6 +999,79 @@ func TestAcceptSyncMakefilePatternCoversAllEnvGatedTests(t *testing.T) {
 	if len(uncovered) > 0 {
 		t.Fatalf("Makefile accept-sync 的 -run pattern %q 未覆盖 env=1-gated 测试 %v —— 装机漂移红线脱离验收流(P1-1 类闭合);修法:把测试名或名子串补进 pattern",
 			pattern, uncovered)
+	}
+}
+
+// ⑱ 【CG-R2b R3·2026-07-24 类闭合】accept-sync 目标的 exec 执行行本身必须携带完整 -run pattern——
+// "非执行位满足护栏"病类的正面锚定挡:直接锁定"tab-indented 且非 @echo/@printf 展示位"的
+// 那一行,断言它自带 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 与 -run '<全 pattern>' 的完整表达。
+//
+// 【为什么再加一挡】⑯ 靠"全量提取 -run 出现位并断言一致"消灭分裂,但若把 exec 行整段 -run 拆走
+// (只留 @echo 展示行) → 全量提取只剩 @echo 里那一处 → 一致性成立 → coverage 检查仍绿 → 逃逸。
+// 本挡直接锚定"exec 执行行自身要携带 -run 完整 pattern",消灭"exec 行整体缺失 -run"的极端漂移。
+//
+// 【exec 行识别规则】
+//   - Makefile recipe 行必须以 tab 起头;
+//   - 剥 tab + 可选 `@` 后,首命令 token 若为 echo/printf,是展示位,跳过;
+//   - 剩下的 recipe 行,若含 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 与 `go test`,即为 exec 执行行;
+//   - 该行必须整体含 `-run '<pattern>'` 且 pattern 与全量首匹配一致。
+//
+// 【杀的突变】
+//   ① 从 :27 exec 行删掉 `-run 'Sync|Verify|DesignReview'` 整段 → exec 行不携带 -run → 本挡红;
+//   ② 只漂 :27 exec 行 pattern 不漂 :26 @echo 展示行 → exec 行 pattern 与全量首匹配不一致 → 本挡红
+//      (与 ⑯ 双杀:⑯ 从"全量一致"角度报,本挡从"exec 行本身要与全量首匹配一致"角度报);
+//   ③ 把 exec 行 recipe 命令换成 @echo(伪装成显示) → 找不到 exec 行 → 本挡红。
+func TestAcceptSyncExecutionLineCarriesRunPattern(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	mkBody, err := os.ReadFile(filepath.Join(repoRoot, "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	runRe := regexp.MustCompile(`-run '([^']+)'`)
+	msAll := runRe.FindAllStringSubmatch(string(mkBody), -1)
+	if len(msAll) == 0 {
+		t.Fatalf("Makefile 里未找到 `-run '...'` —— accept-sync 目标可能被删")
+	}
+	primaryPat := msAll[0][1]
+
+	// 识别 exec 执行行:tab 起头 + 剥 `@` 后首命令非 echo/printf + 含 env 变量 + 含 `go test`。
+	var execLines []string
+	for _, line := range strings.Split(string(mkBody), "\n") {
+		if !strings.HasPrefix(line, "\t") {
+			continue // 非 recipe 行
+		}
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
+			continue // recipe 内注释
+		}
+		cmd := strings.TrimLeft(trimmed, "@")
+		if strings.HasPrefix(cmd, "echo ") || strings.HasPrefix(cmd, "printf ") ||
+			cmd == "echo" || cmd == "printf" {
+			continue // 展示位,跳过
+		}
+		if strings.Contains(trimmed, "CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1") &&
+			strings.Contains(trimmed, "go test") {
+			execLines = append(execLines, trimmed)
+		}
+	}
+	if len(execLines) == 0 {
+		t.Fatalf("找不到 accept-sync 的 exec 执行行(tab-indented 非-@echo 且含 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 与 go test) ——\n"+
+			"可能 recipe 被拆走了或被伪装成 @echo 展示位;R3 类闭合逃逸场景③命中。Makefile body:\n%s", string(mkBody))
+	}
+	// exec 行必须自带完整 -run '<pattern>' 且 pattern 与全量首匹配一致。
+	for _, line := range execLines {
+		m := runRe.FindStringSubmatch(line)
+		if len(m) < 2 {
+			t.Fatalf("exec 执行行本身缺 `-run '...'` 表达(R3 类闭合逃逸场景①命中):\n  %s\n"+
+				"修法:把 -run '<pattern>' 补回 exec 行;不允许仅在 @echo 展示行提及", line)
+		}
+		if m[1] != primaryPat {
+			t.Fatalf("exec 执行行 -run pattern %q ≠ Makefile 全量首匹配 %q(R3 类闭合逃逸场景②命中):\n  exec 行:%s\n"+
+				"漂移复刻:只漂 exec 行不漂 @echo 展示行的兄弟洞;修法:两侧同步改", m[1], primaryPat, line)
+		}
 	}
 }
 

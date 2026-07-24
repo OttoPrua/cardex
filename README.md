@@ -240,7 +240,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 }
 ```
 
-合成：`landed_percent = Σ(weight × done_percent) / Σweight`，与 `progress_percent` 并列展示，来源披露按**实际入账来源**打标（不按配置形态）：`goal_source=manual@as_of`（全人工）/`evidence`（全 evidence 且都取到数）/`mixed@as_of`（人工与 evidence 各有入账）/`manual+degraded@as_of`（配了 evidence 但一条都没入账，靠 manual 撑住合成——**披露降级**，不虚报"混合来源"）/`insufficient`（无任何有效入账）。
+合成：`landed_percent = Σ(weight × done_percent) / Σweight`，与 `progress_percent` 并列展示，来源披露按**实际入账来源**打标（不按配置形态；下列任一非 `insufficient` 标签均可与 `partial=true` 共存——同类里程碑仅部分成功入账时以 `partial` 披露局部失效，标签本身**不承诺**该类全部入账）：`goal_source=manual@as_of`（至少一条 manual 入账，且未配置任何 evidence）/`evidence`（至少一条 evidence 入账，且无 manual 入账；evidence 集合部分失效时以 `partial` 披露）/`mixed@as_of`（manual 与 evidence 各至少一条入账）/`manual+degraded@as_of`（配了 evidence 但一条都没入账，靠 manual 撑住合成——**披露降级**，不虚报"混合来源"）/`insufficient`（无任何有效入账）。
 
 **fail-honest 兜底**（不可绕）：
 - goal 缺失 → 前端**完全不显示**该区块（不猜）；

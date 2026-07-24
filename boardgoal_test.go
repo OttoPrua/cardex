@@ -1801,3 +1801,78 @@ func TestGoalLandedPercentNaNWeightGuarded(t *testing.T) {
 		t.Fatalf("JSON 不得出现 NaN/Infinity: %s", s)
 	}
 }
+
+// TestGoalEvidencePartialLandsAsEvidenceWithPartial —— CG-8b R1 P1 契约反例可验证锚点。
+//
+// 场景 [evidence-A 入账 + evidence-B 文件缺失 + 无 manual 配置]:
+//   - MA: evidence 命中 → source="evidence@...",非 insufficient
+//   - MB: evidence 文件缺失 → insufficient
+//   - manualLanded=false, evidenceLanded=true → goal_source="evidence" + partial=true
+//
+// 承重契约:evidence 标签**不承诺**该类全部入账,只承诺「至少一条 evidence 入账 + 无 manual 入账」;
+// 内部部分失效走 partial 披露。README 若把 "evidence" 描述为「全 evidence 且都取到数 / every entry
+// resolved」即虚述——此测试直接造出「evidence 部分入账」的合法分支,让 README 契约文案的虚假完整性
+// 主张变得可证伪(README 若回退到虚述,复审重跑本测试通过、但文档与实测语义分叉即被识破)。
+func TestGoalEvidencePartialLandsAsEvidenceWithPartial(t *testing.T) {
+	dir := t.TempDir()
+	fxA := filepath.Join(dir, "gates-a.json") // 真实存在,evidence 会入账
+	writeJSONFile(t, fxA, map[string]any{
+		"gate_counts": map[string]any{"pass": 3, "blocked": 1},
+	})
+	fxB := filepath.Join(dir, "gates-b.json") // 故意不创建 → 文件缺失路径,evidence 判 insufficient
+	ov := &boardOverrideGoal{
+		AsOf: "2026-07-23",
+		Milestones: []boardOverrideMilestone{
+			{
+				ID: "MA", Title: "evidence A 入账", Weight: 1,
+				Evidence: &boardOverrideEvidence{
+					Path:        fxA,
+					Numerator:   "gate_counts.pass",
+					Denominator: []string{"gate_counts.pass", "gate_counts.blocked"},
+					MaxAgeHours: 24,
+				},
+			},
+			{
+				ID: "MB", Title: "evidence B 缺失", Weight: 1,
+				Evidence: &boardOverrideEvidence{
+					Path:        fxB, // 从未创建
+					Numerator:   "gate_counts.pass",
+					Denominator: []string{"gate_counts.pass", "gate_counts.blocked"},
+					MaxAgeHours: 24,
+				},
+			},
+		},
+	}
+	pg := buildProjectGoal(ov, "", fixedTime())
+	if pg == nil || len(pg.Milestones) != 2 {
+		t.Fatalf("goal 齐全时不应 nil,milestones 应齐 2 条: %+v", pg)
+	}
+	var mA, mB GoalMilestone
+	for _, m := range pg.Milestones {
+		switch m.ID {
+		case "MA":
+			mA = m
+		case "MB":
+			mB = m
+		}
+	}
+	if mA.Insufficient || mA.DonePercent == nil {
+		t.Fatalf("MA(evidence 存在)必须入账,got=%+v", mA)
+	}
+	if !mB.Insufficient {
+		t.Fatalf("MB(文件缺失)必须 insufficient,got=%+v", mB)
+	}
+	// 承重契约①:goal_source 必须是纯 "evidence"(evidence 分支入账,无 manual 入账;不带 as_of 后缀)
+	if pg.GoalSource != "evidence" {
+		t.Fatalf("evidence 部分失效仍应打 evidence 标签(≥1 条 evidence 入账 + 无 manual 入账),got %q", pg.GoalSource)
+	}
+	// 承重契约②:partial 必须为 true——README 承诺「evidence 集合部分失效时以 partial 披露」,
+	// 若 partial=false,则 README 文案对读者是虚假承诺。
+	if !pg.Partial {
+		t.Fatal("evidence 部分失效时 partial 必须为 true,以坐实 README「失效条目以 partial 披露」的契约")
+	}
+	// 合成值只基于 MA(3/(3+1)=75%)
+	if pg.LandedPercent == nil || *pg.LandedPercent < 74.9 || *pg.LandedPercent > 75.1 {
+		t.Fatalf("landed_percent 应 ≈75(=MA 单值),got=%v", pg.LandedPercent)
+	}
+}

@@ -221,7 +221,7 @@ Three inviolable rules:
 }
 ```
 
-Synthesis: `landed_percent = Σ(weight × done_percent) / Σweight`, shown next to `progress_percent`. Source disclosure is tagged by **what actually landed**, not by config shape: `goal_source = manual@as_of` (all manual) / `evidence` (all-evidence and every entry resolved) / `mixed@as_of` (both channels contributed) / `manual+degraded@as_of` (evidence was configured but not a single entry landed — manual milestones carried the synthesis; degradation **is disclosed** rather than misreported as "mixed") / `insufficient` (nothing valid landed).
+Synthesis: `landed_percent = Σ(weight × done_percent) / Σweight`, shown next to `progress_percent`. Source disclosure is tagged by **what actually landed**, not by config shape (any non-`insufficient` tag below can co-exist with `partial=true` when a subset of same-class milestones failed to land — the tag itself does **not** promise the whole class resolved): `goal_source = manual@as_of` (at least one manual entry landed and no milestone was configured with evidence) / `evidence` (at least one evidence entry landed and no manual entry landed; partial-resolution of the evidence set is disclosed via `partial`) / `mixed@as_of` (both channels landed at least one entry) / `manual+degraded@as_of` (evidence was configured but not a single entry landed — manual milestones carried the synthesis; degradation **is disclosed** rather than misreported as "mixed") / `insufficient` (nothing valid landed).
 
 **Fail-honest guarantees** (non-negotiable):
 - goal missing → the frontend **hides the whole block** (no guessing);

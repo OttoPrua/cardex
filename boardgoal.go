@@ -19,6 +19,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -153,6 +154,26 @@ func buildProjectGoal(ov *boardOverrideGoal, root string, now time.Time) *Projec
 		weightedDone += m.Weight * *pg.Milestones[i].DonePercent
 		validCount++
 	}
+	// 【R2·P1-1 尾巴】合成前非有限数守护——放在 totalWeight/validWeightSum 阈值
+	// 判断**之前**是关键:极端权重(math.MaxFloat64 相乘溢出、NaN 权重)会让
+	// weightedDone/validWeightSum 变成 Inf 或 NaN;NaN 会绕过 m.Weight<0 判断
+	// (NaN<0 恒为 false)、绕过 totalWeight<=0 短路(NaN<=0 恒为 false)、绕过
+	// validWeightSum>0 门(NaN>0 恒为 false)——三重比较全 false 让代码不进任何分支,
+	// LandedPercent 保持 nil 但 Insufficient 也不置位,goal_source 仍标 manual/mixed
+	// 虚报"入账"。round1 再把 Inf 转成任意 int64(Go 规范:超出 int64 值域的浮点
+	// 转换是"实现相关",macOS/amd64 上 +Inf → 0,负数场景可能是 int64.min)。
+	// 三条比较关口全用 math.IsNaN + math.IsInf 单独判定,任何非有限数直接整块 insufficient。
+	// (反例:reason 字符串刻意避免出现 "NaN"/"Inf" 字面量,防止未来 JSON 契约测试
+	// 用 strings.Contains 误命中——契约挡的是"数值渗出",不是"文字提及"。)
+	if math.IsNaN(totalWeight) || math.IsInf(totalWeight, 0) ||
+		math.IsNaN(validWeightSum) || math.IsInf(validWeightSum, 0) ||
+		math.IsNaN(weightedDone) || math.IsInf(weightedDone, 0) {
+		pg.Insufficient = true
+		pg.InsufficientReason = "landed_percent 合成溢出(权重求和为非有限数)"
+		pg.GoalSource = "insufficient"
+		return pg
+	}
+
 	if totalWeight <= 0 {
 		// 反例注入②：milestones 权重和为 0（或全空）→ 整块「数据不足」，
 		// 严禁显示 NaN/Inf/任何百分比。
@@ -164,6 +185,14 @@ func buildProjectGoal(ov *boardOverrideGoal, root string, now time.Time) *Projec
 
 	if validWeightSum > 0 {
 		v := round1(weightedDone / validWeightSum)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			// belt-and-suspenders:上面已挡输入非有限数,理论上除法后不会再出;
+			// 兜底让防线在未来 round1 换算改动下仍自证——比只加注释再回归稳。
+			pg.Insufficient = true
+			pg.InsufficientReason = "landed_percent 合成结果非有限数"
+			pg.GoalSource = "insufficient"
+			return pg
+		}
 		pg.LandedPercent = &v
 	}
 	if insufficientCount > 0 {
@@ -171,22 +200,42 @@ func buildProjectGoal(ov *boardOverrideGoal, root string, now time.Time) *Projec
 		pg.Partial = true
 	}
 
-	// goal_source：全 manual 就写 manual@as_of；含 evidence 就写 mixed@as_of。
-	// evidence 单独出现的场景（无手工里程碑）走 evidence 分支。
-	hasManual := false
-	for _, m := range ov.Milestones {
-		if m.Evidence == nil {
-			hasManual = true
-			break
+	// 【R2·P1-3】goal_source 按**实际入账来源**打标,而非配置形态。
+	// 反例(老逻辑按 ov.Milestones[].Evidence 是否配置打标):evidence 文件全失效降级
+	// 时,实际入账全是 manual,却仍标 "mixed@as_of" 或 "evidence"——向用户虚报数据来源,
+	// 违反 fail-honest 纪律。修法:遍历 pg.Milestones,按 Source 前缀 + !Insufficient
+	// 分类;"配了 evidence 但一条都没入账"追加 +degraded 后缀披露降级。
+	evidenceLanded := false // 至少一条 evidence source 真取到数值(!Insufficient)
+	manualLanded := false   // 至少一条 manual 值成功入账
+	for _, m := range pg.Milestones {
+		if m.Insufficient || m.DonePercent == nil {
+			continue
+		}
+		// 按 Source 前缀分类:evidence@... vs manual(@as_of)
+		switch {
+		case strings.HasPrefix(m.Source, "evidence@"):
+			evidenceLanded = true
+		case strings.HasPrefix(m.Source, "manual"):
+			manualLanded = true
 		}
 	}
 	switch {
-	case hasEvidence && hasManual:
+	case evidenceLanded && manualLanded:
 		pg.GoalSource = withAsOf("mixed", ov.AsOf)
-	case hasEvidence:
+	case evidenceLanded:
 		pg.GoalSource = "evidence"
+	case manualLanded:
+		if hasEvidence {
+			// 配了 evidence 但一条都没入账 → 披露"降级到 manual"。
+			// 前端直接显示字符串,委托人一眼看出机械口径失效、当前读数来自人工估算。
+			pg.GoalSource = withAsOf("manual+degraded", ov.AsOf)
+		} else {
+			pg.GoalSource = withAsOf("manual", ov.AsOf)
+		}
 	default:
-		pg.GoalSource = withAsOf("manual", ov.AsOf)
+		// 无任何有效入账(所有 milestone 都 insufficient)——理论上此时 validWeightSum=0
+		// 且 LandedPercent=nil,标 insufficient 让前端不显示百分数,避免虚报 evidence/manual。
+		pg.GoalSource = "insufficient"
 	}
 	return pg
 }

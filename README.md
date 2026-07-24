@@ -240,11 +240,11 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 }
 ```
 
-合成：`landed_percent = Σ(weight × done_percent) / Σweight`，与 `progress_percent` 并列展示，来源披露 `goal_source=manual@as_of` 或 `mixed@as_of` 或 `evidence`。
+合成：`landed_percent = Σ(weight × done_percent) / Σweight`，与 `progress_percent` 并列展示，来源披露按**实际入账来源**打标（不按配置形态）：`goal_source=manual@as_of`（全人工）/`evidence`（全 evidence 且都取到数）/`mixed@as_of`（人工与 evidence 各有入账）/`manual+degraded@as_of`（配了 evidence 但一条都没入账，靠 manual 撑住合成——**披露降级**，不虚报"混合来源"）/`insufficient`（无任何有效入账）。
 
 **fail-honest 兜底**（不可绕）：
 - goal 缺失 → 前端**完全不显示**该区块（不猜）；
-- 权重和 ≤ 0 或任一 weight<0 → 整块标"数据不足"，`landed_percent` 为 `null`（不出 NaN/Inf/任何数字）；
+- 权重和 ≤ 0 或任一 weight<0 → 整块标"数据不足"，`landed_percent` 为 `null`（不出 NaN/Inf/任何数字）；权重出现非有限数（`NaN`/`±Inf`，如 `MaxFloat64` 相乘溢出、`NaN` 权重绕过 `<0` 判断）→ 合成前 `math.IsNaN`/`IsInf` 守护同样整块"数据不足"（否则 `round1(Inf)` 转 int64 是"实现相关"，前端会渲染出 0% 或天文级负数——比缺数糟糕）；
 - 人工 `done_percent` 越界（<0 或 >100）→ 里程碑判"数据不足"，不得直出负数百分数或 250%（教训：round1 的 int64 截断会把 -50 算成 -49.9，直渲成"-49.9%"是造读数）；
 - evidence 折算结果超 100%（如 pointer 配错让 `num=30, den=[10]` 算出 300%）或折算为负（分子/分母有一个是负）→ 同样"数据不足"，不直出 300% 或 -30%；防线放在 `num` 与 `den` 各自的绝对值上——`num<0` 拒、`den` **分量级 `v<0` 拒**（`{pass:5, blocked:10, adjustment:-3}` 求和为 12>0 但 adjustment 分量为负，若只挡求和会零告警渗出 41.7%）、`den` 求和 `≤0` 拒（除零守护 + 全零分量兜底）；只挡 `pct<0` 会被"双负相消"绕过（如 `{pass:-9, blocked:-2}` 会算出 +81.8%）；
 - **evidence.path 强制绝对路径**：相对路径无论解析到进程 CWD 还是 `board.json` 所在目录，都存在"同名文件静默兜底"的兜底路径（`~/.claudego` 里常有同名脚手架/临时文件），配错时零告警读错——直接判"数据不足"是唯一让读数出处可追溯的做法；

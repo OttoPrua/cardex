@@ -21,6 +21,7 @@ package main
 
 import (
 	"encoding/json"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1635,4 +1636,168 @@ func TestOverviewHandlerBoardOverrideErrorKindJSONContract(t *testing.T) {
 			t.Fatalf("kind 值必须精确为 {type, syntax},got type=%q syntax=%q", typeKind, syntaxKind)
 		}
 	})
+}
+
+// ================== CG-8b 收尾：goal_source 实际入账 + 合成层 NaN/Inf 守护 ==================
+//
+// 【R2·P1-3】goal_source 打标须按**实际入账来源**,而非配置形态。
+// 教训:老代码按 ov.Milestones[].Evidence 是否配置打标——一旦 evidence 文件全失效,
+// 实际入账全是 manual/insufficient,却仍标 "mixed@as_of" 或 "evidence",向用户虚报数据来源。
+// 修法后按 pg.Milestones[].Source(!Insufficient 才计入)分类;"配了 evidence 但全失效"
+// 加 +degraded 后缀披露降级。
+//
+// 【R2·P1-1 尾巴】landed_percent 合成前必须过 math.IsNaN/IsInf 守护。
+// 极端权重(math.MaxFloat64、NaN 权重绕过<0 判断)会让 weightedDone/validWeightSum 溢出;
+// round1 再把 NaN/Inf 转成任意 int64 → 前端渲染出天文级负数或诡异读数——比"数据不足"糟糕。
+
+// TestGoalEvidenceAllFailedDegradesGoalSource evidence 配置齐全但文件全失效,manual
+// milestone 独撑合成 → goal_source 必须是 "manual+degraded@as_of",不得虚报 "mixed@as_of"。
+// 反例注入:老逻辑按配置形态打标,evidence 一条没入账仍会标 mixed,用户被误导以为"混合来源"。
+func TestGoalEvidenceAllFailedDegradesGoalSource(t *testing.T) {
+	dir := t.TempDir()
+	dead := filepath.Join(dir, "never-existed.json") // 不创建 → 文件缺失
+	ov := &boardOverrideGoal{
+		AsOf: "2026-07-23",
+		Milestones: []boardOverrideMilestone{
+			{ID: "M1", Title: "manual 主力", Weight: 1, DonePercent: floatPtr(60)},
+			{
+				ID: "M2", Title: "evidence 全挂", Weight: 1,
+				Evidence: &boardOverrideEvidence{
+					Path:        dead,
+					Numerator:   "gate_counts.pass",
+					Denominator: []string{"gate_counts.pass", "gate_counts.blocked"},
+					MaxAgeHours: 24,
+				},
+			},
+		},
+	}
+	pg := buildProjectGoal(ov, "", fixedTime())
+	if pg == nil {
+		t.Fatal("goal 齐全时不应 nil")
+	}
+	// M2 应 insufficient,M1 应有效
+	var m1, m2 GoalMilestone
+	for _, m := range pg.Milestones {
+		switch m.ID {
+		case "M1":
+			m1 = m
+		case "M2":
+			m2 = m
+		}
+	}
+	if m1.Insufficient || m1.DonePercent == nil {
+		t.Fatalf("M1(manual)必须有效,got=%+v", m1)
+	}
+	if !m2.Insufficient {
+		t.Fatalf("M2(evidence 文件缺失)必须 insufficient,got=%+v", m2)
+	}
+	// 承重契约:实际入账仅有 manual → goal_source 必须披露"配了 evidence 但全失效"
+	if pg.GoalSource != "manual+degraded@2026-07-23" {
+		t.Fatalf("evidence 全失效时 goal_source 必须为 manual+degraded@as_of(披露降级),got %q", pg.GoalSource)
+	}
+	// partial 必须挂(部分里程碑不足)
+	if !pg.Partial {
+		t.Fatal("evidence 全失效但 manual 撑住合成时,partial 必须为 true")
+	}
+	// 合成值只基于 M1(60%)
+	if pg.LandedPercent == nil || *pg.LandedPercent < 59.9 || *pg.LandedPercent > 60.1 {
+		t.Fatalf("landed_percent 应 ≈60(=M1 单值),got=%v", pg.LandedPercent)
+	}
+}
+
+// TestGoalOnlyEvidenceAllFailedGoalSourceInsufficient 只配 evidence 且全失效
+// (无 manual milestone 兜底)→ 无有效入账,goal_source 必须标 "insufficient",不得
+// 仍标 "evidence"(老代码按配置形态打标会这样)。此时 LandedPercent 必为 nil。
+func TestGoalOnlyEvidenceAllFailedGoalSourceInsufficient(t *testing.T) {
+	dir := t.TempDir()
+	dead := filepath.Join(dir, "gone.json")
+	ov := &boardOverrideGoal{
+		AsOf: "2026-07-23",
+		Milestones: []boardOverrideMilestone{
+			{
+				ID: "M4", Title: "evidence-only", Weight: 1,
+				Evidence: &boardOverrideEvidence{
+					Path:        dead,
+					Numerator:   "gate_counts.pass",
+					Denominator: []string{"gate_counts.pass", "gate_counts.blocked"},
+					MaxAgeHours: 24,
+				},
+			},
+		},
+	}
+	pg := buildProjectGoal(ov, "", fixedTime())
+	if pg == nil {
+		t.Fatal("goal 齐全时不应 nil")
+	}
+	if pg.LandedPercent != nil {
+		t.Fatalf("唯一 evidence 全失效时 landed_percent 必为 nil,got=%v", *pg.LandedPercent)
+	}
+	if pg.GoalSource != "insufficient" {
+		t.Fatalf("无任何有效入账时 goal_source 必为 insufficient(不得虚报 evidence),got %q", pg.GoalSource)
+	}
+}
+
+// TestGoalLandedPercentInfWeightGuarded 极端权重触发 weightedDone/分母溢出为 Inf,
+// 合成前 math.IsInf 守护必须整块 insufficient + landed_percent==nil。
+// 反例:老代码只判 validWeightSum>0,不判 Inf → round1(Inf) 把 Inf 转成任意 int64,
+// 前端渲染出天文级数字或负数——比"数据不足"糟糕得多。
+func TestGoalLandedPercentInfWeightGuarded(t *testing.T) {
+	huge := math.MaxFloat64
+	ov := &boardOverrideGoal{
+		AsOf: "2026-07-23",
+		Milestones: []boardOverrideMilestone{
+			// 两个 milestone 都是 MaxFloat64 权重 × 100%: weightedDone = MaxFloat64*100+MaxFloat64*100 → +Inf
+			{ID: "M1", Title: "巨权重 A", Weight: huge, DonePercent: floatPtr(100)},
+			{ID: "M2", Title: "巨权重 B", Weight: huge, DonePercent: floatPtr(100)},
+		},
+	}
+	pg := buildProjectGoal(ov, "", fixedTime())
+	if pg == nil {
+		t.Fatal("goal 齐全时不应 nil")
+	}
+	if pg.LandedPercent != nil {
+		t.Fatalf("Inf 权重合成时 landed_percent 必为 nil,got=%v", *pg.LandedPercent)
+	}
+	if !pg.Insufficient {
+		t.Fatal("Inf/NaN 合成溢出时整块必须 insufficient")
+	}
+	// JSON 契约:任何情况下不得渗出 NaN/Infinity/任意数字
+	b, _ := json.Marshal(pg)
+	s := string(b)
+	if strings.Contains(s, "NaN") || strings.Contains(s, "Infinity") {
+		t.Fatalf("JSON 不得出现 NaN/Infinity: %s", s)
+	}
+	if !strings.Contains(s, `"landed_percent":null`) {
+		t.Fatalf("landed_percent 必须序列化为 null,got %s", s)
+	}
+}
+
+// TestGoalLandedPercentNaNWeightGuarded NaN 权重绕过 m.Weight<0 判断
+// (NaN<0 恒为 false),合成层必须靠 math.IsNaN 守护整块 insufficient。
+// 反例:若无 NaN 守护,round1(NaN) 转 int64 是"实现相关"(通常 0 或 int64.min),
+// 前端会渲染出 0% 或诡异负数——两者都是造读数。
+func TestGoalLandedPercentNaNWeightGuarded(t *testing.T) {
+	ov := &boardOverrideGoal{
+		AsOf: "2026-07-23",
+		Milestones: []boardOverrideMilestone{
+			// NaN 权重:m.Weight<0 判 false 走过短路,进合成层污染 weightedDone → NaN
+			{ID: "M1", Title: "NaN 权重", Weight: math.NaN(), DonePercent: floatPtr(80)},
+			{ID: "M2", Title: "正常", Weight: 1, DonePercent: floatPtr(50)},
+		},
+	}
+	pg := buildProjectGoal(ov, "", fixedTime())
+	if pg == nil {
+		t.Fatal("goal 齐全时不应 nil")
+	}
+	if pg.LandedPercent != nil {
+		t.Fatalf("NaN 权重合成时 landed_percent 必为 nil,got=%v", *pg.LandedPercent)
+	}
+	if !pg.Insufficient {
+		t.Fatal("NaN 权重合成溢出时整块必须 insufficient")
+	}
+	b, _ := json.Marshal(pg)
+	s := string(b)
+	if strings.Contains(s, "NaN") || strings.Contains(s, "Infinity") {
+		t.Fatalf("JSON 不得出现 NaN/Infinity: %s", s)
+	}
 }

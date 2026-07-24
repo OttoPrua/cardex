@@ -77,21 +77,21 @@ func TestInvokeCodexThreadsResolvedModel(t *testing.T) {
 
 	// ① claude 卡降级径（PreferRunner 空）→ -m 降级专用模型
 	tk := &Task{ID: "cm-fb", Dir: t.TempDir(), Type: typeSequence}
-	invokeCodex(context.Background(), cfg, tk, "ping")
+	invokeCodex(context.Background(), t.TempDir(), cfg, tk, "ping")
 	if got := readCapture(); !strings.Contains(got, "fb-terra") || strings.Contains(got, "global-sol") {
 		t.Fatalf("降级径应 -m fb-terra 且不带全局模型, argv:\n%s", got)
 	}
 
 	// ② 卡级钉定盖过降级专用
 	tk2 := &Task{ID: "cm-pin", Dir: t.TempDir(), Type: typeSequence, CodexModel: "pin-luna"}
-	invokeCodex(context.Background(), cfg, tk2, "ping")
+	invokeCodex(context.Background(), t.TempDir(), cfg, tk2, "ping")
 	if got := readCapture(); !strings.Contains(got, "pin-luna") || strings.Contains(got, "fb-terra") {
 		t.Fatalf("卡级钉定应 -m pin-luna, argv:\n%s", got)
 	}
 
 	// ③ codex 主跑卡（PreferRunner=codex）不吃降级模型 → 全局
 	tk3 := &Task{ID: "cm-main", Dir: t.TempDir(), Type: typeSequence, PreferRunner: "codex"}
-	invokeCodex(context.Background(), cfg, tk3, "ping")
+	invokeCodex(context.Background(), t.TempDir(), cfg, tk3, "ping")
 	if got := readCapture(); !strings.Contains(got, "global-sol") || strings.Contains(got, "fb-terra") {
 		t.Fatalf("codex 主跑应 -m global-sol, argv:\n%s", got)
 	}

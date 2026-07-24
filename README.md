@@ -136,7 +136,7 @@ claudego cross -list                                                     # 看�
 
 - 引擎的 `effort` 是 claude / codex 共用的思考等级（claude → `--effort`，codex → `model_reasoning_effort`，同名同序 `low<medium<high<xhigh<max`），任务级覆盖全局 `codex_reasoning`；
 - `claude` 引擎要求指定 `model`、`codex` 引擎要求配好 `codex_bin` + `codex_model`（否则会跑成账号/CLI 默认模型、与 profile 宣称不符，命令直接报错，杜绝静默降级）；
-- 交叉卡是**只读分析**（读契约/源码/改动、不写业务仓，codex 侧 `--sandbox read-only`）；`-dir` 不能是 claudego 数据根或其子目录；
+- 交叉卡是**只读分析**（读契约/源码/改动、不写业务仓）；codex 侧默认走一次性隔离副本 + `--sandbox workspace-write`，副本随卡即建即删,原仓永不受写污染(见"沙箱"段的 CG-R3 `codex_review_sandbox`);`-dir` 不能是 claudego 数据根或其子目录；
 - 甲乙必须**同执行位置**（都在本机，或都在同一台 `remote_hosts` 主机）——三卡共用一个工作目录，跨机引擎对会被 `cross` 直接拒绝；
 - **护栏**：claude 冷却期即便开了 `codex_fallback`，claude 引擎的交叉卡也**绝不**被降级偷换成 codex，codex 钉定卡在 codex 不可用时也**绝不** fail-open 到 claude（否则甲乙同引擎、验证形同虚设）——引擎身份冻结，宁可排队等对应窗口。链任一步断裂会在母卡留痕（`list` 可见），不让单腿结果冒充终局。
 
@@ -309,7 +309,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 
 - 带 claude 会话的多步任务不切换（跨 CLI 无法延续上下文），等重置自动续跑；
 - codex 走自己的额度：不记 claude 账本、其错误不写全局冷却、成功也不清冷却；
-- 沙箱按类型收窄：只读类任务 `--sandbox read-only`，sequence 用 `workspace-write`；
+- 沙箱按类型收窄：`sequence` 落码卡走 `--sandbox workspace-write`；只读类任务(design-review/crosscheck/coordinate/progress-pull)默认建**一次性隔离副本 + `--sandbox workspace-write`**(CG-R3 承 BD-36 工具链③终裁 b, BD-39 附记 2026-07-24)——副本落 `<root>/tmp/codex-review-work/<taskID>-<pid>-<nano>/`,承载 dirty+untracked 面,复审可跑测试/写夹具做动态验证;卡结束即删,崩溃残留由 tick 对账清(pid 死透 + taskID 不在 activeIDs 双条件);原仓永不受写污染(硬语义)。`config.json` 加 `"codex_review_sandbox": "readonly"` 可回落旧的只读行为(退失去动态验证力)。远端复审同治:远端镜像本身已是影本,默认也放宽到 `workspace-write`。
 - 看板与日志标注 `[codex]` / `runner=codex`，emit/进度解析管线照常工作（协调分工在冷却期也能继续入队）。
 
 **降级专用模型与档位对等规则（`codex_fallback_model`）**：`codex_fallback` 生效时若 claude 卡被改道 codex，优先用 `codex_fallback_model`，而非全局 `codex_model`。档位对等映射：**opus 档降级首选同档的 terra（o3），不降设计档的 sol（GPT-5）**——设计档不去干实现档的活。空值回退 `codex_model`；此键仅对降级径（任务 `runner_pref≠codex` 且非远端）生效，codex 主跑卡与远端 codex 不受影响。
@@ -522,6 +522,7 @@ exit 2 → marker 不写 → 每次同步必失败 → divert 永久静默回退
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见上文专节 |
 | `codex_fallback_model` | "" | claude 卡降级到 codex 时用此模型（档位对等：opus→terra，不降 sol）；空回退 `codex_model` |
 | `codex_reasoning` | "" | 全局 codex 推理档（minimal/low/medium/high/xhigh/max/ultra）→ `-c model_reasoning_effort=…`；任务级 effort 可覆盖 |
+| `codex_review_sandbox` | "worktree-write" | codex 只读分析卡(design-review/crosscheck 等)的沙箱策略。默认 `worktree-write`:建一次性隔离副本 + `--sandbox workspace-write`,复审可跑测试/写夹具做动态验证,副本落 `<root>/tmp/codex-review-work/`,卡结束即删,原仓永不受写污染(CG-R3)。改 `readonly` 回落旧行为(codex 直接 `--sandbox read-only` 跑在原仓,只能静态阅读)。sequence 卡不受此配置影响。 |
 | `cross_profiles` | {opus-codex} | 交叉验证引擎对（`claudego cross`），见上文专节 |
 | `default_cross_profile` | "opus-codex" | `cross` 未指定 `-profile` 时用的引擎对 |
 | `default_review_host` | "" | 全局默认审核主机（`remote_hosts` 的键）；三键齐备时本地实现卡自动分流，见上文专节 |

@@ -152,17 +152,38 @@ func resolveCodexModel(cfg *Config, t *Task) string {
 	return cfg.CodexModel
 }
 
-func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+	// CG-R3(承 BD-36 工具链③终裁 b):非 sequence 卡(design-review/crosscheck 等)默认建一次性隔离
+	// 副本 + workspace-write,复审可跑测试/写夹具做实证验证——原仓永不受写污染(硬语义)。
+	// cfg.CodexReviewSandbox = "readonly" 或非 git 仓库 → 回落 read-only 旧路径。
+	// prepareCodexReviewWorkspace 建失败也回落,只是失去 workspace-write 收益(原仓保护不破)。
+	workDir := t.Dir
+	cleanup := func() {}
+	if codexReviewNeedsWorktree(cfg, t) {
+		wd, cl, err := prepareCodexReviewWorkspace(root, cfg, t)
+		if err == nil {
+			workDir, cleanup = wd, cl
+		} else {
+			fmt.Fprintf(os.Stderr, "警告: codex 复审副本建立失败,回落 read-only: %v\n", err)
+		}
+	}
+	defer cleanup()
+
 	sandbox := "read-only"
 	var extra []string
-	if t.Type == typeSequence {
+	switch {
+	case t.Type == typeSequence:
 		sandbox = "workspace-write"
 		// codex 沙箱默认禁写 .git，导致收工 commit 失败（活干了提交不了）；显式放行本仓 .git。
 		extra = []string{"-c", fmt.Sprintf(`sandbox_workspace_write.writable_roots=["%s"]`, filepath.Join(t.Dir, ".git"))}
+	case workDir != t.Dir:
+		// 复审副本模式:跑在副本内的 workspace-write,顺带放行副本 .git(git apply/commit 等)。
+		sandbox = "workspace-write"
+		extra = []string{"-c", fmt.Sprintf(`sandbox_workspace_write.writable_roots=["%s"]`, filepath.Join(workDir, ".git"))}
 	}
 	outFile := filepath.Join(os.TempDir(), "claudego-codex-"+t.ID+".txt")
 	defer os.Remove(outFile)
-	args := []string{"exec", "-C", t.Dir, "--sandbox", sandbox, "--skip-git-repo-check",
+	args := []string{"exec", "-C", workDir, "--sandbox", sandbox, "--skip-git-repo-check",
 		"--color", "never", "-o", outFile}
 	args = append(args, extra...)
 	// 模型：见 resolveCodexModel 优先序（交叉冻结 > 卡级钉定 > 降级专用 > 全局）。
@@ -181,7 +202,9 @@ func invokeCodex(ctx context.Context, cfg *Config, t *Task, prompt string) (*cla
 	defer cancel()
 	cmd := exec.CommandContext(ctx, cfg.CodexBin, args...)
 	setupProcGroup(cmd)
-	cmd.Dir = t.Dir
+	// CG-R3:workDir 在启用副本时指向副本,否则等于 t.Dir——两处必须同源(-C 与 cmd.Dir),
+	// 否则 codex 沙箱只在 -C 那侧生效、cmd.Dir 定位却在原仓,相对路径行为错乱。
+	cmd.Dir = workDir
 	// prompt 走 stdin（codex exec 无 prompt 参数时读 stdin），同 invokeRemoteClaude/invokeClaude——
 	// 不再把 prompt 当 argv 参数，绕开 ARG_MAX 上限，交叉验证的合并 prompt 可注入完整甲/乙结论不截断。
 	// 前置 subagent 前导，抑制 superpowers/gsd 框架注入耗尽回合预算致空终稿（见 codexSubagentPreamble）。
@@ -328,10 +351,16 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	if sandbox == "" {
 		sandbox = "workspace-write"
 	}
-	// 只读类任务（如交叉验证卡）强制 read-only：不写业务仓，与本机 invokeCodex 的按类型选沙箱一致，
-	// 也不被主机配的 workspace-write/danger-full-access 放宽（写权限只给真正要落码的 sequence 卡）。
+	// 只读类任务（复审/交叉/协调等）沙箱按 CodexReviewSandbox 决定（CG-R3, BD-36/BD-39 附记 2026-07-24）：
+	// 远端镜像本身已是"影本"（remoteSync 走单独镜像目录，不覆盖原仓），默认放宽到 workspace-write 以恢复
+	// 复审的动态验证力（跑测试/落 fixture）；配置回落 readonly 则与旧行为一致。sequence 卡永远随主机配置
+	// （用户显式声明的落码卡）不在这里下调。
 	if t.Type != typeSequence {
-		sandbox = "read-only"
+		if resolvedCodexReviewSandbox(cfg) == codexReviewSandboxReadonly {
+			sandbox = "read-only"
+		} else {
+			sandbox = "workspace-write"
+		}
 	}
 	tmp := rh.TmpDir
 	if tmp == "" {
@@ -719,7 +748,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				}
 			case useCodex:
 				// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
-				res, combined, runErr = invokeCodex(ctx, cfg, t, prompt)
+				res, combined, runErr = invokeCodex(ctx, root, cfg, t, prompt)
 			default:
 				res, combined, runErr = invokeClaude(ctx, cfg, t, prompt)
 				if res != nil && res.SessionID != "" {

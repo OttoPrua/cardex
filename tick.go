@@ -91,6 +91,10 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 			patrolCancels[id] = cancelRun
 		}
 		patrolOnce(root, activeIDs, patrolCancels, patrolStates, now)
+		// CG-R3 codex 复审副本孤儿清理(BD-36/BD-39 附记 2026-07-24):
+		// 崩溃/意外退出会在 tmp/codex-review-work/ 留下副本,靠 tick 对账兜底移除。同 patrolOnce 同一
+		// 循环节奏,不新增守护;判活口径 = pid 已死 + taskID 不在 activeIDs(重派新 pid 场景不误清)。
+		cleanupCodexReviewOrphans(root, activeIDs)
 
 		blockReason := ""
 		if cd := loadCooldown(root); !force && cd.active(now) {

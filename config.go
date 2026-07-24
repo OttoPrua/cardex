@@ -108,6 +108,19 @@ type Config struct {
 	DefaultReviewHost string `json:"default_review_host,omitempty"`
 	RemoteMirrorRoot  string `json:"remote_mirror_root,omitempty"`
 	DefaultReviewSync string `json:"default_review_sync,omitempty"`
+
+	// CodexReviewSandbox 控制本机 codex 只读分析卡(design-review/crosscheck/coordinate 等,
+	// 非 sequence)的沙箱策略——CG-R3(承 BD-36 工具链③终裁 b/BD-39 附记):
+	//
+	//   "worktree-write"(默认): 为目标 dir 建一次性隔离副本(git clone --local --no-hardlinks
+	//     + 应用未提交面 + untracked),codex 以 `--sandbox workspace-write` 跑在副本内。
+	//     副本收工即删,原仓永不受写污染;赋能复审跑测试/写夹具做实证验证。
+	//   "readonly": 沿用旧行为——codex 直接以 `--sandbox read-only` 跑在原仓,不建副本。
+	//     只保留为可配置回退,不建议生产开启(阻断复审多轮动态验证,BD-36 立据的悬置问题)。
+	//
+	// 远端 codex 复审受同键控制:默认放开为 workspace-write(远端镜像本身已是 sync-lane
+	// 分发的隔离副本,原仓保护语义等价);"readonly" 时仍强制 read-only。
+	CodexReviewSandbox string `json:"codex_review_sandbox,omitempty"`
 }
 
 // CrossEngine 描述交叉验证链中一个引擎的执行位置（模型来源可切换的落点）。
@@ -182,21 +195,42 @@ const (
 	typeCrossCheck   = "crosscheck"    // 交叉验证：双引擎独立作答→引擎乙拿引擎甲结论对抗式查漏（fable 顶替流）
 )
 
+// CodexReviewSandbox 的合法取值。默认走 worktree-write 走一次性副本（BD-36 终裁 b）。
+const (
+	codexReviewSandboxWorktreeWrite = "worktree-write"
+	codexReviewSandboxReadonly      = "readonly"
+)
+
+// resolvedCodexReviewSandbox 返回归一后的策略（空值/未知值一律回落默认 worktree-write）。
+// 集中一处兜底，避免 invokeCodex/invokeRemoteCodex/清理路径三处各自处理默认值时漂移。
+func resolvedCodexReviewSandbox(cfg *Config) string {
+	if cfg == nil {
+		return codexReviewSandboxWorktreeWrite
+	}
+	switch cfg.CodexReviewSandbox {
+	case codexReviewSandboxReadonly:
+		return codexReviewSandboxReadonly
+	default:
+		return codexReviewSandboxWorktreeWrite
+	}
+}
+
 func defaultConfig(claudeBin string) *Config {
 	return &Config{
-		ClaudeBin:         claudeBin,
-		PollIntervalSec:   300,
-		LimitFallbackMin:  30,
-		CooldownMarginSec: 90,
-		StepTimeoutMin:    60,
-		MaxAttempts:       3,
-		RetryBackoffMin:   5,
-		MaxParallel:       1,
-		ResumeFirst:       true,
-		DrainRescanSec:    15,
-		TypeOrder:         []string{typeProgressPull, typeCoordinate, typeReview, typeSequence, typeAssembly},
-		QueueBudgetTokens: 0,
-		RedlinePercent:    0,
+		ClaudeBin:          claudeBin,
+		PollIntervalSec:    300,
+		LimitFallbackMin:   30,
+		CooldownMarginSec:  90,
+		StepTimeoutMin:     60,
+		MaxAttempts:        3,
+		RetryBackoffMin:    5,
+		MaxParallel:        1,
+		ResumeFirst:        true,
+		DrainRescanSec:     15,
+		CodexReviewSandbox: codexReviewSandboxWorktreeWrite,
+		TypeOrder:          []string{typeProgressPull, typeCoordinate, typeReview, typeSequence, typeAssembly},
+		QueueBudgetTokens:  0,
+		RedlinePercent:     0,
 		UsageFeedMaxAgeMin: 90,
 		ModelWeights: map[string]float64{
 			"default": 1, "opus": 5, "sonnet": 1, "haiku": 0.2, "claude-fable-5": 10, "fable": 10,

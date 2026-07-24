@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 // TypeDefaults 是某一任务类型的默认执行参数，在 add/emit 时烘焙进任务。
@@ -203,18 +205,54 @@ const (
 	codexReviewSandboxReadonly      = "readonly"
 )
 
-// resolvedCodexReviewSandbox 返回归一后的策略（空值/未知值一律回落默认 worktree-write）。
-// 集中一处兜底，避免 invokeCodex/invokeRemoteCodex/清理路径三处各自处理默认值时漂移。
+// codexSandboxWarnW 是"未知 codex_review_sandbox 取值"的披露出口。包级 var 而非直写 os.Stderr:
+// 测试要能断言"确实披露了、且只披露一次"(见 TestResolvedCodexReviewSandboxUnknownFailsClosed)。
+var codexSandboxWarnW io.Writer = os.Stderr
+
+// codexSandboxWarned 记已披露过的未知值(原始串 → true)。resolvedCodexReviewSandbox 在每次 invoke、
+// 每轮 tick 都会被调,不去重会把 launchd 日志刷成同一行噪声,反而淹没这条本该显眼的权限告警。
+var codexSandboxWarned sync.Map
+
+// resolvedCodexReviewSandbox 返回归一后的策略。取值域是三分而非二分:
+//   - 未设置(cfg==nil / 空串)      → worktree-write(BD-39 终裁的默认策略);
+//   - 显式合法值(两个常量之一)      → 原样;
+//   - 未知值(拼错,如 "readonIy")    → readonly(保守侧)+ 首次遇到时披露一次。
+//
+// 集中一处兜底,避免 invokeCodex/invokeRemoteCodex/清理路径三处各自处理默认值时漂移。
+//
+// 【为什么未知值必须落保守侧】CG-R3b 修 1:旧实现把未知值与空值一并 default 到 worktree-write,
+// 是安全向的 fail-open——委托人本意写 "readonly"(把 codex 关进只读沙箱),大写 I 与小写 l 打错一个
+// 字母就静默拿到"clone 副本 + workspace-write"的更宽权限,且全程无任何提示:配置的收紧意图被拼写
+// 事故反向放大成放宽。权限开关的通用纪律是"解析不了就取最小权限",故未知值一律 readonly。
+// 【为什么空值不算未知】空值语义是"配置里没写这一项"——loadConfig 从 defaultConfig 起手再 unmarshal,
+// 没写就该留默认值;把空值也压到 readonly 会把 BD-39 终裁的默认策略整个翻掉(且默认 config.json
+// 的 omitempty 会让"没改过"的配置正好是空串),那是另一种事故,不是修复。
 func resolvedCodexReviewSandbox(cfg *Config) string {
-	if cfg == nil {
+	if cfg == nil || cfg.CodexReviewSandbox == "" {
 		return codexReviewSandboxWorktreeWrite
 	}
 	switch cfg.CodexReviewSandbox {
+	case codexReviewSandboxWorktreeWrite:
+		return codexReviewSandboxWorktreeWrite
 	case codexReviewSandboxReadonly:
 		return codexReviewSandboxReadonly
 	default:
-		return codexReviewSandboxWorktreeWrite
+		warnUnknownCodexReviewSandbox(cfg.CodexReviewSandbox)
+		return codexReviewSandboxReadonly
 	}
+}
+
+// warnUnknownCodexReviewSandbox 对每个不同的未知取值披露一次:说清"读到了什么、回落到哪、想要更宽
+// 该写什么"。静默回落是本病的另一半——权限被收紧而人不知情,下一轮复审只能静态阅读却查不出原因。
+func warnUnknownCodexReviewSandbox(raw string) {
+	if _, seen := codexSandboxWarned.LoadOrStore(raw, true); seen {
+		return
+	}
+	fmt.Fprintf(codexSandboxWarnW,
+		"警告: config.codex_review_sandbox=%q 不是合法取值(合法值: %q / %q);"+
+			"按最小权限回落 %q——若本意是可写副本,请把该键改写为 %q。\n",
+		raw, codexReviewSandboxWorktreeWrite, codexReviewSandboxReadonly,
+		codexReviewSandboxReadonly, codexReviewSandboxWorktreeWrite)
 }
 
 // isRemoteMirrorPath 判断远端 dir 是否位于 cfg.RemoteMirrorRoot 之下(sync-lane 分发的一次性镜像)。

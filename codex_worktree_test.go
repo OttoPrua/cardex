@@ -14,7 +14,9 @@ package main
 // 承接 --sandbox/-C/-m 等旗标,让路径穿线可测(TestInvokeCodexThreadsResolvedModel 已用同法)。
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -109,7 +111,7 @@ func TestCodexReviewCopyIsolatesWrites(t *testing.T) {
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3-iso", Type: typeReview, Dir: src}
 
-	copyDir, cleanup, err := prepareCodexReviewWorkspace(root, cfg, task)
+	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
 	if err != nil {
 		t.Fatalf("prepare copy: %v", err)
 	}
@@ -187,7 +189,7 @@ func TestCodexReviewSandboxRollbackReadonly(t *testing.T) {
 	task := &Task{ID: "cg-r3-ro", Type: typeReview, Dir: src}
 
 	// codexReviewNeedsWorktree 必须返回 false(判据:CodexReviewSandbox 归一后 != worktree-write)。
-	if codexReviewNeedsWorktree(cfg, task) {
+	if codexReviewNeedsWorktree(context.Background(), cfg, task) {
 		t.Fatal("readonly 模式下不应决定建副本")
 	}
 
@@ -225,7 +227,7 @@ func TestCleanupCodexReviewOrphansRemovesCrashed(t *testing.T) {
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3-crash", Type: typeReview, Dir: src}
 
-	copyDir, cleanup, err := prepareCodexReviewWorkspace(root, cfg, task)
+	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
 	if err != nil {
 		t.Fatalf("prepare copy: %v", err)
 	}
@@ -284,7 +286,7 @@ func TestCleanupCodexReviewOrphansSkipsActive(t *testing.T) {
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3-active", Type: typeReview, Dir: src}
 
-	copyDir, cleanup, err := prepareCodexReviewWorkspace(root, cfg, task)
+	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
 	if err != nil {
 		t.Fatalf("prepare copy: %v", err)
 	}
@@ -587,5 +589,334 @@ func TestRemoteCodexReviewSandbox(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, c.want)
 			}
 		})
+	}
+}
+
+// ---- CG-R3b 修 1:codex_review_sandbox 未知值必须 fail-closed(回落最小权限) ----
+
+// TestResolvedCodexReviewSandboxUnknownFailsClosed 是修 1 的可证伪核心。
+//
+// 【修的病】旧实现 switch 只认 "readonly",default 把**空值与未知值一并**回落 worktree-write:
+// 委托人本意写 "readonly"(把 codex 关进只读沙箱),把小写 l 打成大写 I 写出 "readonIy",配置就
+// 静默生效为"clone 副本 + workspace-write"的更宽权限,全程零提示——收紧意图被拼写事故反向放大。
+// 这是安全向 fail-open:权限开关解析不了时倒向宽松侧。
+//
+// 【杀的突变】把 config.go 的 default 分支改回 `return codexReviewSandboxWorktreeWrite`
+// → 下表 4 条未知值用例全红。把 `cfg.CodexReviewSandbox == ""` 的早返回删掉(让空值也压 readonly)
+// → "未设置"两条红(那是另一种事故:BD-39 终裁的默认策略被整个翻掉)。
+func TestResolvedCodexReviewSandboxUnknownFailsClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *Config
+		want string
+	}{
+		{"cfg==nil(无配置) → 默认 worktree-write", nil, codexReviewSandboxWorktreeWrite},
+		{"空串(配置里没写这一项) → 默认 worktree-write", &Config{}, codexReviewSandboxWorktreeWrite},
+		{"显式 worktree-write → 原样", &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}, codexReviewSandboxWorktreeWrite},
+		{"显式 readonly → 原样", &Config{CodexReviewSandbox: codexReviewSandboxReadonly}, codexReviewSandboxReadonly},
+		// 以下四条即本修的红线:任何一条落到 worktree-write 都是 fail-open 复活。
+		{"拼错:readonIy(大写 I 冒充小写 l) → readonly", &Config{CodexReviewSandbox: "readonIy"}, codexReviewSandboxReadonly},
+		{"拼错:read-only(混淆 codex 的 --sandbox 值) → readonly", &Config{CodexReviewSandbox: "read-only"}, codexReviewSandboxReadonly},
+		{"拼错:worktree_write(下划线) → readonly", &Config{CodexReviewSandbox: "worktree_write"}, codexReviewSandboxReadonly},
+		{"整个写错:workspace-write → readonly", &Config{CodexReviewSandbox: "workspace-write"}, codexReviewSandboxReadonly},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := resolvedCodexReviewSandbox(c.cfg); got != c.want {
+				t.Fatalf("got %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// TestUnknownCodexReviewSandboxDoesNotReachWorktreeWrite 类闭合:归一函数改对了不算完,
+// 两个下游消费点必须真的因此收紧——否则修的只是一个没人看的返回值。
+//   - 本机径 codexReviewNeedsWorktree:拼错值不得决定建可写副本;
+//   - 远端径 remoteCodexReviewSandbox:拼错值 + 目录恰在镜像根下(旧实现下最宽的格子)
+//     不得给出 workspace-write。
+//
+// 【杀的突变】把 config.go 的 default 分支改回 worktree-write → 两条断言同时红。
+func TestUnknownCodexReviewSandboxDoesNotReachWorktreeWrite(t *testing.T) {
+	src := mkCodexReviewSrcRepo(t) // 真 git 工作树:排除"因为不是 git 仓库才 false"的假通过
+	bad := &Config{CodexReviewSandbox: "readonIy", RemoteMirrorRoot: "D:/Project/PO-lanes"}
+
+	if codexReviewNeedsWorktree(context.Background(), bad, &Task{ID: "cg-r3b-typo", Type: typeReview, Dir: src}) {
+		t.Fatal("拼错的 codex_review_sandbox 不得让本机径建可写副本(必须回落最小权限 readonly)")
+	}
+	// 前提守卫:同一目录在合法 worktree-write 下确实会建副本——否则上面的 false 可能来自别的原因,
+	// 断言就成了恒真摆设。
+	ok := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
+	if !codexReviewNeedsWorktree(context.Background(), ok, &Task{ID: "cg-r3b-ok", Type: typeReview, Dir: src}) {
+		t.Fatal("前提不成立:合法 worktree-write + git 工作树本应决定建副本,断言无法证伪")
+	}
+
+	mirrorTask := &Task{Type: typeReview, Dir: "D:/Project/PO-lanes/ClaudeGo"}
+	if got := remoteCodexReviewSandbox(bad, mirrorTask); got != "read-only" {
+		t.Fatalf("拼错值 + 镜像目录(旧实现最宽格子)应回落 read-only, got %q", got)
+	}
+}
+
+// TestUnknownCodexReviewSandboxDisclosedOnce 断言"静默"这一半也被修掉:未知值要披露,
+// 但每个不同的值只披露一次——resolvedCodexReviewSandbox 每次 invoke/每轮 tick 都被调,
+// 不去重会把 launchd 日志刷成同一行噪声,反而淹没这条本该显眼的权限告警。
+// 【杀的突变】删掉 warnUnknownCodexReviewSandbox 调用 → 首条断言红;删掉 LoadOrStore 去重 → 末条红。
+func TestUnknownCodexReviewSandboxDisclosedOnce(t *testing.T) {
+	origW := codexSandboxWarnW
+	defer func() {
+		codexSandboxWarnW = origW
+		codexSandboxWarned.Delete("readonIy")
+		codexSandboxWarned.Delete("worktree_write")
+	}()
+	// 同进程内别的用例可能已披露过同一值,先清掉记忆,让本用例从零起算。
+	codexSandboxWarned.Delete("readonIy")
+	codexSandboxWarned.Delete("worktree_write")
+
+	var buf bytes.Buffer
+	codexSandboxWarnW = &buf
+
+	for i := 0; i < 5; i++ {
+		resolvedCodexReviewSandbox(&Config{CodexReviewSandbox: "readonIy"})
+	}
+	if n := strings.Count(buf.String(), "readonIy"); n != 1 {
+		t.Fatalf("同一未知值应恰好披露一次, got %d 次:\n%s", n, buf.String())
+	}
+	if !strings.Contains(buf.String(), codexReviewSandboxReadonly) {
+		t.Fatalf("披露文案须点明回落到的策略(%q), got:\n%s", codexReviewSandboxReadonly, buf.String())
+	}
+	// 合法值与空值绝不披露(否则告警本身成噪声)。
+	buf.Reset()
+	resolvedCodexReviewSandbox(&Config{})
+	resolvedCodexReviewSandbox(&Config{CodexReviewSandbox: codexReviewSandboxReadonly})
+	resolvedCodexReviewSandbox(&Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite})
+	if buf.Len() != 0 {
+		t.Fatalf("合法值/空值不得触发披露, got:\n%s", buf.String())
+	}
+	// 另一个不同的未知值仍应各自披露一次(去重是按值,不是全局一次)。
+	buf.Reset()
+	resolvedCodexReviewSandbox(&Config{CodexReviewSandbox: "worktree_write"})
+	resolvedCodexReviewSandbox(&Config{CodexReviewSandbox: "worktree_write"})
+	if n := strings.Count(buf.String(), "worktree_write"); n != 1 {
+		t.Fatalf("另一未知值应独立披露一次, got %d 次:\n%s", n, buf.String())
+	}
+}
+
+// ---- CG-R3b 修 2:建副本阶段必须受超时/击杀约束 ----
+
+// fakeGitHangingOn 造一个假 git 并把它塞到 PATH 最前:遇到 hangOn 子命令永不退出,其余一律 exit 0。
+// hangOn="clone" → rev-parse 探测正常通过、卡在建副本;hangOn="rev-parse" → 卡在前置探测本身。
+// 【为什么按参数扫描而非 $1】真实调用形如 `git -c core.quotepath=false -C <dir> diff ...`,
+// 子命令并不在 $1;逐参数扫才能精准只吊住目标子命令,其余步骤保持可用。
+// 【为什么 exec sleep 而非 sleep】exec 让 sleep 顶替 sh 的 pid,进程组击杀直接命中,
+// 不给"sh 死了但 sleep 变孤儿继续跑"留缝。
+func fakeGitHangingOn(t *testing.T, hangOn string) {
+	t.Helper()
+	dir := t.TempDir()
+	script := "#!/bin/sh\nfor a in \"$@\"; do\n  case \"$a\" in\n    " + hangOn + ") exec sleep 600 ;;\n  esac\ndone\nexit 0\n"
+	if err := os.WriteFile(filepath.Join(dir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+// TestCodexReviewPrepareKilledOnHangingGit 是修 2 的回红反例(mock git 永不退出)。
+//
+// 【修的病】建副本的四条 git 子进程原先一律 exec.Command(不带 ctx),且整段跑在 invokeCodex 的
+// context.WithTimeout(StepTimeoutMin) **之前**——大仓 clone 卡死(NFS 停顿/等凭据/锁竞争)不受任何
+// 超时约束:巡逻看到进程组活着不触发,step 超时压根还没起算,整条泳道被一张卡无声堵死到天荒地老。
+//
+// 【断言的四件事】① 建副本在子预算内被击杀(不是挂死);② 回落 read-only 后复审照跑(降级不中断);
+// ③ 事件账本落 codex_review_prepare_timeout 留痕(不只有一行随日志轮转消失的 stderr);
+// ④ 副本残留被清干净。
+//
+// 【杀的突变】把 codex_worktree.go 的 runCopyGit 换回 exec.Command(去掉 ctx),或把 runner.go 的
+// WithTimeout 挪回 prepareCodexReviewWorkspace 之后 → clone 不再被击杀 → 本测试卡在 select 超时红。
+func TestCodexReviewPrepareKilledOnHangingGit(t *testing.T) {
+	root := testRoot(t)
+	src := mkCodexReviewSrcRepo(t) // 必须在劫持 PATH **之前**建:造仓要用真 git
+	argvCap := filepath.Join(t.TempDir(), "argv.txt")
+
+	origCap := codexPrepareTimeoutCap
+	codexPrepareTimeoutCap = 700 * time.Millisecond
+	defer func() { codexPrepareTimeoutCap = origCap }()
+	fakeGitHangingOn(t, "clone")
+
+	cfg := defaultConfig("")
+	cfg.CodexBin = fakeCodexArgvCapture(t, argvCap)
+	cfg.StepTimeoutMin = 5 // 远大于 700ms 子预算:证明击杀来自建副本子预算,不是步超时顺带收的
+	task := &Task{ID: "cg-r3b-hang", Type: typeReview, Dir: src}
+
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		_, _, err := invokeCodex(context.Background(), root, cfg, task, "ping")
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if el := time.Since(start); el > 20*time.Second {
+			t.Fatalf("建副本阶段应在子预算(700ms)+收尾内被击杀, 实际耗时 %v", el)
+		}
+		// 断言 ②:回落 read-only 后 fake codex 照常 exit 0——建副本失败是降级,不是把卡判失败。
+		if err != nil {
+			t.Fatalf("建副本超时应回落 read-only 继续跑, got err=%v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("建副本阶段未被超时击杀(clone 挂死不受任何约束)——修 2 回归")
+	}
+
+	// 断言 ②(证据面):argv 走的是 read-only 回落径,绝不是 workspace-write。
+	argv, err := os.ReadFile(argvCap)
+	if err != nil {
+		t.Fatalf("未捕获 codex argv: %v", err)
+	}
+	if got := string(argv); !strings.Contains(got, "read-only") || strings.Contains(got, "workspace-write") {
+		t.Fatalf("建副本失败后应回落 --sandbox read-only, got argv:\n%s", got)
+	}
+
+	// 断言 ③:事件账本留痕,且 reason 精确到"超时"而非泛化失败(区分卡死与 git 真报错)。
+	events, _, err := readEvents(eventsPath(root, task.ID))
+	if err != nil {
+		t.Fatalf("读事件账本: %v", err)
+	}
+	found := false
+	for _, ev := range events {
+		if ev.Type != evStalled || ev.Actor != "runner:codex_review_prepare" {
+			continue
+		}
+		if reason, _ := ev.Detail["reason"].(string); reason == "codex_review_prepare_timeout" {
+			if fb, _ := ev.Detail["fallback_sandbox"].(string); fb != "read-only" {
+				t.Fatalf("事件须披露回落到的沙箱, got fallback_sandbox=%q", fb)
+			}
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("未找到 codex_review_prepare_timeout 事件(降级必须留痕), events=%+v", events)
+	}
+
+	// 断言 ④:半成品副本目录不得残留在 workRoot 下。
+	entries, err := os.ReadDir(codexWorkRoot(root))
+	if err == nil && len(entries) != 0 {
+		names := []string{}
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Fatalf("建副本被击杀后不应残留副本目录, got: %v", names)
+	}
+}
+
+// TestCodexReviewPrepareHonorsParentCtx 类闭合:子预算不得切断父 ctx。
+// 【为什么单独一条】修 2 给建副本加了 min(step_timeout, 10min) 的独立子预算——若实现写成
+// context.WithTimeout(context.Background(), ...) 之类脱离父 ctx 的形式,上面那条测试照样绿,
+// 但 patrol/Ctrl-C/上游取消就再也传不进建副本阶段,"统一击杀路径"名存实亡。
+// 【杀的突变】把 prepareCodexReviewWorkspace 里的 WithTimeout 基底换成 context.Background()
+// → 父 ctx 300ms 到期后 clone 仍活着,本测试撞 select 超时红。
+func TestCodexReviewPrepareHonorsParentCtx(t *testing.T) {
+	root := testRoot(t)
+	src := mkCodexReviewSrcRepo(t)
+
+	origCap := codexPrepareTimeoutCap
+	codexPrepareTimeoutCap = 10 * time.Minute // 子预算故意留得极宽:击杀只能来自父 ctx
+	defer func() { codexPrepareTimeoutCap = origCap }()
+	fakeGitHangingOn(t, "clone")
+
+	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite} // StepTimeoutMin=0 → 子预算取 cap
+	task := &Task{ID: "cg-r3b-parent", Type: typeReview, Dir: src}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		dir string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		dir, cleanup, err := prepareCodexReviewWorkspace(ctx, root, cfg, task)
+		cleanup()
+		done <- result{dir, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatal("父 ctx 已到期,建副本不应报成功")
+		}
+		if !errors.Is(r.err, context.DeadlineExceeded) {
+			t.Fatalf("错误须 %%w 包装 ctx 错(调用侧据此分事件 reason), got %v", r.err)
+		}
+		if r.dir != src {
+			t.Fatalf("失败时 workDir 必须回落原仓, got %q want %q", r.dir, src)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("父 ctx 到期未能击杀建副本——子预算切断了父链,统一击杀路径失效")
+	}
+}
+
+// TestCodexReviewPrepareReportsProbeKill 类闭合:被击杀的**前置探测**不得伪装成"不需要副本"。
+//
+// 【修的病(本轮突变演练发现)】codexReviewNeedsWorktree 的第三条件是 `git rev-parse` 探测,
+// 它被 ctx 击杀时返回 false——与"这压根不是 git 工作树"完全同形。prepare 若不区分二者,就会以
+// (t.Dir, noop, nil) 正常返回:invokeCodex 看到 err==nil,既不落事件也不打 stderr,一次超时被
+// 静默记成"本卡不需要副本"。这与修 2 要消灭的"无声挂死"是同一类病,只是换了个入口——挂死改成了
+// 无声降级,账本上依旧查不出这轮复审为什么没有动态验证能力。
+//
+// 【构造】假 git 吊住 rev-parse(而非 clone),父 ctx 300ms:探测必被击杀,且此时策略确实想要副本
+// (worktree-write + design-review 卡),故必须报错而非静默回落。
+// 【杀的突变】删掉 prepareCodexReviewWorkspace 里 `if ctxErr := ctx.Err(); ctxErr != nil && ...`
+// 那段 → prepare 返回 nil error,本测试首条断言红。
+func TestCodexReviewPrepareReportsProbeKill(t *testing.T) {
+	root := testRoot(t)
+	src := mkCodexReviewSrcRepo(t)
+
+	origCap := codexPrepareTimeoutCap
+	codexPrepareTimeoutCap = 10 * time.Minute // 子预算留宽:击杀只能来自父 ctx
+	defer func() { codexPrepareTimeoutCap = origCap }()
+	fakeGitHangingOn(t, "rev-parse")
+
+	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
+	task := &Task{ID: "cg-r3b-probe", Type: typeReview, Dir: src}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	type result struct {
+		dir string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		dir, cleanup, err := prepareCodexReviewWorkspace(ctx, root, cfg, task)
+		cleanup()
+		done <- result{dir, err}
+	}()
+	select {
+	case r := <-done:
+		if r.err == nil {
+			t.Fatal("前置探测被击杀必须报错(否则超时被静默记成'本卡不需要副本',降级隐身)")
+		}
+		if !errors.Is(r.err, context.DeadlineExceeded) {
+			t.Fatalf("错误须 %%w 包装 ctx 错,调用侧才能落 prepare_timeout 事件, got %v", r.err)
+		}
+		if r.dir != src {
+			t.Fatalf("失败时 workDir 必须回落原仓, got %q want %q", r.dir, src)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("前置探测未被 ctx 击杀")
+	}
+
+	// 反面守卫:策略本就不要副本(readonly)时,即便 ctx 已死透也不得报错——那是正常回落,
+	// 报错会让 readonly 配置每轮白落一条降级事件,把账本刷成噪声。
+	dead, deadCancel := context.WithCancel(context.Background())
+	deadCancel()
+	roCfg := &Config{CodexReviewSandbox: codexReviewSandboxReadonly}
+	if dir, cleanup, err := prepareCodexReviewWorkspace(dead, root, roCfg, task); err != nil {
+		cleanup()
+		t.Fatalf("readonly 策略下 ctx 死透也应静默回落, got err=%v", err)
+	} else {
+		cleanup()
+		if dir != src {
+			t.Fatalf("readonly 回落应返回原仓, got %q", dir)
+		}
 	}
 }

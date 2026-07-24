@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -176,19 +177,40 @@ func resolveCodexModel(cfg *Config, t *Task) string {
 func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	// CG-R3(承 BD-36 工具链③终裁 b):非 sequence 卡(design-review/crosscheck 等)默认建一次性隔离
 	// 副本 + workspace-write,复审可跑测试/写夹具做实证验证——原仓永不受写污染(硬语义)。
-	// cfg.CodexReviewSandbox = "readonly" 或非 git 仓库 → 回落 read-only 旧路径。
-	// prepareCodexReviewWorkspace 建失败也回落,只是失去 workspace-write 收益(原仓保护不破)。
-	workDir := t.Dir
-	cleanup := func() {}
-	if codexReviewNeedsWorktree(cfg, t) {
-		wd, cl, err := prepareCodexReviewWorkspace(root, cfg, t)
-		if err == nil {
-			workDir, cleanup = wd, cl
-		} else {
-			fmt.Fprintf(os.Stderr, "警告: codex 复审副本建立失败,回落 read-only: %v\n", err)
-		}
-	}
+	// cfg.CodexReviewSandbox = "readonly" 或非 git 仓库 → prepareCodexReviewWorkspace 原样返回 t.Dir
+	// (不建副本);建失败/超时也回落 t.Dir,只是失去 workspace-write 收益(原仓保护不破)。
+	//
+	// 【CG-R3b 修 2:超时必须先于建副本建立】步超时的 ctx 从这里就起算,建副本因此跑在
+	// min(step_timeout, 10min) 的子预算内(codexPrepareTimeout)。旧序是"先建副本、后 WithTimeout",
+	// 大仓 clone 卡死不受任何超时约束、整条泳道被一张卡无声堵死。
+	// 【为什么不再先调一次 codexReviewNeedsWorktree】旧写法在这里探一次 git、prepare 里再探一次,
+	// 多一条无约束的裸子进程路径;判定收归 prepare 内部单点,"需不需要"与"建不建得成"同受一条预算约束。
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
+	defer cancel()
+
+	workDir, cleanup, prepErr := prepareCodexReviewWorkspace(ctx, root, cfg, t)
 	defer cleanup()
+	if prepErr != nil {
+		fmt.Fprintf(os.Stderr, "警告: codex 复审副本建立失败,回落 read-only: %v\n", prepErr)
+		// 落事件披露降级:回落本身不改任务状态(仍 running,复审照跑,只是退回静态阅读),但"这一轮
+		// 复审为什么没有动态验证能力"必须在账本里留痕,否则只剩一行 stderr 随 launchd 日志轮转消失。
+		// 【事件类型选 evStalled 的理由】它是仓内既有的"诊断披露、非状态迁移"通道(见 events.go 注释),
+		// actor 与 runner:codex_review_cleanup 同族便于聚合。evStalled 承载非卡死语义的噪声问题
+		// (e57c P2-4 留档)仍待事件语义整理时统一裁,此处不先斩后奏地新增事件类型。
+		reason := "codex_review_prepare_failed"
+		switch {
+		case errors.Is(prepErr, context.DeadlineExceeded):
+			reason = "codex_review_prepare_timeout"
+		case errors.Is(prepErr, context.Canceled):
+			reason = "codex_review_prepare_canceled"
+		}
+		emitTaskEvent(root, t.ID, evStalled, "runner:codex_review_prepare", statusRunning, t.Step, map[string]any{
+			"reason":           reason,
+			"error":            prepErr.Error(),
+			"fallback_sandbox": "read-only",
+			"prepare_budget":   codexPrepareTimeout(cfg).String(),
+		})
+	}
 
 	sandbox := "read-only"
 	var extra []string
@@ -219,8 +241,7 @@ func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt 
 		args = append(args, "-c", "model_reasoning_effort="+cfg.CodexReasoning)
 	}
 
-	ctx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
-	defer cancel()
+	// ctx 已在函数头部按 StepTimeoutMin 限时(建副本与 codex 执行共用同一条步预算,见上方注释)。
 	cmd := exec.CommandContext(ctx, cfg.CodexBin, args...)
 	setupProcGroup(cmd)
 	// CG-R3:workDir 在启用副本时指向副本,否则等于 t.Dir——两处必须同源(-C 与 cmd.Dir),

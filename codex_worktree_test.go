@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -300,5 +301,264 @@ func TestCleanupCodexReviewOrphansSkipsActive(t *testing.T) {
 
 	if _, err := os.Stat(copyDir); err != nil {
 		t.Fatalf("活任务的副本不应被清: %v", err)
+	}
+}
+
+// fakeCodexArgvStdinCapture 返回把 argv 逐行写进 argvOut、把 stdin 全文写进 stdinOut 的假 codex(exit 0)。
+// 【为什么】fakeCodexArgvCapture 只捕 argv,但 P1-1 修复的关键证据在 stdin(路径映射前导)。
+// 单独一个 stdin 捕获脚本让"前导已注入"可测——脚本用 `cat >` 读 stdin,argv 用 printf 逐行落磁盘。
+func fakeCodexArgvStdinCapture(t *testing.T, argvOut, stdinOut string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "codex")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > " + argvOut + "\ncat > " + stdinOut + "\nexit 0\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// argvValueAfter 在 argv 逐行捕获里找 flag 的下一行值(如 "-C" 后一行 = workDir)。
+// 空表示没找到——测试侧一律 t.Fatalf 阻断,不给静默通过的机会。
+func argvValueAfter(argv, flag string) string {
+	lines := strings.Split(argv, "\n")
+	for i, l := range lines {
+		if l == flag && i+1 < len(lines) {
+			return lines[i+1]
+		}
+	}
+	return ""
+}
+
+// TestInvokeCodexWorktreeWriteArgvAndCleanup 正向覆盖·CG-R3 R1 P1-2:
+// 默认 worktree-write 模式经 invokeCodex 的关键接线全套断言,任何一处回归全套测试都会红:
+//   ① sandbox 切换:argv 含 --sandbox workspace-write,不含 read-only;
+//   ② -C 指向副本(而非原仓);副本路径落在 codexWorkRoot(root) 之下;
+//   ③ writable_roots 拼接的是副本 .git 路径(不是原仓 .git);
+//   ④ defer cleanup:invokeCodex 返回后副本目录已被删。
+//
+// 若无此测试,cleanup 回归会被 orphan reaper 的"pid 活即跳过"掩盖(codex_worktree.go:336-338):
+// 测试进程 pid 是活的 → reaper 跳过 → 副本残留只在 stat 时才见 → 全套测试仍绿。
+func TestInvokeCodexWorktreeWriteArgvAndCleanup(t *testing.T) {
+	root := testRoot(t)
+	src := mkCodexReviewSrcRepo(t)
+	argvCap := filepath.Join(t.TempDir(), "argv.txt")
+	stdinCap := filepath.Join(t.TempDir(), "stdin.txt")
+
+	cfg := defaultConfig("")
+	cfg.CodexBin = fakeCodexArgvStdinCapture(t, argvCap, stdinCap)
+	cfg.StepTimeoutMin = 1
+	// 默认 CodexReviewSandbox=worktree-write(defaultConfig 已配),此测试正是要验证默认路径。
+
+	task := &Task{ID: "cg-r3-ww", Type: typeReview, Dir: src}
+
+	if _, _, err := invokeCodex(context.Background(), root, cfg, task, "ping"); err != nil {
+		t.Fatalf("fake codex 应 exit 0: %v", err)
+	}
+
+	argvRaw, err := os.ReadFile(argvCap)
+	if err != nil {
+		t.Fatalf("argv 未捕获: %v", err)
+	}
+	got := string(argvRaw)
+
+	// 断言 ①:--sandbox workspace-write,不含 read-only。
+	if !strings.Contains(got, "workspace-write") {
+		t.Fatalf("argv 应含 --sandbox workspace-write, got:\n%s", got)
+	}
+	if strings.Contains(got, "read-only") {
+		t.Fatalf("默认模式 argv 不应含 read-only, got:\n%s", got)
+	}
+
+	// 断言 ②:-C 指向副本(非原仓);副本必须在 codexWorkRoot(root) 下。
+	cPath := argvValueAfter(got, "-C")
+	if cPath == "" {
+		t.Fatalf("argv 未找到 -C <path>, got:\n%s", got)
+	}
+	if cPath == src {
+		t.Fatalf("-C 目标应为副本,不是原仓 %s", src)
+	}
+	// 不做 EvalSymlinks:invokeCodex 返回时 defer cleanup 已删掉副本目录,
+	// EvalSymlinks(cPath) 失败返回 "" 而 EvalSymlinks(workRoot) 成功返回 /private/var/... 前缀,
+	// 二者对不齐(/var vs /private/var 假不匹配)。cPath 与 workRoot 都由我方按同一 root 字符串
+	// 拼接而成,一定共享前缀链,直接字符串比对即可。
+	workRootRaw := codexWorkRoot(root)
+	if !strings.HasPrefix(cPath, workRootRaw+string(filepath.Separator)) {
+		t.Fatalf("-C 目标不在副本根 %s 下: %s", workRootRaw, cPath)
+	}
+
+	// 断言 ③:writable_roots=[<副本>/.git],不是原仓 .git。
+	expectWritableRoots := fmt.Sprintf(`sandbox_workspace_write.writable_roots=["%s"]`, filepath.Join(cPath, ".git"))
+	if !strings.Contains(got, expectWritableRoots) {
+		t.Fatalf("argv 应含 writable_roots=[<副本>/.git]\n  期望片段: %s\n  实得:\n%s", expectWritableRoots, got)
+	}
+	forbidWritableRoots := fmt.Sprintf(`sandbox_workspace_write.writable_roots=["%s"]`, filepath.Join(src, ".git"))
+	if strings.Contains(got, forbidWritableRoots) {
+		t.Fatalf("writable_roots 不应指向原仓 .git\n  禁止片段: %s\n  实得:\n%s", forbidWritableRoots, got)
+	}
+
+	// 断言 ④:invokeCodex 返回后,副本目录已被 defer cleanup 删除。
+	if _, err := os.Stat(cPath); !os.IsNotExist(err) {
+		t.Fatalf("invokeCodex 返回后副本应已删(defer cleanup),但仍存在: err=%v", err)
+	}
+}
+
+// TestInvokeCodexInjectsCopyPreamble 正向覆盖·CG-R3 R1 P1-1:
+// 副本模式下 stdin 前置必含路径映射(原仓路径 + 副本路径 + "复审副本模式"字面量),
+// 且必须在用户 prompt 之前;否则 codex 依 prompt(原仓路径)去写,workspace-write 全废。
+func TestInvokeCodexInjectsCopyPreamble(t *testing.T) {
+	root := testRoot(t)
+	src := mkCodexReviewSrcRepo(t)
+	argvCap := filepath.Join(t.TempDir(), "argv.txt")
+	stdinCap := filepath.Join(t.TempDir(), "stdin.txt")
+
+	cfg := defaultConfig("")
+	cfg.CodexBin = fakeCodexArgvStdinCapture(t, argvCap, stdinCap)
+	cfg.StepTimeoutMin = 1
+
+	task := &Task{ID: "cg-r3-pre", Type: typeReview, Dir: src}
+	if _, _, err := invokeCodex(context.Background(), root, cfg, task, "USER_PROMPT_MARKER"); err != nil {
+		t.Fatalf("fake codex 应 exit 0: %v", err)
+	}
+	// EvalSymlinks 后比对(原仓 t.Dir 传入 invokeCodex 未 EvalSymlinks,但副本经 EvalSymlinks 前
+	// 可能是同源;前导直接写 workDir + t.Dir 字面量,故用原字面量断言即可)。
+	argvRaw, err := os.ReadFile(argvCap)
+	if err != nil {
+		t.Fatalf("argv 未捕获: %v", err)
+	}
+	workDir := argvValueAfter(string(argvRaw), "-C")
+	if workDir == "" || workDir == src {
+		t.Fatalf("测试前提破坏:workDir 应为副本,实得 %q (src=%s)", workDir, src)
+	}
+
+	stdinRaw, err := os.ReadFile(stdinCap)
+	if err != nil {
+		t.Fatalf("stdin 未捕获: %v", err)
+	}
+	got := string(stdinRaw)
+
+	// 断言 A:含"复审副本模式"字面量(前导起首,唯一辨识)。
+	if !strings.Contains(got, "复审副本模式") {
+		t.Fatalf("stdin 应含'复审副本模式'前导, got:\n%s", got)
+	}
+	// 断言 B:同时含原仓路径 src 与副本路径 workDir。
+	if !strings.Contains(got, src) {
+		t.Fatalf("stdin 前导应含原仓路径 %s, got:\n%s", src, got)
+	}
+	if !strings.Contains(got, workDir) {
+		t.Fatalf("stdin 前导应含副本路径 %s, got:\n%s", workDir, got)
+	}
+	// 断言 C:前导在用户 prompt 之前(不是尾巴,否则 codex 已按 prompt 落地才看到映射说明)。
+	idxPre := strings.Index(got, "复审副本模式")
+	idxUser := strings.Index(got, "USER_PROMPT_MARKER")
+	if idxUser < 0 || idxPre < 0 || idxPre >= idxUser {
+		t.Fatalf("前导应在用户 prompt 之前, 前导位置=%d USER_PROMPT_MARKER位置=%d\nstdin:\n%s", idxPre, idxUser, got)
+	}
+}
+
+// TestInvokeCodexNoCopyPreambleInReadonly 反面:readonly 回落模式(workDir==t.Dir)不注入副本前导。
+// 若这里注入,codex 会被引导去查一个不存在的"副本路径",反而混淆——回落语义就是"跑在原仓,只读"。
+func TestInvokeCodexNoCopyPreambleInReadonly(t *testing.T) {
+	root := testRoot(t)
+	src := mkCodexReviewSrcRepo(t)
+	argvCap := filepath.Join(t.TempDir(), "argv.txt")
+	stdinCap := filepath.Join(t.TempDir(), "stdin.txt")
+
+	cfg := defaultConfig("")
+	cfg.CodexBin = fakeCodexArgvStdinCapture(t, argvCap, stdinCap)
+	cfg.CodexReviewSandbox = codexReviewSandboxReadonly
+	cfg.StepTimeoutMin = 1
+
+	task := &Task{ID: "cg-r3-nopre", Type: typeReview, Dir: src}
+	if _, _, err := invokeCodex(context.Background(), root, cfg, task, "USER_PROMPT_MARKER"); err != nil {
+		t.Fatalf("fake codex 应 exit 0: %v", err)
+	}
+	stdinRaw, err := os.ReadFile(stdinCap)
+	if err != nil {
+		t.Fatalf("stdin 未捕获: %v", err)
+	}
+	got := string(stdinRaw)
+	if strings.Contains(got, "复审副本模式") {
+		t.Fatalf("readonly 模式 stdin 不应含副本模式前导, got:\n%s", got)
+	}
+}
+
+// TestRemoteCodexReviewSandbox 单元表:CG-R3 R1 P0-1 修法的可证伪核心——
+// 决定远端 codex 非 sequence 卡沙箱的判据必须按"目录确为一次性镜像"收窄,
+// 交叉/协调/回退等真实业务仓路径必须回落 read-only(硬保证:原仓字节永不受写污染)。
+// 若某天有人把 remoteCodexReviewSandbox 又改回"非 sequence 就 workspace-write",本表全红。
+func TestRemoteCodexReviewSandbox(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  *Config
+		task *Task
+		want string
+	}{
+		{
+			"镜像目录(review divert 成功) → workspace-write",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/ClaudeGo"},
+			"workspace-write",
+		},
+		{
+			"交叉卡远端腿(真实业务仓) → read-only",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeCrossCheck, Dir: "C:/work/otherrepo"},
+			"read-only",
+		},
+		{
+			"协调卡远端(真实业务仓) → read-only",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeCoordinate, Dir: "D:/other/somewhere"},
+			"read-only",
+		},
+		{
+			"progress-pull 远端(真实业务仓) → read-only",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeProgressPull, Dir: "D:/work/proj"},
+			"read-only",
+		},
+		{
+			"review 卡 sync 失败回退到原仓 → read-only",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeReview, Dir: "C:/work/therepo"},
+			"read-only",
+		},
+		{
+			"CodexReviewSandbox=readonly 恒 read-only(即便在镜像下也强制回落)",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes", CodexReviewSandbox: codexReviewSandboxReadonly},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/ClaudeGo"},
+			"read-only",
+		},
+		{
+			"RemoteMirrorRoot 未配 → read-only(无法判定,保守取硬保证)",
+			&Config{},
+			&Task{Type: typeReview, Dir: "D:/anywhere"},
+			"read-only",
+		},
+		{
+			"前缀假匹配防线:'D:/Project/foo-bar/x' 不算 'D:/Project/foo' 的子孙",
+			&Config{RemoteMirrorRoot: "D:/Project/foo"},
+			&Task{Type: typeReview, Dir: "D:/Project/foo-bar/repo"},
+			"read-only",
+		},
+		{
+			"posix + Windows 分隔符归一:反斜杠 root 与正斜杠 dir 应匹配",
+			&Config{RemoteMirrorRoot: `D:\Project\PO-lanes`},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/ClaudeGo"},
+			"workspace-write",
+		},
+		{
+			"dir == root(等于边缘不算子孙,严格子孙才是镜像) → read-only",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes"},
+			"read-only",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := remoteCodexReviewSandbox(c.cfg, c.task); got != c.want {
+				t.Fatalf("got %q, want %q", got, c.want)
+			}
+		})
 	}
 }

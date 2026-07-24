@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 // TypeDefaults 是某一任务类型的默认执行参数，在 add/emit 时烘焙进任务。
@@ -213,6 +214,43 @@ func resolvedCodexReviewSandbox(cfg *Config) string {
 	default:
 		return codexReviewSandboxWorktreeWrite
 	}
+}
+
+// isRemoteMirrorPath 判断远端 dir 是否位于 cfg.RemoteMirrorRoot 之下(sync-lane 分发的一次性镜像)。
+// 【为什么不用 filepath】远端 dir 可能是 Windows 路径("D:/Project/PO-lanes/ClaudeGo")或
+// posix 路径("/mirror/foo"),且路径分隔符可能反斜/正斜混用(config 手写 vs sync 脚本推导)——
+// filepath 会按本机分隔符做判断,跨平台易错。改用纯字符串前缀 + 归一 forward slash + 强制
+// trailing "/" 边界,消除"/foo" 假匹配"/foo-bar"这类前缀陷阱(见 TestRemoteCodexReviewSandbox 桌面案)。
+func isRemoteMirrorPath(cfg *Config, dir string) bool {
+	if cfg == nil || cfg.RemoteMirrorRoot == "" || dir == "" {
+		return false
+	}
+	normDir := strings.ReplaceAll(dir, `\`, "/")
+	normRoot := strings.TrimRight(strings.ReplaceAll(cfg.RemoteMirrorRoot, `\`, "/"), "/")
+	if normRoot == "" {
+		return false
+	}
+	return strings.HasPrefix(normDir, normRoot+"/")
+}
+
+// remoteCodexReviewSandbox 返回远端 codex 非 sequence 卡的沙箱模式(CG-R3 R1 P0-1):
+//   - CodexReviewSandbox="readonly" → 强制 read-only(旧行为可配置回落);
+//   - t.Dir 位于 cfg.RemoteMirrorRoot 之下(sync-lane 一次性镜像) → workspace-write,
+//     兑现复审动态验证收益("镜像本身已是影本"的假前提在此才成立);
+//   - 其余(crosscheck 远端腿/coordinate/progress-pull 远端卡/review divert 回退后的原仓)
+//     → read-only,恢复"原仓字节永不受写污染"的沙箱级硬保证——这些路径 t.Dir 是真实业务仓,
+//     不是一次性镜像,仅 prompt 纪律兜底不够(见 CG-R3 R1 复审 P0-1)。
+//
+// 判据"目录确为一次性镜像"用 isRemoteMirrorPath(cfg.RemoteMirrorRoot 前缀)——它是编排方
+// 通过 sync-lane 分发副本的落地根,严格子孙才算镜像;等于/边缘不算(边界样例见测试)。
+func remoteCodexReviewSandbox(cfg *Config, t *Task) string {
+	if resolvedCodexReviewSandbox(cfg) == codexReviewSandboxReadonly {
+		return "read-only"
+	}
+	if t != nil && isRemoteMirrorPath(cfg, t.Dir) {
+		return "workspace-write"
+	}
+	return "read-only"
 }
 
 func defaultConfig(claudeBin string) *Config {

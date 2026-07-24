@@ -136,7 +136,7 @@ claudego cross -list                                                     # 看�
 
 - 引擎的 `effort` 是 claude / codex 共用的思考等级（claude → `--effort`，codex → `model_reasoning_effort`，同名同序 `low<medium<high<xhigh<max`），任务级覆盖全局 `codex_reasoning`；
 - `claude` 引擎要求指定 `model`、`codex` 引擎要求配好 `codex_bin` + `codex_model`（否则会跑成账号/CLI 默认模型、与 profile 宣称不符，命令直接报错，杜绝静默降级）；
-- 交叉卡是**只读分析**（读契约/源码/改动、不写业务仓）；codex 侧默认走一次性隔离副本 + `--sandbox workspace-write`，副本随卡即建即删,原仓永不受写污染(见"沙箱"段的 CG-R3 `codex_review_sandbox`);`-dir` 不能是 claudego 数据根或其子目录；
+- 交叉卡是**只读分析**（读契约/源码/改动、不写业务仓）；**本机** codex 侧默认走一次性隔离副本 + `--sandbox workspace-write`（副本随卡即建即删,原仓永不受写污染,见"沙箱"段的 CG-R3 `codex_review_sandbox`）；**远端** codex 侧只在目录位于 `remote_mirror_root` 之下（sync-lane 分发的一次性镜像）时才放宽为 `workspace-write`,跑在真实业务仓（三卡共用工作目录时的常态）维持 `--sandbox read-only` 硬保证（CG-R3 R1 P0-1）；`-dir` 不能是 claudego 数据根或其子目录；
 - 甲乙必须**同执行位置**（都在本机，或都在同一台 `remote_hosts` 主机）——三卡共用一个工作目录，跨机引擎对会被 `cross` 直接拒绝；
 - **护栏**：claude 冷却期即便开了 `codex_fallback`，claude 引擎的交叉卡也**绝不**被降级偷换成 codex，codex 钉定卡在 codex 不可用时也**绝不** fail-open 到 claude（否则甲乙同引擎、验证形同虚设）——引擎身份冻结，宁可排队等对应窗口。链任一步断裂会在母卡留痕（`list` 可见），不让单腿结果冒充终局。
 
@@ -522,7 +522,7 @@ exit 2 → marker 不写 → 每次同步必失败 → divert 永久静默回退
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见上文专节 |
 | `codex_fallback_model` | "" | claude 卡降级到 codex 时用此模型（档位对等：opus→terra，不降 sol）；空回退 `codex_model` |
 | `codex_reasoning` | "" | 全局 codex 推理档（minimal/low/medium/high/xhigh/max/ultra）→ `-c model_reasoning_effort=…`；任务级 effort 可覆盖 |
-| `codex_review_sandbox` | "worktree-write" | codex 只读分析卡(design-review/crosscheck 等)的沙箱策略。默认 `worktree-write`:建一次性隔离副本 + `--sandbox workspace-write`,复审可跑测试/写夹具做动态验证,副本落 `<root>/tmp/codex-review-work/`,卡结束即删,原仓永不受写污染(CG-R3)。改 `readonly` 回落旧行为(codex 直接 `--sandbox read-only` 跑在原仓,只能静态阅读)。sequence 卡不受此配置影响。 |
+| `codex_review_sandbox` | "worktree-write" | codex 只读分析卡(design-review/crosscheck 等)的沙箱策略。默认 `worktree-write`:**本机** codex 建一次性隔离副本 + `--sandbox workspace-write`,复审可跑测试/写夹具做动态验证,副本落 `<root>/tmp/codex-review-work/`,卡结束即删,原仓永不受写污染(CG-R3)。**远端** codex 只对 `t.Dir` 位于 `remote_mirror_root` 之下的镜像卡放宽为 `workspace-write`,交叉/协调/回退等真实业务仓维持 `--sandbox read-only` 硬保证(CG-R3 R1 P0-1)。改 `readonly` 全线回落旧行为(codex 直接 `--sandbox read-only`,只能静态阅读)。sequence 卡不受此配置影响。 |
 | `cross_profiles` | {opus-codex} | 交叉验证引擎对（`claudego cross`），见上文专节 |
 | `default_cross_profile` | "opus-codex" | `cross` 未指定 `-profile` 时用的引擎对 |
 | `default_review_host` | "" | 全局默认审核主机（`remote_hosts` 的键）；三键齐备时本地实现卡自动分流，见上文专节 |

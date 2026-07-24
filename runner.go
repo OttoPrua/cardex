@@ -133,6 +133,27 @@ const codexSubagentPreamble = "[SUBAGENT · 直接执行] 你是被任务队列�
 	"结论/verdict/交付报告)，绝不以工具调用或中途推理结束回合，绝不把回合耗在读框架文档上。\n" +
 	"────────────────────────────────────────\n\n"
 
+// codexCopyPathPreamble 在本机 codex 复审副本模式下(workDir != origDir)前置一段路径映射声明。
+// 【为什么必须存在 · CG-R3 R1 P1-1】review 模板以 {{DIR}} 渲染 prompt,{{DIR}}=t.Dir(原仓绝对路径),
+// 但 codex 实际 cwd 在副本内(--sandbox workspace-write 只放行 cwd)。若不告知,codex 依 prompt 指令
+// 去原仓写夹具/跑测试/落 fixture,统统被沙箱拒写 → 复审只能退回静态阅读标 open,workspace-write
+// 收益全废。四道闸门(fake codex 不解释 prompt)测不到这个洞——本前导让 codex 知道 cwd 与原仓字节
+// 等同、动态验证在 cwd 内做即可,path 映射心里做。
+// workDir == origDir(readonly 回落 / 非 git 仓库) → 返回 "",不注入(避免多余噪声)。
+func codexCopyPathPreamble(workDir, origDir string) string {
+	if workDir == "" || origDir == "" || workDir == origDir {
+		return ""
+	}
+	return "[CG-R3 · 复审副本模式] 你此刻在一次性隔离副本内运行:\n" +
+		"  cwd (副本)          : " + workDir + "\n" +
+		"  prompt 引用的原仓路径: " + origDir + "\n" +
+		"两者字节等同(git clone --local + 未提交面回放 + untracked 拷贝),副本收工即删。\n" +
+		"任何动态验证(跑测试/写夹具/修改文件/git 操作)必须在 cwd(副本)内进行——原仓在沙箱外,\n" +
+		"写入会被拒(--sandbox workspace-write 只放行 cwd);prompt 里出现的 " + origDir + "\n" +
+		"请就地视作等价于当前 cwd,不必物理切换。\n" +
+		"────────────────────────────────────────\n\n"
+}
+
 // resolveCodexModel 决定一次 codex 执行用哪个模型。优先序：
 //  1. XCodexModel——交叉链入队冻结的引擎身份，恒最高（防入队后改配置静默换引擎）；
 //  2. 卡级 CodexModel（-codex-model 钉定）——用户显式意图，主跑/降级两径都尊重；
@@ -208,7 +229,10 @@ func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt 
 	// prompt 走 stdin（codex exec 无 prompt 参数时读 stdin），同 invokeRemoteClaude/invokeClaude——
 	// 不再把 prompt 当 argv 参数，绕开 ARG_MAX 上限，交叉验证的合并 prompt 可注入完整甲/乙结论不截断。
 	// 前置 subagent 前导，抑制 superpowers/gsd 框架注入耗尽回合预算致空终稿（见 codexSubagentPreamble）。
-	cmd.Stdin = strings.NewReader(codexSubagentPreamble + prompt)
+	// 副本模式(workDir != t.Dir)再前置一段路径映射声明——prompt 由模板以 t.Dir=原仓路径渲染,但 codex
+	// cwd 在副本,若不告知则动态验证(写夹具/跑测试)按 prompt 指向原仓 → 沙箱拒写 → 复审退回静态阅读,
+	// workspace-write 收益完全兑现不了(CG-R3 R1 P1-1 修正)。
+	cmd.Stdin = strings.NewReader(codexSubagentPreamble + codexCopyPathPreamble(workDir, t.Dir) + prompt)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -351,16 +375,13 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	if sandbox == "" {
 		sandbox = "workspace-write"
 	}
-	// 只读类任务（复审/交叉/协调等）沙箱按 CodexReviewSandbox 决定（CG-R3, BD-36/BD-39 附记 2026-07-24）：
-	// 远端镜像本身已是"影本"（remoteSync 走单独镜像目录，不覆盖原仓），默认放宽到 workspace-write 以恢复
-	// 复审的动态验证力（跑测试/落 fixture）；配置回落 readonly 则与旧行为一致。sequence 卡永远随主机配置
-	// （用户显式声明的落码卡）不在这里下调。
+	// 只读类任务(复审/交叉/协调等)沙箱按 remoteCodexReviewSandbox 决定(CG-R3 R1 P0-1 修正):
+	// 只有 t.Dir 确为 sync-lane 一次性镜像(位于 cfg.RemoteMirrorRoot 之下)时才放宽到 workspace-write;
+	// 交叉/协调/progress-pull 的远端腿、以及 review 卡 sync 失败回退后的原仓路径 —— t.Dir 均是真实
+	// 业务仓,必须维持 read-only 沙箱级硬保证("原仓字节永不受写污染"),仅靠 prompt 纪律兜底不够。
+	// sequence 卡永远随主机配置(用户显式声明的落码卡),不在这里下调。
 	if t.Type != typeSequence {
-		if resolvedCodexReviewSandbox(cfg) == codexReviewSandboxReadonly {
-			sandbox = "read-only"
-		} else {
-			sandbox = "workspace-write"
-		}
+		sandbox = remoteCodexReviewSandbox(cfg, t)
 	}
 	tmp := rh.TmpDir
 	if tmp == "" {

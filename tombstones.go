@@ -400,8 +400,17 @@ func acquireTombstoneLock(root, taskID string) (func(), error) {
 		// 复用 events 锁的 stale 判据: 内容不可解析且 mtime<=TTL 一律等待不强夺, 只在(可解析&&!alive)
 		// 或 mtime>TTL 判 stale. 保持防御纵深, 消除"空文件窗口→立即强夺"的 bootstrap 竞态.
 		if staleEventLock(path, 5*time.Second) {
+			// 【CG-R1 R3 P2-2 收窄】staleEventLock 到 Rename 之间可能被他人 Link 新鲜锁 (TOCTOU).
+			// 核 stale 内容: 存活异 PID 即 Link 归还目标路径, 本轮 sleep+continue 避免双持。
+			// 与 state.go:acquireLock、events.go:acquireEventLock 同类闭合。
 			stale := fmt.Sprintf("%s.stale-%d-%d", path, os.Getpid(), time.Now().UnixNano())
 			if renameErr := os.Rename(path, stale); renameErr == nil {
+				if isForeignLiveLock(stale) {
+					_ = os.Link(stale, path)
+					_ = os.Remove(stale)
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
 				_ = os.Remove(stale)
 			}
 			continue
@@ -415,6 +424,11 @@ func acquireTombstoneLock(root, taskID string) (func(), error) {
 // 【为什么核 PID】与 releaseEventLock 同源: staleEventLock 对 mtime>TTL 的锁判 stale 强夺, 系统睡眠/
 // 挂起跨 TTL 唤醒后原持有者的 defer release 无条件 Remove 会误删强夺者刚建的新锁, 让第三方进入临界
 // 区连环撞. 读文件失败/解析失败/PID 不匹配都不删, 让下一轮 staleEventLock 兜底.
+//
+// 【CG-R1 R3 P2-2 收窄:核 PID→Remove 间隙的 TOCTOU】ReadFile 到 Remove 之间, 他人若判 stale
+// 强夺 (Rename+Link 新锁), 我们无脑 Remove(path) 会误删他们的新锁。改用 os.Rename 独占搬走
+// 再核内容: 属自身 PID 才 Remove; 内容变了(存活异 PID) 则 Link 归还, 让归属复原。
+// 与 state.go:releaseLock、events.go:releaseEventLock 同类闭合。
 func releaseTombstoneLock(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -427,5 +441,12 @@ func releaseTombstoneLock(path string) {
 	if li.PID != os.Getpid() {
 		return
 	}
-	_ = os.Remove(path)
+	stale := fmt.Sprintf("%s.rel-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+	if err := os.Rename(path, stale); err != nil {
+		return
+	}
+	if isForeignLiveLock(stale) {
+		_ = os.Link(stale, path)
+	}
+	_ = os.Remove(stale)
 }

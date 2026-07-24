@@ -56,6 +56,11 @@ type lockInfo struct {
 // os.Link 挂新锁成功、随即 B 也 Remove 却删掉了 A 刚挂的新锁 → 双持锁。改用 os.Rename
 // 是 POSIX 原子操作, path 只能被一方成功搬走; 失败方(路径已被他人搬走)本轮直接进入下一次
 // for 迭代重试 os.Link, 不会再动到已被夺权者挂上的新锁。与 events.go:216-221 同源同法。
+//
+// 【CG-R1 R3 P2-2 收窄:Rename 后核 stale 内容, 存活异 PID 即 Link 归还】staleLock 判据到
+// Rename 之间, path 可能被他人 Link 新鲜锁 (B 过 staleLock 判据后停顿至 A 完成 Rename+Link,
+// B 的 Rename 会搬走 A 的新鲜锁双持). 核 stale 内容: 若属存活异 PID, os.Link 归还目标路径
+// 并按抢占失败返回, 让 A 的锁不被误删。tombstones.go / events.go 同类闭合。
 func acquireLock(root string, ttl time.Duration) bool {
 	path := lockPath(root)
 	for i := 0; i < 2; i++ {
@@ -76,6 +81,14 @@ func acquireLock(root string, ttl time.Duration) bool {
 		// 搬走)本轮直接进入下一次 for 迭代, 不会再 Remove 一次导致"两方各以为夺权成功"删掉新锁。
 		stale := fmt.Sprintf("%s.stale-%d-%d", path, os.Getpid(), time.Now().UnixNano())
 		if renameErr := os.Rename(path, stale); renameErr == nil {
+			// 复核:staleLock 到 Rename 之间可能被他人 Link 新鲜锁 (P2-2 TOCTOU 收窄). 存活异
+			// PID 即 Link 归还, 本轮按抢占失败返回避免双持; 属自身/已死/不可解析则清 stale, 走
+			// 下一轮 for 重试 Link。
+			if isForeignLiveLock(stale) {
+				_ = os.Link(stale, path)
+				_ = os.Remove(stale)
+				return false
+			}
 			_ = os.Remove(stale)
 		}
 	}
@@ -114,6 +127,11 @@ func staleLock(path string, ttl time.Duration) bool {
 // 无条件 Remove 会删掉强夺者 B 刚建的新锁,让第三写者 C 进临界区双持。核 PID 匹配才 Remove
 // 是"只删自己名下的"最小契约,读文件失败/解析失败/PID 不匹配都不删——留给真正的持有者。
 // 与 events.go:234-247 同源同法。
+//
+// 【CG-R1 R3 P2-2 收窄:核 PID→Remove 间隙的 TOCTOU】ReadFile 到 Remove 之间, 他人若判 stale
+// 强夺 (Rename+Link 新锁), 我们无脑 Remove(path) 会误删他们的新锁。改用 os.Rename 独占搬走
+// 再核内容: 属自身 PID 才 Remove; 内容变了(存活异 PID) 则 Link 归还, 让归属复原。
+// tombstones.go / events.go 同类闭合。
 func releaseLock(root string) {
 	path := lockPath(root)
 	data, err := os.ReadFile(path)
@@ -127,7 +145,37 @@ func releaseLock(root string) {
 	if li.PID != os.Getpid() {
 		return
 	}
-	_ = os.Remove(path)
+	// 归属确认后, Rename 独占搬走再核: TOCTOU 窗口内被他人 Link 新锁的情况下, 搬走的会是
+	// 对方新锁, 内容不再匹配自身 PID → 归还 Link, 让新锁归位。
+	stale := fmt.Sprintf("%s.rel-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+	if err := os.Rename(path, stale); err != nil {
+		return
+	}
+	if isForeignLiveLock(stale) {
+		_ = os.Link(stale, path)
+	}
+	_ = os.Remove(stale)
+}
+
+// isForeignLiveLock 判断 stalePath 处的锁内容是否属**存活的异 PID**——供 acquireLock/
+// releaseLock/acquireEventLock/releaseEventLock/acquireTombstoneLock/releaseTombstoneLock
+// 的 TOCTOU 复核使用: 我们用 os.Rename 抢下的可能是间隙内被他人 Link 上的新鲜锁, 若属存
+// 活异 PID 需要归还 (否则会误删他人正在持有的锁, 造成双持)。
+// 返回 true 才归还; 属自身/已死/不可解析/文件不存在都返回 false, 调用方按"确实抢下 stale"
+// 继续处理。processAlive 已跨 POSIX/Windows 差异实现 (见 state_unix.go / state_windows.go)。
+func isForeignLiveLock(stalePath string) bool {
+	data, err := os.ReadFile(stalePath)
+	if err != nil {
+		return false
+	}
+	var li lockInfo
+	if json.Unmarshal(data, &li) != nil {
+		return false
+	}
+	if li.PID <= 0 || li.PID == os.Getpid() {
+		return false
+	}
+	return processAlive(li.PID)
 }
 
 func lockTTL(cfg *Config) time.Duration {

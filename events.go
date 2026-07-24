@@ -215,8 +215,18 @@ func acquireEventLock(root, taskID string) (func(), error) {
 		if staleEventLock(path, 5*time.Second) {
 			// 强夺唯一化:os.Rename 是 POSIX 原子操作, path 只能被一方成功搬走. 失败者(路径已被他人
 			// 搬走)本轮 sleep 后自然重试, 不会再 Remove 一次导致"两方各以为夺权成功".
+			// 【CG-R1 R3 P2-2 收窄】staleEventLock 到 Rename 之间, path 可能被他人 Link 新鲜锁
+			// (B 过 staleEventLock 判据后停顿至 A 完成 Rename+Link, B 的 Rename 会搬走 A 的新
+			// 鲜锁双持). 核 stale 内容: 存活异 PID 即 os.Link 归还目标路径, 本轮 sleep+continue
+			// 让 A 的锁不被误删。见 state.go:isForeignLiveLock 与 acquireLock 同类闭合。
 			stale := fmt.Sprintf("%s.stale-%d-%d", path, os.Getpid(), time.Now().UnixNano())
 			if renameErr := os.Rename(path, stale); renameErr == nil {
+				if isForeignLiveLock(stale) {
+					_ = os.Link(stale, path)
+					_ = os.Remove(stale)
+					time.Sleep(5 * time.Millisecond)
+					continue
+				}
 				_ = os.Remove(stale)
 			}
 			continue
@@ -231,6 +241,11 @@ func acquireEventLock(root, taskID string) (func(), error) {
 // 系统睡眠/挂起跨 5s 唤醒后, 原持有者的 defer release 无条件 Remove 会删掉强夺者刚建的新锁,
 // 让第三写者进临界区连环撞 seq. 读文件失败/解析失败/PID 不匹配都不删——留给真正的持有者
 // (若真是我们的锁, Unmarshal 必成; 若不是, 让下一轮 staleEventLock 兜底).
+//
+// 【CG-R1 R3 P2-2 收窄:核 PID→Remove 间隙的 TOCTOU】ReadFile 到 Remove 之间, 他人若判 stale
+// 强夺 (Rename+Link 新锁), 我们无脑 Remove(path) 会误删他们的新锁。改用 os.Rename 独占搬走
+// 再核内容: 属自身 PID 才 Remove; 内容变了(存活异 PID) 则 Link 归还, 让归属复原。
+// 与 state.go:releaseLock、tombstones.go:releaseTombstoneLock 同类闭合。
 func releaseEventLock(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -243,7 +258,14 @@ func releaseEventLock(path string) {
 	if li.PID != os.Getpid() {
 		return
 	}
-	_ = os.Remove(path)
+	stale := fmt.Sprintf("%s.rel-%d-%d", path, os.Getpid(), time.Now().UnixNano())
+	if err := os.Rename(path, stale); err != nil {
+		return
+	}
+	if isForeignLiveLock(stale) {
+		_ = os.Link(stale, path)
+	}
+	_ = os.Remove(stale)
 }
 
 // staleEventLock 是事件锁本地的更保守判据:严格执行"仅当(可解析&&!processAlive)或 mtime>TTL 才判 stale".

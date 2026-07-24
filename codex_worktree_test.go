@@ -553,6 +553,33 @@ func TestRemoteCodexReviewSandbox(t *testing.T) {
 			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes"},
 			"read-only",
 		},
+		{
+			// CG-R3 R2 P1-1:反例①—— ".." 词法逃逸:纯前缀比对下
+			// "D:/Project/PO-lanes/../OtherRepo" 字面以 "D:/Project/PO-lanes/" 起头,
+			// 会被误判为镜像→真实业务仓拿到 workspace-write。path.Clean 后应展开为
+			// "D:/Project/OtherRepo",不再是根子孙。
+			"'..' 逃逸(词法归约后跳出根) → read-only",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/../OtherRepo"},
+			"read-only",
+		},
+		{
+			// CG-R3 R2 P1-1:反例②—— "/." 边缘桩:纯前缀比对下
+			// "D:/Project/PO-lanes/." 字面不以 "D:/Project/PO-lanes/" 起头,却与根等价,
+			// 应视为"等于边缘"归 read-only(与 dir==root 同义)。
+			"'/.' 边缘等价桩(词法归约后等于根) → read-only",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/."},
+			"read-only",
+		},
+		{
+			// CG-R3 R2 P1-1:反例③—— 混合 ".." 与 "." 后仍落在子孙,应算镜像。
+			// 保证 Clean 归约不误伤合法子孙(正向不越界)。
+			"混合 .. / . 归约后仍是严格子孙 → workspace-write",
+			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/./sub/../ClaudeGo"},
+			"workspace-write",
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

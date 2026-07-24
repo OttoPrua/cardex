@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 )
@@ -219,15 +220,25 @@ func resolvedCodexReviewSandbox(cfg *Config) string {
 // isRemoteMirrorPath 判断远端 dir 是否位于 cfg.RemoteMirrorRoot 之下(sync-lane 分发的一次性镜像)。
 // 【为什么不用 filepath】远端 dir 可能是 Windows 路径("D:/Project/PO-lanes/ClaudeGo")或
 // posix 路径("/mirror/foo"),且路径分隔符可能反斜/正斜混用(config 手写 vs sync 脚本推导)——
-// filepath 会按本机分隔符做判断,跨平台易错。改用纯字符串前缀 + 归一 forward slash + 强制
-// trailing "/" 边界,消除"/foo" 假匹配"/foo-bar"这类前缀陷阱(见 TestRemoteCodexReviewSandbox 桌面案)。
+// filepath 会按本机分隔符做判断,跨平台易错。改用纯 / 语义的 path.Clean 归一 + 强制 trailing "/"
+// 边界,消除"/foo" 假匹配"/foo-bar"这类前缀陷阱(见 TestRemoteCodexReviewSandbox 桌面案)。
+// 【为什么要 path.Clean】纯前缀比对不会展开 ".." / "/." 段:
+// "D:/Project/PO-lanes/../OtherRepo" 字面以 "D:/Project/PO-lanes/" 起头会误判为镜像,
+// 真实业务仓就拿到 workspace-write——击穿"严格子孙才是镜像"硬保证(CG-R3 R2 P1-1)。
+// 先归一分隔符再 path.Clean(纯 /,与本机分隔符无关)才能杀掉这类词法绕过。
 func isRemoteMirrorPath(cfg *Config, dir string) bool {
 	if cfg == nil || cfg.RemoteMirrorRoot == "" || dir == "" {
 		return false
 	}
-	normDir := strings.ReplaceAll(dir, `\`, "/")
-	normRoot := strings.TrimRight(strings.ReplaceAll(cfg.RemoteMirrorRoot, `\`, "/"), "/")
-	if normRoot == "" {
+	normDir := path.Clean(strings.ReplaceAll(dir, `\`, "/"))
+	normRoot := path.Clean(strings.ReplaceAll(cfg.RemoteMirrorRoot, `\`, "/"))
+	// path.Clean("") == ".";空/"." 根不足以确权,保守不算镜像。
+	if normRoot == "" || normRoot == "." {
+		return false
+	}
+	// 等于边缘不是子孙(严格子孙才算镜像);Clean 已把 "root/." 归一为 "root",
+	// 所以这里同时挡住 ".../PO-lanes/." 这类"看着不等实际等"的桩。
+	if normDir == normRoot {
 		return false
 	}
 	return strings.HasPrefix(normDir, normRoot+"/")

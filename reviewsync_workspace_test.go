@@ -25,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -828,14 +829,205 @@ func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Makefile 应存在于仓根: %v", err)
 	}
+	// 【CG-R2b R2·2026-07-24 类闭合】护栏关键字必须落在代码执行位,不是 Makefile 注释——
+// 同 ps1 侧"注释可满足护栏"病类的兄弟洞:上一轮 R1 已为 ps1 侧剥 `#` 注释再断言(第 875 行),
+// Makefile 侧同理必须剥掉 `#` 起头的注释行,再对 codeBody 断言 "DesignReview" 等 pattern 关键片段。
+	var codeLines []string
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		codeLines = append(codeLines, line)
+	}
+	codeBody := strings.Join(codeLines, "\n")
+
 	must := []string{
-		"accept-sync:",                     // 目标声明
-		"CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1",  // 硬编码 env
-		"go test",                          // 触发验收测试
+		"accept-sync:",                    // 目标声明
+		"CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1", // 硬编码 env
+		"go test",                         // 触发验收测试
+		// 【CG-R2b R2·2026-07-24】pattern 必须覆盖 DesignReview 类装机模板断言;
+		// 首证 t0724-2033-0a20 P1-1:pattern 仅 'Sync|Verify' 时
+		// TestDesignReviewAndFixCycleTemplatesEmbedContractContent 的 (c) 段装机副本红线
+		// 脱离验收流,同 ⑭(R2 P1-3)"env 门无入口挂钩"病类。从 codeBody 里删掉 "DesignReview" 立即红。
+		"DesignReview",
 	}
 	for _, kw := range must {
-		if !strings.Contains(string(body), kw) {
-			t.Fatalf("Makefile 缺关键片段 %q —— accept-sync 目标未接线, body:\n%s", kw, string(body))
+		if !strings.Contains(codeBody, kw) {
+			t.Fatalf("Makefile 代码执行位缺关键片段 %q(注释里的字面提及不算,CG-R2b R2 类闭合) —— accept-sync 目标未接线, codeBody:\n%s", kw, codeBody)
+		}
+	}
+}
+
+// ⑯ 【CG-R2b R2·2026-07-24】accept-sync 的 -run pattern 必须覆盖所有 env=1-gated 测试名——类闭合。
+//
+// 【为什么单独立测】TestVerifyAcceptSyncMakefileTargetExists 只锁"pattern 里含 DesignReview 字面",
+// 未来若新增第 4/5 个 env=1-gated 测试(名字不带 Sync/Verify/DesignReview),仍会静默漂绿
+// (复刻本轮 P1-1 病类)。本挡动态枚举文件里所有 Test* 函数,只要函数体或其传递依赖的助手
+// (syncScriptsRoot/runSyncLocal/runVerify)引用了 CLAUDEGO_REQUIRE_SYNC_SCRIPTS,就必须能被
+// Makefile 的 -run pattern 匹上;匹不上 → 红。加装机测试却忘同步 pattern → 本挡红。
+//
+// 【类闭合枚举】既有 env=1-gated 测试(书面盘点,用于 sanity 检查):
+//   - Test*Sync* / Test*Verify* 系(经由 syncScriptsRoot/runSyncLocal/runVerify);
+//   - TestSyncScriptsInstalled(自读 env);
+//   - TestDesignReviewAndFixCycleTemplatesEmbedContractContent(自读 env,本轮首证)。
+//
+// 【杀的突变】
+//   ① 把 Makefile pattern 改回 'Sync|Verify' → TestDesignReviewAnd... 匹不上 → 本挡红;
+//   ② 新增一个 TestPrepFooEnvGated 但忘同步 pattern → 本挡红(pattern 覆盖度不足)。
+func TestAcceptSyncMakefilePatternCoversAllEnvGatedTests(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	// 从 Makefile 提出 -run 后面的 pattern 字符串(单引号包裹)。
+	mkBody, err := os.ReadFile(filepath.Join(repoRoot, "Makefile"))
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+	// -run '...' 里的内容;正则匹到第一处即用(accept-sync 目标唯一 -run 出现位)。
+	runRe := regexp.MustCompile(`-run '([^']+)'`)
+	m := runRe.FindStringSubmatch(string(mkBody))
+	if len(m) < 2 {
+		t.Fatalf("Makefile 里未找到 `-run '...'`(accept-sync 目标) —— body:\n%s", string(mkBody))
+	}
+	pattern := m[1]
+	patRe, err := regexp.Compile(pattern)
+	if err != nil {
+		t.Fatalf("Makefile -run pattern %q 编译为正则失败: %v", pattern, err)
+	}
+
+	// 读本测试文件,枚举所有 `func Test*(t *testing.T)` 函数;
+	// 函数体从 `func TestX(` 一直到下一个 `\nfunc `(或文件尾)。
+	self, err := os.ReadFile(filepath.Join(repoRoot, "reviewsync_workspace_test.go"))
+	if err != nil {
+		t.Fatalf("read self test file: %v", err)
+	}
+	src := string(self)
+
+	// 已知 env=1-gated 助手(引用 CLAUDEGO_REQUIRE_SYNC_SCRIPTS,或传递依赖它的 helper):
+	// syncScriptsRoot 直接读 env;runSyncLocal 与 runVerify 传递调用 syncScriptsRoot。
+	envGatedHelpers := []string{
+		"CLAUDEGO_REQUIRE_SYNC_SCRIPTS",
+		"syncScriptsRoot(",
+		"runSyncLocal(",
+		"runVerify(",
+	}
+
+	funcRe := regexp.MustCompile(`(?m)^func (Test[A-Za-z0-9_]+)\(t \*testing\.T\) \{`)
+	locs := funcRe.FindAllStringSubmatchIndex(src, -1)
+	if len(locs) == 0 {
+		t.Fatalf("枚举 Test* 函数为空 —— 正则漂?")
+	}
+	// 追加一个哨兵位置,方便算最后一个函数的 end。
+	ends := make([]int, len(locs))
+	for i := 0; i < len(locs); i++ {
+		if i+1 < len(locs) {
+			ends[i] = locs[i+1][0]
+		} else {
+			ends[i] = len(src)
+		}
+	}
+	var envGated []string
+	for i, loc := range locs {
+		name := src[loc[2]:loc[3]]
+		body := src[loc[0]:ends[i]]
+		hit := false
+		for _, h := range envGatedHelpers {
+			if strings.Contains(body, h) {
+				hit = true
+				break
+			}
+		}
+		if hit {
+			envGated = append(envGated, name)
+		}
+	}
+	if len(envGated) == 0 {
+		t.Fatalf("未枚举出任何 env=1-gated 测试 —— 助手清单或函数正则失效")
+	}
+	// sanity: 至少含本轮首证的 3 个已知点。
+	sanity := []string{"TestSyncScriptsInstalled", "TestDesignReviewAndFixCycleTemplatesEmbedContractContent"}
+	for _, s := range sanity {
+		found := false
+		for _, n := range envGated {
+			if n == s {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("env=1-gated 枚举缺已知测试 %s —— 助手识别正则漂;实际枚举=%v", s, envGated)
+		}
+	}
+	// 逐个断言 pattern 匹上。
+	var uncovered []string
+	for _, name := range envGated {
+		if !patRe.MatchString(name) {
+			uncovered = append(uncovered, name)
+		}
+	}
+	if len(uncovered) > 0 {
+		t.Fatalf("Makefile accept-sync 的 -run pattern %q 未覆盖 env=1-gated 测试 %v —— 装机漂移红线脱离验收流(P1-1 类闭合);修法:把测试名或名子串补进 pattern",
+			pattern, uncovered)
+	}
+}
+
+// ⑰ 【CG-R2b R2·2026-07-24】integration.sh 与模板渲染的字符级契约锁——类闭合。
+//
+// 【为什么】上一轮 CG-R2b R1 提交把 templates/design-review.md:3 `审核关注点：` 全角冒号
+// 改为半角 `审核关注点:`,而 test/integration.sh:60 grep 目标是全角 `审核关注点：focus` →
+// set -euo pipefail 下无匹配即静默 exit 1,截断 30+ 场景。本挡把"整数-sh grep 目标 <->
+// template 里的原文"两侧字节同源锁死;任一侧漂移(改字/半全角化)必红。
+//
+// 【类闭合枚举】integration.sh 中对模板渲染文本的 grep 断言:
+//   - line 60: `审核关注点：focus` <- templates/design-review.md 渲染 {{FOCUS}};
+//   - line 512: `按类闭合` <- templates/fix-cycle.md `## 按类闭合(硬要求)` 章节。
+//
+// 【杀的突变】
+//   ① templates/design-review.md 全角冒号改半角(本轮首证) → 本挡红;
+//   ② test/integration.sh:60 grep 改半角(未同步) → 本挡红;
+//   ③ templates/fix-cycle.md 删掉「按类闭合」章节 → 本挡红。
+func TestIntegrationShTemplateRenderContract(t *testing.T) {
+	repoRoot, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("Getwd: %v", err)
+	}
+	read := func(rel string) string {
+		body, err := os.ReadFile(filepath.Join(repoRoot, rel))
+		if err != nil {
+			t.Fatalf("read %s: %v", rel, err)
+		}
+		return string(body)
+	}
+	integration := read("test/integration.sh")
+	contracts := []struct {
+		name             string
+		templatePath     string
+		templateNeeds    string // 模板里必须出现的字节序列
+		integrationNeeds string // integration.sh 里必须出现的字节序列(常见形式是 grep 参数)
+	}{
+		{
+			name:             "design-review 审核关注点(全角冒号)<-> integration.sh:60 grep",
+			templatePath:     "templates/design-review.md",
+			templateNeeds:    "审核关注点：{{FOCUS}}",
+			integrationNeeds: `"审核关注点：focus"`,
+		},
+		{
+			name:             "fix-cycle 按类闭合章节 <-> integration.sh:512 grep",
+			templatePath:     "templates/fix-cycle.md",
+			templateNeeds:    "按类闭合",
+			integrationNeeds: `"按类闭合"`,
+		},
+	}
+	for _, c := range contracts {
+		tpl := read(c.templatePath)
+		if !strings.Contains(tpl, c.templateNeeds) {
+			t.Errorf("[%s] %s 缺片段 %q —— 模板侧漂移(如半/全角化),integration.sh set -euo pipefail 下会静默 exit 1 截断",
+				c.name, c.templatePath, c.templateNeeds)
+		}
+		if !strings.Contains(integration, c.integrationNeeds) {
+			t.Errorf("[%s] test/integration.sh 缺 grep 目标 %q —— 集成侧漂移(改字未同步模板)",
+				c.name, c.integrationNeeds)
 		}
 	}
 }

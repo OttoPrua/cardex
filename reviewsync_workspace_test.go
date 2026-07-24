@@ -864,24 +864,50 @@ func TestPowerShellVerifyScriptContainsR3Fixes(t *testing.T) {
 	if err != nil {
 		t.Fatalf(".ps1 应存在: %v", err)
 	}
+
+	// 【CG-R2b R1·2026-07-24 类闭合】护栏正向片段可能被 rationale 注释满足:
+	// 首证是 `-cmatch` —— ps1:132 注释含字面 `-cmatch`,把 145 行 `$p -cmatch $pat`
+	// 回滚为 `$p -match $pat` 后 strings.Contains(body,"-cmatch") 仍绿 → 突变逃逸。
+	// 同类风险面(枚举):`SortedSet` / `[Console]::OutputEncoding` / `[Console]::InputEncoding` /
+	// `.claudego-fingerprint.files` / `MANIFEST_SHA` 在 ps1 的 rationale 注释里都有字面提及,
+	// 单独用 body 级 strings.Contains 都会被注释满足。系统性修法:先剥掉所有 `#` 起始的注释行,
+	// 只在代码执行位的字节体 codeBody 上做正向断言 —— 一次闭合"注释可满足护栏"整个类。
+	var codeLines []string
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+		codeLines = append(codeLines, line)
+	}
+	codeBody := strings.Join(codeLines, "\n")
+
 	must := []string{
-		"StringComparer]::Ordinal",         // P0-1: 字节序等同排序
-		"SortedSet",                        // P0-1: 单遍排序+去重
-		"System.Text.UTF8Encoding",         // P1-1: UTF-8 编码构造
-		"[Console]::OutputEncoding",        // P1-1: stdout 通道编码
-		"[Console]::InputEncoding",         // P1-1: stdin 通道编码
-		".claudego-fingerprint.files",      // TA-2: 伴生文件校验
-		"MANIFEST_SHA",                     // TA-2: 与 header 的 MANIFEST_SHA 交叉断言
-		"-cmatch",                          // CG-R2b: 过滤走大小写敏感,与 .sh 侧 grep -Ev(ERE)同源;-match 默认不分大小写会误剔 .ds_store/.CLAUDEGO-FINGERPRINT 大小写变体 → 假 STALE
+		"StringComparer]::Ordinal",    // P0-1: 字节序等同排序
+		"SortedSet",                   // P0-1: 单遍排序+去重
+		"System.Text.UTF8Encoding",    // P1-1: UTF-8 编码构造
+		"[Console]::OutputEncoding",   // P1-1: stdout 通道编码
+		"[Console]::InputEncoding",    // P1-1: stdin 通道编码
+		".claudego-fingerprint.files", // TA-2: 伴生文件校验
+		"MANIFEST_SHA",                // TA-2: 与 header 的 MANIFEST_SHA 交叉断言
+		"$p -cmatch $pat",             // CG-R2b R1: 大小写敏感过滤;片段改代码唯一表达式(注释里只有裸 `-cmatch` 无 `$p ... $pat` 上下文)
 	}
 	for _, kw := range must {
-		if !strings.Contains(string(body), kw) {
-			t.Fatalf(".ps1 缺 R3 修法关键片段 %q —— 说明分发的是 R2 或更早版本(或修法漂), 完整 body 长度=%d", kw, len(body))
+		if !strings.Contains(codeBody, kw) {
+			t.Fatalf(".ps1 代码执行位缺 R3 修法关键片段 %q(注释里的字面提及不算,CG-R2b R1 类闭合) —— 说明分发的是 R2 或更早版本(或修法漂),完整 body 长度=%d, codeBody 长度=%d", kw, len(body), len(codeBody))
 		}
 	}
 	// 反面挡:R2 的 `| Sort-Object` 管道用法(语言学序)不应残留在代码路径。
 	// 【注】.ps1 rationale 注释里为解释修法会用反引号引用 `Sort-Object -CaseSensitive -Unique` 字面串,
 	// 那不是代码执行路径,不应误报;所以匹配"管道进入 Sort-Object"这一执行位模式(注释里的引用无 `| ` 前缀)。
+	//
+	// 【CG-R2b R1·2026-07-24】新增:大小写敏感对称的负面挡。
+	// PowerShell `-match`/`-imatch` 默认不分大小写,与 sh 侧 `grep -Ev`(ERE,分大小写)不同源
+	// → untracked 大小写变体(.ds_store / .CLAUDEGO-FINGERPRINT) Mac 侧计入 stored manifest,
+	//   而 ps1 A 通道过滤时被 `-match` 误剔 → COUNT+逐行必不等 → 假 STALE 空转。
+	// 【杀的突变】把过滤循环里 `$p -cmatch $pat` 回滚为 `$p -match $pat` 或 `$p -imatch $pat` → 本挡红。
+	// 小写化后匹配,兼容 `-Match`/`-MATCH` 等大小写变体(PowerShell 操作符本身大小写不敏感)。
+	// `-cmatch $pat` 首字符差异不会命中 `-match $pat`/`-imatch $pat` 子串(手工 offset 验证过),
+	// 因此不会误报正确写法。
 	for _, line := range strings.Split(string(body), "\n") {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "#") {
@@ -889,6 +915,13 @@ func TestPowerShellVerifyScriptContainsR3Fixes(t *testing.T) {
 		}
 		if strings.Contains(trimmed, "| Sort-Object") {
 			t.Fatalf(".ps1 代码路径仍含 `| Sort-Object`(R2 版走 .NET 语言学序,与 sh 的 LC_ALL=C sort -u 不同源)—— 该行必须已换成 SortedSet+Ordinal;命中行:%q", trimmed)
+		}
+		lower := strings.ToLower(trimmed)
+		if strings.Contains(lower, "-match $pat") {
+			t.Fatalf(".ps1 代码路径含 `-match $pat`(PowerShell 默认不分大小写,与 sh 侧 `grep -Ev` 不同源 → 大小写变体假 STALE)—— 必须用 `-cmatch`;命中行:%q", trimmed)
+		}
+		if strings.Contains(lower, "-imatch $pat") {
+			t.Fatalf(".ps1 代码路径含 `-imatch $pat`(强制不分大小写,与 sh 侧不同源)—— 必须用 `-cmatch`;命中行:%q", trimmed)
 		}
 	}
 }
@@ -1023,5 +1056,87 @@ func TestVerifyPassesWithDeletedTrackedFile(t *testing.T) {
 	// (c) verify 通过(两侧同 DELETED)。
 	if code := runVerify(t, m); code != 0 {
 		t.Fatalf("DELETED 分支两侧对称,verify 应 exit 0, got=%d", code)
+	}
+}
+
+// ⑱ 【CG-R2b R1·2026-07-24】模板 D 通道自门 + 修 1 剔除清单同源片段护栏。
+//
+// 【为什么】上一轮 CG-R2b 修 1 只落在 ~/.claudego/templates/design-review.md,
+// 仓库内嵌源 templates/design-review.md 曾缺整个开工自门章节;templates.go:41-51
+// loadTemplate 在数据目录模板缺失时静默回退内嵌版 → 新机装机 / ~/.claudego 副本被清
+// → 自门连同修 1(剔除 .claudego-fingerprint.files 伴生文件)整体无声消失,假 STALE 病
+// 类"闭合"随之蒸发。同类风险:fix-cycle.md 的"提交前机械门"章节曾同样只在装机侧,
+// 修法失效同理。本用例把内嵌源 + 装机副本双侧断言,一次闭合"关键修法仅落装机侧"整个类。
+//
+// 【杀的突变】
+//   ① 从 templates/design-review.md 里删掉开工自门章节 → 内嵌断言红;
+//   ② 从 templates/design-review.md 里删掉 `.claudego-fingerprint(.files)?` 剔除行
+//      → 内嵌断言红(CG-R2b 修 1 直击);
+//   ③ 从 templates/fix-cycle.md 里删掉"提交前机械门"章节 → 内嵌断言红;
+//   ④ 装机侧模板漂移到无自门/无机械门 → env=1 下装机断言红。
+func TestDesignReviewAndFixCycleTemplatesEmbedContractContent(t *testing.T) {
+	// (a) 内嵌 design-review.md 必含开工自门 + 修 1 剔除清单同源片段。
+	//     用不存在的 root 让 loadTemplate 走 embedded 兜底路径。
+	fakeRoot := filepath.Join(t.TempDir(), "no-such-root")
+	drEmbedded, err := loadTemplate(fakeRoot, "design-review")
+	if err != nil {
+		t.Fatalf("loadTemplate design-review 内嵌兜底失败: %v", err)
+	}
+	drMustEmbedded := []string{
+		"开工自门",                          // 章节头
+		"verify-mirror-fingerprint",     // 自门主脚本引用
+		".claudego-fingerprint(.files)?", // CG-R2b 修 1:剔除清单同源正则(伴生文件必包含)
+		"D·原语拆解",                       // D 通道原语兜底章节标识
+	}
+	for _, kw := range drMustEmbedded {
+		if !strings.Contains(drEmbedded, kw) {
+			t.Fatalf("内嵌 templates/design-review.md 缺 CG-R2 自门/CG-R2b 修 1 关键片段 %q —— 说明修法仅落 ~/.claudego 副本,新机装机/副本被清将无声退化;修法:把 ~/.claudego/templates/design-review.md 完整回灌到仓库 templates/design-review.md", kw)
+		}
+	}
+
+	// (b) 内嵌 fix-cycle.md 必含"提交前机械门"章节 + go build/go test 关键片段。
+	fcEmbedded, err := loadTemplate(fakeRoot, "fix-cycle")
+	if err != nil {
+		t.Fatalf("loadTemplate fix-cycle 内嵌兜底失败: %v", err)
+	}
+	fcMustEmbedded := []string{
+		"提交前机械门",
+		"go build ./...",
+		"go test ./...",
+	}
+	for _, kw := range fcMustEmbedded {
+		if !strings.Contains(fcEmbedded, kw) {
+			t.Fatalf("内嵌 templates/fix-cycle.md 缺提交前机械门关键片段 %q —— 修法仅落 ~/.claudego 副本,内嵌兜底会让修复卡失去 build/test 硬要求;修法:把 ~/.claudego/templates/fix-cycle.md 回灌到仓库 templates/fix-cycle.md", kw)
+		}
+	}
+
+	// (c) CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 下再断言装机副本 ~/.claudego/templates/*.md 也含上述片段
+	//    (装机验收流水的显式红线;缺省不吵异环境)。
+	requireEnv := os.Getenv("CLAUDEGO_REQUIRE_SYNC_SCRIPTS") == "1"
+	if !requireEnv {
+		t.Log("提示(非致命):设 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 可对 ~/.claudego 装机副本追加同源断言")
+		return
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	for _, name := range []string{"design-review", "fix-cycle"} {
+		p := filepath.Join(home, ".claudego", "templates", name+".md")
+		body, err := os.ReadFile(p)
+		if err != nil {
+			t.Fatalf("装机模板 %s 缺失或不可读 (%v) —— CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 下必须存在", p, err)
+		}
+		var must []string
+		if name == "design-review" {
+			must = drMustEmbedded
+		} else {
+			must = fcMustEmbedded
+		}
+		for _, kw := range must {
+			if !strings.Contains(string(body), kw) {
+				t.Fatalf("装机 %s 缺关键片段 %q —— 装机副本漂/旧版本;修法:重跑 writeDefaultTemplates 或从仓库 templates/%s.md 覆盖", p, kw, name)
+			}
+		}
 	}
 }

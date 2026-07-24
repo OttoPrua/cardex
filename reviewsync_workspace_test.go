@@ -872,6 +872,7 @@ func TestPowerShellVerifyScriptContainsR3Fixes(t *testing.T) {
 		"[Console]::InputEncoding",         // P1-1: stdin 通道编码
 		".claudego-fingerprint.files",      // TA-2: 伴生文件校验
 		"MANIFEST_SHA",                     // TA-2: 与 header 的 MANIFEST_SHA 交叉断言
+		"-cmatch",                          // CG-R2b: 过滤走大小写敏感,与 .sh 侧 grep -Ev(ERE)同源;-match 默认不分大小写会误剔 .ds_store/.CLAUDEGO-FINGERPRINT 大小写变体 → 假 STALE
 	}
 	for _, kw := range must {
 		if !strings.Contains(string(body), kw) {

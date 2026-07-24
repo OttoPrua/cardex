@@ -107,18 +107,18 @@ func TestOAuthUsageBlocksAtRedline(t *testing.T) {
 	resetOAuthUsageCache()
 	t.Cleanup(resetOAuthUsageCache)
 
-	frac := 0.9 // 起始 90%(以 0.9 分数域喂端点),红线 85% → 应 block
+	pct := 90 // 起始 90%(CG-1b 实测百分域，整数形态),红线 85% → 应 block
 	srv, authPtr, count := startMockOAuthServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"five_hour": map[string]any{"utilization": frac},
+			"five_hour": map[string]any{"utilization": pct},
 		})
 	})
 	cfg := baseCfg(t, srv.URL, creds, 85)
 
 	blocked, reason := budgetBlocked(dir, cfg, time.Now())
 	if !blocked {
-		t.Fatalf("端点报 %.2f(90%%) ≥ 红线 85%% 应 block，实得 blocked=false", frac)
+		t.Fatalf("端点报 %d%% ≥ 红线 85%% 应 block，实得 blocked=false", pct)
 	}
 	if reason == "" {
 		t.Fatal("block 时必须有 reason 披露")
@@ -126,8 +126,8 @@ func TestOAuthUsageBlocksAtRedline(t *testing.T) {
 	mustAssertBearer(t, authPtr) // 硬校验凭据实际送达端点
 	firstCount := *count
 
-	// 低于线样本：切回 40%(0.4 分数域) → 应放行。**必须显式清缓存**,否则 15min TTL 内命中旧样本。
-	frac = 0.4
+	// 低于线样本：切回 40%(整数百分域) → 应放行。**必须显式清缓存**,否则 15min TTL 内命中旧样本。
+	pct = 40
 	resetOAuthUsageCache()
 	blocked, _ = budgetBlocked(dir, cfg, time.Now())
 	if blocked {
@@ -324,9 +324,11 @@ func TestParseOAuthUsageBodyShapes(t *testing.T) {
 		body string
 		want int // 期望的 5h 百分比；-1 表示应识别为"数据不足"
 	}{
-		{"扁平 five_hour + utilization 分数", `{"five_hour":{"utilization":0.42}}`, 42},
+		{"扁平 five_hour + utilization 分数刻度歧义→拒判", `{"five_hour":{"utilization":0.42}}`, -1},
+		{"扁平 five_hour + utilization 整数百分域→42%", `{"five_hour":{"utilization":42}}`, 42},
 		{"扁平 fiveHour + used_percent 整数", `{"fiveHour":{"used_percent":73}}`, 73},
-		{"windows[] 数组 + name=5h", `{"windows":[{"name":"5h","utilization":0.55},{"name":"7d","utilization":0.1}]}`, 55},
+		{"windows[] 数组 + name=5h + utilization 分数刻度歧义→拒判", `{"windows":[{"name":"5h","utilization":0.55},{"name":"7d","utilization":0.1}]}`, -1},
+		{"windows[] 数组 + name=5h + utilization 整数百分域", `{"windows":[{"name":"5h","utilization":55},{"name":"7d","utilization":10}]}`, 55},
 		{"windows[] 数组 + window_minutes=300", `{"windows":[{"window_minutes":300,"used_percent":88}]}`, 88},
 		{"只有 seven_day 无 5h", `{"seven_day":{"utilization":0.9}}`, -1},
 		{"空 JSON 对象", `{}`, -1},
@@ -335,12 +337,12 @@ func TestParseOAuthUsageBodyShapes(t *testing.T) {
 		// 老版把 ≤1 一体 ×100 会读成 100% 假报"已用 100%"锁死全队列;新语义按字段名硬分派,
 		// used_percent 铁定 0-100 域原样→期望 1。
 		{"used_percent=1 边界真1%(不是刻度歧义)", `{"five_hour":{"used_percent":1}}`, 1},
-		// utilization=0.01 (真实 1%) 走分数×100 路径:确认低值边界不被误判为 0 或歧义。
-		{"utilization=0.01 分数域低值真1%", `{"five_hour":{"utilization":0.01}}`, 1},
-		// utilization=1 是刻度歧义点(可能是 1% 也可能是 100%),不猜→数据不足。
+		// utilization=0.01 落在 (0,1] 刻度歧义区间：旧分数 ×100=1% 或新百分 0.01% 均不可信，拒判。
+		{"utilization=0.01 刻度歧义区间拒判", `{"five_hour":{"utilization":0.01}}`, -1},
+		// utilization=1 同样在 (0,1] 歧义区间(1% vs 100% 不可分)→拒判。
 		{"utilization=1 刻度歧义拒判", `{"five_hour":{"utilization":1}}`, -1},
-		// utilization=1.5 超出 0-1 分数域→数据不足,防"未来端点写整数刻度混过 utilization"。
-		{"utilization=1.5 超出分数域拒判", `{"five_hour":{"utilization":1.5}}`, -1},
+		// utilization=1.5 在 (1,100] 百分域合法→2%（不再超出分数域拒判）。
+		{"utilization=1.5 百分域合法→2%", `{"five_hour":{"utilization":1.5}}`, 2},
 		// used_percent=101 超出 0-100 百分比域→数据不足,防"垃圾读数被 clamp 后当有效"。
 		{"used_percent=101 超出百分比域拒判", `{"five_hour":{"used_percent":101}}`, -1},
 	}
@@ -390,8 +392,9 @@ func strContains(haystack, needle string) bool {
 
 // TestReadPercentFieldsRejectsAmbiguousScales — P1-1 底层反例。
 // 老版 readPercentFields 做"0-1 视为分数×100、>1 视为百分比原样"的自动归一,
-// 在整数刻度崩塌:utilization:1(真实1%)→100%,used_percent:0.8(真实 0.8%)→80% 假触线。
-// 新语义:按字段名硬分派、utilization 严格 0-1 分数域(1 判歧义)、used_percent 铁定 0-100 域原样取。
+// 在整数刻度崩塌:used_percent:0.8(真实 0.8%)→80% 假触线。
+// CG-1b 追加:端点实测 utilization 是 0-100 百分比域；(0,1] 区间刻度歧义，拒判为数据不足。
+// 新语义:按字段名硬分派、拒绝任何自动归一、任一歧义值一律"数据不足"拒响应。
 func TestReadPercentFieldsRejectsAmbiguousScales(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -399,11 +402,11 @@ func TestReadPercentFieldsRejectsAmbiguousScales(t *testing.T) {
 		want  int    // -1 表示应识别为歧义/不可信
 		ambig string // 期望 ambig 关键词(空则不强求)
 	}{
-		{"utilization=1(整数)刻度歧义", map[string]any{"utilization": 1}, -1, "刻度歧义"},
+		{"utilization=1(整数)刻度歧义区间", map[string]any{"utilization": 1}, -1, "刻度歧义"},
 		{"utilization=1.0(float)同样拒", map[string]any{"utilization": 1.0}, -1, "刻度歧义"},
-		{"utilization=1.5 超出 0-1 分数域", map[string]any{"utilization": 1.5}, -1, "超出"},
+		{"utilization=1.5 百分域合法值→2%", map[string]any{"utilization": 1.5}, 2, ""},
 		{"utilization=-0.1 负值域外", map[string]any{"utilization": -0.1}, -1, "超出"},
-		{"utilization=0.42 合法分数域→42%", map[string]any{"utilization": 0.42}, 42, ""},
+		{"utilization=0.42 刻度歧义区间拒判", map[string]any{"utilization": 0.42}, -1, "刻度歧义"},
 		{"utilization=0(边界零)→0%", map[string]any{"utilization": 0}, 0, ""},
 		{"used_percent=0.8 老版会假触 80%,新语义原样→四舍五入 1%", map[string]any{"used_percent": 0.8}, 1, ""},
 		{"used_percent=80 合法百分比", map[string]any{"used_percent": 80}, 80, ""},
@@ -655,6 +658,74 @@ func TestLoadOAuthAccessTokenHardIsolatesWhenCredsPathSet(t *testing.T) {
 	cfg2 := &Config{}
 	if tok := loadOAuthAccessToken(cfg2); tok != "sk-ant-oat01-REAL-should-NOT-be-touched" {
 		t.Fatalf("自检:未硬隔离时兜底 HOME 路径应命中,实得 %q", tok)
+	}
+}
+
+// TestCG1bUtilizationPercentDomain — CG-1b 回归锚：utilization 字段实测为 0-100 百分比域。
+//
+// 正反双例证伪两侧归一方向：
+//   - 正例 utilization=54 → 54%（不再"数据不足"）；
+//   - 反例 utilization=0.54 旧分数形态 → 拒判（旧 ×100=54% 或新原样=0.54%，两判均错）。
+//
+// 另：从 testdata/oauth_usage_fixture.json 读脱敏实样 fixture 作额外回归锚（字段形状照真响应，数值已改）。
+func TestCG1bUtilizationPercentDomain(t *testing.T) {
+	now := time.Now()
+
+	// 单元层（直接走 parseOAuthUsageBody）
+	unitCases := []struct {
+		name      string
+		body      string
+		wantPct   int
+		wantOK    bool
+		wantAmbig string
+	}{
+		// 正例：实测形态，直接判 54%
+		{"utilization=54 百分域→54%", `{"five_hour":{"utilization":54}}`, 54, true, ""},
+		// 反例①：旧分数形态，两判均错，拒判（双向防归一）
+		{"utilization=0.54 刻度歧义拒判", `{"five_hour":{"utilization":0.54}}`, 0, false, "刻度歧义"},
+	}
+	for _, c := range unitCases {
+		s, err := parseOAuthUsageBody([]byte(c.body), now)
+		if c.wantOK {
+			if err != nil {
+				t.Errorf("%s: 不应 error，实得 %v", c.name, err)
+				continue
+			}
+			if s == nil || !s.PercentOK || s.Percent != c.wantPct {
+				t.Errorf("%s: 期望 %d%%，实得 %+v", c.name, c.wantPct, s)
+			}
+			continue
+		}
+		// 反例：应拒判（PercentOK=false 或 error）
+		if err == nil && s != nil && s.PercentOK {
+			t.Errorf("%s: 应拒判为数据不足，实得 percent=%d", c.name, s.Percent)
+			continue
+		}
+		if c.wantAmbig != "" {
+			reason := ""
+			if s != nil {
+				reason = s.Reason
+			}
+			if !strContains(reason, c.wantAmbig) {
+				t.Errorf("%s: Reason 应含 %q，实得 %q", c.name, c.wantAmbig, reason)
+			}
+		}
+	}
+
+	// 脱敏 fixture 回归锚（testdata/oauth_usage_fixture.json）
+	fixBody, err := os.ReadFile("testdata/oauth_usage_fixture.json")
+	if err != nil {
+		t.Fatalf("读 fixture 失败: %v", err)
+	}
+	fs, ferr := parseOAuthUsageBody(fixBody, now)
+	if ferr != nil {
+		t.Fatalf("fixture 解析出错: %v", ferr)
+	}
+	if fs == nil || !fs.PercentOK {
+		t.Fatalf("fixture 应解析为有效百分比，实得 %+v", fs)
+	}
+	if fs.Percent < 0 || fs.Percent > 100 {
+		t.Fatalf("fixture 百分比超出 [0,100] 域，实得 %d", fs.Percent)
 	}
 }
 

@@ -459,11 +459,11 @@ func isFiveHourWindow(name, kind string, mins int) bool {
 // 返回 (percent, ok, ambig)——ok=true 表示读到可信百分比;ok=false 且 ambig 非空:字段命中但值歧义/域外,
 // 上层应按"数据不足"披露 ambig 拒响应;ok=false 且 ambig 为空:字段全缺失(不构成异常,继续尝试兄弟节点)。
 //
-// 教训:老版做"0-1 视为分数×100、>1 视为百分比原样"的自动归一——在整数刻度上崩塌:
-//   * utilization:1 真实语义 1%,老版判为分数上限→100% 触发假红线锁队列;
-//   * used_percent:0.8 真实语义 0.8%,老版判为分数×100→80% 同样假触线。
-// 违背模块自身"数据不足不锁队列"的 fail-open 纪律。新语义按字段名硬分派、拒绝任何自动归一,
-// 任一歧义值一律"数据不足"拒响应(fail-open 方向,与其余异常路径一致)。
+// 教训1(CG-1):老版做"0-1 视为分数×100、>1 视为百分比原样"的自动归一——在整数刻度崩塌:
+//   * used_percent:0.8 真实语义 0.8%,老版判为分数×100→80% 假触线。
+// 教训2(CG-1b):端点实测 utilization 是 0-100 百分比域（返回如 54），非 0-1 分数域；
+//   (0,1] 区间存在刻度歧义（旧分数写法 vs 新百分写法），拒判为数据不足。
+// 新语义：按字段名硬分派、拒绝任何自动归一，任一歧义值一律"数据不足"拒响应（fail-open）。
 func readPercentFields(node map[string]any) (int, bool, string) {
 	for _, key := range []string{"utilization", "used_percent", "usedPercent", "percent"} {
 		v, ok := node[key]
@@ -475,15 +475,15 @@ func readPercentFields(node map[string]any) (int, bool, string) {
 			continue
 		}
 		if key == "utilization" {
-			// utilization 严格 0-1 分数域,不接受 0-100 混跑
+			// CG-1b:端点实测为 0-100 百分比域（如 54），按字段名硬分派，原样取整，永不 ×100。
+			// 防双向归一护栏：(0,1] 区间刻度歧义——旧分数写法 ×100 或新百分写法原样均错，拒判。
 			switch {
-			case num < 0 || num > 1:
-				return 0, false, fmt.Sprintf("utilization=%.4g 超出 0-1 分数域", num)
-			case num == 1:
-				// 1 既可能是 1%(整数刻度)也可能是 100%(分数上限)——不猜,判"数据不足"
-				return 0, false, "utilization=1 落在 1%/100% 刻度歧义点(端点约定不明,拒判为数据不足)"
+			case num < 0 || num > 100:
+				return 0, false, fmt.Sprintf("utilization=%.4g 超出 0-100 百分比域", num)
+			case num > 0 && num <= 1:
+				return 0, false, fmt.Sprintf("utilization=%.4g 落在刻度歧义区间 (0,1]：旧分数域 ×100 或新百分域原样两判均错，拒判为数据不足", num)
 			default:
-				return int(num*100 + 0.5), true, ""
+				return int(num + 0.5), true, ""
 			}
 		}
 		// used_percent/usedPercent/percent 铁定 0-100 百分比域,原样取整,永不 ×100

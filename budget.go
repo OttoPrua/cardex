@@ -376,8 +376,9 @@ func fetchOAuthUsage(cfg *Config, now time.Time) (*oauthUsageSample, error) {
 // 端点未文档化 → 用宽松+防御式解析：
 //  - 尝试几种已观察到的字段路径（five_hour / fiveHour / windows[]）；
 //  - 兼容 utilization / used_percent / percent 命名；
-//  - 数值域自动识别 0-1（乘 100）或 0-100（原样）；
-//  - **拿不到就返回 PercentOK=false**（"端点已变更/字段缺失"=数据不足，不猜、不用 header 兜底）。
+//  - 数值域按字段名硬分派、绝不自动归一（CG-1b）：utilization 认 0-100 域原样取整，
+//    (0,1] 区间刻度歧义拒判；used_percent/usedPercent/percent 铁定 0-100 域原样取，详见 readPercentFields；
+//  - **拿不到就返回 PercentOK=false**（"端点已变更/字段缺失/值歧义"=数据不足，不猜、不用 header 兜底）。
 func parseOAuthUsageBody(body []byte, now time.Time) (*oauthUsageSample, error) {
 	if !json.Valid(body) {
 		return nil, fmt.Errorf("响应不是有效 JSON")

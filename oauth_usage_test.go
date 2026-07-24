@@ -97,9 +97,9 @@ func baseCfg(t *testing.T, url, credsPath string, rp int) *Config {
 }
 
 // 验收 1：mock 端点返回 utilization ≥ redline_percent → tick 不派发；改注入低于线样本 → 恢复派发。
-// **注意**:老版此处 pct 传的是整数 90——利用了老 readPercentFields "num>1 视为百分比原样"的启发式;
-// 新语义 utilization 严格 0-1 分数域,整数刻度已被拒绝。所以这里改用 utilization 的合法域(0.9/0.4)+
-// 另留一条形态 A 走 used_percent(0-100 域直取)的场景,双保险覆盖两个字段路径。
+// **注意**:老版(CG-1)此处 pct 传的是整数 90——利用了老 readPercentFields "num>1 视为百分比原样"的启发式。
+// CG-1b 修正后 utilization 实测为 0-100 百分域,整数 90/40 本就是合法直取值(非刻度歧义),
+// 与 used_percent 通道同规矩——两次注入分别走 utilization 通道,覆盖红线上下两侧。
 func TestOAuthUsageBlocksAtRedline(t *testing.T) {
 	dir := t.TempDir()
 	creds := writeFakeCreds(t, dir)
@@ -278,8 +278,8 @@ func TestBudgetBlockedTakesWorstOfThreeSources(t *testing.T) {
 	}
 
 	// oauth_usage：mock 端点报 82%(走 used_percent 通道,0-100 域直取)。
-	// 老版此处用 utilization:82(整数刻度)——新语义下 utilization 严格 0-1 分数域,
-	// 82 已超出域被判"数据不足",反而不会 block,场景意图会失效。
+	// 注:CG-1b 后 utilization 通道同样认 0-100 域,此处若换成 utilization:82 会等价直取 82%;
+	// 选 used_percent 只是顺带覆盖 oauth 侧另一条字段路径(utilization 通道已被别的用例覆盖)。
 	srv, authPtr, _ := startMockOAuthServer(t, func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"five_hour": map[string]any{"used_percent": 82},
@@ -712,7 +712,10 @@ func TestCG1bUtilizationPercentDomain(t *testing.T) {
 		}
 	}
 
-	// 脱敏 fixture 回归锚（testdata/oauth_usage_fixture.json）
+	// 脱敏 fixture 回归锚（testdata/oauth_usage_fixture.json）——字段形状已独立核对真实端点响应
+	// （five_hour/seven_day 各 5 字段含 3 个 null 的 *_dollars、limits[]/extra_usage/spend 等兄弟节点
+	// 与大量顶层 null），非单键 inline 同构体。five_hour.utilization=42 与 seven_day.utilization=88
+	// 刻意取不同值：断言精确绑定 42，若解析器未来误抓 seven_day 或把 42 读岔，此断言必红。
 	fixBody, err := os.ReadFile("testdata/oauth_usage_fixture.json")
 	if err != nil {
 		t.Fatalf("读 fixture 失败: %v", err)
@@ -724,8 +727,68 @@ func TestCG1bUtilizationPercentDomain(t *testing.T) {
 	if fs == nil || !fs.PercentOK {
 		t.Fatalf("fixture 应解析为有效百分比，实得 %+v", fs)
 	}
-	if fs.Percent < 0 || fs.Percent > 100 {
-		t.Fatalf("fixture 百分比超出 [0,100] 域，实得 %d", fs.Percent)
+	if fs.Percent != 42 {
+		t.Fatalf("fixture 应精确解出 5h 窗口 42%%(非 seven_day 的 88%%，非 clamp 后随便一个域内值)，实得 %d", fs.Percent)
+	}
+}
+
+// TestReadmeUtilizationContractMatchesImplementation — P1-1 回归护栏(文档-实现契约漂移类)。
+//
+// CG-1b 复审曾抓到:budget.go 已把 utilization 判为 0-100 百分域,但 README.md/README.en.md
+// 契约句仍写着被推翻的"严格 0-1 分数域"旧语义——维护者可能照旧文档把代码"纠正"回分数域重演
+// 归一乒乓,或用户按文档喂 0-1 mock 反得到反直觉拒判。本测试钉死两份 README:
+//   - 不得再含旧契约短语(证伪:若谁把句子改回旧措辞,本测试报红);
+//   - 必须含新契约的三个关键判据(100 百分域直取 / (0,1] 歧义拒判 / >100 域外拒判)。
+func TestReadmeUtilizationContractMatchesImplementation(t *testing.T) {
+	cases := []struct {
+		file          string
+		staleMarkers  []string
+		requiredGroup [][]string // 每个子切片=一个判据的同义候选,组内命中一个即算该判据过
+	}{
+		{
+			file:         "README.md",
+			staleMarkers: []string{"严格 0-1 分数域"},
+			requiredGroup: [][]string{
+				{"0-100 百分域"},
+				{"(0,1]"},
+				{"刻度歧义"},
+				{">100 域外"},
+			},
+		},
+		{
+			file:         "README.en.md",
+			staleMarkers: []string{"strict 0-1 fractional domain"},
+			requiredGroup: [][]string{
+				{"0-100 percentage domain"},
+				{"(0,1]"},
+				{"scale-ambiguous"},
+				{">100` are likewise rejected as out-of-domain", ">100 are likewise rejected as out-of-domain"},
+			},
+		},
+	}
+	for _, c := range cases {
+		data, err := os.ReadFile(c.file)
+		if err != nil {
+			t.Fatalf("read %s: %v", c.file, err)
+		}
+		content := string(data)
+		for _, stale := range c.staleMarkers {
+			if strContains(content, stale) {
+				t.Errorf("%s: 仍含已被推翻的旧契约短语 %q——与 budget.go 的 0-100 百分域实现矛盾", c.file, stale)
+			}
+		}
+		for _, group := range c.requiredGroup {
+			hit := false
+			for _, m := range group {
+				if strContains(content, m) {
+					hit = true
+					break
+				}
+			}
+			if !hit {
+				t.Errorf("%s: 未找到新契约判据(候选 %v 均未命中)", c.file, group)
+			}
+		}
 	}
 }
 

@@ -1,10 +1,14 @@
 package main
 
-// board.go — 只读 Web 看板的 HTTP 层。
+// board.go — Web 看板的 HTTP 层。
 //
 // 三条纪律：
-//  1. **只读**。所有 handler 只经 os.ReadFile / os.ReadDir 读 ~/.claudego，
-//     不写任何文件、不改任何任务状态。看板挂在生产队列数据上，误写会污染真实队列。
+//  1. **队列数据只读**。所有 handler 读 ~/.claudego 只经 os.ReadFile / os.ReadDir，
+//     tasks/ / archive/ / events/ / 任务 JSON 一个字节都不写、任何任务状态都不改。
+//     看板挂在生产队列数据上，误写会污染真实队列。
+//     唯一的例外是**看板自己的视图状态**：POST /api/project/archive 写
+//     <root>/board_archive.json（项目折叠状态，见 boardarchive.go）。它不参与调度、
+//     不被 runner/tick/patrol 读取、删掉也不丢任何队列数据；GET 路径仍然零写入。
 //  2. **只听 127.0.0.1**。数据里含 prompt 全文、目录路径、账号额度，不该出本机。
 //     -addr 可显式覆盖，但默认永远是回环地址。
 //  3. **带缓存**。tasks/ + archive/ 近 2000 个 JSON、transcript 数十 MB，
@@ -19,6 +23,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -50,6 +55,13 @@ type OverviewResp struct {
 	// 上一轮 review-divert P1-2 根因就是横幅无条件写 syntax 文案——name/desc 明明还生效,
 	// 披露自身失实即 fail-honest 卡自身破线。契约字段名不得擅改(app.js grep 有依赖)。
 	BoardOverrideErrorKind string `json:"board_override_error_kind,omitempty"`
+	// ArchiveStateError 是 board_archive.json 读失败的诊断串（有则挂前端告警）。
+	// 与 override 同理：读不出归档状态时**必须**说出来——静默当成"没有任何项目被归档"
+	// 会让用户手动折叠的十个项目一次性全部冒出来，且界面上零提示。
+	ArchiveStateError string `json:"archive_state_error,omitempty"`
+	// ArchivedCount 是被折叠掉的项目数。前端默认不渲染归档项目，
+	// 不发这个数的话「总览少了三个项目」与「这三个项目没卡了」在界面上无法区分。
+	ArchivedCount int `json:"archived_count"`
 }
 
 // BoardColumn 是 kanban 的一列。
@@ -77,10 +89,11 @@ type ActivityItem struct {
 }
 
 type ProjectResp struct {
-	Project        *Project       `json:"project"`
-	Columns        []BoardColumn  `json:"columns"`
-	PhaseLanes     []PhaseLane    `json:"phase_lanes"`
-	RecentActivity []ActivityItem `json:"recent_activity"`
+	Project           *Project       `json:"project"`
+	Columns           []BoardColumn  `json:"columns"`
+	PhaseLanes        []PhaseLane    `json:"phase_lanes"`
+	RecentActivity    []ActivityItem `json:"recent_activity"`
+	ArchiveStateError string         `json:"archive_state_error,omitempty"`
 }
 
 // ---- 看板服务 ----
@@ -90,6 +103,9 @@ type boardServer struct {
 	snap  *boardCache
 	burn  *burnCache
 	clock func() time.Time
+	// arch 给 board_archive.json 的 read-modify-write 上锁。多标签页同时点归档时，
+	// 无锁会丢更新（两个页面各归档一个项目，后写的把先写的抹掉）。
+	arch boardArchiveStore
 }
 
 // 列顺序按契约固定：running, queued, limit_paused, held, failed, done。
@@ -179,6 +195,7 @@ func (s *boardServer) routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/overview", withGzip(s.handleOverview))
 	mux.HandleFunc("/api/project", withGzip(s.handleProject))
+	mux.HandleFunc("/api/project/archive", s.handleArchive)
 	mux.HandleFunc("/api/burn", withGzip(s.handleBurn))
 	mux.HandleFunc("/api/health", s.handleHealth)
 	mux.HandleFunc("/static/", s.handleStatic)
@@ -219,6 +236,37 @@ func (s *boardServer) handleStatic(w http.ResponseWriter, r *http.Request) {
 	http.StripPrefix("/static/", http.FileServer(http.FS(sub))).ServeHTTP(w, r)
 }
 
+// applyArchiveState 把归档状态叠加到项目副本上，返回被折叠的项目数。
+//
+// 为什么在 handler 里叠而不是在 buildSnapshot 里：快照带 10 秒 TTL 缓存，
+// 归档状态写完后如果要等缓存过期才生效，用户点完按钮会看到"没反应"然后突然跳变。
+// 归档文件只有几百字节，每次请求重读的代价可以忽略；换来的是"点了立刻生效"。
+//
+// arc 为 nil（读失败）时**全部按未归档处理**，同时由调用方把错误挂进响应——
+// 静默按"未归档"渲染且不报错才是问题，报了错的降级是诚实的。
+func applyArchiveState(projects []*Project, tasksOf map[string][]*Task, arc *boardArchiveFile) int {
+	if arc == nil {
+		return 0
+	}
+	n := 0
+	for _, p := range projects {
+		rec, ok := arc.Projects[p.ID]
+		if !ok {
+			continue
+		}
+		count, maxCreated := projectCardMark(tasksOf[p.ID])
+		v := archiveViewFor(&rec, count, maxCreated)
+		p.Archived = v.Archived
+		p.ArchivedAt = v.ArchivedAt
+		p.ArchiveRevived = v.Revived
+		p.ArchiveRevivedReason = v.Reason
+		if v.Archived {
+			n++
+		}
+	}
+	return n
+}
+
 func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 	now := s.clock()
 	snap, err := s.snap.get(s.root, now)
@@ -230,8 +278,10 @@ func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 	for _, p := range snap.Projects {
 		projects = append(projects, projectForOverview(p))
 	}
+	arc, arcErr := loadBoardArchive(s.root)
+	archivedN := applyArchiveState(projects, snap.projTasks, arc)
 	burn := s.burn.get(s.root, snap.Cfg, now)
-	writeJSON(w, http.StatusOK, OverviewResp{
+	resp := OverviewResp{
 		GeneratedAt:            now.Format(time.RFC3339),
 		Root:                   snap.Root,
 		Totals:                 snap.Totals,
@@ -240,7 +290,95 @@ func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 		Quota:                  quotaSummary(burn.Sources),
 		BoardOverrideError:     snap.BoardOverrideError,
 		BoardOverrideErrorKind: snap.BoardOverrideErrorKind,
-	})
+		ArchivedCount:          archivedN,
+	}
+	if arcErr != nil {
+		resp.ArchiveStateError = "读 board_archive.json 失败（本次全部按未归档显示）: " + arcErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// archiveReq 是 POST /api/project/archive 的请求体。
+type archiveReq struct {
+	ID       string `json:"id"`
+	Archived bool   `json:"archived"`
+}
+
+// handleArchive 是看板唯一的写入端点：归档 / 取消归档一个项目。
+//
+// 【三道闸】这是本进程唯一会落盘的 HTTP 路径，而看板可能被 -addr 放到局域网上，
+// 所以就算写的只是视图状态也要挡住"别人替你点按钮"：
+//  1. 只收 POST——GET 会被 <img src> 之类的东西随手触发；
+//  2. Content-Type 必须是 application/json——HTML 表单只能发 urlencoded/multipart/plain，
+//     这一条就把"页面里埋个自动提交表单"的跨站写入挡在门外；
+//  3. 带 Origin 头时其 host 必须等于本次请求的 Host——浏览器发起的跨站 fetch 必带 Origin，
+//     不匹配即拒。同源 fetch 也会带 Origin，故这不是可选校验。
+//     命令行 curl 不带 Origin，放行（本机运维要能脚本化）。
+func (s *boardServer) handleArchive(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
+		writeErr(w, http.StatusMethodNotAllowed, "只接受 POST")
+		return
+	}
+	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
+		writeErr(w, http.StatusUnsupportedMediaType, "Content-Type 必须是 application/json")
+		return
+	}
+	if origin := r.Header.Get("Origin"); origin != "" && !sameOriginHost(origin, r.Host) {
+		writeErr(w, http.StatusForbidden, "跨源写入被拒绝")
+		return
+	}
+	var req archiveReq
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体解析失败: "+err.Error())
+		return
+	}
+	id := strings.TrimSpace(req.ID)
+	if id == "" {
+		writeErr(w, http.StatusBadRequest, "缺少参数 id")
+		return
+	}
+	now := s.clock()
+	snap, err := s.snap.get(s.root, now)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// 归档一个不存在的项目 id 会在状态文件里留下永远清不掉的垃圾记录（前端看不到它，
+	// 也就没有按钮能取消它）。存在性校验挡在写入之前。
+	found := false
+	for _, p := range snap.Projects {
+		if p.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "找不到项目: "+id)
+		return
+	}
+	count, maxCreated := projectCardMark(snap.projTasks[id])
+	rec, err := s.arch.set(s.root, id, req.Archived, count, maxCreated, now)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "写归档状态失败: "+err.Error())
+		return
+	}
+	out := map[string]any{"ok": true, "id": id, "archived": rec != nil}
+	if rec != nil {
+		out["archived_at"] = rec.ArchivedAt
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// sameOriginHost 比对 Origin 头的 host:port 与请求 Host。
+// 只比 host 部分，不比 scheme——看板同时可能经 http 直连与反代访问，
+// 比 scheme 会把正常的反代场景误杀，而 CSRF 防护要的正是 host 这一维。
+func sameOriginHost(origin, host string) bool {
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return u.Host == host
 }
 
 func (s *boardServer) handleBurn(w http.ResponseWriter, r *http.Request) {
@@ -287,12 +425,21 @@ func (s *boardServer) handleProject(w http.ResponseWriter, r *http.Request) {
 	// 于是同一张卡在同一个响应里拿到两套 p50/p80/finish_at。
 	pace := newPaceModel(snap.Cfg, tasks, now)
 
-	writeJSON(w, http.StatusOK, ProjectResp{
-		Project:        proj,
-		Columns:        s.buildColumns(snap.Cfg, pace, tasks, tasks, now, false),
+	// 归档状态叠在**副本**上：snap.Projects 里的那份是缓存的共享对象，
+	// 就地改写会让并发的另一个请求读到半改状态。
+	pc := *proj
+	arc, arcErr := loadBoardArchive(s.root)
+	applyArchiveState([]*Project{&pc}, snap.projTasks, arc)
+	resp := ProjectResp{
+		Project:        &pc,
+		Columns:        s.buildColumns(snap.Cfg, snap.kindOf, pace, tasks, tasks, now, false),
 		PhaseLanes:     s.buildLanes(snap, proj, pace, tasks, now),
 		RecentActivity: buildActivity(s.root, tasks),
-	})
+	}
+	if arcErr != nil {
+		resp.ArchiveStateError = "读 board_archive.json 失败（本次按未归档显示）: " + arcErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // buildColumns 把一批卡摊成 kanban 列。
@@ -301,8 +448,8 @@ func (s *boardServer) handleProject(w http.ResponseWriter, r *http.Request) {
 // 可调度队列算，否则泳道里的卡会得到一个与调度现实无关的名次。
 // lite=true 时省掉 prompt 摘录与工具清单——泳道与总列展示的是同一批卡，
 // 重字段发两遍是纯粹的浪费（实测单次响应 2.5MB，泳道占七成）。
-func (s *boardServer) buildColumns(cfg *Config, pace *paceModel, tasks, siblings []*Task,
-	now time.Time, lite bool) []BoardColumn {
+func (s *boardServer) buildColumns(cfg *Config, kindOf map[string]kindMark, pace *paceModel,
+	tasks, siblings []*Task, now time.Time, lite bool) []BoardColumn {
 
 	byStatus := map[string][]*Task{}
 	for _, t := range tasks {
@@ -317,7 +464,7 @@ func (s *boardServer) buildColumns(cfg *Config, pace *paceModel, tasks, siblings
 			ts, col.Truncated = ts[:doneColumnCap], true
 		}
 		for _, t := range ts {
-			col.Tasks = append(col.Tasks, toDetail(cfg, t, pace, siblings, now, lite))
+			col.Tasks = append(col.Tasks, toDetail(cfg, kindOf[t.ID], t, pace, siblings, now, lite))
 		}
 		cols = append(cols, col)
 	}
@@ -337,7 +484,7 @@ func (s *boardServer) buildLanes(snap *boardSnapshot, proj *Project, pace *paceM
 	for _, ph := range proj.Phases {
 		lanes = append(lanes, PhaseLane{
 			Phase:   ph,
-			Columns: s.buildColumns(snap.Cfg, pace, byPhase[ph.Name], tasks, now, true),
+			Columns: s.buildColumns(snap.Cfg, snap.kindOf, pace, byPhase[ph.Name], tasks, now, true),
 		})
 	}
 	return lanes
@@ -346,9 +493,12 @@ func (s *boardServer) buildLanes(snap *boardSnapshot, proj *Project, pace *paceM
 // promptExcerptLen 是详情里 prompt 摘录的字数上限（按 rune，中文不能按字节切）。
 const promptExcerptLen = 600
 
-func toDetail(cfg *Config, t *Task, pace *paceModel, siblings []*Task, now time.Time, lite bool) TaskDetail {
+func toDetail(cfg *Config, km kindMark, t *Task, pace *paceModel, siblings []*Task,
+	now time.Time, lite bool) TaskDetail {
+
 	br := toBrief(cfg, t, now)
 	br.ETA = pace.estimateTask(t, siblings, now)
+	br.applyKind(km)
 	d := TaskDetail{
 		TaskBrief:    br,
 		Dir:          t.Dir,
@@ -511,6 +661,8 @@ func cmdBoard(args []string) error {
 	fmt.Printf("数据目录: %s\n", root)
 	if *addr != "127.0.0.1" && *addr != "localhost" && *addr != "::1" {
 		fmt.Printf("⚠️  正在监听 %s（非回环）：响应含 prompt 全文、目录路径与账号额度，请确认这是你要的。\n", *addr)
+		fmt.Printf("    同网段的人还能调 POST /api/project/archive 折叠/展开项目（只改 %s，不动任何任务卡）。\n",
+			boardArchivePath(root))
 	}
 	httpSrv := &http.Server{
 		Handler:           srv.routes(),

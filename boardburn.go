@@ -49,23 +49,31 @@ type BurnPoint struct {
 //   - ResetsAt / MinutesToReset 为 null = 源数据里就没有重置时刻（不是估算失败）。
 //     后者与 verdict、stale **都不相关**，别拿 verdict 当护栏。
 type BurnSource struct {
-	ID              string      `json:"id"`
-	Provider        string      `json:"provider"`
-	AccountKey      string      `json:"account_key"`
-	AccountLabel    string      `json:"account_label"`
-	Window          string      `json:"window"`
-	WindowLabel     string      `json:"window_label"`
-	WindowMinutes   int         `json:"window_minutes"`
-	UsedPercent     float64     `json:"used_percent"`
-	CapturedAt      string      `json:"captured_at"`
-	ResetsAt        *string     `json:"resets_at"`
-	MinutesToReset  *float64    `json:"minutes_to_reset"`
-	Stale           bool        `json:"stale"`
-	Series          []BurnPoint `json:"series"`
-	BurnRatePctPerH *float64    `json:"burn_rate_pct_per_hour"`
-	ExhaustAt       *string     `json:"exhaust_at"`
-	ExhaustBefore   bool        `json:"exhaust_before_reset"`
-	Verdict         string      `json:"verdict"`
+	ID            string  `json:"id"`
+	Provider      string  `json:"provider"`
+	AccountKey    string  `json:"account_key"`
+	AccountLabel  string  `json:"account_label"`
+	Window        string  `json:"window"`
+	WindowLabel   string  `json:"window_label"`
+	WindowMinutes int     `json:"window_minutes"`
+	UsedPercent   float64 `json:"used_percent"`
+	// RemainingPercent = 100 − UsedPercent，钳在 [0,100]。
+	//
+	// 为什么后端算而不是让前端减：额度这一屏的**主读数是"还剩多少"**——
+	// "还能干多久"才是用户要做的决定，"已经烧了多少"是过程量。让每个消费方各自做减法，
+	// 迟早有一处忘了钳位（源数据出现 >100 时会算出负剩余）或忘了处理缺样本，
+	// 于是同一份数据在两个地方显示成两个数。口径只有一处、只算一次。
+	// used_percent **保留不动**：它是 CodexBar 的原始读数，改口径会连坐所有历史消费方。
+	RemainingPercent float64     `json:"remaining_percent"`
+	CapturedAt       string      `json:"captured_at"`
+	ResetsAt         *string     `json:"resets_at"`
+	MinutesToReset   *float64    `json:"minutes_to_reset"`
+	Stale            bool        `json:"stale"`
+	Series           []BurnPoint `json:"series"`
+	BurnRatePctPerH  *float64    `json:"burn_rate_pct_per_hour"`
+	ExhaustAt        *string     `json:"exhaust_at"`
+	ExhaustBefore    bool        `json:"exhaust_before_reset"`
+	Verdict          string      `json:"verdict"`
 }
 
 type TokenSeriesPoint struct {
@@ -201,6 +209,23 @@ type rawSample struct {
 	resetsAt string
 }
 
+// remainingPercent 把「已用%」翻成「剩余%」并钳到 [0,100]。
+//
+// 钳位不是防御性冗余：CodexBar 的样本实测出现过 100.0 以上（窗口刚重置前的最后一笔），
+// 不钳会算出负剩余，前端画进度条时会得到负宽度（渲染成 0，看着像"刚好耗尽"，
+// 其实是"已超"）；同样，负的 used 会算出 >100 的剩余，读成"比满额还多"。
+// 两个方向都必须夹住——这是读数，不是装饰。
+func remainingPercent(used float64) float64 {
+	r := 100 - used
+	if r < 0 {
+		return 0
+	}
+	if r > 100 {
+		return 100
+	}
+	return round1(r)
+}
+
 // buildBurnSource 把某个窗口的原始样本序列压成 BurnSource。
 // 关键约束：只用**当前窗口周期**（与最新样本同一个 resetsAt）内的点算速率。
 func buildBurnSource(id, provider, acctKey, acctLabel, window, windowLabel string,
@@ -215,7 +240,9 @@ func buildBurnSource(id, provider, acctKey, acctLabel, window, windowLabel strin
 	src := &BurnSource{
 		ID: id, Provider: provider, AccountKey: acctKey, AccountLabel: acctLabel,
 		Window: window, WindowLabel: windowLabel, WindowMinutes: windowMinutes,
-		UsedPercent: latest.pct, CapturedAt: latest.at.UTC().Format(time.RFC3339),
+		UsedPercent:      latest.pct,
+		RemainingPercent: remainingPercent(latest.pct),
+		CapturedAt:       latest.at.UTC().Format(time.RFC3339),
 	}
 
 	period := currentPeriod(samples, windowMinutes)

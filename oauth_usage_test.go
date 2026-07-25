@@ -734,9 +734,10 @@ func TestCG1bUtilizationPercentDomain(t *testing.T) {
 
 // TestReadmeUtilizationContractMatchesImplementation — P1-1 回归护栏(文档-实现契约漂移类)。
 //
-// CG-1b 复审曾抓到:budget.go 已把 utilization 判为 0-100 百分域,但 README.md/README.en.md
+// CG-1b 复审曾抓到:budget.go 已把 utilization 判为 0-100 百分域,但双语文档的
 // 契约句仍写着被推翻的"严格 0-1 分数域"旧语义——维护者可能照旧文档把代码"纠正"回分数域重演
-// 归一乒乓,或用户按文档喂 0-1 mock 反得到反直觉拒判。本测试钉死两份 README:
+// 归一乒乓,或用户按文档喂 0-1 mock 反得到反直觉拒判。契约句现居 docs/guide.md /
+// docs/guide.en.md(README 瘦身后额度红线细节搬进进阶指南)。本测试钉死这两份文档:
 //   - 不得再含旧契约短语(证伪:若谁把句子改回旧措辞,本测试报红);
 //   - 必须含新契约的三个关键判据(100 百分域直取 / (0,1] 歧义拒判 / >100 域外拒判)。
 func TestReadmeUtilizationContractMatchesImplementation(t *testing.T) {
@@ -746,7 +747,7 @@ func TestReadmeUtilizationContractMatchesImplementation(t *testing.T) {
 		requiredGroup [][]string // 每个子切片=一个判据的同义候选,组内命中一个即算该判据过
 	}{
 		{
-			file:         "README.md",
+			file:         "docs/guide.md",
 			staleMarkers: []string{"严格 0-1 分数域"},
 			requiredGroup: [][]string{
 				{"0-100 百分域"},
@@ -756,7 +757,7 @@ func TestReadmeUtilizationContractMatchesImplementation(t *testing.T) {
 			},
 		},
 		{
-			file:         "README.en.md",
+			file:         "docs/guide.en.md",
 			staleMarkers: []string{"strict 0-1 fractional domain"},
 			requiredGroup: [][]string{
 				{"0-100 percentage domain"},

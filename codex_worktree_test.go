@@ -809,12 +809,15 @@ func TestCodexReviewPrepareKilledOnHangingGit(t *testing.T) {
 
 // TestReadmeCopyPhaseContractMatchesImplementation 绑定 P1-1③:双语契约句必须与实现同步且不超卖。
 //
-// 【修的病】上一轮 README 双语契约句把"拷贝"写进 min(step_timeout,10min) 的子预算承诺,而拷贝腿
+// 契约句所在文档:docs/guide.md / docs/guide.en.md(README 瘦身后,细节段落搬进进阶指南;
+// 若日后再搬,改这里的 file 字段即可,双语同锚的语义不变)。
+//
+// 【修的病】上一轮双语契约句把"拷贝"写进 min(step_timeout,10min) 的子预算承诺,而拷贝腿
 // 当时压根不查 ctx、还会跟随链接打开无写端 FIFO——契约句超卖,消费方(委托人/复审)据此以为
 // "泳道不会被建副本堵死",实际堵得死死的。契约句是对外承诺,必须有测试钉住。
 //
 // 【锚三件事】
-//   ① 两份 README 都得有这句 —— 只改中文不改英文照样过 = 双语漂移的假绿;
+//   ① 两份指南都得有这句 —— 只改中文不改英文照样过 = 双语漂移的假绿;
 //   ② 句子里必须出现本轮新增的两条硬约束(逐文件边界查预算 / 从不打开非常规文件),
 //      防止有人把句子改回旧版超卖措辞;
 //   ③ 实现侧**剥掉注释后**必须真有这两条的代码痕迹 —— 否则 README 可以单方面写得漂亮而代码回退,
@@ -827,11 +830,11 @@ func TestReadmeCopyPhaseContractMatchesImplementation(t *testing.T) {
 		anchor string
 		must   []string
 	}{
-		{"README.md", "建副本阶段(探测/clone/apply/拷贝)", []string{
+		{"docs/guide.md", "建副本阶段(探测/clone/apply/拷贝)", []string{
 			"min(step_timeout, 10min)", "每个文件边界", "从不打开非常规文件",
 			"symlink", "codex_review_prepare_timeout",
 		}},
-		{"README.en.md", "The copy-build phase (probe/clone/apply/copy)", []string{
+		{"docs/guide.en.md", "The copy-build phase (probe/clone/apply/copy)", []string{
 			"min(step_timeout, 10min)", "at every file boundary", "never opens a non-regular file",
 			"symlink", "codex_review_prepare_timeout",
 		}},

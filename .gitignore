@@ -2,3 +2,5 @@ bin/
 .serena/
 tmp/
 /claudego
+/claudego.exe
+.DS_Store

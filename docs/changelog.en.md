@@ -2,6 +2,44 @@
 
 [中文](changelog.md) | **English** · back to [README](../README.en.md)
 
+## 2026-07-26 · Board display-semantics fixes
+
+Four fixes for readings that were **distorted in a specific direction** — none of them arithmetic bugs,
+all of them "correct but reads optimistic / is awkward to use":
+
+- **Quota now reports what's left**: the headline reading in the top quota strip and the burndown page
+  flips from "used %" to "remaining %" (new `BurnSource.remaining_percent`, computed server-side and
+  clamped to [0,100] — real samples above 100 exist, and without clamping you get a negative remainder
+  that renders as a zero-width bar and reads as "just exhausted" rather than "over budget").
+  The burndown curve becomes an actual burndown (descending, hitting bottom = exhausted; the projection
+  line now terminates at zero remaining) and the y-axis is labelled `剩余%`. `used_percent` is
+  **preserved verbatim** in the response and shown alongside in tooltips, subtitles and the sample table.
+- **Progress split by kind of work (`Project.kinds`)**: one total bar averages design/impl/fix/review
+  work **weighted by card count**, and since review+fix cards routinely make up 70% of cards with a
+  naturally high completion rate, the total gets dragged to ~90% while impl may sit at 40%.
+  Five buckets (design / impl / fix / review / coord) now each report their own completion using the
+  identical formula; the total bar is kept as the comparable anchor. Classification prefers structural
+  signals (`review_of` / `fix_round` / `type`) over keywords, and every card carries `kind_source`.
+  **Review is decided before fix** — review cards inherit the reviewed card's `fix_round`, and the wrong
+  order silently moves hundreds of review cards into the fix bucket. Unclassifiable cards fall into
+  "impl", not "unclassified" (the distortion being prevented is *underestimating* remaining work).
+  `board.json` gains `kind_rules` as a precise manual escape hatch; invalid rules are skipped one by one
+  and reported via `kind_rule_error`.
+- **Manual project archiving**: an "Archive" button on the project card and project page collapses
+  long-finished projects off the overview. State lives in `~/.claudego/board_archive.json` — **not a
+  single byte of any task card changes**, and scheduling and status counts are unaffected. A new card
+  (higher count, or a newer `created_at`) restores the project to active with the reason shown;
+  **card status changes do not trigger restoration** (otherwise archiving a running project bounces
+  back on the next tick). Restoration is a read-only derivation, never written back, so GET stays
+  write-free. `POST /api/project/archive` is the board's only write endpoint, behind three gates:
+  POST only / `Content-Type: application/json` / same-origin `Origin` host. A corrupted state file is
+  surfaced as an error and further writes are refused.
+- **Overview becomes a horizontal rail**: one column per project, scroll sideways to switch, with all
+  vertical space given to the phase/task list inside a column (independent scrolling; column height is
+  derived from the rail's real position so there are never two nested scrollbars). Projects are parallel,
+  not sequential — stacking them vertically pushes the second project behind the first one's several
+  hundred cards. Narrow screens (≤720 px) fall back to vertical stacking.
+
 ## 2026-07 (v0.10 line — 56 commits since the first public push)
 
 Main changes since the last public push (PR #1, review divert), grouped by theme:

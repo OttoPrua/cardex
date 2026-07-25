@@ -183,6 +183,68 @@ function progressBar(stats, pct) {
     }));
 }
 
+const KIND_ZH = {
+  design: '设计', impl: '落地', fix: '修复', review: '审核', coord: '协调',
+};
+const KIND_SOURCE_ZH = {
+  review_of: '被审卡链接（盘上事实）',
+  fix_round: '修复轮次字段（盘上事实）',
+  x_role: '交叉验证链角色（盘上事实）',
+  type: '任务类型（盘上事实）',
+  override: 'board.json 人工规则',
+  title: '标题关键词（启发式，可能判错）',
+  default: '兜底：未命中任何信号，按待落地计',
+};
+
+const KIND_BASIS = '每行与总条同口径（已完成 ÷ 非取消卡）。审核／修复卡张数大、完成率天然高，'
+  + '只看总条会高估落地进度。分类优先取卡上的 review_of／fix_round／类型等结构信号，'
+  + '标题关键词垫底，判不出的按待落地计。';
+
+// 每一桶收哪些卡，悬停在类别名上可见——不写清楚的话，「落地 41%」的分母里到底
+// 混了什么全靠猜，尤其是"判不出类别的卡也算落地"这条必须让人知道。
+const KIND_SCOPE = {
+  design: '设计／方案／调研类卡（按标题关键词判定，可能判错）',
+  impl: '落地实现卡；判不出类别的卡也计在这里——本页要防的是低估剩余工作量，故往保守一侧偏',
+  fix: '自动修复卡（fix_round>0，或标题「修复R<n>:」）',
+  review: '对抗审核／复审卡（review_of 非空、design-review 类型，或交叉验证链的 C 卡）',
+  coord: '协调／收口／进度回收类记账卡（coordinate、progress-pull、prompt-assembly 等）',
+};
+
+/**
+ * 按工作性质拆分的进度块。与总条**并列而非替换**。
+ *
+ * 【为什么必须拆】总条口径是「done ÷ 非取消卡」，没算错，但它把三种性质完全不同的活
+ * 按张数等权平均了：审核卡与修复卡生命周期短、完成率天然高，张数又常占七成以上，
+ * 于是总条被它们抬到 90% 上下，而真正的落地卡可能才走了四成。
+ * 拆开后「审核 96% ／ 落地 41%」一眼可见，读者不会再把总条读成"快完了"。
+ *
+ * 【为什么总条还留着】它是唯一与历史读数可比的口径，删掉等于把过去所有截图作废；
+ * 而且分桶依赖启发式，总条是那条不依赖任何分类判断的锚。
+ */
+function kindProgress(stats, pct, kinds, opts) {
+  const o = opts || {};
+  const wrap = h('div', { class: 'prog-group' });
+  wrap.append(h('div', { class: 'prog-row is-total' },
+    h('span', { class: 'prog-key', title: '全部卡的完成占比，分母已排除已取消卡', text: '总进度' }),
+    h('span', { class: 'prog-n', text: `${stats.done || 0}/${(stats.total || 0) - (stats.canceled || 0)}` }),
+    progressBar(stats, pct)));
+
+  if (!kinds || !kinds.length) return wrap;
+  for (const k of kinds) {
+    const den = (k.stats.total || 0) - (k.stats.canceled || 0);
+    wrap.append(h('div', { class: 'prog-row' },
+      h('span', { class: 'prog-key', title: KIND_SCOPE[k.key] || k.label, text: k.label }),
+      h('span', { class: 'prog-n', text: `${k.stats.done || 0}/${den}` }),
+      progressBar(k.stats, k.progress_percent)));
+  }
+  // 总览一屏并排十来个项目，整段口径说明逐列重复会把任务清单挤出视口；
+  // 压成一行 + 悬停给全文，说明本身一个字都没少（项目页仍给全文）。
+  wrap.append(o.compact
+    ? h('p', { class: 'prog-note', title: KIND_BASIS, text: '口径同总条；分类依据见悬停说明 ⓘ' })
+    : h('p', { class: 'prog-note', text: KIND_BASIS }));
+  return wrap;
+}
+
 function statusLegend(stats) {
   return h('div', { class: 'legend' }, STATUS_ORDER.filter((k) => stats[k] > 0).map((k) =>
     h('span', { class: 'legend-item' },
@@ -335,6 +397,24 @@ async function apiGet(path) {
   return data;
 }
 
+/**
+ * 唯一的写入通道（目前只有归档）。Content-Type 必须是 application/json——
+ * 后端拿它当 CSRF 闸门之一（HTML 表单发不出这个类型），不是可选的装饰。
+ */
+async function apiPost(path, body) {
+  const r = await fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await r.text();
+  let data = null;
+  try { data = JSON.parse(text); } catch (_) { /* 同上 */ }
+  if (!r.ok) throw new Error(data && data.error ? data.error : `HTTP ${r.status}`);
+  if (data === null) throw new Error('响应不是合法 JSON');
+  return data;
+}
+
 /* ============================ 应用外壳 ============================ */
 
 const el = {
@@ -360,8 +440,35 @@ const state = {
   // allCollapsed：全局「全部收起」开关。默认 false=所有阶段默认展开（含已完成项目），
   // 这样 100% 完成的项目（如 PerlicaAnywhere/TLink，所有阶段都是 done）也把任务铺开，
   // 不会因为「已完成=收起」而整卡看着空空如也。用户可一键收起，或单独折叠某个阶段。
-  ui: { openPhases: new Set(), closedPhases: new Set(), allCollapsed: false, laneMode: false, burnAll: false },
+  // flash 是一次性提示（归档写入失败等）。写操作失败必须看得见——
+  // 只在 console 里报错等于让用户以为"点了就生效了"，而盘上什么都没变。
+  flash: null,
+  ui: {
+    openPhases: new Set(), closedPhases: new Set(), allCollapsed: false,
+    laneMode: false, burnAll: false,
+    // showArchived：总览是否把已归档项目也铺出来（默认折叠，这正是归档的用途）。
+    showArchived: false,
+  },
 };
+
+/** 归档 / 取消归档一个项目。只写看板自己的视图状态，任务卡一个字节都不动。 */
+async function setArchived(id, archived) {
+  try {
+    await apiPost('/api/project/archive', { id, archived });
+    el.live.textContent = archived ? '项目已归档' : '项目已恢复活跃';
+  } catch (err) {
+    state.flash = { kind: 'critical', text: `归档状态写入失败：${(err && err.message) || err}` };
+  }
+  await load({ silent: true });
+}
+
+/** 取出并清空一次性提示——它是"这次操作的结果"，不该在下一次渲染里继续常驻。 */
+function takeFlash() {
+  const f = state.flash;
+  state.flash = null;
+  if (!f) return null;
+  return callout(f.kind, f.kind === 'critical' ? '✕' : 'ⓘ', f.text);
+}
 
 function setLoading(on) {
   state.loading = on;
@@ -406,6 +513,42 @@ function renderError(err, retry) {
 function mount(node) {
   el.app.replaceChildren(node);
   el.app.dataset.ready = '1';
+  syncRailHeight();
+  // 再补一帧：字体/图标加载完、顶栏额度条换行与否定下来之后，轨道顶端还会挪一次。
+  // 只测一次的话会把"布局还没落定"时的位置当成最终值，列高卡在 min-height 上，
+  // 外层滚动条就回来了。
+  requestAnimationFrame(syncRailHeight);
+}
+
+/**
+ * 按轨道的实际位置算出列高（--rail-h），让轨道正好落在视口底边。
+ *
+ * 为什么不写死一个常数：页头高度会变——项目数变化会换行、数据目录路径长了会折成两行、
+ * 多出「已归档 N」按钮也会撑高。常数一旦对不上就会同时出现外层与列内两条滚动条，
+ * 那正是横排要解决的问题（先纵向滚回去才能横滚）。
+ *
+ * 用**文档相对**的顶端而不是视口相对：页面已经滚过一段时再测，视口相对值会偏小、
+ * 算出一个比视口还高的列，于是外层滚动条又回来了。
+ * 轨道顶端只由它上面的内容决定、与列高无关，所以这里不会触发反复重排。
+ */
+function syncRailHeight() {
+  const rail = el.app.querySelector('.project-rail');
+  if (!rail) return;
+  const docTop = rail.getBoundingClientRect().top + window.scrollY;
+  const padBottom = parseFloat(getComputedStyle(el.app).paddingBottom) || 0;
+  // 12 = 轨道自身给横向滚动条留的下边距
+  const h = Math.max(320, Math.round(window.innerHeight - docTop - padBottom - 12));
+  const next = `${h}px`;
+  // 值没变就不写：写入会触发 ResizeObserver 再跑一遍，同值短路让它一轮就收敛。
+  if (document.documentElement.style.getPropertyValue('--rail-h') === next) return;
+  document.documentElement.style.setProperty('--rail-h', next);
+}
+
+// 视口/布局尺寸一变就重算列高。为什么不只监听 window.resize：顶栏额度条换不换行、
+// 页头路径折几行都会挪动轨道顶端，而这些变化不一定伴随 window 尺寸事件。
+// 观察 #app 会形成"改列高 → app 变高 → 再触发"的回路，靠 syncRailHeight 的同值短路一轮收敛。
+if (typeof ResizeObserver === 'function') {
+  new ResizeObserver(syncRailHeight).observe(el.app);
 }
 
 async function load(opts) {
@@ -457,11 +600,26 @@ const QUOTA_SLOTS = [
   ['codex_secondary', 'Codex 周'],
 ];
 
-/** 用量百分比 → 状态色。语义色，不是系列色。 */
-function usageColor(pct) {
-  if (pct >= 90) return 'var(--st-critical)';
-  if (pct >= 75) return 'var(--st-serious)';
-  if (pct >= 50) return 'var(--st-warning)';
+/**
+ * 剩余额度百分比。全站额度读数的**唯一主口径**。
+ *
+ * 为什么主读数是剩余而不是已用：用户在这一屏要做的决定是「还能不能再派一批卡」，
+ * 那是「还剩多少」的直接函数；「已经烧了多少」要先在脑子里做一次减法才能用。
+ * 后端 remaining_percent 已钳到 [0,100]，这里的 100-used 只是老响应的兜底
+ * （字段缺失 → null，绝不折成 0：0 会被读成「一点不剩」，那是编造）。
+ */
+function remainPct(src) {
+  if (!src) return null;
+  if (isNum(src.remaining_percent)) return src.remaining_percent;
+  if (isNum(src.used_percent)) return Math.max(0, Math.min(100, 100 - src.used_percent));
+  return null;
+}
+
+/** 剩余额度 → 状态色。语义色，不是系列色；阈值与 usedColor 互补，只在这一处定义。 */
+function remainColor(rem) {
+  if (rem <= 10) return 'var(--st-critical)';
+  if (rem <= 25) return 'var(--st-serious)';
+  if (rem <= 50) return 'var(--st-warning)';
   return 'var(--st-good)';
 }
 
@@ -470,17 +628,21 @@ function renderQuota(quota) {
   if (!quota) return;
   for (const [key, label] of QUOTA_SLOTS) {
     const src = quota[key];
-    // 槽位本身可能是 null（实测 codex_primary 就经常没有），此时明说「无数据」。
-    if (!src) {
+    const rem = remainPct(src);
+    // 槽位可能是 null（实测 codex_primary 就经常没有），样本在但百分比字段缺失也可能。
+    // 两种都明说「无数据」——不拿 0% 或 100% 顶上。
+    if (!src || rem === null) {
       el.quota.append(h('span', {
-        class: 'quota-pill is-stale', title: `${label}：本机没有该窗口的用量样本`,
+        class: 'quota-pill is-stale',
+        title: `${label}：本机没有该窗口的可用量样本，剩余额度未知`,
       },
         h('span', { class: 'qp-name', text: label }),
         h('span', { class: 'qp-val', text: '无数据' })));
       continue;
     }
-    const pct = isNum(src.used_percent) ? src.used_percent : 0;
-    const bits = [`${src.account_label}／${src.window_label}`, `结论：${src.verdict}`];
+    const bits = [`${src.account_label}／${src.window_label}`];
+    if (isNum(src.used_percent)) bits.push(`已用 ${Math.round(src.used_percent)}%`);
+    bits.push(`结论：${src.verdict}`);
     if (isNum(src.minutes_to_reset)) bits.push(`${fmtDur(src.minutes_to_reset)}后重置`);
     else bits.push('源数据未提供重置时刻');
     if (src.stale) bits.push('样本已过期');
@@ -488,9 +650,11 @@ function renderQuota(quota) {
       class: `quota-pill${src.stale ? ' is-stale' : ''}`, href: '#/burn', title: bits.join('｜'),
     },
       h('span', { class: 'qp-name', text: label }),
+      // 条形填的是**剩余**：条越短越危险，与「剩余 8%」的文字同向。
+      // 填已用而写剩余会让长条配小数字，是最容易读反的组合。
       h('span', { class: 'qp-meter', 'aria-hidden': 'true' },
-        h('span', { class: 'qp-fill', style: `width:${Math.min(100, pct)}%;background:${usageColor(pct)}` })),
-      h('span', { class: 'qp-val', text: `${Math.round(pct)}%${src.stale ? ' ⚠' : ''}` })));
+        h('span', { class: 'qp-fill', style: `width:${rem}%;background:${remainColor(rem)}` })),
+      h('span', { class: 'qp-val', text: `剩 ${Math.round(rem)}%${src.stale ? ' ⚠' : ''}` })));
   }
 }
 
@@ -501,6 +665,15 @@ async function viewOverview() {
   renderQuota(d.quota);
 
   const frag = document.createDocumentFragment();
+  const flash = takeFlash();
+  if (flash) frag.append(flash);
+  // 归档状态读失败必须显式披露：静默按"未归档"渲染会让用户手动折叠的项目一次性全冒出来，
+  // 而界面上零提示——与 board.json 解析失败同一条纪律。
+  if (d.archive_state_error) {
+    frag.append(callout('warning', '⚠', h('div', {},
+      h('strong', { text: '归档状态未生效：' }),
+      h('code', { text: d.archive_state_error }))));
+  }
   // board.json 解析失败必须显式披露：静默降级会让"配错了但没生效"看起来完全正常，
   // 违反 fail-honest。这条告警在总览顶端常驻，直到 board.json 修好为止。
   // 【R3·P1-2】按 error_kind 分渲染：type 错时 loadBoardOverride 会跳过出错字段但保留
@@ -524,13 +697,31 @@ async function viewOverview() {
   const activeN = (totals.queued || 0) + (totals.running || 0) +
     (totals.limit_paused || 0) + (totals.held || 0);
 
+  const all = d.projects || [];
+  const live = all.filter((p) => !p.archived);
+  const archived = all.filter((p) => p.archived);
+
+  const sub = h('p', { class: 'page-sub' },
+    `${live.length} 个项目并行・${activeN} 张待推进・最多 ${d.max_parallel} 路并发`);
+  // 顶部状态计数覆盖**全部**卡（含已归档项目的），这与下面只铺活跃项目的列表不同口径。
+  // 不写出来的话，"计数 900 张但只看得见 5 个项目"会被读成有卡凭空消失了。
+  if (archived.length) {
+    sub.append(h('span', { text: `　已归档 ${archived.length} 个项目（下方状态计数仍含它们的卡）` }));
+  }
+  sub.append(h('span', { text: `　数据目录 ${d.root}` }));
+
   frag.append(h('div', { class: 'page-head' },
-    h('div', {},
-      h('h1', { class: 'page-title', text: '总览' }),
-      h('p', { class: 'page-sub' },
-        `${d.projects.length} 个项目并行・${activeN} 张待推进・最多 ${d.max_parallel} 路并发`,
-        h('span', { text: `　数据目录 ${d.root}` }))),
+    h('div', {}, h('h1', { class: 'page-title', text: '总览' }), sub),
     h('div', { class: 'head-right' },
+      archived.length
+        ? h('button', {
+          class: 'ghost-btn', type: 'button',
+          'aria-pressed': String(state.ui.showArchived),
+          title: '已归档项目默认折叠；点开可临时查看并取消归档',
+          onclick: () => { state.ui.showArchived = !state.ui.showArchived; load({ silent: true }); },
+          text: state.ui.showArchived ? `隐藏已归档（${archived.length}）` : `已归档 ${archived.length}`,
+        })
+        : null,
       h('button', {
         class: 'ghost-btn', type: 'button',
         'aria-pressed': String(state.ui.allCollapsed),
@@ -550,14 +741,54 @@ async function viewOverview() {
           h('span', { class: 'tc-n', text: String(totals[k]) }),
           h('span', { class: 'tc-l', text: STATUS_ZH[k] })))))));
 
-  if (!d.projects.length) {
+  if (!all.length) {
     frag.append(emptyState('队列里还没有任何任务卡。'));
     return frag;
   }
-  const grid = h('div', { class: 'project-grid' });
-  for (const p of d.projects) grid.append(projectCard(p));
-  frag.append(grid);
+  if (!live.length) {
+    frag.append(emptyState(`${archived.length} 个项目全部已归档。点右上「已归档」查看或取消归档。`));
+  } else {
+    frag.append(projectRail(live));
+  }
+  if (archived.length && state.ui.showArchived) {
+    frag.append(h('div', { class: 'section-head', style: 'margin:22px 0 8px' },
+      h('h2', { class: 'section-title', text: `已归档项目（${archived.length}）` }),
+      h('span', {
+        class: 'section-note',
+        text: '归档只影响本页折叠，任务卡状态与调度完全不受影响；项目一旦有新卡会自动切回活跃。',
+      })));
+    frag.append(projectRail(archived));
+  }
   return frag;
+}
+
+/**
+ * 项目横向轨道：一个项目一列，左右滚动切项目，纵向空间全部留给单个项目的任务清单。
+ *
+ * 【为什么改成横排】原来是自适应网格，一个项目的阶段/任务铺开就占满一屏，
+ * 想看第二个项目得往下滚过几百张卡。项目之间是并列关系而不是先后关系，
+ * 横排 + 列内独立纵向滚动才对得上"多项目并行"的实际用法。
+ * tabindex/role 是给键盘用户的：横向滚动容器不可聚焦的话，只能靠鼠标横滚。
+ */
+function projectRail(projects) {
+  const rail = h('div', {
+    class: 'project-rail', role: 'region', tabindex: '0',
+    'aria-label': `项目横向滚动区，共 ${projects.length} 个项目，用左右方向键或横向滚动切换`,
+  });
+  for (const p of projects) rail.append(projectCard(p));
+  return rail;
+}
+
+/** 归档按钮。总览卡与项目页共用，保证两处措辞一致。 */
+function archiveBtn(p) {
+  return h('button', {
+    class: `arch-btn${p.archived ? ' is-on' : ''}`, type: 'button',
+    title: p.archived
+      ? '取消归档：重新在总览常驻显示'
+      : '归档：在总览折叠该项目。只改看板视图状态，不动任何任务卡、不影响调度；该项目一旦有新卡会自动切回活跃。',
+    onclick: (ev) => { ev.preventDefault(); setArchived(p.id, !p.archived); },
+    text: p.archived ? '取消归档' : '归档',
+  });
 }
 
 function projectCard(p) {
@@ -565,9 +796,16 @@ function projectCard(p) {
     h('div', { class: 'proj-titlerow' },
       h('h2', { class: 'proj-name' },
         h('a', { href: `#/p/${encodeURIComponent(p.id)}`, text: p.name })),
-      h('a', { class: 'proj-open', href: `#/p/${encodeURIComponent(p.id)}`, text: '看板 →' })),
+      h('div', { class: 'proj-actions' },
+        archiveBtn(p),
+        h('a', { class: 'proj-open', href: `#/p/${encodeURIComponent(p.id)}`, text: '看板 →' }))),
     descBlock(p.desc, p.desc_source),
     h('div', { class: 'proj-metarow' },
+      p.archived ? metaChip(`已归档 ${fmtTime(p.archived_at) || ''}`.trim()) : null,
+      // 自动复活必须说出来，否则用户会以为自己没点上归档按钮。
+      p.archive_revived
+        ? metaChip('已自动恢复活跃', { title: p.archive_revived_reason || '归档后检测到新卡' })
+        : null,
       p.models.slice(0, 3).map((m) => tierBadge(m.model, m.tier)),
       p.models.length > 3 ? metaChip(`+${p.models.length - 3} 个模型`) : null,
       p.dirs.length
@@ -575,14 +813,15 @@ function projectCard(p) {
           { mono: true, title: p.dirs.join('\n') })
         : null,
       relTime(p.last_activity) ? metaChip(`活动 ${relTime(p.last_activity)}`) : null),
-    progressBar(p.stats, p.progress_percent),
+    kindProgress(p.stats, p.progress_percent, p.kinds, { compact: true }),
+    p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     statusLegend(p.stats),
     etaLine(p.eta));
 
   const phases = h('div', { class: 'phases' });
   for (const ph of p.phases) phases.append(phaseBlock(ph));
-  return h('section', { class: 'card proj' }, head, phases);
+  return h('section', { class: `card proj${p.archived ? ' is-archived' : ''}` }, head, phases);
 }
 
 function phaseBlock(ph) {
@@ -672,20 +911,33 @@ async function viewProject(id) {
   }
   const p = d.project;
   const frag = document.createDocumentFragment();
+  const flash = takeFlash();
+  if (flash) frag.append(flash);
+  if (d.archive_state_error) {
+    frag.append(callout('warning', '⚠', h('div', {},
+      h('strong', { text: '归档状态未生效：' }),
+      h('code', { text: d.archive_state_error }))));
+  }
 
   frag.append(h('div', { class: 'page-head' },
     h('div', {},
       h('p', { class: 'page-sub' }, h('a', { href: '#/', text: '← 总览' })),
       h('h1', { class: 'page-title', text: p.name }),
       descBlock(p.desc, p.desc_source)),
-    h('div', { class: 'totals' }, STATUS_ORDER.filter((k) => p.stats[k] > 0).map((k) =>
-      h('span', { class: 'total-chip' },
-        statusDot(k, true),
-        h('span', { class: 'tc-n', text: String(p.stats[k]) }),
-        h('span', { class: 'tc-l', text: STATUS_ZH[k] }))))));
+    h('div', { class: 'head-right' },
+      archiveBtn(p),
+      h('div', { class: 'totals' }, STATUS_ORDER.filter((k) => p.stats[k] > 0).map((k) =>
+        h('span', { class: 'total-chip' },
+          statusDot(k, true),
+          h('span', { class: 'tc-n', text: String(p.stats[k]) }),
+          h('span', { class: 'tc-l', text: STATUS_ZH[k] })))))));
 
   frag.append(h('div', { class: 'card', style: 'padding:13px 17px;margin-bottom:16px' },
-    progressBar(p.stats, p.progress_percent),
+    p.archive_revived
+      ? callout('warning', 'ⓘ', p.archive_revived_reason || '归档后检测到新卡，已自动切回活跃')
+      : null,
+    kindProgress(p.stats, p.progress_percent, p.kinds),
+    p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     etaLine(p.eta),
     p.dirs.length
@@ -772,6 +1024,11 @@ function taskCard(t) {
     };
     row('任务 ID', t.id, true);
     row('类型', t.type);
+    // 工作性质与它的判定来源必须同行显示：结构信号是盘上事实、标题关键词是猜的，
+    // 只写"设计"而不写靠什么判的，读者无从判断这条分类值不值得信。
+    if (t.kind) {
+      row('工作性质', `${KIND_ZH[t.kind] || t.kind}（判定来源：${KIND_SOURCE_ZH[t.kind_source] || t.kind_source || '未知'}）`);
+    }
     row('优先级', t.priority);
     row('模型来源', MODEL_SOURCE_ZH[t.model_source] || t.model_source);
     row('执行档位', t.effort);
@@ -877,7 +1134,10 @@ async function viewBurn() {
   if (risky.length) {
     frag.append(callout('critical', '⚠', h('div', {},
       h('strong', { text: `${risky.length} 个窗口会在重置前烧完：` }),
-      risky.map((x) => `${x.account_label}／${x.window_label}（${Math.round(x.used_percent)}%）`).join('、'))));
+      risky.map((x) => {
+        const rem = remainPct(x);
+        return `${x.account_label}／${x.window_label}（剩余 ${rem === null ? '未知' : Math.round(rem) + '%'}）`;
+      }).join('、'))));
   } else if (fresh.length) {
     frag.append(callout('good', '✓', '当前没有窗口按现有速率会在重置前烧完。'));
   } else {
@@ -890,7 +1150,10 @@ async function viewBurn() {
   const sec = h('section', { class: 'section' },
     h('div', { class: 'section-head' },
       h('h2', { class: 'section-title', text: '各账号窗口' }),
-      h('span', { class: 'section-note', text: '百分比来自 CodexBar 采样；速率只在当前窗口周期内拟合' }),
+      h('span', {
+        class: 'section-note',
+        text: '主读数是剩余额度（源数据给的是已用 %，剩余 = 100 − 已用）；速率只在当前窗口周期内拟合',
+      }),
       h('button', {
         class: 'btn-ghost',
         'aria-pressed': String(state.ui.burnAll),
@@ -918,20 +1181,25 @@ function verdictKind(v) {
 }
 
 function burnCard(src) {
-  const pct = isNum(src.used_percent) ? src.used_percent : 0;
+  const rem = remainPct(src);
   const head = h('div', { class: 'chart-head' },
     h('div', {},
       h('h3', { class: 'chart-title' }, `${src.account_label}　`,
         h('span', { style: 'font-weight:500;color:var(--ink-mute)', text: src.window_label })),
       h('p', {
         class: 'chart-sub',
-        text: `采样于 ${fmtTime(src.captured_at)}（${relTime(src.captured_at)}）・${src.series.length} 个样本点`,
+        text: `采样于 ${fmtTime(src.captured_at)}（${relTime(src.captured_at)}）・${src.series.length} 个样本点`
+          + (isNum(src.used_percent) ? `・已用 ${Math.round(src.used_percent)}%` : ''),
       })),
     h('div', { class: 'chart-actions' },
       src.stale
         ? h('span', { class: 'meta-chip', title: '样本已过期，不代表当前窗口的现状', text: '⚠ 已过期' })
         : null,
-      h('span', { class: 'meta-chip', text: `${Math.round(pct)}%` })));
+      h('span', {
+        class: 'meta-chip',
+        style: rem === null ? null : `color:${remainColor(rem)};font-weight:640`,
+        text: rem === null ? '剩余未知' : `剩余 ${Math.round(rem)}%`,
+      })));
 
   // 结论横幅。每个可空字段都有自己的措辞，不含糊带过。
   const detail = [];
@@ -963,13 +1231,21 @@ function burnCard(src) {
 }
 
 /**
- * 单个额度窗口的折线图。
+ * 单个额度窗口的**燃尽**曲线：纵轴是剩余额度，线往下走、触底即耗尽。
+ *
+ * 为什么画剩余而不是已用：这一屏的所有文字读数都改成了「剩余 8%」，
+ * 曲线若还往上爬到 92%，同一张卡上就出现一个小数字配一条高线——
+ * 读者会在两种方向之间反复换算，最容易读反的正是这种组合。
+ * 剩余口径下"线越低越危险"与文字同向，也才对得上「燃尽」这个名字。
+ *
  * 只有 exhaust_at 非 null（后端已过速率下限、地平线上限、不给过去时刻三道闸）
  * 且 verdict 不是「数据不足」时，才画那条虚线外推——否则一条预测线都不画。
  */
 function burnChart(src) {
   const W = 560, H = 170, PAD = { t: 12, r: 16, b: 26, l: 34 };
-  const pts = src.series.map((p) => ({ t: parseTime(p.t), v: p.used_percent })).filter((p) => p.t);
+  const pts = src.series
+    .map((p) => ({ t: parseTime(p.t), v: remainPct(p), used: p.used_percent }))
+    .filter((p) => p.t && isNum(p.v));
   if (pts.length < 2) return h('div', { class: 'nodata', text: '样本不足，不画图。' });
 
   const drawProjection = !!src.exhaust_at && src.verdict !== '数据不足';
@@ -984,9 +1260,11 @@ function burnChart(src) {
   const x = (t) => PAD.l + ((t - tMin) / span) * (W - PAD.l - PAD.r);
   const y = (v) => PAD.t + (1 - Math.min(100, Math.max(0, v)) / 100) * (H - PAD.t - PAD.b);
 
+  const remNow = remainPct(src);
   const g = sv('svg', {
     viewBox: `0 0 ${W} ${H}`, role: 'img',
-    'aria-label': `${src.account_label} ${src.window_label} 用量曲线，当前 ${Math.round(src.used_percent)}%`,
+    'aria-label': `${src.account_label} ${src.window_label} 剩余额度曲线，当前剩余 `
+      + `${remNow === null ? '未知' : Math.round(remNow) + '%'}，线触底即额度耗尽`,
   });
 
   for (const v of [0, 25, 50, 75, 100]) {
@@ -998,6 +1276,12 @@ function burnChart(src) {
       style: 'font-size:9px;fill:var(--ink-mute)', 'aria-hidden': 'true',
     }, String(v)));
   }
+  // 纵轴换了口径就必须写出来：同一张图上 80 从"烧了八成"变成"还剩八成"，
+  // 不标注等于让老读者照旧读法读出正好相反的结论。
+  g.append(sv('text', {
+    x: PAD.l - 6, y: PAD.t - 4, 'text-anchor': 'end',
+    style: 'font-size:8.5px;fill:var(--ink-mute)', 'aria-hidden': 'true',
+  }, '剩余%'));
 
   const line = pts.map((p, i) => `${i ? 'L' : 'M'}${x(p.t.getTime()).toFixed(1)},${y(p.v).toFixed(1)}`).join(' ');
   g.append(sv('path', {
@@ -1007,16 +1291,18 @@ function burnChart(src) {
   g.append(sv('path', { d: line, style: 'fill:none;stroke:var(--s1);stroke-width:2;stroke-linejoin:round' }));
   for (const p of pts) {
     g.append(sv('circle', { cx: x(p.t.getTime()), cy: y(p.v), r: 2.4, style: 'fill:var(--s1)' },
-      sv('title', {}, `${fmtTime(p.t.toISOString())}　${p.v}%`)));
+      sv('title', {}, `${fmtTime(p.t.toISOString())}　剩余 ${p.v}%`
+        + (isNum(p.used) ? `（已用 ${p.used}%）` : ''))));
   }
 
   if (exhaust) {
+    // 外推线的终点是**剩余 0**，不是 100——纵轴口径翻过来了，这里跟着翻。
     const last = pts[pts.length - 1];
     g.append(sv('path', {
-      d: `M${x(last.t.getTime()).toFixed(1)},${y(last.v).toFixed(1)} L${x(exhaust.getTime()).toFixed(1)},${y(100).toFixed(1)}`,
+      d: `M${x(last.t.getTime()).toFixed(1)},${y(last.v).toFixed(1)} L${x(exhaust.getTime()).toFixed(1)},${y(0).toFixed(1)}`,
       style: 'fill:none;stroke:var(--st-critical);stroke-width:1.6;stroke-dasharray:4 3',
-    }, sv('title', {}, `按当前速率预计 ${fmtTime(src.exhaust_at)} 打到 100%`)));
-    g.append(sv('circle', { cx: x(exhaust.getTime()), cy: y(100), r: 3, style: 'fill:var(--st-critical)' }));
+    }, sv('title', {}, `按当前速率预计 ${fmtTime(src.exhaust_at)} 剩余归零`)));
+    g.append(sv('circle', { cx: x(exhaust.getTime()), cy: y(0), r: 3, style: 'fill:var(--st-critical)' }));
   }
   if (reset) {
     g.append(sv('line', {
@@ -1036,10 +1322,10 @@ function burnChart(src) {
 
   const legend = h('div', { class: 'chart-legend' },
     h('span', { class: 'cl-item' },
-      h('span', { class: 'cl-line', style: 'border-top-color:var(--s1)' }), '实测用量'),
+      h('span', { class: 'cl-line', style: 'border-top-color:var(--s1)' }), '实测剩余额度'),
     exhaust ? h('span', { class: 'cl-item' },
       h('span', { class: 'cl-line', style: 'border-top-color:var(--st-critical);border-top-style:dashed' }),
-      '按当前速率外推') : null,
+      '按当前速率外推至归零') : null,
     reset ? h('span', { class: 'cl-item' },
       h('span', { class: 'cl-line', style: 'border-top-color:var(--st-good-ink);border-top-style:dashed' }),
       '重置时刻') : null,
@@ -1055,12 +1341,20 @@ function burnTable(src) {
       style: 'cursor:pointer;font-size:11.5px;color:var(--ink-mute);margin-top:8px',
       text: '查看样本数值',
     }));
+  // 两列并排：剩余是主读数，已用是源数据原值。图上只能画一条，表里两个都给全，
+  // 免得有人想核对 CodexBar 的原始百分比时还要自己做减法。
   det.append(
     h('div', { class: 'tbl-wrap' },
       h('table', { class: 'tbl' },
-        h('thead', {}, h('tr', {}, h('th', { text: '采样时刻' }), h('th', { text: '用量 %' }))),
-        h('tbody', {}, src.series.map((p) =>
-          h('tr', {}, h('td', { text: fmtTime(p.t) || p.t }), h('td', { text: String(p.used_percent) })))))),
+        h('thead', {}, h('tr', {},
+          h('th', { text: '采样时刻' }), h('th', { text: '剩余 %' }), h('th', { text: '已用 %（源数据）' }))),
+        h('tbody', {}, src.series.map((p) => {
+          const rp = remainPct(p);
+          return h('tr', {},
+            h('td', { text: fmtTime(p.t) || p.t }),
+            h('td', { text: rp === null ? '—' : String(rp) }),
+            h('td', { text: isNum(p.used_percent) ? String(p.used_percent) : '—' }));
+        })))),
     h('p', {
       class: 'chart-sub',
       text: `账号键 ${src.account_key}・窗口 ${src.window}（${src.window_minutes} 分钟）`,
@@ -1256,6 +1550,7 @@ document.addEventListener('visibilitychange', () => {
     load({ silent: true });
   }
 });
+window.addEventListener('resize', syncRailHeight);
 setInterval(tickFreshness, 15000);
 
 navigate();

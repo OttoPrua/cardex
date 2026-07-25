@@ -131,6 +131,13 @@ type TaskBrief struct {
 	XRole          string  `json:"x_role"`
 	RemoteHost     string  `json:"remote_host"`
 	BlockedReason  string  `json:"blocked_reason"`
+	// Kind 是工作性质（design/impl/fix/review/coord，见 boardkind.go），与 phase 正交：
+	// phase 回答"这活属于哪一波"，kind 回答"这是哪种活"。
+	Kind string `json:"kind"`
+	// KindSource 交代这次判定靠什么得出（review_of / fix_round / type / title / override / default）。
+	// 必须与 Kind 成对出现：结构信号是盘上事实、标题关键词是猜的，
+	// 只发 kind 会让两者在界面上长得一模一样，等于把猜测伪装成事实。
+	KindSource string `json:"kind_source"`
 }
 
 // TaskDetail 是 TaskBrief 加上单项目页才需要的重字段（prompt 摘录等）。
@@ -177,6 +184,25 @@ type Project struct {
 	// 那就是编造。ProgressPercent 是「派出的活干完多少」，Goal 是「离目标多远」，
 	// 两条并列而非替换——参见 boardgoal.go 顶部注释。
 	Goal *ProjectGoal `json:"goal,omitempty"`
+	// Kinds 是按工作性质切分的进度切片（设计/落地/修复/审核/协调，见 boardkind.go）。
+	// 与 ProgressPercent **并列而非替换**：总条口径不变（全部卡的完成占比），
+	// 分桶只是把"总条为什么这么高"摊开——审核卡与修复卡完成率天然高、占比又大，
+	// 单看总条会把"落地才走了四成"读成"整体快完了"。
+	Kinds []KindProgress `json:"kinds"`
+	// KindRuleError 是 board.json kind_rules 里被跳过的规则的披露串（无问题时 omitempty 消失）。
+	// 坏规则逐条跳过而非整块拒，但被跳过的必须说出来——静默失效即造读数。
+	KindRuleError string `json:"kind_rule_error,omitempty"`
+
+	// ---- 手动归档（视图状态，见 boardarchive.go；不改任何任务卡）----
+	// Archived=true 时总览默认折叠该项目。任务卡状态一个字节都不变。
+	Archived bool `json:"archived"`
+	// ArchivedAt 是人工归档时刻；即使已被新卡自动复活也保留，供前端说清"何时归的档"。
+	ArchivedAt string `json:"archived_at,omitempty"`
+	// ArchiveRevived=true 表示有归档记录但检测到新卡，已自动切回活跃。
+	ArchiveRevived bool `json:"archive_revived,omitempty"`
+	// ArchiveRevivedReason 是复活原因的人话说明。只说"恢复了"不说为什么，
+	// 用户会怀疑是自己没点上归档按钮。
+	ArchiveRevivedReason string `json:"archive_revived_reason,omitempty"`
 }
 
 // ---- 快照与缓存 ----
@@ -205,6 +231,10 @@ type boardSnapshot struct {
 	projTasks map[string][]*Task
 	// phaseOf 是 task id → 阶段名，避免详情页重算。
 	phaseOf map[string]string
+	// kindOf 是 task id → 工作性质判定（含来源），/api/project 拼 TaskBrief 时复用。
+	// 与 phaseOf 同理：分类是 per-project 的（board.json kind_rules 按项目配），
+	// 不能在详情页重算——重算时拿不到项目上下文就会丢掉人工规则。
+	kindOf map[string]kindMark
 }
 
 // boardCache 给快照做 TTL 缓存。看板是只读视图，10 秒内的陈旧度完全可接受，
@@ -770,6 +800,16 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 	return b
 }
 
+// applyKind 把分类结果贴到摘要上。空 mark（理论上不该出现：kindOf 由同一批卡填充）
+// 落到 impl/"default"，与 buildKindProgress 的兜底保持一致——两处若各自兜底成不同的桶，
+// 单卡显示的类别与该类别的计数就会对不上。
+func (b *TaskBrief) applyKind(m kindMark) {
+	if m.Kind == "" {
+		m = kindMark{Kind: kindImpl, Source: "default"}
+	}
+	b.Kind, b.KindSource = m.Kind, m.Source
+}
+
 func round1(f float64) float64 { return float64(int64(f*10+0.5)) / 10 }
 
 // ---- 看板覆盖文件（board.json）----
@@ -790,10 +830,20 @@ type boardOverride struct {
 // 拆成命名类型是为了容纳 CG-8 的 goal 字段——原先内联匿名 struct 无法从别的文件
 // （boardgoal.go）引用，加字段就要动这里的 shape，索性一次拆干净。
 type boardOverrideProject struct {
-	Name   string                `json:"name"`
-	Desc   string                `json:"desc"`
-	Phases map[string]string     `json:"phases"`
-	Goal   *boardOverrideGoal    `json:"goal,omitempty"`
+	Name   string             `json:"name"`
+	Desc   string             `json:"desc"`
+	Phases map[string]string  `json:"phases"`
+	Goal   *boardOverrideGoal `json:"goal,omitempty"`
+	// KindRules 是人工分类规则（见 boardkind.go）。标题关键词启发式再怎么调都会判错几张卡，
+	// 给一个精确出口比继续往 kindDesignHints 里堆词更诚实——堆词会让别的项目跟着遭殃。
+	KindRules []boardOverrideKindRule `json:"kind_rules,omitempty"`
+}
+
+// boardOverrideKindRule 是单条人工分类规则：match 命中标题子串（大小写不敏感）或任务 ID 全串，
+// 命中即把该卡判成 kind。首条命中即用，优先级高于所有自动判定。
+type boardOverrideKindRule struct {
+	Match string `json:"match"`
+	Kind  string `json:"kind"`
 }
 
 // 【R3·P1-2】overrideErrKind 分类:app.js 需按这个把顶端横幅的文案区分开 ——
@@ -933,6 +983,7 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 		byID:                   byID,
 		projTasks:              map[string][]*Task{},
 		phaseOf:                map[string]string{},
+		kindOf:                 map[string]kindMark{},
 	}
 
 	// 分量必须按稳定键遍历：Go 的 map 迭代顺序是随机化的，
@@ -982,7 +1033,7 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 			id += "-" + shortHash(comp)
 		}
 
-		p := buildProject(cfg, ov, id, name, dirs, ts, byID, now, snap.phaseOf)
+		p := buildProject(cfg, ov, id, name, dirs, ts, byID, now, snap.phaseOf, snap.kindOf)
 		snap.Projects = append(snap.Projects, p)
 		snap.projTasks[id] = ts
 	}
@@ -1031,15 +1082,24 @@ func (t *boardTotals) addStatus(status string) {
 const maxPhaseTasks = 40
 
 func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string,
-	ts []*Task, byID map[string]*Task, now time.Time, phaseOf map[string]string) *Project {
+	ts []*Task, byID map[string]*Task, now time.Time,
+	phaseOf map[string]string, kindOf map[string]kindMark) *Project {
 
 	p := &Project{ID: id, Name: name, Dirs: dirs, DescSource: "derived"}
 
-	// 阶段分桶
+	// 人工分类规则先取出来：分桶时每张卡都要过一遍，不能在循环里反复解析。
+	// 坏规则逐条跳过并把披露串挂到项目上（见 parseKindRules 的注释）。
+	var kindRules []boardKindRule
+	if o, ok := ov.Projects[id]; ok && len(o.KindRules) > 0 {
+		kindRules, p.KindRuleError = parseKindRules(o.KindRules)
+	}
+
+	// 阶段分桶（同时定工作性质：两者正交，一趟循环各记各的）
 	phaseTasks := map[string][]*Task{}
 	for _, t := range ts {
 		ph := phaseForTask(t, byID, 0)
 		phaseOf[t.ID] = ph
+		kindOf[t.ID] = deriveTaskKind(t, kindRules)
 		phaseTasks[ph] = append(phaseTasks[ph], t)
 		p.Stats.add(t.Status)
 		if t.UpdatedAt > p.LastActivity {
@@ -1048,6 +1108,7 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 	}
 	p.ActiveTotal = p.Stats.activeTotal()
 	p.ProgressPercent = progressPercent(&p.Stats)
+	p.Kinds = buildKindProgress(ts, kindOf)
 
 	// 模型分布（覆盖项目全部卡：这是「这个项目在用什么档位的模型」的完整画像）
 	mc := map[string]int{}
@@ -1075,7 +1136,7 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 	// 阶段。siblings 一律传项目全集 ts：调度器没有阶段概念，
 	// 阶段内排位没有调度意义，传阶段切片会让同一张卡在同一个响应里出现两个 finish_at。
 	for phName, pts := range phaseTasks {
-		ph := buildPhase(cfg, id, phName, pts, ts, now, pace)
+		ph := buildPhase(cfg, id, phName, pts, ts, now, pace, kindOf)
 		if o, ok := ov.Projects[id]; ok {
 			if d, ok2 := o.Phases[phName]; ok2 && d != "" {
 				ph.Desc, ph.DescSource = d, "override"
@@ -1162,7 +1223,9 @@ func phaseSettled(status string) bool { return status == "done" || status == "ca
 //
 // projTasks 是**整个项目**的卡，专门用于单卡排位——阶段只是展示分组，
 // 调度器不认阶段，用阶段切片算排位会得出一个与调度现实无关的名次。
-func buildPhase(cfg *Config, projID, name string, ts, projTasks []*Task, now time.Time, pace *paceModel) Phase {
+func buildPhase(cfg *Config, projID, name string, ts, projTasks []*Task, now time.Time,
+	pace *paceModel, kindOf map[string]kindMark) Phase {
+
 	ph := Phase{
 		ID:         projID + "/" + name,
 		Name:       name,
@@ -1200,6 +1263,7 @@ func buildPhase(cfg *Config, projID, name string, ts, projTasks []*Task, now tim
 	for _, t := range ts {
 		br := toBrief(cfg, t, now)
 		br.ETA = pace.estimateTask(t, projTasks, now)
+		br.applyKind(kindOf[t.ID])
 		ph.Tasks = append(ph.Tasks, br)
 	}
 	ph.Desc = derivedPhaseDesc(&ph)

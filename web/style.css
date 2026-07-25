@@ -367,30 +367,67 @@ button { font: inherit; color: inherit; }
   min-width: 0;
 }
 
-/* 项目网格：宽屏多列，窄屏单列 */
-.project-grid {
-  display: grid; gap: 16px;
-  grid-template-columns: repeat(auto-fill, minmax(430px, 1fr));
+/* 项目横向轨道：一个项目一列，左右滚动切项目。
+   纵向空间全部留给单个项目的任务清单——项目之间是并列关系而不是先后关系，
+   原来的自适应网格会让第二个项目被第一个项目的几百张卡顶到屏幕外。 */
+.project-rail {
+  display: flex; gap: 16px; align-items: stretch;
+  overflow-x: auto; overflow-y: hidden;
+  padding-bottom: 12px;
+  scroll-snap-type: x proximity;
+  scrollbar-gutter: stable;
 }
-@media (max-width: 560px) {
-  .project-grid { grid-template-columns: 1fr; }
+.project-rail:focus-visible { outline: 2px solid var(--s1); outline-offset: 3px; border-radius: var(--r-lg); }
+.project-rail > .proj {
+  flex: 0 0 clamp(360px, 30vw, 480px);
+  scroll-snap-align: start;
+  /* 列高钉在视口内，卡片清单在列内滚 —— 否则最长的那个项目会把整条轨道撑到几屏高，
+     横向滚动就失去意义（还得先纵向滚回顶部才能横滚）。
+     --rail-h 由 app.js 按轨道的实际位置算出（页头高度会随项目数/路径长度变化，
+     写死常数就会同时冒出外层与列内两条滚动条）；变量缺失时的回退值是常见页头的经验值。 */
+  max-height: var(--rail-h, calc(100vh - 310px));
+  min-height: 320px;
 }
-.project-grid > * { min-width: 0; }
+/* 窄屏（手机）退回纵向堆叠：横向轨道在小屏上一次只能看见半列，反而更难用。 */
+@media (max-width: 720px) {
+  .project-rail {
+    display: flex; flex-direction: column; overflow-x: visible;
+  }
+  .project-rail > .proj { flex: 0 0 auto; max-height: none; }
+}
 
-.proj { display: flex; flex-direction: column; overflow: hidden; }
+.proj { display: flex; flex-direction: column; overflow: hidden; min-width: 0; }
+.proj.is-archived { opacity: .82; border-style: dashed; }
 .proj-head {
   padding: 15px 17px 13px;
   border-bottom: 1px solid var(--border);
   display: flex; flex-direction: column; gap: 9px;
+  flex: 0 0 auto;   /* 项目头恒常可见，滚动的是下面的阶段清单 */
 }
 .proj-titlerow { display: flex; align-items: flex-start; gap: 10px; }
+.proj-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+
+/* 归档按钮：与 .proj-open 同一视觉族，按下态用实底区分 */
+.arch-btn {
+  font-size: 12px; color: var(--ink-mute); cursor: pointer;
+  background: transparent;
+  border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 3px 9px; white-space: nowrap;
+  transition: background .13s, color .13s, border-color .13s;
+}
+.arch-btn:hover { background: var(--surface-2); color: var(--ink); border-color: var(--border-2); }
+.arch-btn.is-on {
+  background: color-mix(in oklab, var(--s1) 13%, transparent);
+  color: color-mix(in oklab, var(--s1) 78%, var(--ink));
+  border-color: color-mix(in oklab, var(--s1) 38%, transparent);
+}
 .proj-name {
   font-size: 16px; font-weight: 660; letter-spacing: -.012em;
   margin: 0; min-width: 0; overflow-wrap: anywhere;
 }
 .proj-name a:hover { color: var(--s1); }
 .proj-open {
-  margin-left: auto; flex: 0 0 auto;
+  flex: 0 0 auto;
   font-size: 12px; color: var(--ink-mute);
   border: 1px solid var(--border); border-radius: var(--r-sm);
   padding: 3px 9px; transition: background .13s, color .13s, border-color .13s;
@@ -424,6 +461,36 @@ button { font: inherit; color: inherit; }
 .prog-pct {
   font-size: 12px; font-weight: 640; color: var(--ink-2);
   font-variant-numeric: tabular-nums; flex: 0 0 auto;
+  min-width: 42px; text-align: right;
+}
+
+/* 按工作性质拆分的进度组：总条在上、分类各一行。
+   固定列宽（类别名 / 分数 / 条）让各行的条左右对齐 —— 不对齐的话
+   "落地 41% vs 审核 96%"要靠读数字比较，拆分就白拆了。 */
+.prog-group { display: flex; flex-direction: column; gap: 4px; }
+.prog-row {
+  display: grid; grid-template-columns: 42px 54px 1fr;
+  align-items: center; gap: 8px;
+}
+.prog-row.is-total {
+  padding-bottom: 4px; margin-bottom: 1px;
+  border-bottom: 1px dashed var(--border);
+}
+.prog-row.is-total .prog-key { font-weight: 660; color: var(--ink); }
+.prog-row.is-total .prog { height: 9px; }
+.prog-key {
+  font-size: 11.5px; font-weight: 560; color: var(--ink-2);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.prog-n {
+  font-size: 11px; color: var(--ink-mute);
+  font-variant-numeric: tabular-nums; text-align: right;
+}
+/* 分类行的条细一档：视觉层级上总条是主、分类是辅 */
+.prog-row:not(.is-total) .prog { height: 6px; }
+.prog-note {
+  margin: 3px 0 0; font-size: 10.5px; color: var(--ink-mute);
+  line-height: 1.5; overflow-wrap: anywhere;
 }
 
 /* 落地进度（CG-8）：与卡片进度**并列**呈现，视觉上要能一眼分清"活干完了多少"
@@ -511,7 +578,13 @@ button { font: inherit; color: inherit; }
 }
 
 /* ---------- 7. 阶段 ---------- */
-.phases { display: flex; flex-direction: column; }
+/* 阶段清单是项目列里唯一可滚的部分（项目头恒常可见）。min-height:0 是必需的：
+   flex 子项默认 min-height:auto，不置零的话 overflow-y 永远不生效，
+   内容会把整列撑高、把横向轨道顶出视口。 */
+.phases { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+@media (max-width: 720px) {
+  .phases { overflow-y: visible; }
+}
 .phase {
   border-bottom: 1px solid var(--border);
 }

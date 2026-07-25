@@ -124,11 +124,15 @@ claudego board -ttl 30       # task-snapshot cache TTL in seconds (default 10)
 ```
 
 Three inviolable rules:
-- **Read-only**: every handler uses only `os.ReadFile` / `os.ReadDir` — no writes to task state, no write endpoints. The board sits on top of live queue data; any write would corrupt the real queue.
+- **Queue data is read-only**: every handler reads `~/.claudego` through `os.ReadFile` / `os.ReadDir` only — `tasks/` / `archive/` / `events/` / task JSON are never written, no task state is ever changed. The board sits on top of live queue data; any write would corrupt the real queue. The single exception is the board's **own view state**: `POST /api/project/archive` writes `~/.claudego/board_archive.json` (project collapse state, see "Project archiving" below) — it takes no part in scheduling, is never read by runner/tick/patrol, and deleting it loses no queue data. Every GET path remains write-free.
 - **127.0.0.1 only**: responses contain full prompt text, directory paths, and quota data. `-addr` can override the bind address, but the default is always the loopback; binding to a non-loopback address prints a warning — not recommended.
 - **TTL cache**: task snapshots and the burndown view each have their own TTL (burndown TTL = task TTL × 3, minimum 30 s), preventing a full disk scan of tasks/ and transcripts on every request. `/api/*` endpoints are gzip-compressed (2.5 MB → 320 KB in practice).
 
-**Project override `~/.claudego/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Allowed fields: `name` / `desc` / `phases.<name>` / `goal`.
+**The overview is a horizontal rail**: one column per project, scroll sideways to switch projects, with all vertical space given to the phase/task list inside a single column (each column scrolls on its own; column height is computed from the rail's actual position, so you never get two nested scrollbars). Projects are parallel to each other, not sequential — stacking them vertically pushes the second project off-screen behind the first one's several hundred cards. Narrow screens (≤720 px) fall back to vertical stacking.
+
+**Quota is shown as remaining**: the headline reading in both the top quota strip and the burndown page is **remaining quota** (`BurnSource.remaining_percent`, computed server-side and clamped to [0,100]); the burndown curve descends and hitting zero means exhausted. The source data (CodexBar) reports used %, so `used_percent` is preserved verbatim in the response and shown alongside in tooltips / subtitles / the sample table — whenever both appear on screen, which one you're looking at is always labelled. The decision you make on this screen ("can I dispatch another batch?") is a direct function of what's left; "how much has burned" requires a subtraction first.
+
+**Project override `~/.claudego/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Allowed fields: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules`.
 
 **`goal` field (CG-8 "landed progress")**: a mechanized "how far from the project goal" view, displayed **alongside** the card-based `progress_percent` (never replacing it). V1 does synthesis only — no history/trend.
 
@@ -164,6 +168,51 @@ Synthesis: `landed_percent = Σ(weight × done_percent) / Σweight`, shown next 
 - `board.json` present but syntactically invalid (jsonc comments, trailing commas, unclosed braces) → `OverviewResp.board_override_error` is populated, the red banner stays up, and **the entire override block** drops back to auto-derivation; **field-type typos** (`"weight":"1"` / `"done_percent":"50%"`, i.e. `*json.UnmarshalTypeError`) → the banner is populated too, but **the partial-fill result is preserved** (other projects' unaffected name/desc/phases/goal still apply) — one typo does not collectively erase the whole override. Neither shape is **ever silently swallowed**.
 
 **The board only reads evidence files, never executes commands**: producing that JSON is the job of the orchestration session/card (e.g. `ops/test-ready/check`); the board only consumes what has been written to disk.
+
+### Progress split by kind of work (`Project.kinds`)
+
+A single project progress bar divides done cards by all cards — not wrong, but it averages three completely different kinds of work **weighted by card count**. Review and fix cards are short-lived, so their completion rate is naturally high, and they routinely make up 70%+ of the cards (one real project: 430 `design-review` cards against 800 `sequence` ones). The total bar gets dragged up to ~90% while the cards that actually land the work may be at 40%. **The total bar is optimistic in a specific direction** — exactly the "later-stage work gets underestimated" problem.
+
+So each project also emits `kinds[]`: five buckets — **design / impl / fix / review / coord** — each reporting its own completion using the identical formula as the total (`done ÷ (total − canceled)`). Empty buckets are omitted. The total bar is **kept unchanged**: it is the only reading comparable with historical screenshots, and the one anchor that depends on no classification judgement at all. Real example: a project whose total reads 87.9% splits into design 83.3% / **impl 73.2%** / fix 95.5% / review 100%.
+
+Classification order *is* the priority order — **structural signals first, keywords last** — and every card carries a `kind_source` stating what the verdict was based on:
+
+| Order | Signal | `kind_source` | Bucket |
+|---|---|---|---|
+| 1 | first matching `kind_rules` entry in `board.json` | `override` | as specified |
+| 2 | `x_role=C` / non-empty `review_of` / `type=design-review` / title prefixed 审核:／对抗复审: | `x_role`/`review_of`/`type`/`title` | review |
+| 3 | `fix_round>0` / title prefixed 修复R1: (**colon required**) | `fix_round`/`title` | fix |
+| 4 | `type ∈ {coordinate, progress-pull, prompt-assembly, batch}` / title prefixed 收口:／进度: | `type`/`title` | coord |
+| 5 | title contains 设计/方案/规划/调研/选型/架构/评估/蓝图/草案/立项/盘点 or design/spec/rfc/roadmap/proposal/blueprint/research | `title` | design |
+| 6 | nothing matched | `default` | impl |
+
+Two deliberate, non-negotiable choices:
+- **Review must be decided before fix.** Review cards inherit the reviewed card's `fix_round`; getting the order wrong silently moves hundreds of review cards into the fix bucket — impl progress looks unchanged, the fix bucket doubles out of nowhere, and nothing errors.
+- **Unclassifiable cards go to "impl", not "unclassified"** (the opposite of the phase layer's "unsorted"). The distortion this feature exists to prevent is *underestimating remaining work*, so counting unclassifiable work as work still to land errs on the conservative side; a separate "unclassified" bucket would instead make impl look emptier than it is. `kind_source=default` states this plainly.
+
+Keywords are a heuristic and will misfire; `kind_rules` is the precise escape hatch (more honest than piling more words into the keyword list, which would hurt unrelated projects):
+
+```jsonc
+"kind_rules": [
+  {"match": "HB-",             "kind": "design"},   // title substring, case-insensitive
+  {"match": "t0723-0304-c0d8", "kind": "coord"}     // or a full task ID
+]
+```
+
+Valid `kind` values are only `design` / `impl` / `fix` / `review` / `coord`. Invalid rules are **skipped one by one** (the rest still apply — one typo doesn't take out the whole list), but every skipped rule is reported through `Project.kind_rule_error` and shown as a yellow warning on the project card — silent no-ops are fabricated readings.
+
+### Project archiving (collapse on the overview)
+
+Once you have enough projects, long-finished ones still occupy a column on the overview forever. The "归档 / Archive" button on the project card and project page collapses one away:
+
+- Archive state lives in `~/.claudego/board_archive.json`; **not a single byte of any task card changes**, and scheduling, ETA and status counts are all unaffected. The top status counts still include archived projects' cards, and the page header says so explicitly ("N projects archived — the status counts below still include their cards").
+- Archived projects are not laid out on the overview rail by default; the "已归档 N" toggle in the top right expands them temporarily so you can un-archive in place.
+- **A new card automatically restores the project to active.** Archiving records the (card count, newest `created_at`) at that moment; if the count later grows, or a newer `created_at` appears, the project is judged to have new cards and flips back to active, with a badge and the reason ("auto-restored") on the card — omit the reason and users assume their archive click never registered. The two criteria are OR'd: count alone is fooled by "remove one, add one"; timestamp alone misses cards with a missing `created_at`.
+- **Card status changes do not trigger restoration** (queued→done, running→failed all count as no change). Manual archiving means "I don't want to look at this project for now"; a known card finishing is not new information. Judging by `updated_at` would make archiving a still-running project bounce back on the very next tick.
+- Auto-restoration is a **read-only derivation and is never written back**: the archive record stays put and is re-evaluated on every request. That keeps GET paths write-free and rules out "restoration failed to persist → half-archived state".
+- If the state file cannot be read (corrupted), the error is **surfaced** (`archive_state_error`, yellow banner) and everything renders as un-archived; writes onto a corrupted file are **refused**. Silently treating it as "nothing archived" would make ten hand-collapsed projects reappear at once with zero explanation.
+
+`POST /api/project/archive` is the board's only write endpoint (body `{"id":"<project id>","archived":true}`), behind three gates: POST only; `Content-Type` must be `application/json` (HTML forms cannot produce that type, which blocks cross-site auto-submitting forms); and when an `Origin` header is present its host must equal the request Host (browser cross-site fetches always send Origin). Command-line `curl` sends no Origin and is allowed through — local ops needs to be scriptable.
 
 **Burndown view — three sources** (`/api/burn`): of these, `usage-history.jsonl` (= `usage_feed`) is the only source shared with `claudego quota`; `claude.json` and transcript scanning are board-exclusive — `claudego quota` does not read those two sources:
 1. **CodexBar `claude.json`**: per-account session / weekly / opus window percentage time-series for the claude side;

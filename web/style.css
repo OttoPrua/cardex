@@ -146,7 +146,8 @@ button { font: inherit; color: inherit; }
   border-bottom: 1px solid var(--border);
 }
 .topbar-inner {
-  max-width: 1760px; margin: 0 auto;
+  /* 与 .app 同宽（都跟随视口，见那里的注释），顶栏与主区的左右边缘才对得齐。 */
+  width: 100%; margin: 0 auto;
   min-height: var(--topbar-h);
   padding: 7px 18px;
   display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
@@ -248,7 +249,11 @@ button { font: inherit; color: inherit; }
 
 /* ---------- 5. 主区 ---------- */
 .app {
-  max-width: 1760px; margin: 0 auto;
+  /* 跟随视口，不设固定上限。原来钉死 1760px：超宽屏（2560/3440）上两侧留出大片空白，
+     而项目轨道恰恰是"每多一像素就多露一点下一个项目"的布局——把宽度让给留白等于
+     白白少看一列。正文可读行宽由各自的卡片/网格控制（.burn-grid、.tiles 都是
+     auto-fill minmax），不靠外层截断来维持。 */
+  width: 100%; margin: 0 auto;
   padding: 20px 18px 72px;
   /* 刷新时保持旧渲染、降低不透明度 —— 不出现骨架闪烁 */
   transition: opacity .18s;
@@ -282,16 +287,41 @@ button { font: inherit; color: inherit; }
   background: color-mix(in oklab, var(--s1) 10%, var(--surface));
 }
 
-/* 总计条 */
+/* 总计条 —— 同时是状态筛选开关（按下=隐藏该状态的卡片清单，数字永远是全量） */
 .totals { display: flex; gap: 7px; flex-wrap: wrap; align-items: center; }
 .total-chip {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 4px 10px; border-radius: 999px;
   background: var(--surface); border: 1px solid var(--border);
-  font-size: 12px; white-space: nowrap;
+  font: inherit; font-size: 12px; white-space: nowrap;
+  color: var(--ink); cursor: pointer;
+  transition: opacity .12s, border-color .12s, background .12s;
 }
+.total-chip:hover { border-color: var(--border-2); background: var(--surface-2); }
+.total-chip:focus-visible { outline: 2px solid var(--s1); outline-offset: 2px; }
+/* 关闭态：压暗 + 虚线边 + 标签划掉。三重编码，不只靠透明度——
+   一排半透明的小圆片在深色主题下几乎看不出差别。 */
+.total-chip.is-off {
+  opacity: .5; border-style: dashed; background: transparent;
+}
+.total-chip.is-off .tc-l { text-decoration: line-through; }
 .total-chip .tc-n { font-weight: 680; font-variant-numeric: tabular-nums; }
 .total-chip .tc-l { color: var(--ink-2); }
+
+/* 筛选生效时的常驻披露条 */
+.filter-note {
+  display: flex; align-items: baseline; gap: 9px; flex-wrap: wrap;
+  margin: -6px 0 16px; padding: 8px 13px;
+  border: 1px dashed var(--border-2); border-radius: var(--r-md);
+  background: var(--surface-2);
+  font-size: 12px; color: var(--ink-2); line-height: 1.6;
+}
+.filter-note .fn-mark { color: var(--ink-mute); flex: 0 0 auto; }
+.filter-note .fn-text { min-width: 0; }
+.filter-note .fn-text strong { color: var(--ink); font-weight: 640; }
+/* 紧跟文字，不用 margin-left:auto —— 超宽屏上那会把按钮甩到一米开外，
+   读完"已隐藏…"还得横穿整屏去找怎么恢复。 */
+.filter-note .ghost-btn { flex: 0 0 auto; }
 
 /* 状态圆点（所有状态色的唯一承载物，文字一律用文本色） */
 .dot {

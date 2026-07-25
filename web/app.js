@@ -431,6 +431,11 @@ const el = {
 // 没人看的时候每 30 秒重扫近 2000 个 JSON 是纯粹的浪费。
 const AUTO_REFRESH_MS = 30000;
 
+// HIDDEN_STATUS_KEY 必须声明在 state 之前：state 的初始化会调 loadHiddenStatuses()，
+// 而 const 在声明之前处于 TDZ——放到后面会抛 ReferenceError，又被那里的 try/catch
+// 吞成"读不出，按不筛选处理"。表现是筛选静默失效、localStorage 里明明存着值。
+const HIDDEN_STATUS_KEY = 'claudego.board.hiddenStatuses';
+
 const state = {
   route: null,
   loading: false,
@@ -448,8 +453,93 @@ const state = {
     laneMode: false, burnAll: false,
     // showArchived：总览是否把已归档项目也铺出来（默认折叠，这正是归档的用途）。
     showArchived: false,
+    // hiddenStatuses：被折叠掉的状态（只影响**卡片清单**，见 statusFilterChips 的注释）。
+    hiddenStatuses: loadHiddenStatuses(),
   },
 };
+
+/* ---- 状态筛选（只藏清单，不动读数）---- */
+
+/**
+ * 筛选状态存 localStorage：一屏上千张卡，把「已完成」藏起来是常态操作，
+ * 每次刷新都要重设一遍的话没人会用。代价是"刷新后还藏着"，
+ * 靠 filterNote() 的常驻横幅兜住——藏了什么必须一直看得见。
+ * 读不出/存不进（隐私模式、配额满）一律静默降级成"不筛选"：
+ * 这是个显示偏好，不该让它把整页拖挂。
+ */
+function loadHiddenStatuses() {
+  try {
+    const raw = localStorage.getItem(HIDDEN_STATUS_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    // 过一遍白名单：手改过的 localStorage 不该往状态集里塞未知键。
+    return new Set(Array.isArray(arr) ? arr.filter((k) => STATUS_ORDER.includes(k)) : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+
+function saveHiddenStatuses() {
+  try {
+    localStorage.setItem(HIDDEN_STATUS_KEY, JSON.stringify([...state.ui.hiddenStatuses]));
+  } catch (_) { /* 存不进就只在本次会话里生效，不值得报错打断 */ }
+}
+
+const statusHidden = (s) => state.ui.hiddenStatuses.has(s);
+
+function toggleStatus(s) {
+  if (statusHidden(s)) state.ui.hiddenStatuses.delete(s);
+  else state.ui.hiddenStatuses.add(s);
+  saveHiddenStatuses();
+  load({ silent: true });
+}
+
+function clearStatusFilter() {
+  state.ui.hiddenStatuses.clear();
+  saveHiddenStatuses();
+  load({ silent: true });
+}
+
+/**
+ * 状态计数条，同时是筛选开关。
+ *
+ * 【纪律】筛选**只藏卡片清单**，绝不改任何读数：这排数字、进度条、各分类桶、ETA
+ * 一律按全部卡算。藏掉「已完成」之后进度条跟着掉下去的话，那不是筛选，那是伪造快照
+ * ——用户会拿着一个自己无意中造出来的数字去做决定。
+ * 所以数字**永远显示全量**，哪怕该状态的卡一张都没铺出来。
+ */
+function statusFilterChips(counts) {
+  const wrap = h('div', { class: 'totals' });
+  for (const k of STATUS_ORDER) {
+    if (!counts[k]) continue;
+    const off = statusHidden(k);
+    wrap.append(h('button', {
+      class: `total-chip${off ? ' is-off' : ''}`, type: 'button',
+      'aria-pressed': String(!off),
+      title: off
+        ? `「${STATUS_ZH[k]}」的卡片清单当前已隐藏，点击恢复。计数 ${counts[k]} 与进度不受筛选影响。`
+        : `点击隐藏「${STATUS_ZH[k]}」的卡片清单。计数与进度仍按全部卡算，不会跟着变。`,
+      onclick: () => toggleStatus(k),
+    },
+      statusDot(k, true),
+      h('span', { class: 'tc-n', text: String(counts[k]) }),
+      h('span', { class: 'tc-l', text: STATUS_ZH[k] })));
+  }
+  return wrap;
+}
+
+/** 筛选生效时的常驻披露。藏了东西却不说，就成了"这个项目怎么空了"的悬案。 */
+function filterNote() {
+  const hidden = STATUS_ORDER.filter(statusHidden);
+  if (!hidden.length) return null;
+  return h('div', { class: 'filter-note' },
+    h('span', { class: 'fn-mark', 'aria-hidden': 'true', text: '⃠' }),
+    h('span', { class: 'fn-text' },
+      `已隐藏 ${hidden.map((k) => STATUS_ZH[k]).join('、')} 的卡片清单——`,
+      h('strong', { text: '上方计数、进度条与 ETA 仍按全部卡计算' }),
+      '，未受筛选影响。'),
+    h('button', { class: 'ghost-btn', type: 'button', onclick: clearStatusFilter, text: '全部显示' }));
+}
 
 /** 归档 / 取消归档一个项目。只写看板自己的视图状态，任务卡一个字节都不动。 */
 async function setArchived(id, archived) {
@@ -735,11 +825,8 @@ async function viewOverview() {
         },
         text: state.ui.allCollapsed ? '全部展开' : '全部收起',
       }),
-      h('div', { class: 'totals' }, STATUS_ORDER.filter((k) => totals[k] > 0).map((k) =>
-        h('span', { class: 'total-chip' },
-          statusDot(k, true),
-          h('span', { class: 'tc-n', text: String(totals[k]) }),
-          h('span', { class: 'tc-l', text: STATUS_ZH[k] })))))));
+      statusFilterChips(totals))));
+  frag.append(filterNote());
 
   if (!all.length) {
     frag.append(emptyState('队列里还没有任何任务卡。'));
@@ -868,14 +955,32 @@ function phaseBlock(ph) {
 
 function taskList(tasks, total) {
   if (!tasks || !tasks.length) return h('div', { class: 'kcol-empty', text: '本阶段没有任务卡。' });
-  const list = h('div', { class: 'task-list' });
-  for (const t of tasks) list.append(taskRow(t));
-  const wrap = h('div', {}, list);
-  // 总览每阶段最多带 40 条（后端截断）。差额必须说出来，不能让人以为这就是全部。
+  const shown = tasks.filter((t) => !statusHidden(t.status));
+  const filteredOut = tasks.length - shown.length;
+
+  const wrap = h('div', {});
+  if (shown.length) {
+    const list = h('div', { class: 'task-list' });
+    for (const t of shown) list.append(taskRow(t));
+    wrap.append(list);
+  } else {
+    wrap.append(h('div', {
+      class: 'kcol-empty',
+      text: `本阶段 ${tasks.length} 张卡都被状态筛选隐藏了。`,
+    }));
+  }
+  // 「后端只发了 40 条」与「我自己把某些状态藏了」是两件完全不同的事，
+  // 合成一句"显示 3 / 共 40"会让人以为看板丢了数据。两条提示分开写。
   if (isNum(total) && total > tasks.length) {
     wrap.append(h('p', {
       class: 'more-hint',
       text: `显示 ${tasks.length} / 共 ${total} 张，完整清单见项目看板。`,
+    }));
+  }
+  if (filteredOut) {
+    wrap.append(h('p', {
+      class: 'more-hint',
+      text: `另有 ${filteredOut} 张被状态筛选隐藏（进度与计数不受影响）。`,
     }));
   }
   return wrap;
@@ -926,11 +1031,8 @@ async function viewProject(id) {
       descBlock(p.desc, p.desc_source)),
     h('div', { class: 'head-right' },
       archiveBtn(p),
-      h('div', { class: 'totals' }, STATUS_ORDER.filter((k) => p.stats[k] > 0).map((k) =>
-        h('span', { class: 'total-chip' },
-          statusDot(k, true),
-          h('span', { class: 'tc-n', text: String(p.stats[k]) }),
-          h('span', { class: 'tc-l', text: STATUS_ZH[k] })))))));
+      statusFilterChips(p.stats))));
+  frag.append(filterNote());
 
   frag.append(h('div', { class: 'card', style: 'padding:13px 17px;margin-bottom:16px' },
     p.archive_revived
@@ -967,10 +1069,28 @@ async function viewProject(id) {
   return frag;
 }
 
+// kanban 的列**就是**状态，所以状态筛选在这里表现为"整列消失"，
+// 而不是列还在、里面空着——后者会被读成"这个状态一张卡都没有"。
+// 藏掉了几列必须写出来，否则整版少一列没有任何痕迹。
 function kanbanView(columns) {
-  const k = h('div', { class: 'kanban' });
-  for (const c of columns) k.append(kanbanColumn(c));
-  return k;
+  const shown = columns.filter((c) => !statusHidden(c.key));
+  const hidden = columns.filter((c) => statusHidden(c.key));
+  const wrap = h('div', {});
+  if (shown.length) {
+    const k = h('div', { class: 'kanban' });
+    for (const c of shown) k.append(kanbanColumn(c));
+    wrap.append(k);
+  } else {
+    wrap.append(h('div', { class: 'kcol-empty', text: '所有列都被状态筛选隐藏了。' }));
+  }
+  if (hidden.length) {
+    wrap.append(h('p', {
+      class: 'more-hint',
+      text: `已隐藏 ${hidden.map((c) => `「${c.label}」${c.total} 张`).join('、')}——`
+        + '计数与进度仍按全部卡算。',
+    }));
+  }
+  return wrap;
 }
 
 function kanbanColumn(c) {

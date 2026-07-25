@@ -36,6 +36,8 @@ func main() {
 		err = cmdAdopt(os.Args[2:])
 	case "plan":
 		err = cmdPlan(os.Args[2:])
+	case "cross":
+		err = cmdCross(os.Args[2:])
 	case "brief":
 		err = cmdBrief(os.Args[2:])
 	case "progress":
@@ -46,6 +48,8 @@ func main() {
 		err = cmdCmd(os.Args[2:])
 	case "quota":
 		err = cmdQuota(os.Args[2:])
+	case "board":
+		err = cmdBoard(os.Args[2:])
 	case "list", "status", "ls":
 		err = cmdList(os.Args[2:])
 	case "run", "tick":
@@ -100,6 +104,9 @@ func printUsage() {
   review    [-dir D] [-priority N] [-model M] [-session S] ["关注点"]
             设计审核：只读审查产出分级报告；-session 挂到既有审核角色会话
   adopt     <session-id> [-dir D] [-model M] ["续跑提示"]  # 接管一个被限额打断的既有会话
+  cross     [-profile NAME] [-dir D] [-priority N] [-title T] [-file f] "任务内容"
+            交叉验证（设计档顶替流）：引擎甲(如 claude opus)独立作答 → 引擎乙(如 codex)独立作答后
+            拿甲的结论对抗式交叉查漏；两侧都走第一性原理+对抗式审查。-list 看可用引擎对
 
 进度回收与分工协调
   sessions  [-dir D] [-n 10]              # 列出该项目最近的 claude 会话（桌面端与 CLI 同池）
@@ -117,6 +124,8 @@ func printUsage() {
   list                             # 任务看板（-json 机器可读，-all 含已归档状态）
   log <id> [-n 60]                 # 查看任务执行日志
   quota                            # 5 小时额度视图：队列消耗/红线状态/外部用量源
+  board     [-port 8787] [-addr 127.0.0.1] [-ttl 10]
+            只读 Web 看板：项目/阶段/任务三层视图 + 额度燃尽曲线（默认只听本机回环）
 
 任务管理
   hold/release <id>                # 挂起 / 恢复排队
@@ -200,6 +209,7 @@ func cmdAdd(args []string) error {
 	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
 	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
+	codexModel := fs.String("codex-model", "", "钉定经 codex 执行时的模型（如 gpt-5.6-terra）：配 -runner codex 主跑生效；不配 runner 时作为本卡 codex_fallback 降级模型")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
 	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
@@ -235,10 +245,10 @@ func cmdAdd(args []string) error {
 
 	var wd string
 	if *host != "" {
-		// 远端任务：-dir 是远端主机上的路径（如 D:/Project/Trading），不做本地校验。
+		// 远端任务：-dir 是远端主机上的路径（如 D:/Project/MyApp），不做本地校验。
 		wd = strings.TrimSpace(*dir)
 		if wd == "" {
-			return fmt.Errorf("-host 远程任务必须显式指定 -dir（远端工作目录，如 D:/Project/Trading）")
+			return fmt.Errorf("-host 远程任务必须显式指定 -dir（远端工作目录，如 D:/Project/MyApp）")
 		}
 	} else {
 		wd, err = resolveDir(*dir)
@@ -281,7 +291,13 @@ func cmdAdd(args []string) error {
 		if cfg.CodexBin == "" {
 			return fmt.Errorf("config.json 未配置 codex_bin，无法钉定 codex 执行器")
 		}
+		// -model 对 codex 引擎是零效 no-op（claude 专用旗标）——报错防"以为设了模型"的误导，
+		// 与交叉引擎 profile 校验同一原则；codex 模型请用 -codex-model。
+		if *model != "" {
+			return fmt.Errorf("-runner codex 的模型请用 -codex-model 指定（-model 是 claude 专用旗标，对 codex 无效）")
+		}
 	}
+	t.CodexModel = strings.TrimSpace(*codexModel)
 	if *host != "" {
 		t.RemoteHost = *host
 		if !codexEligible(t) {
@@ -307,7 +323,200 @@ func cmdAdd(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	// 事件账本入队事件：actor 用 cli:add 让活动流能溯源到人工触发点。
+	// -hold 直入 held 的卡也从 queued 记起,再补一条 held——诚实历史"入了队但立刻被人挂"。
+	emitTaskEvent(root, t.ID, evQueued, "cli:add", statusQueued, t.Step, map[string]any{
+		"type": t.Type, "priority": t.Priority, "prompts": len(t.Prompts),
+	})
+	if *hold {
+		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step, map[string]any{"reason": "add -hold"})
+	}
 	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d）\n", t.ID, t.Type, t.Title, len(t.Prompts), t.Priority)
+	return nil
+}
+
+// cmdCross 铺设一条交叉验证链（fable 顶替流）：只入队引擎甲的 A 卡，B/C 由 runner 在
+// 各上游卡完成后自动派出（引擎乙独立作答 B → 引擎乙拿甲结论交叉查漏 C）。模型来源靠 profile 切换。
+func cmdCross(args []string) error {
+	fs := flag.NewFlagSet("cross", flag.ExitOnError)
+	rootFlag := fs.String("root", "", "数据目录")
+	profile := fs.String("profile", "", "引擎对 profile 名（config.cross_profiles；默认 config.default_cross_profile）")
+	dir := fs.String("dir", "", "工作目录（默认当前目录；远端引擎时为远端路径）")
+	title := fs.String("title", "", "任务标题")
+	priority := fs.Int("priority", 0, "优先级，越大越先跑")
+	file := fs.String("file", "", "从文件读取任务内容")
+	list := fs.Bool("list", false, "列出可用的引擎对 profile 后退出")
+	_ = fs.Parse(args)
+
+	root := resolveRoot(*rootFlag)
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+
+	if *list {
+		return listCrossProfiles(cfg)
+	}
+
+	// 读任务内容（-file 或命令行剩余参数）。
+	var task string
+	if *file != "" {
+		data, err := os.ReadFile(*file)
+		if err != nil {
+			return err
+		}
+		task = strings.TrimSpace(string(data))
+	} else {
+		task = strings.TrimSpace(strings.Join(fs.Args(), " "))
+	}
+	if task == "" {
+		_ = listCrossProfiles(cfg)
+		return fmt.Errorf("缺少任务内容：直接写在命令行，或用 -file 指定")
+	}
+
+	// 解析 profile。
+	name := *profile
+	if name == "" {
+		name = cfg.DefaultCrossProfile
+	}
+	if name == "" {
+		return fmt.Errorf("未指定 -profile 且 config.default_cross_profile 为空")
+	}
+	prof, ok := cfg.CrossProfiles[name]
+	if !ok {
+		return fmt.Errorf("未知 profile %q（claudego cross -list 查看可用引擎对）", name)
+	}
+	// 甲乙必须同执行位置：交叉链 A/B/C 共用一个工作目录，跨机/本机-远端混排会让 B/C 拿错目录。
+	if la, lb := crossEngineLoc(prof.A), crossEngineLoc(prof.B); la != lb {
+		return fmt.Errorf("profile %q 的甲乙引擎执行位置不同（%s vs %s）：交叉链共用一个工作目录，一对引擎须同在本机或同一远端主机", name, la, lb)
+	}
+	// 甲乙必须是**不同引擎**：同 kind+同模型（codex 同 codex_model / claude 同 model / 远端同 host+model）=
+	// 单引擎自审，交叉验证形同虚设。
+	if ia, ib := crossEngineIdentity(prof.A, cfg), crossEngineIdentity(prof.B, cfg); ia == ib {
+		return fmt.Errorf("profile %q 的甲乙是同一引擎（%s）：交叉验证要求两个不同引擎，否则退化为单引擎自审", name, ia)
+	}
+
+	// 工作目录：引擎甲是远端时 -dir 为远端路径，不做本地校验。
+	var wd string
+	aRemote := crossEngineLoc(prof.A) != "local"
+	if aRemote {
+		wd = strings.TrimSpace(*dir)
+		if wd == "" {
+			return fmt.Errorf("引擎甲是远端执行器，必须显式指定 -dir（远端工作目录）")
+		}
+	} else {
+		wd, err = resolveDir(*dir)
+		if err != nil {
+			return err
+		}
+		// 工作目录不得是（或位于）claudego 数据根——否则交叉卡的 cwd 直接含 tasks/，B 一读就看到 A 卡。
+		// 解符号链接后比对（否则 /tmp→/private/tmp 或软链数据根可绕过守卫）。
+		cleanWd, cleanRoot := resolveSymPath(wd), resolveSymPath(root)
+		sep := string(os.PathSeparator)
+		// 拒：数据根本身、其子目录、或其**父目录**（-dir=$HOME 时 cwd 直接包含 $HOME/.claudego）。
+		if cleanWd == cleanRoot || strings.HasPrefix(cleanWd, cleanRoot+sep) || strings.HasPrefix(cleanRoot, cleanWd+sep) {
+			return fmt.Errorf("-dir 不能是 claudego 数据根、其子目录或其父目录（数据根 %s）：交叉卡工作目录会包含/暴露编排态", cleanRoot)
+		}
+		// 若工作目录是 git 仓，注入 HEAD 作代码评审锚点。**这是非强制 advisory**：本工具不做工作树
+		// 快照/checkout，未提交改动 HEAD 不变——故若工作树脏，额外警告"链执行期间勿改动"。（诚实降级，
+		// 不谎称快照钉固：真正的同代码态需你自己在链执行前提交或保持工作树不变。）
+		if sha := gitHeadSha(wd); sha != "" {
+			anchor := fmt.Sprintf("\n\n[代码锚点·非强制] 若本任务涉及代码，以 git 提交 %s 为准评估。", sha)
+			if gitTreeDirty(wd) {
+				anchor += "注意：工作树当前有**未提交改动**，本工具不做快照——请确保交叉链 A/B/C 执行期间不再改动它，否则三腿可能审的不是同一代码态。"
+			}
+			task += anchor
+		}
+	}
+
+	tpl, err := loadTemplate(root, "crosscheck-solo")
+	if err != nil {
+		return err
+	}
+	solo := renderTemplate(tpl, map[string]string{"TASK": task})
+
+	// 套引擎甲；谱系键用不透明随机键（非 A 卡 ID）；把乙引擎**解析成冻结规格**钉进 A 卡随链传递，
+	// B/C 执行时直接套用、不再从当前 config 重解析（防"入队后改 profile/codex_model 静默换引擎"漂移）。
+	a := newTask(root, cfg, typeCrossCheck, "交叉A["+name+"]: "+orDefaultTitle(*title, task), wd, []string{solo}, *priority)
+	a.XRole = "A"
+	a.XKey = newCrossKey()
+	a.XProfile = name
+	a.XTask = task
+	if err := applyCrossEngine(a, prof.A, cfg); err != nil {
+		return fmt.Errorf("引擎甲(%s): %w", crossEngineLabel(prof.A), err)
+	}
+	if prof.A.Kind == "codex" || prof.A.Kind == "remote-codex" {
+		a.XCodexModel = cfg.CodexModel // 甲若是 codex,也冻结其模型
+	}
+	frozenB, err := freezeCrossEngine(prof.B, cfg) // 解析+校验+冻结乙引擎（含 codex 模型）
+	if err != nil {
+		return fmt.Errorf("引擎乙(%s): %w", crossEngineLabel(prof.B), err)
+	}
+	a.XEngineB = frozenB
+	if err := saveTask(root, a); err != nil {
+		return err
+	}
+	emitTaskEvent(root, a.ID, evQueued, "cli:cross", statusQueued, 0, map[string]any{
+		"profile": name, "x_role": "A", "x_key": a.XKey,
+	})
+	fmt.Printf(`已入队交叉验证链 [%s]  甲=%s  乙=%s
+  A %s  引擎甲独立作答（第一性原理+对抗式自审）
+  ↓ 完成后自动派：
+  B      引擎乙独立作答（不见甲结论、无 A 指针）
+  ↓ 完成后自动派：
+  C      引擎乙拿甲结论对抗式交叉查漏 → 结论落进度报告
+链 ID: %s   最终结论: claudego progress -show %s   A 卡日志: claudego log %s
+工作目录: %s
+`, name, crossEngineLabel(prof.A), crossEngineLabel(prof.B), a.ID, a.XKey, a.XKey, a.ID, wd)
+	return nil
+}
+
+// gitHeadSha 返回目录当前 git HEAD 的完整 sha；非 git 仓/出错时返回空串。
+func gitHeadSha(dir string) string {
+	out, err := exec.Command("git", "-C", dir, "rev-parse", "HEAD").Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// gitTreeDirty 判断工作树是否有未提交改动（git status --porcelain 非空）。非 git 仓/出错返回 false。
+func gitTreeDirty(dir string) bool {
+	out, err := exec.Command("git", "-C", dir, "status", "--porcelain").Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(out)) != ""
+}
+
+// resolveSymPath 解析符号链接后返回清理过的绝对路径；解析失败退回 filepath.Clean（用于路径包含判定）。
+func resolveSymPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return filepath.Clean(r)
+	}
+	return filepath.Clean(p)
+}
+
+// listCrossProfiles 打印可用的交叉验证引擎对。
+func listCrossProfiles(cfg *Config) error {
+	if len(cfg.CrossProfiles) == 0 {
+		fmt.Println("（config.cross_profiles 为空，无可用引擎对）")
+		return nil
+	}
+	fmt.Println("可用交叉验证引擎对（-profile）:")
+	var names []string
+	for n := range cfg.CrossProfiles {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		p := cfg.CrossProfiles[n]
+		def := ""
+		if n == cfg.DefaultCrossProfile {
+			def = "  (默认)"
+		}
+		fmt.Printf("  %-14s 甲=%s  乙=%s%s\n", n, crossEngineLabel(p.A), crossEngineLabel(p.B), def)
+	}
 	return nil
 }
 
@@ -350,6 +559,9 @@ func cmdAssemble(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:assemble", statusQueued, 0, map[string]any{
+		"type": t.Type, "emit_hold": t.EmitHold,
+	})
 	fmt.Printf("已入队装配任务 %s：完成后产出的任务序列会自动进入队列。\n", t.ID)
 	return nil
 }
@@ -390,6 +602,9 @@ func cmdReview(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:review", statusQueued, 0, map[string]any{
+		"type": t.Type, "focus": focus,
+	})
 	fmt.Printf("已入队审核任务 %s [%s]\n", t.ID, wd)
 	return nil
 }
@@ -432,6 +647,9 @@ func cmdAdopt(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:adopt", statusQueued, 0, map[string]any{
+		"session_id": sessionID,
+	})
 	fmt.Printf("已入队 %s：将 --resume %s 继续执行。\n", t.ID, sessionID)
 	return nil
 }
@@ -478,6 +696,9 @@ func cmdPlan(args []string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
+	emitTaskEvent(root, t.ID, evQueued, "cli:plan", statusQueued, 0, map[string]any{
+		"type": t.Type, "emit_hold": t.EmitHold,
+	})
 	if *holdOut {
 		fmt.Printf("已入队协调任务 %s：分工产出的任务将挂起等待人工放行（claudego release）。\n", t.ID)
 	} else {
@@ -590,6 +811,9 @@ func cmdBrief(args []string) error {
 		if err := saveTask(root, t); err != nil {
 			return err
 		}
+		emitTaskEvent(root, t.ID, evQueued, "cli:brief", statusQueued, 0, map[string]any{
+			"type": t.Type, "session_id": sess,
+		})
 		fmt.Printf("已入队进度回收任务 %s（--resume %s，模型 %s）：完成后报告写入 %s\n",
 			t.ID, sess, orDash(t.Model), progressPath(root, key))
 		return nil
@@ -723,6 +947,14 @@ func reportStatus(r map[string]any) string {
 	if isRawReport(r) {
 		return "[raw] " + oneLine(rptStr(r["raw"]))
 	}
+	// 交叉验证合并报告（含 verdict）：给列表一行「⚖ 结论」，否则计数/现状路径全落空显 —。
+	if v := strings.TrimSpace(rptStr(r["verdict"])); v != "" {
+		s := oneLine(rptStr(r["summary"]))
+		if s == "" {
+			s = oneLine(v)
+		}
+		return "⚖ " + s
+	}
 	ip := strings.TrimSpace(rptStr(r["in_progress"]))
 	if ip != "" && !strings.HasPrefix(ip, "无") && !strings.EqualFold(ip, "none") && !strings.EqualFold(ip, "n/a") {
 		return "▶ " + oneLine(ip)
@@ -756,6 +988,23 @@ func renderReport(e *ProgressEntry, full bool) {
 	if isRawReport(r) {
 		fmt.Println("\n[原文兜底 raw]")
 		fmt.Println(rptStr(r["raw"]))
+		return
+	}
+	// 交叉验证合并报告：按 结论→置信度→摘要→双方一致/分歧/仅甲/仅乙/残留风险 渲染（否则全落空只印表头）。
+	if v := strings.TrimSpace(rptStr(r["verdict"])); v != "" {
+		fmt.Printf("\n交叉验证结论: %s", v)
+		if conf := strings.TrimSpace(rptStr(r["confidence"])); conf != "" {
+			fmt.Printf("   置信度: %s", conf)
+		}
+		fmt.Println()
+		if s := strings.TrimSpace(rptStr(r["summary"])); s != "" {
+			fmt.Printf("摘要: %s\n", s)
+		}
+		printReportList("双方一致", rptArr(r["agreements"]))
+		printReportList("分歧裁断", rptArr(r["disagreements"]))
+		printReportList("仅甲发现", rptArr(r["only_A"]))
+		printReportList("仅乙发现", rptArr(r["only_B"]))
+		printReportList("残留风险", rptArr(r["residual_risks"]))
 		return
 	}
 	if g := strings.TrimSpace(rptStr(r["goal"])); g != "" {
@@ -923,24 +1172,56 @@ func cmdQuota(args []string) error {
 	}
 
 	_, effRP, _ := effectiveThresholds(cfg, now)
-	if cfg.UsageFeed != "" {
-		if s, err := latestFeedSample(cfg.UsageFeed); err != nil {
-			fmt.Println("外部用量源：暂无 claude 样本（放行）——", err)
-		} else if at, perr := time.Parse(time.RFC3339, s.SampledAt); perr == nil {
-			age := now.Sub(at).Round(time.Minute)
-			stale := ""
-			if age > time.Duration(cfg.UsageFeedMaxAgeMin)*time.Minute {
-				stale = "，已过期→放行"
-			}
-			rpNote := "红线未启用"
-			if effRP > 0 {
-				rpNote = fmt.Sprintf("当前红线 %d%%", effRP)
-			}
-			fmt.Printf("外部用量源：全局 5h 窗口已用 %d%%（%s，样本 %s 前%s）\n",
-				s.UsedPercent, rpNote, age, stale)
+	rpNote := "红线未启用"
+	if effRP > 0 {
+		rpNote = fmt.Sprintf("当前红线 %d%%", effRP)
+	}
+	// 三源并列展示（队列账本 / usage_feed / oauth_usage 端点）。
+	// 百分比通道两条（feed + oauth）并肩：合并规则=可用样本里最保守（percent 最大）判线。
+	// 读数分歧显式披露，不做投票也不做平均——观测口径不一致时,极端值兜住比"折中"更诚实。
+	feedRead := readUsageFeedPercent(cfg, now)
+	printSource := func(label, cfgHint string, r percentRead) {
+		if r.Available {
+			fmt.Printf("%s：全局 5h 窗口已用 %d%%（%s%s）\n", label, r.Percent, rpNote, r.AgeSuffix)
+			return
 		}
+		if r.Reason == "" {
+			fmt.Printf("%s：%s\n", label, cfgHint)
+			return
+		}
+		fmt.Printf("%s：不可用→放行——%s\n", label, r.Reason)
+	}
+	if cfg.UsageFeed != "" {
+		printSource("外部用量源(usage_feed)", "", feedRead)
 	} else {
-		fmt.Println("外部用量源：未配置（usage_feed，支持 CodexBar usage-history.jsonl 格式）")
+		fmt.Println("外部用量源(usage_feed)：未配置（支持 CodexBar usage-history.jsonl 格式）")
+	}
+	var reads []percentRead
+	reads = append(reads, feedRead)
+	if cfg.OAuthUsage {
+		oauthRead := readOAuthUsagePercent(cfg, now)
+		printSource("oauth 端点(oauth_usage)", "", oauthRead)
+		reads = append(reads, oauthRead)
+	} else {
+		fmt.Println("oauth 端点(oauth_usage)：未启用（config.json 的 oauth_usage=true 开启；端点未文档化，任何异常均按数据不足处理）")
+	}
+	// 分歧披露：两源都可用且百分比差 >= 5 → 明确报出来（合并已按最保守值判线，这里只做诚实披露）。
+	available := 0
+	minP, maxP := 100, 0
+	for _, r := range reads {
+		if r.Available {
+			available++
+			if r.Percent < minP {
+				minP = r.Percent
+			}
+			if r.Percent > maxP {
+				maxP = r.Percent
+			}
+		}
+	}
+	if available >= 2 && maxP-minP >= 5 {
+		fmt.Printf("⚠ 用量源分歧：读数区间 %d%%..%d%%（差 %d%%）——判线取最保守值 %d%%\n",
+			minP, maxP, maxP-minP, maxP)
 	}
 
 	for _, w := range cfg.RedlineWindows {
@@ -1136,6 +1417,12 @@ func cmdSetStatus(args []string, action string) error {
 		}
 		t.Status = statusQueued
 		t.NotBeforeEpoch = 0
+		// CG-4 Round-1 修复(同类闭合):release 分支也须清 reconcile:cross 墓碑——否则
+		// reconcile skipped 分支挂 held 后,ops release → queued → runTask 走完 no_more_prompts
+		// 又回 done+孤儿 → tombstone 仍 pending(2)/final → 再次 skipped → 再次挂 held
+		// = 无穷 held↔release 循环。retry 只能作用于终态/limit_paused,唯一从 held→queued
+		// 的路径是 release,因此这条被审核审过的 P1 类还有一处同构位点必须一并闭合。
+		_ = resetTombstoneKind(root, t.ID, reconcileCrossKind())
 	case "retry":
 		if !t.terminal() && t.Status != statusLimitPaused {
 			return fmt.Errorf("%s 当前状态 %s 无需 retry", t.ID, t.Status)
@@ -1149,6 +1436,14 @@ func cmdSetStatus(args []string, action string) error {
 			t.Step = 0
 			t.MidStep = false
 		}
+		// CG-4 Round-1 修复:reconcile:cross 墓碑在人工 retry 时必须显式重置——
+		// 【为什么】resume:<step> 走 runTask 顶部 reset-at-entry(status!=running 即清)拿到重置路径,
+		// 但 reconcile:cross 由 tick 主循环写、不进 runTask,若不在这里清,一张被 reconcile 判 failed 的
+		// A 卡 retry 复活、再次成为孤儿时会被 final 墓碑静默挡住,单腿 done 卡永久冒充可采信结果、零披露。
+		// 【纪律对齐】retry 是"编排层认可的新一轮尝试",与 resume 侧的 fresh-entry 判据同源(见 tombstones.go
+		// 文件头【为什么 reset-at-entry ...】)。反例:去掉本行,TestCmdRetryResetsReconcileCrossTombstone
+		// 报红——保留 final、再撞 reconcile 直接跳过。
+		_ = resetTombstoneKind(root, t.ID, reconcileCrossKind())
 	case "cancel":
 		wasRunning := t.Status == statusRunning
 		t.Status = statusCanceled
@@ -1156,6 +1451,10 @@ func cmdSetStatus(args []string, action string) error {
 		if err := saveTask(root, t); err != nil {
 			return err
 		}
+		// cancel 事件先落再决定是否归档:即便随后 archive 失败,事件已记留痕。
+		emitTaskEvent(root, t.ID, evCanceled, "cli:cancel", statusCanceled, t.Step, map[string]any{
+			"was_running": wasRunning,
+		})
 		if wasRunning {
 			// 进程还活着，先别归档：drain 每个重扫周期对账任务文件，见 canceled 即
 			// 击杀其执行进程组、释放槽位与目录互斥，然后归档（调度进程不在场时由
@@ -1172,6 +1471,17 @@ func cmdSetStatus(args []string, action string) error {
 	t.touch()
 	if err := saveTask(root, t); err != nil {
 		return err
+	}
+	// hold/release/retry 事件:诚实历史需要人工介入的每次动作都留痕。
+	switch action {
+	case "hold":
+		emitTaskEvent(root, t.ID, evHeld, "cli:hold", statusHeld, t.Step, nil)
+	case "release":
+		// release 是 held→queued 的"重新入队":用 evQueued 保持类型枚举与状态一致(活动流才能标"入队")。
+		emitTaskEvent(root, t.ID, evQueued, "cli:release", statusQueued, t.Step, map[string]any{"reason": "release"})
+	case "retry":
+		// retry 是 terminal|limit_paused→queued 的"重新入队":同上,用 evQueued。
+		emitTaskEvent(root, t.ID, evQueued, "cli:retry", statusQueued, t.Step, map[string]any{"reason": "retry"})
 	}
 	fmt.Printf("%s -> %s\n", t.ID, zhStatus(t.Status))
 	return nil

@@ -59,8 +59,8 @@ func TestReviewDivertToRemoteHost(t *testing.T) {
 	}
 }
 
-// P0-1 类闭合：远端 typeReview 的执行器选择必须命中远端 claude,绝不因 Model 为空被路由到远端 codex。
-// remoteUsesClaude 是 runTask 远端分支的选择判据(抽出可测),这里直接钉住该契约。
+// P0-1 类闭合：远端 typeReview 默认命中远端 claude；但 runner_pref=codex 是用户显式钉定，
+// 必须优先于 type/model 默认值。remoteUsesClaude 是 runTask 远端分支的选择判据。
 func TestRemoteReviewRoutesToClaudeNotCodex(t *testing.T) {
 	// 空 Model 的远程审核卡:必须走远端 claude(平衡 claude 额度),绝不走烧 GPT 额度的远端 codex。
 	if !remoteUsesClaude(&Task{Type: typeReview, RemoteHost: "remotehost"}) {
@@ -73,6 +73,17 @@ func TestRemoteReviewRoutesToClaudeNotCodex(t *testing.T) {
 	// 带模型的远程卡走远端 claude。
 	if !remoteUsesClaude(&Task{Type: typeSequence, Model: "opus", RemoteHost: "h"}) {
 		t.Fatal("带模型的远程卡应走远端 claude")
+	}
+	// 显式 runner_pref=codex 必须覆盖审核类型和由 type_defaults 继承来的 fable 模型。
+	// 这是远端 Sol 复审卡的真实形态：若不覆盖，会名义用 Codex、实际继续烧 Fable。
+	if remoteUsesClaude(&Task{
+		Type:         typeReview,
+		Model:        "claude-fable-5",
+		PreferRunner: "codex",
+		CodexModel:   "gpt-5.6-sol",
+		RemoteHost:   "remotehost",
+	}) {
+		t.Fatal("显式 runner_pref=codex 的远端审核卡应走远端 codex")
 	}
 }
 
@@ -362,6 +373,145 @@ func TestReviewDivertEscalationUsesOrigDir(t *testing.T) {
 	}
 	if esc.Dir != impl.Dir {
 		t.Fatalf("升级卡 Dir 应为实现卡 Dir %q（非审核镜像 %q）, got %q", impl.Dir, rv.Dir, esc.Dir)
+	}
+}
+
+// P0 类闭合(CG-5 review sync 竞态根修):sync 主体在 ctx 预算内成功但派生孙进程吊住 stdout 管
+// 道时,marker 文件见证用户命令的真实退出码,把"完成判定"从 pipe 关闭/ctx 超时解耦。
+// 【旧路径病灶】ctx 到期→ctx.Err()=DeadlineExceeded→runReviewSync 返回"超时"错→上游收掉 divert
+// →每轮回退本机审、分流特性静默失效。窗口极窄但真实存在,长期以"回退无害"带病运行。
+// 【杀的突变】把 runReviewSync 回退到只看 ctx.Err()/rescueWaitDelay 的旧代码 → sh 主体成功但
+// 孙进程吊管 → 返回"同步命令超时"→本测试立刻红。
+func TestReviewSyncMarkerSavesSuccessDespitePipeHoldRace(t *testing.T) {
+	origTO := reviewSyncTimeout
+	origPoll := reviewSyncMarkerPoll
+	// ctx 800ms、sleep 100ms:主体在 ~200ms 完成 → marker 见证 ec=0 → watcher 立即整组击杀。
+	// 旧路径孙进程 sleep 5 吊管 → cmd.Wait 挂到 WaitDelay(10s) 或 ctx(800ms) → ctx.Err=超时→误报。
+	reviewSyncTimeout = 800 * time.Millisecond
+	reviewSyncMarkerPoll = 10 * time.Millisecond
+	defer func() {
+		reviewSyncTimeout = origTO
+		reviewSyncMarkerPoll = origPoll
+	}()
+
+	root := testRoot(t)
+	// sh 主体 sleep 100ms 后 exit 0(远早于 ctx 800ms),同时后台 sleep 5 吊住 stdout。
+	// 若 marker 见证机制生效:主体 exit 后 marker 立现 ec=0,watcher 击杀 → wait 立即收 → 返回 nil。
+	// 若 marker 缺失(比如实现回退到旧代码):等到 ctx 到期 → ctx.Err()=DeadlineExceeded → 报"超时"错。
+	impl := &Task{ID: "impl-race-marker", Dir: "/tmp", ReviewSync: "sleep 0.1; sleep 5 & exit 0"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	start := time.Now()
+	if err := runReviewSync(impl, lg); err != nil {
+		t.Fatalf("成功同步被误判失败(marker 见证机制失效): %v", err)
+	}
+	// marker watcher 命中后应立即整组击杀 → wait 立即返回;不应等到 ctx 到期。
+	if el := time.Since(start); el >= reviewSyncTimeout {
+		t.Fatalf("runReviewSync 耗时 %v ≥ 超时 %v,marker watcher 未及时收尾", el, reviewSyncTimeout)
+	}
+}
+
+// CG-5 R2 P1-1 类闭合:runReviewSync 从 postComplete 调用时任务仍在 activeIDs,同步 pid 必须
+// 登记 taskPG——否则 anyTaskProcAlive 假 → patrol 在 sync 跑 >75s 时误判 procgroup_dead → 落假
+// evStalled(status=running 实际 sync 中)+ 对已完成任务空放 cancel,事件链呈 done→stalled 无 canceled,
+// 违背 CG-5 声明的"dispatched→stalled→canceled"因果契约。
+// 【杀的突变】把 runReviewSync 里的 registerTaskInvoke/unregisterTaskInvoke 移除(回退到只登记
+// procGroups) → anyTaskProcAlive 返回 false → 本测试红。
+func TestReviewSyncRegistersTaskPGDuringExecution(t *testing.T) {
+	root := testRoot(t)
+	// 同步命令写"看得见 anyTaskProcAlive 结果"的哨兵:sh 里 sleep 1s 保持进程活着,主 goroutine
+	// 期间轮询 anyTaskProcAlive 应真;sh 退出后应假(defer 里 unregister)。
+	// 【P2 放宽】原 300ms + 200ms deadline 在重载 CI 上 sh 冷启动可能超窗致 flake——放宽到 1s+2s。
+	impl := &Task{ID: "impl-sync-register", Dir: "/tmp", ReviewSync: "sleep 1"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	// 前提:runReviewSync 未跑前 anyTaskProcAlive 必假(没有登记)。
+	if anyTaskProcAlive(impl.ID) {
+		t.Fatal("前提:runReviewSync 未启动前不应有 taskPG 登记")
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- runReviewSync(impl, lg) }()
+
+	// 等 sh 启动(deadline 2s——放宽避免重载 CI flake:sh 冷启动 + cmd.Start + register 需 <100ms
+	// 常态,但 hostile 环境下 200ms 会窗口偏小)。
+	deadline := time.Now().Add(2 * time.Second)
+	sawAlive := false
+	for time.Now().Before(deadline) {
+		if anyTaskProcAlive(impl.ID) {
+			sawAlive = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !sawAlive {
+		t.Fatal("runReviewSync 期间 anyTaskProcAlive 应真(sync pid 必须登记 taskPG 才能骗过 patrol 的 pgDead 判据)")
+	}
+
+	// 等 sync 收尾,taskPG 应 unregister → anyTaskProcAlive 转假。
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("sleep 1 同步应成功, got %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("runReviewSync 未在预算内收尾")
+	}
+	// 立刻查:defer 已执行 → 应假。
+	if anyTaskProcAlive(impl.ID) {
+		t.Fatal("runReviewSync 返回后 defer 应 unregisterTaskInvoke,anyTaskProcAlive 转假")
+	}
+}
+
+// CG-5 R2 P1-2 类闭合:runReviewSync 包壳的闭括号必须独立成行,否则用户命令以 '#' 尾注释结尾
+// (rsync ... # notes)时,'#' 会吞掉同一行 ')' → sh 语法错误 exit 2 → marker 不写 → divert
+// 永久静默回退本机审,恰是本卡立项要救的故障被另一形态重新引入。
+// 【杀的突变】把 wrapped 改回旧的 "( %s )" 单行 → 本测试 sh 报语法错、runReviewSync 返回非 nil → 红。
+func TestReviewSyncSupportsCommandWithTrailingComment(t *testing.T) {
+	root := testRoot(t)
+	// 命令以 '#' 注释结尾——生产里 rsync 命令带尾注释是常见写法。
+	impl := &Task{ID: "impl-sync-trailing-comment", Dir: "/tmp", ReviewSync: "true # trailing comment note"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	if err := runReviewSync(impl, lg); err != nil {
+		t.Fatalf("尾注释命令应正常 exit 0(闭括号独立成行), got err=%v", err)
+	}
+}
+
+// CG-5 R2 P1-2 反例守卫:heredoc/多行命令同样不得被"闭括号并行"吞坏。用户命令自身含换行时,
+// 若 wrapped 仍是 "( %s )" 单行,heredoc 内部第一行会把 ')' 挡到 heredoc 定界符外之外的诸多副作用
+// (最典型:heredoc 未闭合前 ')' 位置错乱)。用最简 heredoc 触发同类风险面。
+func TestReviewSyncSupportsHeredocCommand(t *testing.T) {
+	root := testRoot(t)
+	// heredoc:cat 读取 <<EOF...EOF,输出"ok",exit 0。
+	impl := &Task{ID: "impl-sync-heredoc", Dir: "/tmp", ReviewSync: "cat <<EOF\nok\nEOF"}
+	lg, err := os.Create(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+
+	if err := runReviewSync(impl, lg); err != nil {
+		t.Fatalf("heredoc 多行命令应 exit 0(闭括号独立成行),got err=%v", err)
+	}
+	// 二次验证:日志应含 heredoc 输出 "ok"(排除命令根本没跑到)。
+	logData, err := os.ReadFile(taskLogPath(root, impl.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(logData), "ok") {
+		t.Fatalf("heredoc 应执行并输出 ok,日志未见\n----\n%s", logData)
 	}
 }
 

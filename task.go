@@ -40,8 +40,13 @@ type Task struct {
 	// PreferRunner 为 "codex" 时任务钉在 codex 上执行（不管 claude 忙闲），
 	// 用独立的 GPT 额度跑填充类任务；要求任务满足 codexEligible（fresh 或单步无会话）。
 	PreferRunner string `json:"runner_pref,omitempty"`
+	// CodexModel 钉定本卡经 codex 执行时的具体模型（-codex-model，如 gpt-5.6-terra）。
+	// 两条路径生效：①runner_pref=codex 主跑；②claude 卡触发 codex_fallback 降级改道。
+	// 空 = 按径回落（降级径先看 config.codex_fallback_model，再全局 codex_model；主跑径直接全局）。
+	// 交叉链卡的 XCodexModel（入队冻结的引擎身份）恒优先于本字段。
+	CodexModel string `json:"codex_model,omitempty"`
 	// RemoteHost 非空时任务在该远程主机执行（SSH → 远端 codex），键入 Config.RemoteHosts。
-	// 让 5090 等机器进编排（跨机 dev，如 Trading）；要求 remoteEligible（单步/fresh、无 claude 会话）。
+	// 让远端机器进编排（跨机 dev）；要求 remoteEligible（单步/fresh、无 claude 会话）。
 	RemoteHost string `json:"remote_host,omitempty"`
 	// ReviewHost 非空时，本卡完成后自动派的对抗审核卡分流到该远程主机执行（键入 Config.RemoteHosts）。
 	// 用于把只读审核负载分流到第二台机器、平衡两侧模型额度；实现卡自身仍在原处执行。经修复链继承。
@@ -71,6 +76,28 @@ type Task struct {
 	// FreshSteps 表示步骤间不 --resume：每一步都是全新会话（配合"状态在文件里"的项目规约，
 	// prompt 自带读状态文件的开工动作）。永不依赖会话记忆，也就不会撞会话上下文上限。
 	FreshSteps bool `json:"fresh_steps,omitempty"`
+	// ---- 交叉验证链（fable 顶替流：双引擎独立作答→引擎乙对抗式交叉查漏）----
+	// XRole 交叉验证链中的角色："A"(引擎甲,先独立作答) / "B"(引擎乙,独立作答) / "C"(引擎乙交叉查漏)。空=非交叉链。
+	XRole string `json:"x_role,omitempty"`
+	// XKey 交叉验证链的谱系键（A/B/C 共享，不透明随机键、非 A 卡 ID），用于关联与把 C 的最终结论落进度报告。
+	XKey string `json:"x_key,omitempty"`
+	// XProfile 使用的引擎对 profile 名（config.cross_profiles 的键），派生 B/C 时据此选引擎乙。
+	XProfile string `json:"x_profile,omitempty"`
+	// XTask 原始任务内容（未包裹方法纪律的裸文本），随链 A→B→C 传递，供 C 的合并模板重述任务对象。
+	XTask string `json:"x_task,omitempty"`
+	// XEngineB 是**冻结**的乙引擎执行规格（cmdCross 入队时解析并钉死，随链 A→B→C 传递）。
+	// B/C 由它套用，绝不再从当前 config.cross_profiles 重解析——否则入队后改 profile 会静默换乙引擎/
+	// 令甲乙相同（身份漂移）。
+	XEngineB *XFrozenEngine `json:"x_engine_b,omitempty"`
+	// XCodexModel 是本卡冻结的 codex 模型（codex/远端 codex 引擎）。invokeCodex/invokeRemoteCodex 优先用它，
+	// 空才回落全局 codex_model——否则入队后改/清 codex_model 会静默换模型或掉 -m 跑默认模型。
+	XCodexModel string `json:"x_codex_model,omitempty"`
+	// 注：甲的结论**不**放在任何交叉卡的字段里，也不写进 A 的日志（RESULT 被抹）——最小化 B 的执行器
+	// 从盘上被动读到 A 的表面。A 完成后其结论落进 <root>/crosscheck/<XKey>.a 隔离侧车，仅由编排进程在派 C 时
+	// 读取注入 C 的 prompt、用完即删。B 卡不含 A 卡 ID、不含 A 结论。**诚实边界**：B 持有 XKey，而侧车路径
+	// 由 XKey 确定性推导——严格说 XKey 就是指向侧车的键。故这不是硬沙箱，是被动暴露最小化 + 行为护栏（见上）。
+	// 这是被动暴露最小化 + 行为护栏（solo 模板明令别找），**非硬沙箱**：codex read-only 能读全盘，刻意搜索
+	// 仍可能触达侧车——强隔离需限制执行器读权限，本工具不提供（见 README 诚实声明）。
 	// EmitHold 表示本任务产出的任务先挂起（held），人工审核后 release 放行。
 	EmitHold bool `json:"emit_hold,omitempty"`
 	// EmitProgress 表示任务完成后把最终输出中的 json 块存为进度报告（progress/ 目录）。
@@ -99,6 +126,14 @@ func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }
 
 func (t *Task) terminal() bool {
 	return t.Status == statusDone || t.Status == statusFailed || t.Status == statusCanceled
+}
+
+// newCrossKey 生成交叉验证链的不透明谱系键：随机、与 A 卡 ID 无关——故 B 无法据它推出 A 的
+// 日志/侧车路径去偷读甲结论（独立性的一环）。
+func newCrossKey() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return "x" + hex.EncodeToString(b)
 }
 
 func newID(root string) string {
@@ -245,5 +280,19 @@ func archiveTask(root string, t *Task) error {
 	if err := os.MkdirAll(archiveDir(root), 0o755); err != nil {
 		return err
 	}
-	return os.Rename(taskPath(root, t.ID), filepath.Join(archiveDir(root), t.ID+".json"))
+	if err := os.Rename(taskPath(root, t.ID), filepath.Join(archiveDir(root), t.ID+".json")); err != nil {
+		return err
+	}
+	// 事件账本随卡归档：activity 层遇归档卡时仍能取到完整历史,而不是"卡在但事件消失"的断线。
+	// 归档失败只打警告不回退——任务本体已归档,事件迁移属留痕,回退更容易造成"卡半档"的数据不一致。
+	if err := archiveTaskEvents(root, t.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 事件账本归档失败 %s: %v\n", t.ID, err)
+	}
+	// CG-4 墓碑随卡归档:审计要看"这张卡的注入尝试了几次、有没有耗尽 bound",归档后墓碑也得跟着走,
+	// 否则 clean 之后墓碑残留在 tombstones/,新卡碰到同 ID(极小概率)会读到旧墓碑误跳注入。
+	// 同事件账本策略:失败只警告不回退,避免"卡半档"。
+	if err := archiveTaskTombstones(root, t.ID); err != nil {
+		fmt.Fprintf(os.Stderr, "警告: 墓碑账本归档失败 %s: %v\n", t.ID, err)
+	}
+	return nil
 }

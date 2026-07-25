@@ -30,6 +30,10 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	if rescan <= 0 {
 		rescan = 15 * time.Second
 	}
+	// CG-5 R2.2 P1 补:patrolHeartbeatTimeout 与 cfg 耦合——生产曾按 ~150min 步超时运行时,硬编码
+	// 70min 会让长步任务死透后一进 pgGrace 就被误归为 no_heartbeat 类污染审计视图。触发面已在
+	// patrol.go 收敛到 pgDeadTooLong,阈值现仅影响 reason 分类。抽成 helper 以便直测。
+	updatePatrolHeartbeatTimeout(cfg)
 
 	type doneMsg struct{ t *Task }
 	ch := make(chan doneMsg)
@@ -37,6 +41,9 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	activeDirs := map[string]bool{}
 	claimedDir := map[string]bool{}                  // 哪些在跑任务占用了目录互斥（只读类型不占用）
 	activeCancels := map[string]context.CancelFunc{} // 取消对账命中时击杀该任务的执行进程组
+	// CG-5 巡逻累积状态:同一 drain 周期内跨轮记住 pgSeenAlive/日志 size/上次 stall 时间。
+	// 生命周期 = 一次 drain(tick 函数体);任务离开 activeIDs 后由 patrolOnce 内部清理。
+	patrolStates := map[string]*patrolState{}
 	// 只读类型（审核/进度回收）不写文件：既不占用同目录互斥，也不被互斥挡住——
 	// 审核卡可与同仓下一批并行（依赖护栏在排批层：批内叶组互不依赖、不消费未过审契约）。
 	readOnly := func(t *Task) bool { return t.Type == typeReview || t.Type == typeProgressPull }
@@ -74,6 +81,20 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				cancelRun()
 			}
 		}
+		// CG-5 drain 内巡逻:与取消对账贴附同一循环节奏,不新增守护进程。R2.2 起触发面严格 = pgDeadTooLong
+		// (曾活过→现死透→死超 pgGrace),心跳降为已死后的 reason 分类信号,不再独立触发。先记 evStalled 再
+		// 走 cancelRun(与人工 cancel 同一收尾管线,不引入第二套击杀)。patrol 与 cancel 对账正交:
+		// cancel 反映"人工/盘上表态",patrol 反映"执行器真死透但 runTask 收尾 goroutine 卡住"——两轴独立
+		// 故拆两段。patrolCancels 是类型适配壳(context.CancelFunc → func())。
+		patrolCancels := make(map[string]func(), len(activeCancels))
+		for id, cancelRun := range activeCancels {
+			patrolCancels[id] = cancelRun
+		}
+		patrolOnce(root, activeIDs, patrolCancels, patrolStates, now)
+		// CG-R3 codex 复审副本孤儿清理(BD-36/BD-39 附记 2026-07-24):
+		// 崩溃/意外退出会在 tmp/codex-review-work/ 留下副本,靠 tick 对账兜底移除。同 patrolOnce 同一
+		// 循环节奏,不新增守护;判活口径 = pid 已死 + taskID 不在 activeIDs(重派新 pid 场景不误清)。
+		cleanupCodexReviewOrphans(root, activeIDs)
 
 		blockReason := ""
 		if cd := loadCooldown(root); !force && cd.active(now) {
@@ -93,6 +114,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 					return err
 				}
 			} else {
+				reconcileCrossChains(root, tasks, activeIDs) // 崩溃对账：单腿孤儿交叉卡置 failed
 				viaCodex := map[string]bool{}
 				var cands []*Task
 				for _, t := range tasks {
@@ -115,9 +137,16 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						}
 					case t.PreferRunner == "codex" && cfg.CodexBin != "" && codexEligible(t):
 						viaCodex[t.ID] = true
+					case t.PreferRunner == "codex":
+						// codex 钉定但上面条件没满足（codex_bin 缺失/不 eligible）：绝不 fail-open 到 claude。
+						// 引擎身份是交叉验证的交付物——甲乙跑成同引擎=验证形同虚设。跳过本轮，等 codex 可用。
+						continue
 					case blockReason == "":
 						// claude 可用，正常走
-					case cfg.CodexFallback && cfg.CodexBin != "" && codexEligible(t) && !noFallback(cfg, t.Model):
+					case cfg.CodexFallback && cfg.CodexBin != "" && codexEligible(t) && !noFallback(cfg, t.Model) && t.Type != typeCrossCheck:
+						// 交叉验证卡的引擎身份就是交付物：claude 引擎的交叉卡(如甲=opus)绝不能被通用 codex
+						// 降级偷换成 codex——否则甲乙同引擎,交叉验证形同虚设。它宁可排队等 claude 窗口。
+						// (乙的 B/C 卡带 PreferRunner=codex,走上面首个 case,不受此影响。)
 						viaCodex[t.ID] = true
 					default:
 						continue // claude 被拦且没有 codex 出路
@@ -174,7 +203,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		}
 		// 等一个任务完成；或定时超时后回到循环顶重扫队列——让 drain 期间新入队的任务
 		// （尤其分离执行器，如远端主机的并行设计循环）能及时补进空闲槽位，
-		// 而不必干等某个在跑的长任务结束（否则 Mac 与 5090 的并行设计线会被串行化）。
+		// 而不必干等某个在跑的长任务结束（否则本机与远端主机的并行设计线会被串行化）。
 		select {
 		case msg := <-ch:
 			delete(activeIDs, msg.t.ID)

@@ -1,0 +1,95 @@
+{
+  "five_hour": {
+    "utilization": 42,
+    "resets_at": "2026-01-01T05:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day": {
+    "utilization": 88,
+    "resets_at": "2026-01-05T17:00:00.000000+00:00",
+    "limit_dollars": null,
+    "used_dollars": null,
+    "remaining_dollars": null
+  },
+  "seven_day_oauth_apps": null,
+  "seven_day_opus": null,
+  "seven_day_sonnet": null,
+  "seven_day_reserved_a": null,
+  "seven_day_reserved_b": null,
+  "reserved_flag_a": null,
+  "reserved_flag_b": null,
+  "reserved_flag_c": null,
+  "reserved_flag_d": null,
+  "reserved_flag_e": null,
+  "reserved_flag_f": null,
+  "extra_usage": {
+    "is_enabled": false,
+    "monthly_limit": null,
+    "used_credits": null,
+    "utilization": null,
+    "currency": null,
+    "decimal_places": null,
+    "disabled_reason": null,
+    "user_disabled": false,
+    "spend_limit_reached": false,
+    "credits_ever_enabled": false,
+    "daily": null,
+    "weekly": null
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "group": "session",
+      "percent": 42,
+      "severity": "normal",
+      "resets_at": "2026-01-01T05:00:00.000000+00:00",
+      "scope": null,
+      "is_active": false
+    },
+    {
+      "kind": "weekly_all",
+      "group": "weekly",
+      "percent": 88,
+      "severity": "warning",
+      "resets_at": "2026-01-05T17:00:00.000000+00:00",
+      "scope": null,
+      "is_active": true
+    },
+    {
+      "kind": "weekly_scoped",
+      "group": "weekly",
+      "percent": 65,
+      "severity": "normal",
+      "resets_at": "2026-01-05T16:59:59.000000+00:00",
+      "scope": {
+        "model": {
+          "id": null,
+          "display_name": "Fable"
+        },
+        "surface": null
+      },
+      "is_active": false
+    }
+  ],
+  "spend": {
+    "used": {
+      "amount_minor": 0,
+      "currency": "USD",
+      "exponent": 2
+    },
+    "limit": null,
+    "percent": 0,
+    "severity": "normal",
+    "enabled": false,
+    "disabled_reason": null,
+    "cap": null,
+    "balance": null,
+    "auto_reload": null,
+    "disclaimer": "Usage credits cover you once plan limits are reached; see account billing settings for details.",
+    "can_purchase_credits": false,
+    "can_toggle": false
+  },
+  "member_dashboard_available": false
+}

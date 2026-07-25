@@ -104,6 +104,44 @@ sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-mode
   故命令里的相对路径（如 `rsync -a ./ hostb:/mirror/`）以实现卡目录为基准，而非 daemon 启动目录。
   同步命令须**前台执行完毕**（勿用 `&` 后台化），exit 0 即视为同步完成——后台化会让审核开跑时镜像尚未就绪。
 
+**全局默认分流**（config 三件套，省去每张卡手动指定）：三键 `default_review_host` / `remote_mirror_root` / `default_review_sync` 齐备时，本地实现卡（`RemoteHost` 空）且未显式声明 `ReviewHost` 的 `review_after` 自动审核，一律分流到 `default_review_host`，审核目录自动推导为 `<remote_mirror_root>/<实现卡目录名>`，同步命令继承 `default_review_sync`。三键**缺任一则不套默认**；任务级 `-review-host` / `-review-dir` / `-review-sync` 显式值恒优先；远端实现卡（`RemoteHost` 非空）不受此默认影响（已在远端审）。
+
+### 交叉验证（fable 顶替：双引擎独立作答 + 对抗式交叉查漏）
+
+设计档模型（fable）撞周限额时，用两个**不同**引擎对同一 fable 级任务（设计/审核/裁决/追认）各自独立作答，再让第二个引擎拿第一个的结论对抗式查漏——两份独立视角比一个更难被同一盲点带偏：
+
+```bash
+claudego cross -dir ~/Projects/myapp "某配置键缺省时的契约语义，请裁决"   # 用默认引擎对
+claudego cross -profile my-pair -dir ~/Projects/myapp "..."             # 换成你在 cross_profiles 里自定义的对
+claudego cross -list                                                     # 看可用引擎对
+```
+
+事件驱动三卡链，只需入队 A，B/C 自动衔接：
+
+- **A**：引擎甲独立作答（第一性原理 + 对抗式自审），产出结论 A；
+- **B**：A 完成后自动派出，引擎乙独立作答——**prompt 与 A 完全相同、不含 A 的结论**。甲结论落进 `~/.claudego/crosscheck/<链ID>.a` 隔离侧车（只由编排进程读写、`0600`、C 用完即删），既不进 B 的卡字段、也**不写进 A 或 B 的日志**（A 的结论日志被抹）；B 用的是与 A 卡 ID 无关的不透明链 ID，solo 模板还明令 B 不得读编排/状态目录。默认下 B 拿不到 A，是因为它**没被给、被明令别找**——**但这不是硬沙箱**：诚实说，B 卡里带着链 ID，而侧车路径由链 ID 确定性推导，所以那本质上是一个指向侧车的键；codex `--sandbox read-only` 又能读全盘，一个刻意搜索的执行器仍可能找到侧车。这里做到的是**被动暴露最小化 + 行为护栏**，真正的强隔离需限制执行器读权限（本工具不提供）；
+- **C**：B 完成后自动派出，引擎乙从侧车取回 A、连同 B **对抗式交叉查漏**（谁遗漏了什么 / 分歧点裁断 / 仅一方发现的盲点），产出合并结论并落进度报告（`claudego progress -show <链ID>` 取回，交你综合定稿）。
+
+**模型来源可切换** = `config.cross_profiles` 里的命名引擎对（`default_cross_profile` 定默认）。默认 `opus-codex` = 甲 `claude opus·max` + 乙 `codex·max`（乙的具体模型由你的 `codex_model` 决定；两侧都跑各自最高标准思考档）。每个引擎的 `kind` 可选 `claude` / `codex` / `remote-claude` / `remote-codex`：
+
+```jsonc
+"default_cross_profile": "opus-codex",
+"cross_profiles": {
+  "opus-codex": {
+    "a": { "kind": "claude", "model": "claude-opus-4-8", "effort": "max", "label": "opus·max" },
+    "b": { "kind": "codex",  "effort": "max", "label": "codex·max" }
+  }
+}
+```
+
+- 引擎的 `effort` 是 claude / codex 共用的思考等级（claude → `--effort`，codex → `model_reasoning_effort`，同名同序 `low<medium<high<xhigh<max`），任务级覆盖全局 `codex_reasoning`；
+- `claude` 引擎要求指定 `model`、`codex` 引擎要求配好 `codex_bin` + `codex_model`（否则会跑成账号/CLI 默认模型、与 profile 宣称不符，命令直接报错，杜绝静默降级）；
+- 交叉卡是**只读分析**（读契约/源码/改动、不写业务仓）；**本机** codex 侧默认走一次性隔离副本 + `--sandbox workspace-write`（副本随卡即建即删,原仓永不受写污染,见"沙箱"段的 CG-R3 `codex_review_sandbox`）；**远端** codex 侧只在目录位于 `remote_mirror_root` 之下（sync-lane 分发的一次性镜像）时才放宽为 `workspace-write`,跑在真实业务仓（三卡共用工作目录时的常态）维持 `--sandbox read-only` 硬保证（CG-R3 R1 P0-1）；`-dir` 不能是 claudego 数据根或其子目录；
+- 甲乙必须**同执行位置**（都在本机，或都在同一台 `remote_hosts` 主机）——三卡共用一个工作目录，跨机引擎对会被 `cross` 直接拒绝；
+- **护栏**：claude 冷却期即便开了 `codex_fallback`，claude 引擎的交叉卡也**绝不**被降级偷换成 codex，codex 钉定卡在 codex 不可用时也**绝不** fail-open 到 claude（否则甲乙同引擎、验证形同虚设）——引擎身份冻结，宁可排队等对应窗口。链任一步断裂会在母卡留痕（`list` 可见），不让单腿结果冒充终局。
+
+**已知局限（诚实声明）**：①甲乙"不同引擎"是**文本级** best-effort 校验（比 kind + 模型名），拦不了模型别名指向同一模型——profile 是你自写，别名同引擎属配置责任；②入队时冻结的是引擎身份（kind/模型/思考档），**不冻结基建路径**（codex/ssh 可执行位置、远端 sandbox 等）——正常运行中改这些属基建变更、不算身份漂移；③三卡链事件驱动、非崩溃原子：进程恰在"标 done 与派后继卡之间"崩溃的单腿孤儿由每轮 `reconcile` 置 failed 兜底（可见），但"崩溃 + 人工 `clean` 归档母卡"叠加的极窄组合可能漏网。这些是罕见崩溃/配置边界，非正常路径缺陷。
+
 ### 存量角色会话的接管（此前手动维护的 审核/装配/执行 session）
 
 一个项目文件夹里已经养了一批长驻角色会话时，按角色分流：
@@ -163,21 +201,86 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 
 **跨平台**：核心是纯 Go，macOS / Linux / Windows 都能编译运行（`go build` 出对应平台二进制）。`install-launchd`（开机自启 + 每 5 分钟自动 tick）只对接 macOS 的 launchd；其他平台用 `claudego daemon` 前台常驻，或让系统定时器每 5 分钟拉一次 `claudego run`——Linux 用 systemd timer / cron，**Windows 用任务计划程序（Task Scheduler）**。单实例锁已跨平台（Windows 走 `OpenProcess` 探活），定时并发不会撞车。
 
+## Web 看板（board 命令）
+
+实时只读 kanban，本机浏览器访问。
+
+```bash
+claudego board               # 默认 http://127.0.0.1:8787
+claudego board -port 9000    # 自定义端口
+claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
+```
+
+三条纪律（不可破）：
+- **只读**：所有接口仅经 `os.ReadFile` / `os.ReadDir` 读文件，绝不写任何任务状态，无 write endpoint。看板挂在生产队列数据上，误写会污染真实队列。
+- **只听 127.0.0.1**：响应含 prompt 全文、目录路径、账号额度，不应出本机。`-addr` 可显式覆盖，但默认永远是回环，非回环地址会打印警告——不建议外放。
+- **TTL 缓存**：任务快照与燃尽视图各有独立 TTL（燃尽 TTL = 任务快照 TTL × 3，至少 30s），防止每次请求全盘扫 tasks/ + transcript。`/api/*` 带 gzip 压缩（实测单次响应 2.5MB → 320KB）。
+
+**项目覆盖块 `~/.claudego/board.json`**：项目/阶段自动推导的介绍难免干瘪，可人工写一份更准的；文件缺失就全部走自动推导。允许字段：`name` / `desc` / `phases.<name>` / `goal`。
+
+**`goal` 字段（CG-8「落地进度」）**：项目"离目标多远"的机械化视图，与卡片进度**并列**呈现（不替换）。V1 只做合成，不做历史/趋势。
+
+> ⚠️ **上面代码块里的 `//` 只是 README 演示注释——实际 `board.json` 是严格 JSON，不接受注释、不接受尾逗号**。抄示例时请去掉这些 `//`。写坏了？看板顶端会挂出红色告警 `board.json 未生效`（`OverviewResp.board_override_error`）。分两种降级——都会披露，永不静默：**语法错**（漏逗号、抄了 jsonc 注释、括号不闭合）无法部分解析，整块 override 失效并回落自动推导；**字段类型手误**（如 `"weight":"1"`、`"done_percent":"50%"`）Unmarshal 会 skip 该字段并继续填充其它字段，因此**保留部分结果**（其它无手误的 name/desc/phases/goal 仍生效）+ 挂错披露——一处手误不连坐吃掉整个覆盖块，但降级本身必须挂告警。
+
+```jsonc
+"goal": {
+  "statement": "落地实际使用",
+  "as_of": "2026-07-23",              // 人工评估日期；驱动 goal_source=manual@as_of
+  "milestones": [
+    {"id":"M1","title":"设计收口","weight":1,"done_percent":100,"basis":"REVIEW Go"},
+    {"id":"M4","title":"test-ready gates","weight":1,
+     "evidence": {                     // 有 evidence 就用它覆盖人工 done_percent
+       "path":"/Users/you/.claudego/logs/check.json", // **必须**绝对路径；相对路径直接判"数据不足"，不做 CWD/boardRoot 兜底
+       "numerator":"gate_counts.pass",  // 点分路径，取到的必须是 JSON 数值
+       "denominator":["gate_counts.pass","gate_counts.blocked"],
+       "max_age_hours": 24              // 超龄→里程碑标 stale + 数据不足；负值判配置错误
+     },
+     "basis":"ops/test-ready/check"}
+  ]
+}
+```
+
+合成：`landed_percent = Σ(weight × done_percent) / Σweight`，与 `progress_percent` 并列展示，来源披露按**实际入账来源**打标（不按配置形态；下列任一非 `insufficient` 标签均可与 `partial=true` 共存——同类里程碑仅部分成功入账时以 `partial` 披露局部失效，标签本身**不承诺**该类全部入账）：`goal_source=manual@as_of`（至少一条 manual 入账，且未配置任何 evidence）/`evidence`（至少一条 evidence 入账，且无 manual 入账；evidence 集合部分失效时以 `partial` 披露）/`mixed@as_of`（manual 与 evidence 各至少一条入账）/`manual+degraded@as_of`（配了 evidence 但一条都没入账，靠 manual 撑住合成——**披露降级**，不虚报"混合来源"）/`insufficient`（无任何有效入账）。
+
+**fail-honest 兜底**（不可绕）：
+- goal 缺失 → 前端**完全不显示**该区块（不猜）；
+- 权重和 ≤ 0 或任一 weight<0 → 整块标"数据不足"，`landed_percent` 为 `null`（不出 NaN/Inf/任何数字）；权重出现非有限数（`NaN`/`±Inf`，如 `MaxFloat64` 相乘溢出、`NaN` 权重绕过 `<0` 判断）→ 合成前 `math.IsNaN`/`IsInf` 守护同样整块"数据不足"（否则 `round1(Inf)` 转 int64 是"实现相关"，前端会渲染出 0% 或天文级负数——比缺数糟糕）；
+- 人工 `done_percent` 越界（<0 或 >100）→ 里程碑判"数据不足"，不得直出负数百分数或 250%（教训：round1 的 int64 截断会把 -50 算成 -49.9，直渲成"-49.9%"是造读数）；
+- evidence 折算结果超 100%（如 pointer 配错让 `num=30, den=[10]` 算出 300%）或折算为负（分子/分母有一个是负）→ 同样"数据不足"，不直出 300% 或 -30%；防线放在 `num` 与 `den` 各自的绝对值上——`num<0` 拒、`den` **分量级 `v<0` 拒**（`{pass:5, blocked:10, adjustment:-3}` 求和为 12>0 但 adjustment 分量为负，若只挡求和会零告警渗出 41.7%）、`den` 求和 `≤0` 拒（除零守护 + 全零分量兜底）；只挡 `pct<0` 会被"双负相消"绕过（如 `{pass:-9, blocked:-2}` 会算出 +81.8%）；
+- **evidence.path 强制绝对路径**：相对路径无论解析到进程 CWD 还是 `board.json` 所在目录，都存在"同名文件静默兜底"的兜底路径（`~/.claudego` 里常有同名脚手架/临时文件），配错时零告警读错——直接判"数据不足"是唯一让读数出处可追溯的做法；
+- evidence 文件缺失 / 超 `max_age_hours` / pointer 取不到 **JSON 数值类型**（如字段是字符串 `"9/21"`）→ 该里程碑标"数据不足"，合成值仅基于可用里程碑并标 `partial`——**evidence 存在即独占**，失败/超龄一律"数据不足"，**绝不回退到人工值**（读数含义漂移就是造假）；
+- `board.json` 存在但 JSON 语法非法（含 jsonc 注释、尾逗号、括号不闭合等）→ `OverviewResp.board_override_error` 挂出错误，前端顶部红色告警常驻，**整个 override 块**全部失效并回落自动推导；**字段类型手误**（`"weight":"1"`、`"done_percent":"50%"` 等 `*json.UnmarshalTypeError`）→ 同样挂 `board_override_error` 披露，但 **保留 Unmarshal 已尽力填充的其它字段**（其它无手误项目的 name/desc/phases/goal 仍生效）——一处手误不连坐吃掉整个覆盖块。两种降级都**不静默吞**。
+
+**看板只读 evidence 文件、绝不执行命令**：落盘取数由编排 session / 卡（如 `ops/test-ready/check`）负责，看板只读它们的产出。
+
+**燃尽视图三源**（`/api/burn`）：三源中 `usage-history.jsonl`（即 `usage_feed`）与 `claudego quota` 共用同源；`claude.json` 与 transcript 扫描为 board 独有读数，`claudego quota` 不读这两源：
+1. **CodexBar `claude.json`**：claude 侧各账号 session / weekly / opus 窗口的百分比时间序列；
+2. **CodexBar `usage-history.jsonl`**（= `usage_feed`）：codex 侧 primary（5h）/ secondary（周）百分比时间序列；
+3. **`~/.claude/projects/*/*.jsonl` transcript**：每条 assistant 消息的绝对 token 用量（四类等权相加，附额度口径折算）。
+
+**"数据不足"语义**：只有一个样本点时没有速率可算；样本比它所描述的窗口还老（如 5h 窗口配一条 14 小时前的样本）；或重置时刻已过——三种情况一律 `verdict="数据不足"`，`burn_rate` / `exhaust_at` 保持 null，绝不编造估算值。只在当前窗口周期内（与最新样本同属同一 resetsAt 边界，容差 90s）的点才参与速率拟合。
+
 ## 5 小时额度红线（保底额度）
 
-给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。两条独立通道，`claudego quota` 随时查看：
+给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。三条通道，`claudego quota` 随时查看：
 
 ```jsonc
 // ~/.claudego/config.json
 "queue_budget_tokens": 2000000,  // ① 本地账本：滑动 5h 窗口内队列最多消耗的加权 token，0 关
-"redline_percent": 85,           // ② 外部全局用量源：5h 窗口 usedPercent 达线即停，0 关
+"redline_percent": 85,           // ②③ 百分比通道共享红线：任一源 usedPercent 达线即停，0 关
 "usage_feed": "/Users/you/Library/Application Support/CodexBar/usage-history.jsonl",
-"usage_feed_max_age_min": 90,    //    样本过期视为不可用→放行（fail-open）
+"usage_feed_max_age_min": 90,    // ②   样本过期视为不可用→放行（fail-open）；**0/负值归位默认 90 min，不接受"永远采信"**
+"oauth_usage": true,             // ③   订阅端点直读（第三用量源），默认关；端点未文档化
+"oauth_usage_max_age_min": 15,   // ③   兼作**端点结果的进程级缓存 TTL**：tick 15s 循环内复用不重打；0/负值归位默认 15 min
+"oauth_usage_timeout_sec": 6,    // ③   HTTP 超时（秒）
+"oauth_usage_creds_path": "",    // ③   显式指定即**硬隔离**——只信该文件,不再兜底 ~/.claude/keychain（测试/自定义部署用；空=按默认顺序找）
 "model_weights": {"default":1,"opus":5,"sonnet":1,"haiku":0.2}   // 账本的模型加权
 ```
 
-- ①只统计 claudego 自己的调用（桌面端消耗不可见），语义是"队列预算上限"——保底 = 总额度 − 队列预算。先跑几天 `claudego quota` 看典型消耗再定值。
-- ②是全局视角，样本格式兼容 CodexBar 的 usage-history.jsonl（需在 CodexBar 里开启 Claude 用量探测）；任何工具按同格式落一行 JSONL 都能接。
+- ① 只统计 claudego 自己的调用（桌面端消耗不可见），语义是"队列预算上限"——保底 = 总额度 − 队列预算。先跑几天 `claudego quota` 看典型消耗再定值。
+- ② 是全局视角，样本格式兼容 CodexBar 的 usage-history.jsonl（需在 CodexBar 里开启 Claude 用量探测）；任何工具按同格式落一行 JSONL 都能接。
+- ③ 直读 `api.anthropic.com/api/oauth/usage`（`anthropic-beta: oauth-2025-04-20` 头 + 复用 `~/.claude/.credentials.json` 或 macOS keychain 的 OAuth accessToken），取 5h 窗口 utilization。**端点未文档化、可随时变更**——任何异常（网络/凭据/HTTP 4xx-5xx/字段缺失/字段值歧义/格式漂移）一律按"数据不足"→ fail-open 放行；实现只信响应 body，绝不解析响应头（响应头容易被中间层伪造/覆盖，且核验已推翻"响应头带 unified 限流数值"之说）。`utilization` 实测 0-100 百分域原样取整（实样：端点回 31.0 即 31%，与 `limits[].percent=31` 互证）、`used_percent/percent` 同为 0-100 域原样取，**任一自动归一都是假触线温床**（教训：老版 `utilization:1`→100%、`used_percent:0.8`→80% 都能锁死队列）；`utilization` 落在 (0,1] 区间判为刻度歧义（旧分数写法 vs 新百分写法两判均可能错）拒判为数据不足，>100 域外同拒。`oauth_usage_creds_path` 非空即**硬隔离**——只读该文件，不再兜底 `~/.claude`/keychain（避免 Windows `UserHomeDir` 兜底摸真实凭据造成测试隔离失效或权限漂移）。端点结果自带**进程级缓存**（TTL=`oauth_usage_max_age_min` 或默认 15 min），tick 每 15s 重扫不会每次都打端点、也不会重复触发 macOS keychain 弹窗；缓存过期后重抓失败会保留旧样本并披露"已过期+重抓失败"两要素，让 `quota` 能诚实展示。
+- ②③ 合并规则=**最保守值优先**（可用样本里 percent 最大者判线）——观测口径不一致时,最坏假设兜住,而不是投票或平均。`claudego quota` 会并列展示三源读数并在分歧 ≥5% 时明确披露区间。
 - 真正耗尽时仍有限额冷却兜底（解析重置时间、到点续跑），红线只是提前让路。
 
 **分时段红线**（`redline_windows`）：时段内非零字段覆盖全局阈值，时段外回落全局；跨零点用 from > to。
@@ -206,8 +309,12 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 
 - 带 claude 会话的多步任务不切换（跨 CLI 无法延续上下文），等重置自动续跑；
 - codex 走自己的额度：不记 claude 账本、其错误不写全局冷却、成功也不清冷却；
-- 沙箱按类型收窄：只读类任务 `--sandbox read-only`，sequence 用 `workspace-write`；
+- 沙箱按类型收窄：`sequence` 落码卡走 `--sandbox workspace-write`；只读类任务(design-review/crosscheck/coordinate/progress-pull)默认建**一次性隔离副本 + `--sandbox workspace-write`**(CG-R3 承 BD-36 工具链③终裁 b, BD-39 附记 2026-07-24)——副本落 `<root>/tmp/codex-review-work/<taskID>-<pid>-<nano>/`,承载 dirty+untracked 面,复审可跑测试/写夹具做动态验证;卡结束即删,崩溃残留由 tick 对账清(pid 死透 + taskID 不在 activeIDs 双条件);原仓永不受写污染(硬语义)。建副本阶段(探测/clone/apply/拷贝)跑在 `min(step_timeout, 10min)` 的独立子预算内(CG-R3b):git 子进程超时即整组击杀,拷贝腿**每个文件边界**查一次子预算、到期即止,且**从不打开非常规文件**(FIFO/socket/设备跳过;symlink 按链接本体复制、不跟随——否则一条指向无写端管道的 untracked 链接就能让 `open` 永久阻塞,把整条泳道占死且任何取消都解不开)。任一腿卡住都回落 `read-only` 继续跑,事件账本落 `codex_review_prepare_timeout` 留痕——降级而非把整条泳道堵死。`config.json` 加 `"codex_review_sandbox": "readonly"` 可回落旧的只读行为(退失去动态验证力)。远端复审同治:远端镜像本身已是影本,默认也放宽到 `workspace-write`。
 - 看板与日志标注 `[codex]` / `runner=codex`，emit/进度解析管线照常工作（协调分工在冷却期也能继续入队）。
+
+**降级专用模型与档位对等规则（`codex_fallback_model`）**：`codex_fallback` 生效时若 claude 卡被改道 codex，优先用 `codex_fallback_model`，而非全局 `codex_model`。档位对等映射：**opus 档降级首选同档的 terra（o3），不降设计档的 sol（GPT-5）**——设计档不去干实现档的活。空值回退 `codex_model`；此键仅对降级径（任务 `runner_pref≠codex` 且非远端）生效，codex 主跑卡与远端 codex 不受影响。
+
+**钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
 
 ## 限额中断与自动恢复的细节
 
@@ -215,6 +322,174 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 - 每一步成功后立刻落盘（任务文件原子写入），进程被杀也不丢进度。
 - 单实例锁（`.lock`）保证 launchd 的多次触发不会并发跑任务；持锁进程死掉会自动清锁。
 - 其他错误（网络、超时等）按 `retry_backoff_min` 退避重试，超过 `max_attempts_per_step` 次标记失败，`claudego retry <id>` 可带着会话与进度重新入队。
+
+## 失败分类分流（CG-3）
+
+单一 `retry_backoff` 遇到明显不可重试的错误（凭据失效/权限拒绝/输入超长）仍在盲目烧 `max_attempts_per_step`，
+是把订阅额度打进注定失败的重试里。CG-3 引入有限枚举的失败分类器，每类映射独立策略：
+
+| 类别 | 判据 | 策略 | 事件 |
+|---|---|---|---|
+| `auth` | 401 / invalid api key / oauth expired / 请重新登录 | 直接 `held`，**不烧 attempts**，等人工 relogin 后 `release` | `evHeld` actor=`runner:classifier` |
+| `permission` | 403 / policy 拒绝 / policy/admin blocked | 直接 `held`，不烧 attempts，等 policy/授权调整 | `evHeld` |
+| `input_too_long` | prompt too long / context length exceeded / 上下文超长 | 直接 `failed`，不烧 attempts（同 prompt 再送必然再超长） | `evFailed` |
+| `timeout` | 步骤超时(N 分钟) / context deadline exceeded | 沿用退避重试（可重试类，只是审计聚合上标类别） | `evRetry`/`evFailed` |
+| `executor_crash` | signal killed/aborted / executable not found | 沿用退避重试 | `evRetry`/`evFailed` |
+| `unknown` | 判不出来的一切 | **兜底为现行 `retry_backoff`**，行为与旧版逐字节一致（不加类别前缀） | `evRetry`/`evFailed` |
+
+**限额与分类器严格互斥**：`usage limit / limit reached / hit your limit / session limit` 由 `isLimitHit` 独占
+（写全局冷却+`limit_paused`），分类器绝不吃 `limit` 类。反例注入的核心验收：与限额相似但无 `limitRe` 特征
+的文本（如 `quota nearly consumed with 5% remaining`）**必须**走 `unknown`、不写全局冷却——若被误分类为限额，
+`cooldown.json` 一被写测试立即报红。
+
+**未知类兜底纪律**：分类器是"越权就烧钱"的组件——判据用严格枚举正则，只认服务端与执行器明确措辞
+（`error`/`failed` 这类广谱词禁用）；判不出来一律 `unknown`，让调用方走现行 `retry_backoff`。这是"新分类器
+不能改动已验证行为"的硬边界，回归基线断言（`TestRunTaskUnknownClass_RegressionBaseline`）把它钉死。
+
+**事件账本**：分类结果写入 `events.jsonl` 的 `detail.failure_class` 字段，配合 CG-2 事件流可按类别聚合
+"哪种失败在烧 attempts"、"held 里几张是认证问题"。auth/permission/input_too_long 的 `LastError` 带
+`[<class>]` 前缀让 CLI/看板一眼可辨；unknown 保持不加前缀以维持回归基线。
+
+**transcript 来源判据不落终态（Round-3 复审 P1）**：`classifyFailure` 只吃 `errorSummary` 提炼的
+`msg` 是**第一道防线**，但 `msg` 可能是 `invokeCodex/invokeRemoteCodex/invokeRemoteClaude` 从
+`combined`（stdout+stderr transcript）挑出的行——`codexErrorLine` 会命中 codex 硬错误正则挑走裸
+`401 unauthorized`/`403 forbidden`/`invalid api key` 等字面量，`invokeRemoteClaude` 的
+`parseClaudeJSON=nil` 分支会取 `firstLine(combined)`。这些引用行进 `res.Result` 后经 `msg` 被
+`classifyFailure` 判成 auth/permission 直接落 held，等价于让基线本会退避自愈的超时/瞬时抖动被无人
+值守静默停摆。**第二道防线**：在 `res` 增加 `ResultFromTranscript` 标记，`runTask` 分类后调
+`classificationFromTranscript(res, runErr)`——命中即把终态分类**降级** `retry_backoff`
+（`failure_class` 事件仍写供审计，`detail.softened_from_terminal=true`+`reason=softened_transcript_derived`
+标注"原本会落 held/failed 被降级"）。`LastError` 按 `unknown` 语义不加前缀，与旧版逐字节一致。
+反例注入：`TestRunTaskCodexTranscriptDerivedAuth_SoftenedToRetry` 与 `..._Permission_..._SoftenedToRetry`
+两测试锁定该分流；反向对照 `TestRunTaskClaudeStructuredAuth_StillHeld` 证明 claude 结构化 JSON 的
+真 401（`ResultFromTranscript=false`）仍走 held 不误伤。
+
+**不做**：不做自动 replan/decompose——已被 CAMEL 类工作验证但 ClaudeGo 现状 held 升级人工的路径已够用，
+自动 replan 一旦误判等于"任务被 AI 悄悄改写"，与"完整任务血缘可审计"的诚实性纪律冲突。真需要时单独立卡。
+
+## drain 内巡逻 + review sync 竞态根修（CG-5）
+
+两条独立卡死信号叠加事件账本，让"看得见的完成态"（harvest 早收割）与"什么都看不见"的僵态（patrol）
+都进内核处理，不新增守护进程。
+
+**drain 内巡逻（patrol）**——`tick` 循环里已经在跑的取消对账每 `drain_rescan_sec`（默认 15s）扫一轮；
+`patrolOnce` 贴附同一循环节奏，对每张在跑卡查两条信号：
+- **进程组存活**：`taskPG` 登记表 + `processAlive(pid)` 双查（伪存活/死 pid 残留不骗过巡逻）。
+- **心跳**：任务日志 `~/.claudego/logs/<id>.log` 文件 size 是否增长（多步任务的步骤边界才有增长）。
+
+判据（CG-5 R2.2 修订，触发面严格单一条件）：**只**看 `pgDeadTooLong = pgSeenAlive && !alive && dead-since ≥
+`patrolPGGrace`（默认 60s）——`patrol` 只处理"执行器进程组已死透且死超 pgGrace"的收尾僵态。心跳
+（日志文件 size 静默 ≥ `patrolHeartbeatTimeout`）**不再作独立触发**，只在 `pgDeadTooLong` 成立时用于把事件
+从 `procgroup_dead` 升级为 `procgroup_dead_and_no_heartbeat` reason。原因：runner.go 里 stdout 收进内存
+buffer，`logBlock` 只在 `invoke` 返回后追加，单步执行期任务日志**天然零增长**；`step_timeout_min` 默认 60min
+里 opus 重卡跑单步 30+ 分钟是常态，若心跳独立触发会永久取消归档健康重卡。R2.1 曾把"心跳超阈值 + `pgDead`
+(raw)"作为独立触发通道，可绕过 pgGrace 保护窗提前开火（step_timeout≥70min 配置下 step_timeout 击杀后
+WaitDelay 10s 窗口或步间 invoke 切换窗口）——R2.2 收紧到 `pgDeadTooLong` 单一触发面消灭该走廊。"活但静默"
+场景交给 `invoke` 自带的 `WithTimeout(step_timeout_min)` 兜底。procgroup 存活是**唯一授权凭证**：反例注入
+（脚本刷心跳但真实执行器已死）仍被 `pgDeadTooLong` 揪出。启动窗口保护：`pgSeenAlive` 前置守卫排除"任务
+刚进 activeIDs 但 invoke 尚未 register"的假阳性。
+
+`patrolHeartbeatTimeout` 随 `cfg.StepTimeoutMin` 伸缩——`tick` 入口按 `max(70min, step_timeout_min + 10min)`
+设置（默认 60min → 70min；生产曾按 ~150min 步超时运行 → 160min）。硬编码 70min 会让长步任务死透后一进
+pgGrace 就被误归为 `no_heartbeat` 类污染审计视图。伸缩后阈值恒 ≥ step_timeout+10min。
+
+**review sync 从 postComplete 调用时的 patrol 兼容**（CG-5 R2 P1-1 补）：`runReviewSync` 在 `postComplete`
+里跑（此时任务仍在 `activeIDs`），必须把 sync pid 也登记进 `taskPG`（`registerTaskInvoke`/`unregisterTaskInvoke`
+配对），否则 `anyTaskProcAlive` 假 → `pgSeenAlive && !alive` 计时 → sync 跑 >`patrolPGGrace` 就会被 patrol
+误判 `procgroup_dead`，落假 `evStalled`（状态 running 实际 sync 中）+ 对已完成任务空放 cancel，事件链呈
+`done→stalled 无 canceled`，违背 `dispatched→stalled→canceled` 因果契约。
+
+触发后**先记 `evStalled` 事件再走 `cancel`**：`evStalled` 是"披露判定卡死"的诊断事件（状态仍 running）,
+随后 `cancelRun()` 走同一收尾管线（`cmd.Cancel = killProcGroup` → `ctx.Err()` → `finalizeCanceled` → emit
+`evCanceled`）——不引入第二套击杀路径。事件序列 `dispatched → stalled(诊断) → canceled(收尾)`保留完整因果。
+`patrolEventCooldown`（默认 5min）挡重复 `evStalled` 噪声。
+
+**review sync 竞态根修**（`runReviewSync` marker 文件）——旧路径"记录不修"：sync 在 ~110s+ 完成且孙进程
+（rsync-over-ssh 的 ssh mux 等）吊住 stdout 管道时，`WaitDelay` 10s 收尾跨过 120s deadline，成功同步被
+`ctx.Err()=DeadlineExceeded` 误报超时 → 收掉 divert、每轮回退本机审、分流特性静默失效。窗口极窄但真实
+存在，长期以"回退无害"带病运行。
+
+根修：包壳跑用户命令并写 marker 文件见证退出码——marker 存在 → 完全按 marker 记录判定，`ctx.Err()`/
+`cmd.Wait` 都是 pipe 行为的次生产物不再作证。见到 marker 立即整组击杀，让 `cmd.Wait` 从"知道退出码但还
+得等 WaitDelay/ctx 到期"提速到"知道退出码且 wait 立即返回"。用 `( ... )` 子壳包裹用户命令，防用户显式
+`exit N` 直接退外壳跳过写 marker 逻辑。**闭括号必须独立成行**（CG-5 R2 P1-2 补）——若与用户命令并行成
+`( <cmd> )`，用户命令以 `#` 尾注释结尾（`rsync ... # notes`）或含 heredoc 时 `#` 会吞掉 `)` → sh 语法错误
+exit 2 → marker 不写 → 每次同步必失败 → divert 永久静默回退本机审，即本卡立项要救的故障被另一形态重新
+引入。`rescueWaitDelay` 保留作二道防线（marker 未按预期写出的边角）。
+
+## 事件账本（per-task `events.jsonl`）
+
+看板"活动流"由每张卡的事件账本驱动，不再拿 `task.Status` 反推伪造历史（把
+`queued→running→limit_paused→running→done` 压平成一句"当前 running"违反诚实性纪律）。
+
+- 位置：活动卡在 `~/.claudego/events/<id>.jsonl`，随 `clean` 归档到 `archive/events/<id>.jsonl`；
+- 每条事件是一行 JSON：`seq`（卡内单调递增）+ `ts`（RFC3339Nano）+ `type` + `actor`（谁触发）
+  + `status`（迁移后的状态快照）+ `step` + `detail`（如恢复时间戳、错误摘要、下游派生卡 ID 等）；
+- `type` 枚举与状态机迁移一一对应：`queued` / `dispatched` / `step_ok` / `limit_paused` / `held`
+  / `retry` / `canceled` / `done` / `failed` / `closeout`（完成后派生的下游卡入队）；
+- 写入是 `O_APPEND` + `fsync`：POSIX 保证追加是原子的（多进程 tick 与 CLI 同时改状态机也不会互写字节），
+  `fsync` 保证宣称已写的事件必落盘。`kill -9` 留在末尾的半截 JSON 下轮追加时先补 `\n` 封成独立坏行，
+  读者按行 `Unmarshal` 失败即丢弃，已落事件不受影响；
+- **`seq` 分配用双层锁**：`O_APPEND` 只挡 write 定位竞态，不挡 `nextSeq`(读)-算-`Write` 的组合竞态——
+  两个写者同时读到 max=N 各写 seq=N+1 → 两条同 seq 被"删中间事件也测不出"绕过缺口检测。因此
+  `nextSeq+append+fsync` 三步整体加 (a) 进程内 `sync.Mutex`（挡同进程 goroutine + 挡 stale-lock
+  bootstrap 竞态）+ (b) `<id>.jsonl.lock` 文件锁（O_EXCL 抢占, TTL 5s, 挡跨进程）。
+- **事件缺口不掩盖**：看板活动流按 `seq` 单调检测跳号，见跳号（含 `seq=1` 之前的头部缺失）即插一条
+  "事件缺口（缺失 seq X..Y）"显式披露；尾部残尾也披露一条"事件缺口（尾部残行或损坏行已丢弃）"。
+  绝不用相邻事件补齐或用 `task.Status` 反推冒充完整历史。
+- 首期不做签名（防篡改无已证需求，只取追加留痕语义）。
+
+## 幂等墓碑（per-task `tombstones/<id>.json`）
+
+事件账本记录"发生了什么"；墓碑账本记录"这个副作用是否已被注入过"——防止进程重启在同一个注入点上反复重发。
+
+三处"至多一次注入"点由墓碑护栏包住：
+1. **limit_paused 恢复**：任务撞用量限额挂起后再被 tick 复派，`runTask` 顶部若 `MidStep=true+SessionID` 非空，
+   会向同一 claude 会话发 `resume_prompt`（"继续。上一条指令因为用量限额被中断…"）。若崩溃落在"提示已发送、
+   状态未回写"处，重启后 tick 会再撞一次，把一次续跑放大成 N 次重发烧 token。
+2. **mid_step 续跑**：与 1) 同一代码路径，区别在触发原因是崩溃中断而非限额。
+3. **cross 链 reconcile**：`tick` 每轮扫孤儿 A/B 卡，判 `done+无后继` 就 `saveTask(failed) + emit failed`。
+   崩溃落在两者之间会漏事件；两轮 tick 之间也可能重复裁决。
+
+护栏语义（`tombstones.go`）：
+- 每次注入前先写 `pending(attempt+1)`；注入成功后再落 `final`。
+- Tick 复扫时见 `phase=final` 即跳过；见 `phase=pending` 且 `attempt≥bound` 也跳过（bound=2，允许崩一次+重试一次）。
+- **反例注入**：损坏字节按无墓碑处理并 stderr 披露，不 crash 也不静默跳步——静默跳步会永远不再注入，卡死更隐蔽。
+- **reset-at-entry**：`runTask` 顶部若上一轮盘上状态非 `running`（`queued/limit_paused/held`），则清当前步的
+  resume 墓碑——这是"编排层认可的新一轮尝试"信号，让新一轮 bound=2 保护从零起算；若上一轮仍是 `running`，
+  则保留墓碑挡住崩溃风暴。
+- **cli 明示重置（Round-1 追加）**：`cmdSetStatus` 的 `retry` 与 `release` 分支显式调
+  `resetTombstoneKind(reconcileCrossKind())` 清 reconcile 墓碑——这两条是 `held/failed → queued` 的唯一
+  cli 通道，与 `resume` 侧的 fresh-entry 同源；不清就会让"final 挡住的孤儿卡"永久冒充可采信 done。
+- **skipped 强升 held（Round-1 追加）**：`reconcileCrossChains` 的 `injectAtMostOnce` 返回 `skipped=true`
+  时（final 已在 / bound 耗尽），把卡从 `done` 升级到 `held` 并 emit
+  `evHeld(reason=reconcile_cross_tombstone_exhausted, actor=runner:reconcile-tombstone)`——不再让单腿
+  `done` 卡永久冒充可采信结果，也不再靠每轮 drain 的 stderr 无限刷屏当披露。
+- **每任务墓碑锁 + 两阶段临界区（Round-2 追加）**：Round-1 的 cli 明示重置让 CLI 与 runner tick 首次
+  并发读-改-写同一墓碑账本。无锁下 `injectAtMostOnce` 的 final 回写会静默复活被并发 `resetTombstoneKind`
+  删除的条目——`retry` 承诺的"清墓碑重新起 bound=2 自动再裁决"被作废。根修：
+  - `sync.Mutex`（同进程 goroutine）+ `tombstones/<id>.json.lock`（跨进程；tmp+`os.Link` 原子挂名，TTL 5s，
+    stale 判据与 release 侧 PID 校验都复用 `staleEventLock`/`releaseEventLock` 同源实现）。
+  - `injectAtMostOnce` 两阶段：阶段 1 持锁读账本 + 写 pending → 释锁；阶段 2 无锁跑 `inject`
+    （resume 侧的 LLM 子进程单次可达数分钟，持锁横穿会被 stale 强夺）；阶段 3 再取锁认领并升级 final。
+  - **entry-gone / nonce 二层防御**：阶段 3 再读账本时若条目已被并发 `reset` 删掉，或 nonce 已不是我们写的
+    pending，一律放弃 final 重建——即便锁语义未来回归，final 也不会静默复活 reset。
+  - **类闭合**：`resetTombstoneKind`（`runTask` fresh-entry / cli `retry` / cli `release` 三处）与
+    `archiveTaskTombstones`（`clean` / `postComplete` 两条 archive 路径）都走同一把锁；`archive` 侧的
+    裸 `os.Rename` 与 `injectAtMostOnce` 阶段 3 竞态会造出"归档文件 + 只剩 final 一条的活动墓碑"骗审现场。
+- **emit 必须先于 saveTask（Round-3 追加）**：`reconcileCrossChains` 的 skipped→held 分支与
+  `injectAtMostOnce` 闭包的 failed 分支旧顺序（save 先 emit 后）在崩溃/IO 错落两者之间时——卡已落盘
+  `held/failed`，孤儿谓词 `status==done` 永久排除该卡，`evHeld/evFailed` 永久丢失且无补发路径，账本呈现
+  `done→held/failed` 零事件跳变，正是墓碑要消灭的"零披露"缺陷类。修复：把 emit 挪到 `saveTask` 之前，与
+  `runTask` resume 侧顺序对齐——崩溃落中间时盘上仍 `done`，下轮 tick 重入孤儿谓词，再 emit+save 自愈收敛；
+  代价至多一条重复事件（`bound=2` 挡住无限重复），优于永久静默。事件重复优于事件永久缺失，是墓碑存在的
+  第一性理由；`TestReconcileSkippedHeldEmitsBeforeSave` / `TestReconcileFailedEmitsBeforeSave` 用
+  `saveTask` 失败代理"崩溃在 save 后 emit 前"，任一处顺序回退即报红；`TestResumeHeldSourceOrder` 用源码
+  静态守卫锁死 resume 侧同一契约防未来重构反转。
+- **随卡归档**：墓碑账本随 `archiveTask` 移到 `archive/tombstones/<id>.json`，审计可看"这张卡的每次注入都尝试了几次"。
+
+数据模型（单 JSON 而非 JSONL）：`{"version": 1, "entries": {"resume:0": {kind, attempt, phase, nonce, ts}, "reconcile:cross": {...}}}`
+——一次 `atomicWrite`（tmp→rename）即可原子替换整份账本，注入点数量少（步数上限），不需要行级追加语义。
 
 ## 权限与安全
 
@@ -242,12 +517,74 @@ claudego list                  # 看板；log <id> 看细节；doctor 自检
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `thinking_tokens` | 0 | >0 时给 claude 调用设 MAX_THINKING_TOKENS（设计活加大思考预算） |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见上文专节 |
+| `oauth_usage` / `oauth_usage_*` | false | 订阅端点直读（第三用量源），端点未文档化——异常按数据不足处理 |
 | `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行；design-review/progress-pull 只读类型豁免，可同仓并发） |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见上文专节 |
-| `codex_reasoning` | "" | 可选 codex 推理档（minimal/low/medium/high/xhigh）→ `-c model_reasoning_effort=…` |
+| `codex_fallback_model` | "" | claude 卡降级到 codex 时用此模型（档位对等：opus→terra，不降 sol）；空回退 `codex_model` |
+| `codex_reasoning` | "" | 全局 codex 推理档（minimal/low/medium/high/xhigh/max/ultra）→ `-c model_reasoning_effort=…`；任务级 effort 可覆盖 |
+| `codex_review_sandbox` | "worktree-write" | codex 只读分析卡(design-review/crosscheck 等)的沙箱策略。默认 `worktree-write`:**本机** codex 建一次性隔离副本 + `--sandbox workspace-write`,复审可跑测试/写夹具做动态验证,副本落 `<root>/tmp/codex-review-work/`,卡结束即删,原仓永不受写污染(CG-R3)。**远端** codex 只对 `t.Dir` 位于 `remote_mirror_root` 之下的镜像卡放宽为 `workspace-write`,交叉/协调/回退等真实业务仓维持 `--sandbox read-only` 硬保证(CG-R3 R1 P0-1)。改 `readonly` 全线回落旧行为(codex 直接 `--sandbox read-only`,只能静态阅读)。**取值写错时按最小权限回落 `readonly`(fail-closed)并在日志披露一次**——拼错一个字母不该静默换来更宽的沙箱(CG-R3b);键留空/不写才用默认 `worktree-write`。sequence 卡不受此配置影响。 |
+| `cross_profiles` | {opus-codex} | 交叉验证引擎对（`claudego cross`），见上文专节 |
+| `default_cross_profile` | "opus-codex" | `cross` 未指定 `-profile` 时用的引擎对 |
+| `default_review_host` | "" | 全局默认审核主机（`remote_hosts` 的键）；三键齐备时本地实现卡自动分流，见上文专节 |
+| `remote_mirror_root` | "" | 远端镜像根；与 `default_review_host` 成对，审核目录自动推导为 `<root>/<worktree名>` |
+| `default_review_sync` | "" | 全局默认分流前同步命令（sh -c，cwd=实现卡目录）；三键缺一不套默认 |
 
 提示词模板在 `~/.claudego/templates/*.md`，可直接修改（`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` 会被替换；
 `coordinate.md` 里的 `{{QUEUE}}` `{{PROGRESS}}` 在**派发时**替换为实时快照）。
+
+## 更新记录
+
+### 2026-07（v0.10 线，开源首推之后的 56 个提交）
+
+上一次公开推送（PR #1，审核分流）之后的主要变化，按主题归并：
+
+**可观测性 —— 从"状态反推"改成"事件为准"**
+
+- **事件账本（CG-2）**：新增 per-task `events.jsonl`，状态迁移点单写点收敛（不新增写者），归档时同步搬运。
+  Web 看板的活动流改读事件流，**不再由当前状态反推历史**（反推会伪造出从未发生过的时间线）；
+  账本缺口（崩溃残尾、旧任务无账本）在 UI 上**显式披露**而不是静默补全。
+- **幂等墓碑（CG-4）**：per-task `tombstones/<id>.json` 保证续接/回收/release 三处注入**至多一次**，
+  `bound=2` 挡住崩溃-重启风暴；每任务墓碑锁 + 两阶段临界区，`emit` 先于 `saveTask` 消灭"零披露"窗口。
+- **Web 看板（`claudego board`）**：只读看板落地——项目/阶段/任务三层总览 + kanban + 额度燃尽曲线，
+  模型等级分类色、阶段介绍脱离折叠、默认全展开；`board.json` 静态快照机械化为目标锚定进度（CG-8），
+  `goal_source` 按实际入账打标、合成层加非有限数守护、人工 `done_percent` 越界判"数据不足"而非直渲负百分比。
+
+**稳态运行 —— 失败不再变成静默卡死**
+
+- **失败分类分流（CG-3）**：认证/权限失败直接 `held`（重试只会烧额度）、输入超长直接 `failed`、
+  未知类兜底 `retry_backoff`；`classifyFailure` **只吃结果 msg、拒 transcript 污染**，
+  `isLimitHit` 三向收敛挡住自审仓 transcript 的误命中。
+- **drain 内巡逻（CG-5）**：drain 期间独立巡逻，**两个独立信号**才判卡死，marker 文件见证真实退出码；
+  心跳不再独立触发、阈值随配置伸缩。
+- **单实例锁**：`acquireLock` / `acquireEventLock` 原子挂名，防双持锁。
+- **codex 可靠性**：结果在手早收割（远端结果已回、ssh 被孙进程吊住时两拍击杀，不再空挂到超时）；
+  限额识别补 session limit 措辞与**跨天重置**解析；超轮限升级卡继承被审卡 `remote_host`（否则远端链的升级卡被派回本机 cd 失败）。
+
+**额度 —— 第三个用量源与百分域收口**
+
+- **订阅用量端点直读（CG-1）**：`oauth_usage` 打开后直读 `api.anthropic.com/api/oauth/usage` 作为第三用量源，
+  与 CodexBar 两源**分歧时取最保守值**；只信响应 body、**拒解析响应头**（易被中间层伪造）。
+- **百分域语义收口（CG-1b）**：`utilization` / `used_percent` / `percent` 一律按 **0-100 百分域原样取整**，
+  任一自动归一都是假触线温床；落在 `(0,1]` 的取值判为**刻度歧义**、拒判为"数据不足"，`>100` 同拒。
+- **凭据硬隔离**：`oauth_usage_creds_path` 非空时只读该文件，不再兜底 `~/.claude` / keychain。
+
+**审核分流 —— 镜像可信与沙箱收窄**
+
+- **review-sync 工作树洞根修（CG-R1/CG-R2）**：sync 补送**未提交面**并落 fingerprint，
+  自门拦住"镜像过期"空转（此前远端会对着旧镜像出一份看似正常的审核报告）。
+- **codex 复审沙箱（CG-R3/CG-R3b）**：只读分析卡默认建**一次性隔离副本 + `--sandbox workspace-write`**，
+  复审得以跑测试、写夹具做动态验证，副本随卡即建即删、原仓永不受写污染；
+  **远端**只对位于 `remote_mirror_root` 之下的镜像卡放宽（前缀判据加 `path.Clean` 词法归约，消除 `..` / `.` 逃逸），
+  真实业务仓维持 `read-only` 硬保证；`codex_review_sandbox` **取值写错按最小权限回落 `readonly`（fail-closed）**；
+  建副本阶段跑在 `min(step_timeout, 10min)` 独立子预算内（拷贝腿每文件边界查预算），
+  且**从不打开非常规文件**（FIFO/socket/设备跳过、symlink 按本体复制不跟随——一条指向无写端管道的链接就能让 `open` 永久阻塞、占死整条泳道）。
+
+**其他**
+
+- **交叉验证（`claudego cross`）**：双引擎独立作答 → 对抗式交叉查漏的三卡链，含 codex 失败可靠性根修。
+- **卡级 codex 模型钉定**：`-codex-model` 与降级专用 `codex_fallback_model`（档位对等，opus→terra 不降 sol）。
+- **文档与测试**：新增 `docs/specs/` 生态对标三件套（landscape 调研 / CG 卡 / 定位与非目标）；
+  README 配置键名加 `go test` 校验防文档漂移；mock claude 全状态机验收测试覆盖崩溃残尾与账本缺口注入。
 
 ## 测试
 

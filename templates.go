@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
+	"regexp"
 )
 
 //go:embed templates/*.md
@@ -50,10 +50,17 @@ func loadTemplate(root, name string) (string, error) {
 	return string(data), nil
 }
 
+var templateVarRe = regexp.MustCompile(`\{\{(\w+)\}\}`)
+
+// renderTemplate 单遍替换 {{KEY}} 占位符。单遍(而非按 map 循环 ReplaceAll)有两个必须:
+// ①注入值里若含字面 {{OTHER}} 不会被二次替换(否则甲结论含 {{B}} 会被乙结论顶掉=注入);
+// ②与 vars 的 map 迭代顺序无关(Go map 迭代随机,循环替换会让 C 的合并 prompt 跨运行非确定)。
+// 未在 vars 里的 {{X}} 原样保留(同旧行为)。
 func renderTemplate(tpl string, vars map[string]string) string {
-	out := tpl
-	for k, v := range vars {
-		out = strings.ReplaceAll(out, "{{"+k+"}}", v)
-	}
-	return out
+	return templateVarRe.ReplaceAllStringFunc(tpl, func(m string) string {
+		if v, ok := vars[m[2:len(m)-2]]; ok {
+			return v
+		}
+		return m
+	})
 }

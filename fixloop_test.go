@@ -178,6 +178,7 @@ func TestFixLoopRoundLimitEscalates(t *testing.T) {
 	impl := mkImplTask(t, root, cfg)
 	impl.Title = "修复R3: 实现 任务甲 [concerns:0P0+1P1]" // 第 3 轮修复卡
 	impl.FixRound = 3
+	impl.RemoteHost = "host-a" // 远端链：升级卡若不继承主机,远端 dir 会被派到本机 cd 失败
 	if err := saveTask(root, impl); err != nil {
 		t.Fatal(err)
 	}
@@ -198,6 +199,9 @@ func TestFixLoopRoundLimitEscalates(t *testing.T) {
 	}
 	if esc.ReviewAfter {
 		t.Fatal("升级卡不应再挂审核")
+	}
+	if esc.RemoteHost != "host-a" {
+		t.Fatalf("升级卡应继承被审卡的 remote_host, got %q", esc.RemoteHost)
 	}
 	// 标题不嵌套:应剥掉"修复R3: "前缀与判定尾注
 	if strings.Contains(esc.Title, "修复R3") || !strings.Contains(esc.Title, "实现 任务甲") {

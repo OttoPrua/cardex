@@ -2,6 +2,21 @@
 
 [中文](changelog.md) | **English** · back to [README](../README.en.md)
 
+## 2026-07-26 · Viewport-width layout + status filter
+
+- **Page width follows the viewport**: `.app` / `.topbar-inner` were pinned at
+  `max-width: 1760px`, which left wide margins on ultrawide displays (2560/3440) and cut the
+  project rail short. The rail is precisely the kind of layout where every extra pixel reveals a
+  bit more of the next project, so spending that width on margins costs a whole column.
+- **Status filter (hides lists, never touches readings)**: the status-count chips in the page
+  header became toggles — clicking one collapses that status's card list (task rows on the
+  overview; the whole column on the project page, since a kanban column *is* a status and an
+  empty-but-present column reads as "no cards in this status"). **Filtering never changes any
+  reading**: chip counts, progress bars, the five kind buckets and the ETA are all computed over
+  every card. A banner stays pinned while a filter is active, and "the backend only sent 40" vs.
+  "I hid some statuses myself" are reported as two separate lines. The filter persists in
+  localStorage, made safe by that pinned banner.
+
 ## 2026-07-26 · Board display-semantics fixes
 
 Four fixes for readings that were **distorted in a specific direction** — none of them arithmetic bugs,

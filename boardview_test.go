@@ -830,62 +830,74 @@ func TestTaskSpendByModelSortedAndDeterministic(t *testing.T) {
 				t.Fatalf("第 %d 次重算次序变了：%v vs %v", i+1, again.ByModel, first.ByModel)
 			}
 		}
-		if len(again.Top) != len(first.Top) || again.Top[0].ID != first.Top[0].ID {
-			t.Fatalf("第 %d 次重算逐卡表次序变了", i+1)
+		if len(again.ByProject) != len(first.ByProject) ||
+			again.ByProject[0].ID != first.ByProject[0].ID {
+			t.Fatalf("第 %d 次重算按项目表次序变了", i+1)
 		}
 	}
 }
 
-func TestTaskSpendTopSortedByCost(t *testing.T) {
+// TestTaskSpendByProjectAggregates —— 项目维度：金额/轮数按项目合并，
+// 卡数给「计入 / 全部」两个，主力模型取项目内花得最多的那个。
+func TestTaskSpendByProjectAggregates(t *testing.T) {
 	now := fixedTime()
 	root := bootSpendRoot(t, now)
 	sp := spendFor(t, root, "24h", now)
-	if len(sp.Top) != 3 {
-		t.Fatalf("逐卡表只收有花费的卡，应为 3 行，got %d", len(sp.Top))
+
+	if len(sp.ByProject) != 1 || sp.ProjectsN != 1 {
+		t.Fatalf("四张卡同目录，应聚成 1 个项目，got %+v", sp.ByProject)
 	}
-	for i := 1; i < len(sp.Top); i++ {
-		if sp.Top[i-1].CostUSD < sp.Top[i].CostUSD {
-			t.Fatalf("逐卡表未按花费降序：%+v", sp.Top)
-		}
+	p := sp.ByProject[0]
+	if p.CostUSD != 47 {
+		t.Fatalf("项目花费应为 30+5+12=47，got %v", p.CostUSD)
 	}
-	if sp.Top[0].CostUSD != 30 || !strings.Contains(sp.Top[0].Title, "贵的") {
-		t.Fatalf("第一行应是最贵那张，got %+v", sp.Top[0])
+	// 反例①的项目级镜像：无花费的 codex 卡要计进 Tasks 但不计进 Priced——
+	// 只给一个卡数会让"这条线只花了 $47"分不清是活少还是花费没记上。
+	if p.Tasks != 4 || p.Priced != 3 {
+		t.Fatalf("卡数应为 计入3/全部4，got tasks=%d priced=%d", p.Tasks, p.Priced)
 	}
-	// 逐卡行要带项目名与工作性质，否则"这笔钱花在哪个项目的什么活上"答不出来。
-	if sp.Top[0].Project == "" || sp.Top[0].Kind == "" {
-		t.Fatalf("逐卡行缺 project/kind：%+v", sp.Top[0])
+	if p.TurnsUsed != 470 {
+		t.Fatalf("轮数只统计有花费的卡，got %d", p.TurnsUsed)
+	}
+	// opus 两张合 $35 > fable 一张 $12，主力模型应是 opus。
+	if p.TopModel != "opus" || p.TopModelCost != 35 {
+		t.Fatalf("主力模型应为 opus $35，got %s $%v", p.TopModel, p.TopModelCost)
 	}
 	if sp.TopTruncated {
-		t.Fatal("只有 3 行时不该标截断")
+		t.Fatal("只有 1 个项目时不该标截断")
 	}
 }
 
-// TestTaskSpendTopTruncationDisclosed —— 反例④：截断必须自报。
-func TestTaskSpendTopTruncationDisclosed(t *testing.T) {
+// TestTaskSpendByProjectSeparatesProjects —— 不同目录的卡必须落进不同项目行，
+// 否则"钱花在哪条线上"这个问题根本答不出来。
+func TestTaskSpendByProjectSeparatesProjects(t *testing.T) {
 	now := fixedTime()
 	root := testRoot(t)
 	if err := saveConfig(root, defaultConfig("claude")); err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < spendTopN+7; i++ {
-		tk := newTask(root, testCfg(), typeSequence, "花费卡", "/tmp/spendproj", []string{"干活"}, 5)
+	mk := func(dir string, cost float64) {
+		tk := newTask(root, testCfg(), typeSequence, "活", dir, []string{"干活"}, 5)
 		tk.Status = statusDone
 		tk.Model = "opus"
-		tk.CostUSD = float64(i + 1)
+		tk.CostUSD = cost
 		tk.UpdatedAt = now.Add(-time.Hour).Format(time.RFC3339)
 		if err := saveTask(root, tk); err != nil {
 			t.Fatal(err)
 		}
 	}
+	mk("/tmp/alpha", 10)
+	mk("/tmp/beta", 90)
 	sp := spendFor(t, root, "24h", now)
-	if len(sp.Top) != spendTopN {
-		t.Fatalf("逐卡表应截到 %d 行，got %d", spendTopN, len(sp.Top))
+	if len(sp.ByProject) != 2 {
+		t.Fatalf("两个目录应是两个项目，got %+v", sp.ByProject)
 	}
-	if !sp.TopTruncated {
-		t.Fatal("截断了却没标 top_truncated —— 前端会把 30 行当成全部")
+	// 花得多的排前面。
+	if sp.ByProject[0].CostUSD != 90 || sp.ByProject[1].CostUSD != 10 {
+		t.Fatalf("按项目表未按花费降序：%+v", sp.ByProject)
 	}
-	if sp.Priced != spendTopN+7 {
-		t.Fatalf("priced 必须是全量 %d，不能跟着截断，got %d", spendTopN+7, sp.Priced)
+	if sp.ByProject[0].Name == sp.ByProject[1].Name {
+		t.Fatal("两行的项目名不该相同")
 	}
 }
 
@@ -957,5 +969,85 @@ func TestRound2KeepsCents(t *testing.T) {
 		if got := round2(c.in); got != c.want {
 			t.Errorf("round2(%v)=%v want %v —— 花费是钱，分位不能抹", c.in, got, c.want)
 		}
+	}
+}
+
+// ---- token 曲线跟随窗口 ----
+
+// TestTokenScanPlanScalesWithRange —— 窗口一长，桶要变粗、预算要跟上。
+// 桶不变粗则 30 天要画 2880 个点（卡且无信息）；预算不跟上则必然截断，
+// 而"扫了一半的全月"是造读数。实测体量：24h≈104MB / 7d≈419MB / 30d≈1.06GB。
+func TestTokenScanPlanScalesWithRange(t *testing.T) {
+	prev := tokenScanPlanFor("24h")
+	if prev.LookbackHours != 24 || prev.BucketMinutes != 15 {
+		t.Fatalf("24h 计划应为 24 小时/15 分钟桶，got %+v", prev)
+	}
+	for _, k := range []string{"7d", "30d", "all"} {
+		p := tokenScanPlanFor(k)
+		if p.LookbackHours <= prev.LookbackHours {
+			t.Errorf("%s 的回看窗口应比上一档长：%d vs %d", k, p.LookbackHours, prev.LookbackHours)
+		}
+		if p.BucketMinutes <= prev.BucketMinutes {
+			t.Errorf("%s 的桶应比上一档粗（否则点数爆炸）：%d vs %d", k, p.BucketMinutes, prev.BucketMinutes)
+		}
+		if p.ByteBudget <= prev.ByteBudget {
+			t.Errorf("%s 的字节预算应比上一档大（否则必然截断）：%d vs %d", k, p.ByteBudget, prev.ByteBudget)
+		}
+		prev = p
+	}
+	// 未知窗口回落 24h，与 resolveSpendRange 保持一致。
+	if got := tokenScanPlanFor("不存在"); got.LookbackHours != 24 {
+		t.Fatalf("未知窗口应回落 24h 计划，got %+v", got)
+	}
+	// 30 天的预算必须覆盖实测体量（1.06 GB）并留余量，否则一上线就截断。
+	if tokenScanPlanFor("30d").ByteBudget < 2*1024*mib {
+		t.Fatal("30d 预算不足以覆盖实测 1.06 GB 的两倍余量")
+	}
+}
+
+// TestTokenSeriesCarriesScanDisclosure —— 契约：曲线必须自报窗口与扫描完整性。
+// 少了 truncated，一条读了一半的曲线与"那段时间没跑活"在图上无法区分。
+func TestTokenSeriesCarriesScanDisclosure(t *testing.T) {
+	ts := buildTokenSeries(testCfg(), fixedTime(), "7d")
+	if ts.Range != "7d" {
+		t.Fatalf("曲线应回吐自己的窗口，got %q", ts.Range)
+	}
+	if ts.Since == "" {
+		t.Fatal("曲线必须给出窗口起点 since")
+	}
+	if ts.BucketMinutes != tokenScanPlanFor("7d").BucketMinutes {
+		t.Fatalf("bucket_minutes 应与扫描计划一致，got %d", ts.BucketMinutes)
+	}
+	b, _ := json.Marshal(ts)
+	for _, key := range []string{`"range"`, `"since"`, `"truncated"`, `"files_matched"`, `"files_scanned"`, `"bytes_scanned"`} {
+		if !strings.Contains(string(b), key) {
+			t.Errorf("JSON 契约缺 %s：%s", key, string(b))
+		}
+	}
+}
+
+// TestBurnCacheIsPerRange —— 反例：窗口共用一格缓存的话，
+// 每次切标签页都会重扫最贵的那个窗口（30 天要读 1 GB）。
+func TestBurnCacheIsPerRange(t *testing.T) {
+	root := bootSpendRoot(t, fixedTime())
+	c := &burnCache{ttl: time.Hour}
+	now := fixedTime()
+	a := c.get(root, testCfg(), now, "24h")
+	b := c.get(root, testCfg(), now, "7d")
+	if a == b {
+		t.Fatal("不同窗口必须落在不同缓存格，否则切换窗口拿到的是另一个窗口的读数")
+	}
+	if again := c.get(root, testCfg(), now, "24h"); again != a {
+		t.Fatal("同一窗口在 TTL 内应命中缓存，而不是重扫")
+	}
+	if len(c.entries) != 2 {
+		t.Fatalf("应有两格缓存，got %d", len(c.entries))
+	}
+	// 未知窗口归一到 24h 那一格，不额外开格（否则 ?range=xxx 能把缓存撑爆）。
+	if again := c.get(root, testCfg(), now, "乱写的"); again != a {
+		t.Fatal("未知窗口应归一到 24h 那一格")
+	}
+	if len(c.entries) != 2 {
+		t.Fatalf("未知窗口不该新开缓存格，got %d", len(c.entries))
 	}
 }

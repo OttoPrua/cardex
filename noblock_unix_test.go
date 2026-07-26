@@ -424,6 +424,6 @@ func TestBuildTokenSeriesSkipsNonRegularTranscript(t *testing.T) {
 	}
 
 	mustReturnWithin(t, "buildTokenSeries(transcript 里有 FIFO 链接)", 20*time.Second, func() {
-		_ = buildTokenSeries(&Config{}, time.Now())
+		_ = buildTokenSeries(&Config{}, time.Now(), "24h")
 	})
 }

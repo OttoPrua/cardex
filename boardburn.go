@@ -23,6 +23,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -90,9 +91,20 @@ type TokenSeriesPoint struct {
 // 不把拆分和折算值一并发出去，消费方根本无从在界面上说清这件事。
 // 于是 ByComponent / WeightedTotal / Basis 三个字段是**口径披露**，不是可选装饰。
 type TokenSeries struct {
+	// Range / Since 交代这条曲线covers 的窗口——它跟着消耗视图的时间标签页走。
+	Range         string             `json:"range"`
+	Since         string             `json:"since"`
 	BucketMinutes int                `json:"bucket_minutes"`
 	Models        []string           `json:"models"`
 	Points        []TokenSeriesPoint `json:"points"`
+	// Truncated / FilesMatched / FilesScanned / BytesScanned 是**扫描完整性**披露。
+	// 长窗口下 transcript 体量会撞上字节预算闸（实测 30 天 1.06 GB）；
+	// 一条少了后半段的曲线与"那段时间没跑活"在图上长得一模一样，
+	// 静默截断就是造读数，所以截没截、扫了多少必须一起发出去。
+	Truncated    bool  `json:"truncated"`
+	FilesMatched int   `json:"files_matched"`
+	FilesScanned int   `json:"files_scanned"`
+	BytesScanned int64 `json:"bytes_scanned"`
 	// ByComponent 是窗口内四类 token 的合计：input / output / cache_creation / cache_read。
 	ByComponent map[string]float64 `json:"by_component"`
 	// WeightedTotal 是同一批样本按 budget.go 权重折算后的额度口径合计，
@@ -652,13 +664,42 @@ func codexBurnSources(cfg *Config, now time.Time, maxAge time.Duration) []BurnSo
 
 // ---- transcript 绝对 token 曲线 ----
 
-const (
-	tokenBucketMinutes = 15
-	tokenLookbackHours = 24
-	// transcriptByteBudget 是单次扫描的总字节上限（安全阀）。
-	// ~/.claude/projects 实测近 900MB，只有按 mtime 过滤 + 封顶才敢在 HTTP 请求里扫。
-	transcriptByteBudget = int64(512 * 1024 * 1024)
+// tokenUsageMark / tokenAssistantMark 是逐行预筛用的字面量。提到包级是为了
+// 不在每行调用里重新分配（每行两次 []byte(...) 转换，1 GB 的量级下相当可观）。
+var (
+	tokenUsageMark     = []byte(`"usage"`)
+	tokenAssistantMark = []byte(`"assistant"`)
 )
+
+// tokenScanPlan 是一个窗口下的扫描参数：回看多久、多少分钟一桶、最多读多少字节。
+//
+// 【三者必须一起定】桶大小要让点数落在可画的范围（曲线画 2000 个点既卡又没信息）；
+// 字节预算要够覆盖该窗口的真实体量，否则扫一半就停——而"扫了一半的全月"是**造读数**，
+// 比不给这个窗口糟得多。实测体量：24h≈104MB / 7d≈419MB / 30d≈1.06GB。
+// 预算取实测量的 2 倍余量：transcript 会随使用增长，卡得太紧会在某天悄悄开始截断。
+type tokenScanPlan struct {
+	LookbackHours int
+	BucketMinutes int
+	ByteBudget    int64
+}
+
+const mib = int64(1024 * 1024)
+
+// tokenScanPlanFor 把消耗视图的窗口映射成扫描参数。
+// range=all 对 transcript 没有"全部"可言（那个目录可能存着一年的历史，且没有上限），
+// 故按 90 天封顶并在 basis 里说明——给一个跑不完的窗口不如给一个说得清的。
+func tokenScanPlanFor(key string) tokenScanPlan {
+	switch key {
+	case "7d":
+		return tokenScanPlan{LookbackHours: 24 * 7, BucketMinutes: 60, ByteBudget: 1024 * mib}
+	case "30d":
+		return tokenScanPlan{LookbackHours: 24 * 30, BucketMinutes: 360, ByteBudget: 2560 * mib}
+	case "all":
+		return tokenScanPlan{LookbackHours: 24 * 90, BucketMinutes: 720, ByteBudget: 4096 * mib}
+	default: // 24h
+		return tokenScanPlan{LookbackHours: 24, BucketMinutes: 15, ByteBudget: 512 * mib}
+	}
+}
 
 type transcriptLine struct {
 	Timestamp string `json:"timestamp"`
@@ -686,16 +727,21 @@ type tokenAgg struct {
 
 // buildTokenSeries 扫 transcript 得到按模型分的绝对 token 曲线。
 // 这是**不分账号**的绝对用量（与百分比源互补：百分比看还剩多少，token 看烧了多少）。
-func buildTokenSeries(cfg *Config, now time.Time) TokenSeries {
-	ts := TokenSeries{BucketMinutes: tokenBucketMinutes, Models: []string{}, Points: []TokenSeriesPoint{}}
+func buildTokenSeries(cfg *Config, now time.Time, rangeKey string) TokenSeries {
+	plan := tokenScanPlanFor(rangeKey)
+	ts := TokenSeries{
+		Range: resolveSpendRange(rangeKey).Key, BucketMinutes: plan.BucketMinutes,
+		Models: []string{}, Points: []TokenSeriesPoint{},
+	}
 	root := transcriptRoot()
 	if root == "" {
 		return ts
 	}
-	cut := now.Add(-tokenLookbackHours * time.Hour)
+	cut := now.Add(-time.Duration(plan.LookbackHours) * time.Hour)
+	ts.Since = cut.UTC().Format(time.RFC3339)
 
 	var files []string
-	// 只挑最近改动过的文件：24 小时的曲线不可能来自上周就没再写过的会话。
+	// 只挑最近改动过的文件：这个窗口的曲线不可能来自窗口之前就没再写过的会话。
 	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			return nil // 单个目录读不了就跳过，不让整棵树的遍历失败
@@ -710,6 +756,7 @@ func buildTokenSeries(cfg *Config, now time.Time) TokenSeries {
 		files = append(files, p)
 		return nil
 	})
+	ts.FilesMatched = len(files)
 
 	agg := &tokenAgg{
 		cfg:       cfg,
@@ -717,11 +764,15 @@ func buildTokenSeries(cfg *Config, now time.Time) TokenSeries {
 		models:    map[string]bool{},
 		component: map[string]float64{},
 	}
-	var budget = transcriptByteBudget
+	var budget = plan.ByteBudget
 	for _, p := range files {
 		if budget <= 0 {
+			// 撞上预算闸 = 这条曲线**不完整**。必须记下来往外发：
+			// 一条少了后半段的曲线看起来和"那段时间没跑活"一模一样，静默截断就是造读数。
+			ts.Truncated = true
 			break
 		}
+		ts.FilesScanned++
 		// 【CG-R3b R1 类闭合】p 来自 ~/.claude/projects 的目录遍历——那是 claude CLI 自己写的目录,
 		// 属 ClaudeGo 控制域之外:WalkDir 的 d.IsDir() 对 symlink 恒为 false,一条名为 *.jsonl 的
 		// symlink→FIFO 就能让 os.Open 永久阻塞,把 board 的燃尽采样 goroutine 占死(web handler
@@ -736,10 +787,15 @@ func buildTokenSeries(cfg *Config, now time.Time) TokenSeries {
 			// （transcript 里有把整个文件内容塞进一条消息的行）。
 			line, err := rd.ReadBytes('\n')
 			budget -= int64(len(line))
+			ts.BytesScanned += int64(len(line))
 			if len(line) > 0 {
-				accumulateTokenLine(line, cut, agg)
+				accumulateTokenLine(line, cut, plan.BucketMinutes, agg)
 			}
 			if err != nil || budget <= 0 {
+				// budget<=0 时这个文件也只读了一半——同样是截断，同样要披露。
+				if budget <= 0 {
+					ts.Truncated = true
+				}
 				break
 			}
 		}
@@ -766,19 +822,30 @@ func buildTokenSeries(cfg *Config, now time.Time) TokenSeries {
 	}
 	ts.ByComponent = agg.component
 	ts.WeightedTotal = round1(agg.weighted)
-	ts.Basis = tokenSeriesBasis(agg)
+	ts.Basis = tokenSeriesBasis(agg, &ts)
 	return ts
 }
 
 // tokenSeriesBasis 如实交代 by_model 的口径，并在缓存读取占比高时明说
 // 「这个数不等同于额度消耗」——它与 queue_spend.weighted_tokens 差一个数量级。
-func tokenSeriesBasis(agg *tokenAgg) string {
+func tokenSeriesBasis(agg *tokenAgg, ts *TokenSeries) string {
+	// 截断先说：一条不完整的曲线，后面所有比例数字都只覆盖读到的那部分。
+	var pre string
+	if ts.Truncated {
+		pre = fmt.Sprintf("⚠ 本次扫描撞上字节预算上限，只读了 %d/%d 个 transcript 文件（%.1f GB）——"+
+			"下面的曲线与数字**不完整**，只覆盖读到的那部分。缩短窗口可得到完整读数。",
+			ts.FilesScanned, ts.FilesMatched, float64(ts.BytesScanned)/float64(1024*1024*1024))
+	}
+	if ts.Range == "all" {
+		pre += "窗口 all 对 transcript 按 90 天封顶（那个目录没有上限，" +
+			"给一个跑不完的窗口不如给一个说得清的）。"
+	}
 	total := 0.0
 	for _, v := range agg.component {
 		total += v
 	}
 	if total <= 0 {
-		return "最近 24 小时内没有可用的 transcript 用量样本。"
+		return pre + "这个窗口内没有可用的 transcript 用量样本。"
 	}
 	fresh := agg.component["input"] + agg.component["output"] + agg.component["cache_creation"]
 	b := fmt.Sprintf(
@@ -792,12 +859,15 @@ func tokenSeriesBasis(agg *tokenAgg) string {
 		b += fmt.Sprintf("等权口径相当于新处理量的 %.1f 倍，**不可**与 queue_spend.weighted_tokens 直接相比。",
 			total/fresh)
 	}
-	return b
+	return pre + b
 }
 
-func accumulateTokenLine(line []byte, cut time.Time, agg *tokenAgg) {
+func accumulateTokenLine(line []byte, cut time.Time, bucketMin int, agg *tokenAgg) {
 	// 廉价预筛：绝大多数行不是带 usage 的 assistant 消息，先用子串排掉再谈 JSON 解析。
-	if !strings.Contains(string(line), `"usage"`) || !strings.Contains(string(line), `"assistant"`) {
+	// 用 bytes.Contains 而不是 strings.Contains(string(line), …)——后者会给**每一行**
+	// 复制一份字符串。24 小时窗口是 104 MB 还看不出来，30 天窗口要扫 1.0 GB，
+	// 那就是凭空多分配 1 GB、多走一遍 GC。
+	if !bytes.Contains(line, tokenUsageMark) || !bytes.Contains(line, tokenAssistantMark) {
 		return
 	}
 	var r transcriptLine
@@ -821,7 +891,7 @@ func accumulateTokenLine(line []byte, cut time.Time, agg *tokenAgg) {
 	if total <= 0 {
 		return
 	}
-	b := at.UTC().Truncate(tokenBucketMinutes * time.Minute)
+	b := at.UTC().Truncate(time.Duration(bucketMin) * time.Minute)
 	if agg.buckets[b] == nil {
 		agg.buckets[b] = map[string]float64{}
 	}
@@ -844,25 +914,36 @@ func accumulateTokenLine(line []byte, cut time.Time, agg *tokenAgg) {
 
 // burnCache 给燃尽视图单独做缓存：transcript 扫描是整个看板最贵的操作
 // （按 mtime 过滤后仍有数十 MB），TTL 比任务快照长。
+// burnCache 按**窗口**分别缓存。窗口一进 transcript 扫描的成本模型就变了：
+// 24h 读 104 MB、30d 读 1.06 GB，共用一个缓存槽会让每次换标签页都重扫一遍最贵的那个。
+// 每个窗口一格，各自计时。
 type burnCache struct {
-	mu   sync.Mutex
-	ttl  time.Duration
+	mu      sync.Mutex
+	ttl     time.Duration
+	entries map[string]*burnCacheEntry
+}
+
+type burnCacheEntry struct {
 	at   time.Time
 	resp *BurnResp
 }
 
-func (c *burnCache) get(root string, cfg *Config, now time.Time) *BurnResp {
+func (c *burnCache) get(root string, cfg *Config, now time.Time, rangeKey string) *BurnResp {
+	key := resolveSpendRange(rangeKey).Key
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.resp != nil && now.Sub(c.at) < c.ttl {
-		return c.resp
+	if c.entries == nil {
+		c.entries = map[string]*burnCacheEntry{}
 	}
-	r := buildBurn(root, cfg, now)
-	c.at, c.resp = now, r
+	if e := c.entries[key]; e != nil && now.Sub(e.at) < c.ttl {
+		return e.resp
+	}
+	r := buildBurn(root, cfg, now, key)
+	c.entries[key] = &burnCacheEntry{at: now, resp: r}
 	return r
 }
 
-func buildBurn(root string, cfg *Config, now time.Time) *BurnResp {
+func buildBurn(root string, cfg *Config, now time.Time, rangeKey string) *BurnResp {
 	maxAgeMin := 90
 	if cfg != nil && cfg.UsageFeedMaxAgeMin > 0 {
 		maxAgeMin = cfg.UsageFeedMaxAgeMin
@@ -888,7 +969,7 @@ func buildBurn(root string, cfg *Config, now time.Time) *BurnResp {
 	return &BurnResp{
 		GeneratedAt: now.Format(time.RFC3339),
 		Sources:     sources,
-		TokenSeries: buildTokenSeries(cfg, now),
+		TokenSeries: buildTokenSeries(cfg, now, rangeKey),
 		QueueSpend: QueueSpend{
 			WindowHours: windowHours, WeightedTokens: round1(spent), ByModel: byModel,
 		},

@@ -280,7 +280,9 @@ func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 	arc, arcErr := loadBoardArchive(s.root)
 	archivedN := applyArchiveState(projects, snap.projTasks, arc)
-	burn := s.burn.get(s.root, snap.Cfg, now)
+	// 顶部额度条只用 burn.Sources（与窗口无关），取最便宜的 24h 那格即可——
+	// 传别的窗口会让总览页顺带触发 30 天的 transcript 全扫。
+	burn := s.burn.get(s.root, snap.Cfg, now, "24h")
 	resp := OverviewResp{
 		GeneratedAt:            now.Format(time.RFC3339),
 		Root:                   snap.Root,
@@ -396,11 +398,13 @@ func (s *boardServer) handleBurn(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, cerr.Error())
 		return
 	}
-	resp := *s.burn.get(s.root, cfg, now)
-	// 任务消耗按请求的窗口现算：它只是把快照里已在内存的卡再过一遍，不碰磁盘，
-	// 所以不进 burnCache——否则每个窗口都要占一份 transcript 扫描的缓存位。
+	rangeKey := r.URL.Query().Get("range")
+	// burnCache 按窗口分格缓存（transcript 扫描量随窗口从 104 MB 涨到 1 GB，
+	// 共用一格会让每次换标签页都重扫最贵的那个）。
+	resp := *s.burn.get(s.root, cfg, now, rangeKey)
+	// 任务消耗现算：它只是把快照里已在内存的卡再过一遍，不碰磁盘，缓存它没有意义。
 	if snap != nil {
-		resp.TaskSpend = buildTaskSpend(cfg, snap, r.URL.Query().Get("range"), now)
+		resp.TaskSpend = buildTaskSpend(cfg, snap, rangeKey, now)
 	}
 	writeJSON(w, http.StatusOK, resp)
 }
@@ -613,6 +617,7 @@ func buildActivity(root string, tasks []*Task) []ActivityItem {
 //   - evDispatched: 派上时 Step=待执行步序(0-indexed),显示 +1 得到"第 1 步";
 //   - evStepOK/evDone/evFailed: 已在 runner.go:779 做过 t.Step++,Step 是"已完成步数"(1-indexed),
 //     直接显示即"第 N 步";若再 +1 会显示"第 N+1 步·末步"这类不存在的步(实测两步卡末步曾报"第 3 步")。
+//
 // 其他 evLimitPaused/evRetry/evHeld/evCanceled 的 ev.Step 视迁移点各异但描述不显示步号,不受此坑影响。
 func describeEvent(ev TaskEvent) string {
 	switch ev.Type {

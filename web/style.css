@@ -437,6 +437,23 @@ button { font: inherit; color: inherit; }
 .proj-titlerow { display: flex; align-items: flex-start; gap: 10px; }
 .proj-actions { margin-left: auto; display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 
+/* 拖拽手柄：默认压到很淡，鼠标进到列头才显出来——常驻的高对比抓手会跟项目名抢注意力，
+   而调整次序是低频操作。focus-visible 时必须显形（键盘用户看不到 hover）。 */
+.drag-grip {
+  flex: 0 0 auto; margin-top: 3px;
+  display: grid; place-items: center;
+  width: 18px; height: 18px; border-radius: var(--r-sm);
+  color: var(--ink-mute); opacity: .35;
+  cursor: grab; user-select: none;
+  transition: opacity .13s, background .13s, color .13s;
+}
+.proj-head:hover .drag-grip { opacity: .8; }
+.drag-grip:hover { background: var(--surface-2); color: var(--ink); opacity: 1; }
+.drag-grip:focus-visible { opacity: 1; outline: 2px solid var(--s1); outline-offset: 1px; }
+.drag-grip:active { cursor: grabbing; }
+/* 被拖走的那一列压暗 + 虚线框，明确"这块正在换位置"而不是"这块坏了"。 */
+.proj.is-dragging { opacity: .4; border-style: dashed; }
+
 /* 归档按钮：与 .proj-open 同一视觉族，按下态用实底区分 */
 .arch-btn {
   font-size: 12px; color: var(--ink-mute); cursor: pointer;

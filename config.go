@@ -287,8 +287,10 @@ func isRemoteMirrorPath(cfg *Config, dir string) bool {
 
 // remoteCodexReviewSandbox 返回远端 codex 非 sequence 卡的沙箱模式(CG-R3 R1 P0-1):
 //   - CodexReviewSandbox="readonly" → 强制 read-only(旧行为可配置回落);
-//   - t.Dir 位于 cfg.RemoteMirrorRoot 之下(sync-lane 一次性镜像) → workspace-write,
-//     兑现复审动态验证收益("镜像本身已是影本"的假前提在此才成立);
+//   - t.Dir 位于 cfg.RemoteMirrorRoot 之下(sync-lane 一次性镜像) → 默认 workspace-write;
+//     若该远端主机显式配置 Sandbox=danger-full-access,则继承它。Windows 上 Codex 的
+//     workspace-write/read-only runner 可能无法建立 pipe-in,而 danger-full-access 不走该
+//     OS sandbox;这里只允许严格镜像子孙继承,真实业务仓仍不得放宽。
 //   - 其余(crosscheck 远端腿/coordinate/progress-pull 远端卡/review divert 回退后的原仓)
 //     → read-only,恢复"原仓字节永不受写污染"的沙箱级硬保证——这些路径 t.Dir 是真实业务仓,
 //     不是一次性镜像,仅 prompt 纪律兜底不够(见 CG-R3 R1 复审 P0-1)。
@@ -300,6 +302,11 @@ func remoteCodexReviewSandbox(cfg *Config, t *Task) string {
 		return "read-only"
 	}
 	if t != nil && isRemoteMirrorPath(cfg, t.Dir) {
+		if cfg != nil {
+			if host, ok := cfg.RemoteHosts[t.RemoteHost]; ok && host.Sandbox == "danger-full-access" {
+				return "danger-full-access"
+			}
+		}
 		return "workspace-write"
 	}
 	return "read-only"

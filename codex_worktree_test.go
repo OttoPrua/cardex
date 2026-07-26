@@ -334,10 +334,11 @@ func argvValueAfter(argv, flag string) string {
 
 // TestInvokeCodexWorktreeWriteArgvAndCleanup 正向覆盖·CG-R3 R1 P1-2:
 // 默认 worktree-write 模式经 invokeCodex 的关键接线全套断言,任何一处回归全套测试都会红:
-//   ① sandbox 切换:argv 含 --sandbox workspace-write,不含 read-only;
-//   ② -C 指向副本(而非原仓);副本路径落在 codexWorkRoot(root) 之下;
-//   ③ writable_roots 拼接的是副本 .git 路径(不是原仓 .git);
-//   ④ defer cleanup:invokeCodex 返回后副本目录已被删。
+//
+//	① sandbox 切换:argv 含 --sandbox workspace-write,不含 read-only;
+//	② -C 指向副本(而非原仓);副本路径落在 codexWorkRoot(root) 之下;
+//	③ writable_roots 拼接的是副本 .git 路径(不是原仓 .git);
+//	④ defer cleanup:invokeCodex 返回后副本目录已被删。
 //
 // 若无此测试,cleanup 回归会被 orphan reaper 的"pid 活即跳过"掩盖(codex_worktree.go:336-338):
 // 测试进程 pid 是活的 → reaper 跳过 → 副本残留只在 stat 时才见 → 全套测试仍绿。
@@ -501,6 +502,28 @@ func TestRemoteCodexReviewSandbox(t *testing.T) {
 			&Config{RemoteMirrorRoot: "D:/Project/PO-lanes"},
 			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/ClaudeGo"},
 			"workspace-write",
+		},
+		{
+			"Windows 主机显式禁用 OS sandbox + 严格镜像目录 → danger-full-access",
+			&Config{
+				RemoteMirrorRoot: "D:/Project/PO-lanes",
+				RemoteHosts: map[string]RemoteHostConfig{
+					"qmthost": {Sandbox: "danger-full-access"},
+				},
+			},
+			&Task{Type: typeReview, Dir: "D:/Project/PO-lanes/ClaudeGo", RemoteHost: "qmthost"},
+			"danger-full-access",
+		},
+		{
+			"Windows 主机 danger-full-access 不得放宽镜像根外真实仓",
+			&Config{
+				RemoteMirrorRoot: "D:/Project/PO-lanes",
+				RemoteHosts: map[string]RemoteHostConfig{
+					"qmthost": {Sandbox: "danger-full-access"},
+				},
+			},
+			&Task{Type: typeReview, Dir: "D:/Project/production/ClaudeGo", RemoteHost: "qmthost"},
+			"read-only",
 		},
 		{
 			"交叉卡远端腿(真实业务仓) → read-only",
@@ -817,11 +840,13 @@ func TestCodexReviewPrepareKilledOnHangingGit(t *testing.T) {
 // "泳道不会被建副本堵死",实际堵得死死的。契约句是对外承诺,必须有测试钉住。
 //
 // 【锚三件事】
-//   ① 两份指南都得有这句 —— 只改中文不改英文照样过 = 双语漂移的假绿;
-//   ② 句子里必须出现本轮新增的两条硬约束(逐文件边界查预算 / 从不打开非常规文件),
-//      防止有人把句子改回旧版超卖措辞;
-//   ③ 实现侧**剥掉注释后**必须真有这两条的代码痕迹 —— 否则 README 可以单方面写得漂亮而代码回退,
-//      注释里的漂亮话也不算数(承 CG-R2c"剥注释后做 must[] 断言"的既定纪律)。
+//
+//	① 两份指南都得有这句 —— 只改中文不改英文照样过 = 双语漂移的假绿;
+//	② 句子里必须出现本轮新增的两条硬约束(逐文件边界查预算 / 从不打开非常规文件),
+//	   防止有人把句子改回旧版超卖措辞;
+//	③ 实现侧**剥掉注释后**必须真有这两条的代码痕迹 —— 否则 README 可以单方面写得漂亮而代码回退,
+//	   注释里的漂亮话也不算数(承 CG-R2c"剥注释后做 must[] 断言"的既定纪律)。
+//
 // 【杀的突变】把任一 README 的契约句改回旧版 → ① 或 ② 红;把 copyUntrackedPath 的 os.Lstat 换回
 // os.Open、或删掉循环里的 ctx.Err() → ③ 红(即便注释还写着也照红)。
 func TestReadmeCopyPhaseContractMatchesImplementation(t *testing.T) {

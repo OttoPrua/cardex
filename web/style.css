@@ -949,6 +949,39 @@ table.tbl thead th {
 }
 table.tbl td { font-variant-numeric: tabular-nums; color: var(--ink-2); }
 table.tbl tbody tr:last-child td { border-bottom: 0; }
+table.tbl td.is-mono { font-family: var(--mono); font-size: 10.5px; }
+table.tbl td.is-num { font-weight: 620; color: var(--ink); }
+/* 逐卡表里的标题：整行不换行会把表撑到几屏宽，截断 + title 悬停给全文 */
+.sp-title {
+  display: inline-block; max-width: 34ch;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  vertical-align: bottom; color: var(--ink);
+}
+
+/* 按模型分的消耗条 */
+.spend-list { display: flex; flex-direction: column; gap: 7px; margin-top: 11px; }
+.spend-row {
+  display: grid; grid-template-columns: minmax(120px, 190px) 1fr auto auto;
+  align-items: center; gap: 11px;
+}
+.spend-row .sr-model { min-width: 0; }
+.spend-row .sr-bar {
+  height: 8px; border-radius: 4px; background: var(--surface-sunk);
+  overflow: hidden; min-width: 0;
+}
+.spend-row .sr-fill { display: block; height: 100%; border-radius: 4px; background: var(--s1); }
+.spend-row .sr-cost {
+  font-size: 12.5px; font-weight: 680; color: var(--ink);
+  font-variant-numeric: tabular-nums; min-width: 82px; text-align: right;
+}
+.spend-row .sr-meta {
+  font-size: 11px; color: var(--ink-mute);
+  font-variant-numeric: tabular-nums; min-width: 96px; text-align: right;
+}
+@media (max-width: 620px) {
+  .spend-row { grid-template-columns: 1fr auto; }
+  .spend-row .sr-bar { grid-column: 1 / -1; }
+}
 
 /* 统计磁贴 */
 .tiles { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); }

@@ -383,17 +383,26 @@ func sameOriginHost(origin, host string) bool {
 
 func (s *boardServer) handleBurn(w http.ResponseWriter, r *http.Request) {
 	now := s.clock()
-	// 燃尽视图只需要 config，不需要整份任务快照；但快照顺带把 config 读好了，复用它。
+	// 燃尽视图的百分比/token 部分只需要 config；任务消耗那一段要整份快照。
+	// 快照顺带把 config 读好了，复用它；快照读不出来时退回单读 config——
+	// 额度曲线不该因为队列目录有问题就整页挂掉。
 	var cfg *Config
-	if snap, err := s.snap.get(s.root, now); err == nil {
-		cfg = snap.Cfg
+	var snap *boardSnapshot
+	if sn, err := s.snap.get(s.root, now); err == nil {
+		snap, cfg = sn, sn.Cfg
 	} else if c, cerr := loadConfig(s.root); cerr == nil {
 		cfg = c
 	} else {
 		writeErr(w, http.StatusInternalServerError, cerr.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, s.burn.get(s.root, cfg, now))
+	resp := *s.burn.get(s.root, cfg, now)
+	// 任务消耗按请求的窗口现算：它只是把快照里已在内存的卡再过一遍，不碰磁盘，
+	// 所以不进 burnCache——否则每个窗口都要占一份 transcript 扫描的缓存位。
+	if snap != nil {
+		resp.TaskSpend = buildTaskSpend(cfg, snap, r.URL.Query().Get("range"), now)
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *boardServer) handleProject(w http.ResponseWriter, r *http.Request) {

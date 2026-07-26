@@ -492,6 +492,10 @@ const state = {
     hiddenStatuses: loadHiddenStatuses(),
     // projectOrder：人工拖拽出来的项目次序（project id 数组，空=用后端的默认排序）。
     projectOrder: loadProjectOrder(),
+    // spendRange：队列消耗的统计窗口。默认 7 天而不是 24 小时——
+    // 24 小时里常常只跑过一两个模型（实测就是这样），一进来只看到一个模型
+    // 会被当成"看板漏了数据"，而真实原因只是窗口太窄。
+    spendRange: '7d',
   },
 };
 
@@ -1443,7 +1447,7 @@ function activitySection(items) {
 /* ============================ 视图：燃尽 ============================ */
 
 async function viewBurn() {
-  const d = await apiGet('/api/burn');
+  const d = await apiGet(`/api/burn?range=${encodeURIComponent(state.ui.spendRange)}`);
   const frag = document.createDocumentFragment();
 
   const sources = d.sources || [];
@@ -1472,6 +1476,7 @@ async function viewBurn() {
     frag.append(callout('warning', '!', '所有额度样本都已过期，下面的百分比不代表现状。'));
   }
 
+  frag.append(spendSection(d.task_spend || {}));
   frag.append(tokenSection(d.token_series || {}, d.queue_spend || {}));
 
   const shown = state.ui.burnAll ? sources : fresh;
@@ -1690,6 +1695,115 @@ function burnTable(src) {
   return det;
 }
 
+/* ---- 队列任务消耗（按时间窗口）---- */
+
+const SPEND_RANGES = [
+  ['24h', '24 小时'], ['7d', '7 天'], ['30d', '30 天'], ['all', '全部'],
+];
+
+/** 金额。两位小数不省——花费是钱，抹掉分位会让 $0.04 和 $0.05 看着一样。 */
+function usd(v) {
+  if (!isNum(v)) return '—';
+  return '$' + v.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/**
+ * 队列任务消耗。与上面的 transcript 曲线**不是同一个源、也不是同一个口径**，
+ * 所以单独成节而不是并进那张图：
+ *   - 这里一行是一张卡，只含 claudego 派发的活（交互会话不在内）；
+ *   - 曲线扫的是 ~/.claude/projects，里面混着人手敲的会话，且只能回看 24 小时
+ *     （30 天的 transcript 有 1 GB，扫描字节闸必然截断）。
+ * 两者并排放着不说清楚，就会被读成"同一个数怎么对不上"。
+ */
+function spendSection(sp) {
+  const head = h('div', { class: 'section-head' },
+    h('h2', { class: 'section-title', text: '队列任务消耗' }),
+    h('div', { class: 'seg', role: 'group', 'aria-label': '统计窗口' },
+      SPEND_RANGES.map(([key, label]) => h('button', {
+        type: 'button',
+        'aria-pressed': String(state.ui.spendRange === key),
+        onclick: () => {
+          if (state.ui.spendRange === key) return;
+          state.ui.spendRange = key;
+          load({ silent: true });
+        },
+        text: label,
+      }))),
+    h('span', {
+      class: 'section-note',
+      text: sp.since ? `窗口自 ${fmtTime(sp.since) || sp.since} 起（按卡跑完的时刻归档）` : '全部历史',
+    }));
+
+  const sec = h('section', { class: 'section' }, head);
+
+  if (!sp.tasks) {
+    sec.append(emptyState('这个窗口里没有任务卡。'));
+    return sec;
+  }
+
+  sec.append(h('div', { class: 'tiles' },
+    tile('合计花费', usd(sp.cost_usd), '',
+      '订阅制下这是 API 等价成本，不是实际扣款'),
+    tile('计入的卡', num(sp.priced || 0), '张',
+      `窗口内共 ${num(sp.tasks || 0)} 张卡`),
+    tile('无花费数据', num(sp.unpriced || 0), '张',
+      'codex / 远端 codex 不回报花费，未跑或已取消的卡同样为空——未计入合计'),
+    tile('合计轮数', num(sp.turns_used || 0), '轮', '只统计有花费数据的卡')));
+
+  const models = sp.by_model || [];
+  if (models.length) {
+    const maxCost = Math.max(...models.map((m) => m.cost_usd || 0), 0.01);
+    const rows = h('div', { class: 'spend-list' });
+    for (const m of models) {
+      rows.append(h('div', { class: 'spend-row' },
+        h('span', { class: 'sr-model' }, tierBadge(m.model, m.tier)),
+        h('span', { class: 'sr-bar', 'aria-hidden': 'true' },
+          h('span', { class: 'sr-fill', style: `width:${((m.cost_usd || 0) / maxCost) * 100}%` })),
+        h('span', { class: 'sr-cost', text: usd(m.cost_usd) }),
+        h('span', { class: 'sr-meta', text: `${num(m.tasks || 0)} 张・${num(m.turns_used || 0)} 轮` })));
+    }
+    sec.append(h('section', { class: 'card chart-card', style: 'margin-top:14px' },
+      h('h3', { class: 'chart-title', text: '按模型分' }),
+      h('p', {
+        class: 'chart-sub',
+        text: '模型取每张卡**实际生效**的那个（codex 侧经 resolveCodexModel 解析，claude 侧回落类型默认）。',
+      }),
+      rows));
+  }
+
+  const top = sp.top || [];
+  if (top.length) {
+    const body = h('tbody', {}, top.map((t) => h('tr', {},
+      h('td', {}, h('span', { class: 'sp-title', title: t.title, text: t.title })),
+      h('td', { class: 'is-mono', text: t.project || '—' }),
+      h('td', {}, tierBadge(t.model, t.model_tier)),
+      h('td', { text: t.kind ? (KIND_ZH[t.kind] || t.kind) : '—' }),
+      h('td', {}, statusBadge(t.status)),
+      h('td', { class: 'is-num', text: usd(t.cost_usd) }),
+      h('td', { class: 'is-num', text: t.turns_used ? String(t.turns_used) : '—' }),
+      h('td', { text: fmtTime(t.updated_at) || '—' }))));
+    const card = h('section', { class: 'card chart-card', style: 'margin-top:14px' },
+      h('h3', { class: 'chart-title', text: '逐卡消耗（按花费降序）' }),
+      h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' },
+        h('thead', {}, h('tr', {},
+          h('th', { text: '任务' }), h('th', { text: '项目' }), h('th', { text: '模型' }),
+          h('th', { text: '性质' }), h('th', { text: '状态' }), h('th', { text: '花费' }),
+          h('th', { text: '轮数' }), h('th', { text: '完成时刻' }))),
+        body)));
+    // 截断必须说出来：只看到 30 行会被当成"这个窗口就这么多卡有花费"。
+    if (sp.top_truncated) {
+      card.append(h('p', {
+        class: 'more-hint',
+        text: `显示花费最高的 ${top.length} 张 / 窗口内共 ${num(sp.priced || 0)} 张有花费数据的卡。`,
+      }));
+    }
+    sec.append(card);
+  }
+
+  if (sp.basis) sec.append(h('div', { style: 'margin-top:12px' }, callout('warning', 'ⓘ', sp.basis)));
+  return sec;
+}
+
 /* ---- token 曲线 ---- */
 
 function tokenSection(ts, spend) {
@@ -1700,6 +1814,14 @@ function tokenSection(ts, spend) {
         class: 'section-note',
         text: `最近 24 小时・${ts.bucket_minutes || 15} 分钟一桶・来自 transcript，不分账号`,
       })));
+  // 这一节最容易被误读成"看板只认识一个模型"。窗口窄 + 口径不是队列，两件事都要写明。
+  sec.append(callout('warning', 'ⓘ', h('div', {},
+    h('strong', { text: '为什么这里常常只有一两个模型：' }),
+    '窗口固定 24 小时（30 天的 transcript 实测 1 GB，扫描有字节上限，拉长必然静默截断——'
+    + '给一个只读了一半的"全月"比不给更糟），而一天里往往只跑过一两个模型；'
+    + '并且它扫的是 ~/.claude/projects，里面**混着你在 Claude Code 里手敲的交互会话**，'
+    + '不只是队列派发的卡。要看完整的模型分布与更长的窗口，用上面的「队列任务消耗」——'
+    + '那份账随卡长期留存，且是纯队列口径。')));
 
   const comp = ts.by_component || {};
   const total = Object.values(comp).reduce((a, b) => a + b, 0);

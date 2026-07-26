@@ -222,6 +222,22 @@ Once you have enough projects, long-finished ones still occupy a column on the o
 
 `POST /api/project/archive` is the board's only write endpoint (body `{"id":"<project id>","archived":true}`), behind three gates: POST only; `Content-Type` must be `application/json` (HTML forms cannot produce that type, which blocks cross-site auto-submitting forms); and when an `Origin` header is present its host must equal the request Host (browser cross-site fetches always send Origin). Command-line `curl` sends no Origin and is allowed through — local ops needs to be scriptable.
 
+### Queue task spend (`task_spend`, windowed)
+
+The burndown page's token curve scans transcripts under `~/.claude/projects`, which imposes two hard constraints — and together they explain **why the curve so often shows only one or two models**:
+
+1. **The window cannot be widened.** 30 days of transcripts measures 1.0 GB in practice (7 days: 409 MB), against a 512 MB byte budget on the scan — stretching to 30 days would silently truncate, and a "full month" that only read half the data is worse than not offering the window at all. So it is fixed at 24 hours, and a single day often only ran one or two models.
+2. **Its scope is not the queue.** That directory also holds sessions you typed by hand in Claude Code, interleaved with claudego-dispatched cards in the same files; they cannot be told apart.
+
+So there is a second ledger: `/api/burn?range=24h|7d|30d|all` returns `task_spend`, sourced from **the task cards' own `cost_usd` / `turns_used`** (the runner writes back the `total_cost_usd` / `num_turns` reported by the claude CLI when a card finishes). This ledger persists with the cards (including `archive/`), so any window is available at zero extra scanning — the snapshot already holds every card in memory and this just walks it again. It is queue-scoped by construction; interactive sessions are simply not in it. It yields: total spend / priced card count / unpriced card count / total turns, a per-model breakdown (resolved through `effectiveModel`, so codex-side cards go through `resolveCodexModel`), and a per-task table sorted by cost (capped at 30 rows, with the remainder disclosed).
+
+**Two boundaries that must be stated out loud** (`task_spend.basis` is rendered verbatim on the page):
+
+- `cost_usd` is the **API-equivalent cost** reported by the claude CLI. On a subscription it is **not an actual charge** — only "what this work would have cost at API prices". Read as a bill it produces an alarming and wrong number.
+- **codex / remote-codex cards report no cost**, and cards that never ran or were cancelled are likewise empty — in practice 448 of 1423 cards have no cost data. They burn a different quota entirely and are **excluded** from the total; the size of that gap has to be on screen, or "the codex half was free" gets taken as fact.
+
+The time dimension uses each card's **`updated_at` (the moment it finished)**, not `created_at`: the cost is produced and written back when the card completes, so filing it by creation time would push a card queued last week and finished today into last week — that money was spent today. An unknown `range` falls back to `24h` without erroring or guessing. Because the window comes from a request parameter, `task_spend` **does not enter `burnCache`** (that cache holds the window-independent transcript scan; mixing them would give every window its own copy of an expensive scan) and is computed per request instead.
+
 **Burndown view — three sources** (`/api/burn`): of these, `usage-history.jsonl` (= `usage_feed`) is the only source shared with `claudego quota`; `claude.json` and transcript scanning are board-exclusive — `claudego quota` does not read those two sources:
 1. **CodexBar `claude.json`**: per-account session / weekly / opus window percentage time-series for the claude side;
 2. **CodexBar `usage-history.jsonl`** (= `usage_feed`): primary (5 h) / secondary (weekly) percentage time-series for the codex side;

@@ -2,6 +2,35 @@
 
 [中文](changelog.md) | **English** · back to [README](../README.en.md)
 
+## 2026-07-26 · Queue task spend (windowed + per-task)
+
+**Why**: the "last 24 hours" token curve on the burndown page frequently showed a single model,
+which looks like the board dropped data. It is neither a bug nor missing data — the curve scans
+transcripts under `~/.claude/projects` with a fixed 24-hour window (30 days of transcripts measures
+1.0 GB against a 512 MB scan budget, so widening it would silently truncate, and a "full month"
+that read half the data is worse than no such window), and a single day often ran only one or two
+models. That directory also interleaves hand-typed Claude Code sessions, so its scope was never
+the queue to begin with.
+
+**New `task_spend`** (`/api/burn?range=24h|7d|30d|all`) uses a different source — **the task cards'
+own ledger** (`cost_usd` / `turns_used`, written back by the runner when a card finishes). It
+persists with the cards (including `archive/`), so any window costs no extra scanning (the snapshot
+already holds every card), and it is queue-scoped by construction. It reports total spend / priced
+cards / unpriced cards / total turns, a per-model breakdown (resolved via `effectiveModel`), and a
+per-task table sorted by cost (capped at 30 rows with the remainder disclosed). The burndown page
+gains window tabs, defaulting to 7 days — 24 hours often contains only one or two models, and
+landing on a single-model view reads as missing data when the real cause is just a narrow window.
+
+**Two boundaries are written into `basis` and stay on screen**: (1) `cost_usd` is the
+**API-equivalent cost** reported by the claude CLI, not an actual charge on a subscription;
+(2) codex / remote-codex report no cost (448 of 1423 cards in practice), burn a different quota,
+and are excluded from the total — the size of that gap must be visible. Time is filed by each
+card's `updated_at` (when it finished) rather than `created_at`: a card queued last week and
+finished today spent that money today. An unknown `range` falls back to `24h`; `task_spend` stays
+out of `burnCache` (the window comes from a parameter, and mixing them would give every window its
+own copy of the expensive transcript scan) and is computed per request. The transcript section also
+gained a pinned note explaining the one-or-two-models effect on the spot.
+
 ## 2026-07-26 · Drag-reorderable projects + status order as a fill gauge
 
 - **Projects are drag-reorderable**: the grip in each column header drags a project to a new

@@ -721,3 +721,241 @@ func TestArchiveDoesNotTouchQueueFiles(t *testing.T) {
 		}
 	}
 }
+
+// ================== 四、队列任务消耗（按时间窗口）==================
+//
+// 反例注入：
+//   ① 无花费数据的卡（codex 不回报 cost）若被算进"计入的卡"，平均每卡花费会凭空腰斩；
+//   ② 窗口按 created_at 而非 updated_at 归档的话，上周入队今天跑完的卡会被算进上周——
+//      那笔钱是今天花的；
+//   ③ by_model 次序不定的话，30 秒一次的自动刷新会让表格行每次都跳位；
+//   ④ 逐卡表被截断却不披露，30 行会被当成"这个窗口只有 30 张卡有花费"。
+
+// bootSpendRoot 造一批带花费的卡：窗口内 3 张有花费 + 1 张无花费，窗口外 1 张。
+func bootSpendRoot(t *testing.T, now time.Time) string {
+	t.Helper()
+	root := testRoot(t)
+	if err := saveConfig(root, defaultConfig("claude")); err != nil {
+		t.Fatal(err)
+	}
+	mk := func(title, model string, cost float64, turns int, updated time.Time) {
+		tk := newTask(root, testCfg(), typeSequence, title, "/tmp/spendproj", []string{"干活"}, 5)
+		tk.Status = statusDone
+		tk.Model = model
+		tk.CostUSD = cost
+		tk.TurnsUsed = turns
+		tk.UpdatedAt = updated.Format(time.RFC3339)
+		if err := saveTask(root, tk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mk("窗口内·贵的", "opus", 30, 300, now.Add(-2*time.Hour))
+	mk("窗口内·便宜的", "opus", 5, 50, now.Add(-3*time.Hour))
+	mk("窗口内·另一个模型", "claude-fable-5", 12, 120, now.Add(-4*time.Hour))
+	mk("窗口内·codex 无花费", "", 0, 0, now.Add(-5*time.Hour))       // 反例①
+	mk("窗口外·三天前", "sonnet", 999, 9999, now.Add(-72*time.Hour)) // 反例②
+	return root
+}
+
+func spendFor(t *testing.T, root string, key string, now time.Time) TaskSpend {
+	t.Helper()
+	snap, err := buildSnapshot(root, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return buildTaskSpend(snap.Cfg, snap, key, now)
+}
+
+func TestTaskSpendWindowAndUnpriced(t *testing.T) {
+	now := fixedTime()
+	root := bootSpendRoot(t, now)
+	sp := spendFor(t, root, "24h", now)
+
+	if sp.Tasks != 4 {
+		t.Fatalf("24h 窗口内应有 4 张卡（三天前那张在窗口外），got %d", sp.Tasks)
+	}
+	// 反例①：无花费的卡计进 Tasks/Unpriced，但**不**计进 Priced 与合计金额。
+	if sp.Priced != 3 || sp.Unpriced != 1 {
+		t.Fatalf("有花费 3 / 无花费 1，got priced=%d unpriced=%d", sp.Priced, sp.Unpriced)
+	}
+	if sp.CostUSD != 47 {
+		t.Fatalf("合计应为 30+5+12=47，got %v", sp.CostUSD)
+	}
+	if sp.TurnsUsed != 470 {
+		t.Fatalf("轮数只统计有花费的卡（300+50+120），got %d", sp.TurnsUsed)
+	}
+	// 反例②：窗口外那张 $999 一分钱都不能漏进来。
+	if sp.CostUSD >= 999 {
+		t.Fatal("窗口外的卡被算进来了——时间过滤失效")
+	}
+	if sp.Since == "" {
+		t.Fatal("有限窗口必须给出起点 since")
+	}
+}
+
+func TestTaskSpendAllRangeIncludesEverything(t *testing.T) {
+	now := fixedTime()
+	root := bootSpendRoot(t, now)
+	sp := spendFor(t, root, "all", now)
+	if sp.Tasks != 5 || sp.Priced != 4 {
+		t.Fatalf("all 窗口应收全部 5 张（4 张有花费），got tasks=%d priced=%d", sp.Tasks, sp.Priced)
+	}
+	if sp.CostUSD != 1046 {
+		t.Fatalf("合计应为 47+999=1046，got %v", sp.CostUSD)
+	}
+	// all 表示"有史以来"，不是"从 0 时刻起"——给个假的 since 会让人以为窗口有下界。
+	if sp.Since != "" {
+		t.Fatalf("range=all 不该给 since，got %q", sp.Since)
+	}
+}
+
+func TestTaskSpendByModelSortedAndDeterministic(t *testing.T) {
+	now := fixedTime()
+	root := bootSpendRoot(t, now)
+	first := spendFor(t, root, "24h", now)
+	if len(first.ByModel) != 2 {
+		t.Fatalf("应有 opus / claude-fable-5 两个模型，got %+v", first.ByModel)
+	}
+	if first.ByModel[0].Model != "opus" || first.ByModel[0].CostUSD != 35 {
+		t.Fatalf("花费最高的应是 opus $35（30+5），got %+v", first.ByModel[0])
+	}
+	if first.ByModel[0].Tasks != 2 {
+		t.Fatalf("opus 应计 2 张有花费的卡，got %d", first.ByModel[0].Tasks)
+	}
+	// 反例③：map 遍历顺序随机，不定序的话自动刷新会让行每次跳位。跑 5 遍必须一致。
+	for i := 0; i < 5; i++ {
+		again := spendFor(t, root, "24h", now)
+		for j := range again.ByModel {
+			if again.ByModel[j].Model != first.ByModel[j].Model {
+				t.Fatalf("第 %d 次重算次序变了：%v vs %v", i+1, again.ByModel, first.ByModel)
+			}
+		}
+		if len(again.Top) != len(first.Top) || again.Top[0].ID != first.Top[0].ID {
+			t.Fatalf("第 %d 次重算逐卡表次序变了", i+1)
+		}
+	}
+}
+
+func TestTaskSpendTopSortedByCost(t *testing.T) {
+	now := fixedTime()
+	root := bootSpendRoot(t, now)
+	sp := spendFor(t, root, "24h", now)
+	if len(sp.Top) != 3 {
+		t.Fatalf("逐卡表只收有花费的卡，应为 3 行，got %d", len(sp.Top))
+	}
+	for i := 1; i < len(sp.Top); i++ {
+		if sp.Top[i-1].CostUSD < sp.Top[i].CostUSD {
+			t.Fatalf("逐卡表未按花费降序：%+v", sp.Top)
+		}
+	}
+	if sp.Top[0].CostUSD != 30 || !strings.Contains(sp.Top[0].Title, "贵的") {
+		t.Fatalf("第一行应是最贵那张，got %+v", sp.Top[0])
+	}
+	// 逐卡行要带项目名与工作性质，否则"这笔钱花在哪个项目的什么活上"答不出来。
+	if sp.Top[0].Project == "" || sp.Top[0].Kind == "" {
+		t.Fatalf("逐卡行缺 project/kind：%+v", sp.Top[0])
+	}
+	if sp.TopTruncated {
+		t.Fatal("只有 3 行时不该标截断")
+	}
+}
+
+// TestTaskSpendTopTruncationDisclosed —— 反例④：截断必须自报。
+func TestTaskSpendTopTruncationDisclosed(t *testing.T) {
+	now := fixedTime()
+	root := testRoot(t)
+	if err := saveConfig(root, defaultConfig("claude")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < spendTopN+7; i++ {
+		tk := newTask(root, testCfg(), typeSequence, "花费卡", "/tmp/spendproj", []string{"干活"}, 5)
+		tk.Status = statusDone
+		tk.Model = "opus"
+		tk.CostUSD = float64(i + 1)
+		tk.UpdatedAt = now.Add(-time.Hour).Format(time.RFC3339)
+		if err := saveTask(root, tk); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sp := spendFor(t, root, "24h", now)
+	if len(sp.Top) != spendTopN {
+		t.Fatalf("逐卡表应截到 %d 行，got %d", spendTopN, len(sp.Top))
+	}
+	if !sp.TopTruncated {
+		t.Fatal("截断了却没标 top_truncated —— 前端会把 30 行当成全部")
+	}
+	if sp.Priced != spendTopN+7 {
+		t.Fatalf("priced 必须是全量 %d，不能跟着截断，got %d", spendTopN+7, sp.Priced)
+	}
+}
+
+// TestTaskSpendBasisDisclosesCaveats —— 两条边界必须出现在披露串里：
+// 花的是 API 等价成本（不是扣款）、有多少张卡没有花费数据。
+func TestTaskSpendBasisDisclosesCaveats(t *testing.T) {
+	now := fixedTime()
+	root := bootSpendRoot(t, now)
+	sp := spendFor(t, root, "24h", now)
+	for _, want := range []string{"API 等价成本", "不是实际扣款", "codex", "未计入", "updated_at", "队列口径"} {
+		if !strings.Contains(sp.Basis, want) {
+			t.Errorf("披露串缺 %q：%s", want, sp.Basis)
+		}
+	}
+}
+
+func TestResolveSpendRangeFallsBackTo24h(t *testing.T) {
+	for _, k := range []string{"", "90d", "../etc", "ALL"} {
+		if got := resolveSpendRange(k); got.Key != "24h" {
+			t.Errorf("未知窗口 %q 应回落 24h，got %q", k, got.Key)
+		}
+	}
+	for _, k := range []string{"24h", "7d", "30d", "all"} {
+		if got := resolveSpendRange(k); got.Key != k {
+			t.Errorf("合法窗口 %q 被改成了 %q", k, got.Key)
+		}
+	}
+}
+
+// TestBurnEndpointCarriesTaskSpend —— 契约：/api/burn 必须带 task_spend，且 range 参数生效。
+func TestBurnEndpointCarriesTaskSpend(t *testing.T) {
+	now := fixedTime()
+	root := bootSpendRoot(t, now)
+	s := newTestBoardServer(t, root, now)
+
+	get := func(q string) map[string]any {
+		rec := httptest.NewRecorder()
+		s.routes().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/burn"+q, nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("/api/burn%s 应 200，got %d", q, rec.Code)
+		}
+		var out map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+			t.Fatalf("响应不是合法 JSON: %v", err)
+		}
+		sp, _ := out["task_spend"].(map[string]any)
+		if sp == nil {
+			t.Fatalf("/api/burn%s 响应缺 task_spend", q)
+		}
+		return sp
+	}
+	if got := get("?range=24h")["tasks"]; got != float64(4) {
+		t.Fatalf("24h 应 4 张卡，got %v", got)
+	}
+	if got := get("?range=all")["tasks"]; got != float64(5) {
+		t.Fatalf("all 应 5 张卡，got %v", got)
+	}
+	// 不带 range 时回落 24h，不得 500。
+	if got := get("")["range"]; got != "24h" {
+		t.Fatalf("缺省 range 应回落 24h，got %v", got)
+	}
+}
+
+func TestRound2KeepsCents(t *testing.T) {
+	cases := []struct{ in, want float64 }{
+		{0.044, 0.04}, {0.045, 0.05}, {12.3456, 12.35}, {0, 0}, {1234.567, 1234.57},
+	}
+	for _, c := range cases {
+		if got := round2(c.in); got != c.want {
+			t.Errorf("round2(%v)=%v want %v —— 花费是钱，分位不能抹", c.in, got, c.want)
+		}
+	}
+}

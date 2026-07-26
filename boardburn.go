@@ -120,6 +120,10 @@ type BurnResp struct {
 	Sources     []BurnSource `json:"sources"`
 	TokenSeries TokenSeries  `json:"token_series"`
 	QueueSpend  QueueSpend   `json:"queue_spend"`
+	// TaskSpend 是按时间窗口的队列消耗（见 boardspend.go）。它**不进 burnCache**：
+	// 窗口由请求参数决定，而缓存里那份 transcript 扫描与窗口无关，
+	// 混在一起会让每个窗口各占一份昂贵的缓存。由 handleBurn 逐请求填。
+	TaskSpend TaskSpend `json:"task_spend"`
 }
 
 // ---- 源文件定位 ----

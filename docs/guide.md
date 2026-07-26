@@ -241,6 +241,22 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 
 `POST /api/project/archive` 是看板唯一的写入端点（body `{"id":"<项目 id>","archived":true}`），三道闸：只收 POST；`Content-Type` 必须是 `application/json`（HTML 表单发不出这个类型，挡住跨站自动提交表单）；带 `Origin` 头时其 host 必须等于请求 Host（浏览器跨站 fetch 必带 Origin）。命令行 `curl` 不带 Origin，放行——本机运维要能脚本化。
 
+### 队列任务消耗（`task_spend`，按时间窗口）
+
+燃尽页的 token 曲线扫的是 `~/.claude/projects` 的 transcript，有两个硬约束，**这两条一起解释了"为什么曲线里常常只看得到一两个模型"**：
+
+1. **窗口拉不长**。实测 30 天的 transcript 有 1.0 GB（7 天 409 MB），而扫描有 512 MB 的字节预算闸——拉到 30 天必然撞闸静默截断，给一个"只读了一半的全月"比不给这个窗口更糟。所以它固定 24 小时，而一天里往往只跑过一两个模型。
+2. **口径不是队列**。那个目录里混着你在 Claude Code 里手敲的交互会话，与 claudego 派发的卡在同一批文件里，分不开。
+
+于是另开一份账：`/api/burn?range=24h|7d|30d|all` 回吐 `task_spend`，源是**任务卡自己的 `cost_usd` / `turns_used`**（runner 在卡跑完时把 claude CLI 回报的 `total_cost_usd` / `num_turns` 写回卡上）。这份账随卡长期留存（含 `archive/`），要看多久就看多久且零额外扫描——快照已经把全部卡读进内存了，这里只是再过一遍。它天然是队列口径，交互会话根本不在里面。给出：合计花费 / 计入的卡数 / 无花费数据的卡数 / 合计轮数、按模型分（用 `effectiveModel` 解析每张卡**实际生效**的模型，codex 侧经 `resolveCodexModel`）、以及按花费降序的逐卡表（截到 30 行并披露差额）。
+
+**两条必须说出口的边界**（`task_spend.basis` 原样呈现在页面上）：
+
+- `cost_usd` 是 claude CLI 回报的 **API 等价成本**，订阅制下**不是实际扣款**，只是"这些活按 API 价该值多少钱"。当成账单看会得出一个吓人且错误的数字。
+- **codex / 远端 codex 卡不回报花费**，未跑或已取消的卡同样为空——实测 1423 张卡里 448 张没有花费数据。它们烧的是另一套额度，**未计入**合计；缺口张数必须显示，否则"codex 那半边没花钱"会被当成事实。
+
+时间维度用卡的 **`updated_at`（跑完那一刻）**而非 `created_at`：花费是在卡跑完时产生并写回的，按创建时间归档会把一张上周入队、今天才跑完的卡算进上周——那笔钱是今天花的。`range` 取未知值时回落 `24h`，不报错也不猜。窗口由请求参数决定，所以 `task_spend` **不进 `burnCache`**（那份缓存装的是与窗口无关的 transcript 扫描，混在一起会让每个窗口各占一份昂贵缓存），改为逐请求现算。
+
 **燃尽视图三源**（`/api/burn`）：三源中 `usage-history.jsonl`（即 `usage_feed`）与 `claudego quota` 共用同源；`claude.json` 与 transcript 扫描为 board 独有读数，`claudego quota` 不读这两源：
 1. **CodexBar `claude.json`**：claude 侧各账号 session / weekly / opus 窗口的百分比时间序列；
 2. **CodexBar `usage-history.jsonl`**（= `usage_feed`）：codex 侧 primary（5h）/ secondary（周）百分比时间序列；

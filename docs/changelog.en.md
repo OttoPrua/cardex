@@ -2,6 +2,31 @@
 
 [中文](changelog.md) | **English** · back to [README](../README.en.md)
 
+## 2026-07-26 · Drag-reorderable projects + status order as a fill gauge
+
+- **Projects are drag-reorderable**: the grip in each column header drags a project to a new
+  position (or focus it and press ←/→ — drag-and-drop is unusable by keyboard, so this is not an
+  optional extra; focus returns to the same grip after each move). The order lives in
+  localStorage: a viewing preference, not a queue fact. While a manual order is active a banner
+  stays pinned with a one-click reset (the default sort carries information: active work first,
+  then most recent activity). Projects that appear after you set an order go to the **front**, not
+  the end — the rail scrolls horizontally, so the end is several screens away and a brand-new
+  project is exactly the one you want to see.
+- **Status presentation order is now `canceled → done │ running → queued → limit_paused → held →
+  failed`**: the progress bar is a fill gauge (like a battery meter), so the left portion is "the
+  part you no longer have to think about", which is what makes "everything unfinished is on the
+  right" true. The old order put running/queued at the far left and done second-from-right, which
+  read as "the longer the bar, the worse it is" — the opposite of everyone's default expectation
+  of a progress bar. Within the right half the order increases by distance from done (the first
+  three advance on their own; the last two need a human). Bar segments, legend and header chips
+  share one order — they are three renderings of the same reading, and ordering them differently
+  would stop the chips lining up with the ribbon beneath them. **Kanban column order does not
+  follow**: a workflow board flows left-to-right toward "done"; fill gauge and flow board are
+  different metaphors, each keeping its own convention.
+- Also fixed: `frag.append(null)` inserts the literal string "null" (the native API does not skip
+  empty values the way our own `h()` does — with both optional banners absent the page grew a
+  stray "nullnull" line). Conditional blocks now go through a new `appendMaybe()`.
+
 ## 2026-07-26 · Viewport-width layout + status filter
 
 - **Page width follows the viewport**: `.app` / `.topbar-inner` were pinned at

@@ -119,7 +119,28 @@ const STATUS_GLYPH = {
   running: '▶', queued: '•', limit_paused: '⏸',
   held: '✋', failed: '✕', done: '✓', canceled: '⊘',
 };
-const STATUS_ORDER = ['running', 'queued', 'limit_paused', 'held', 'failed', 'done', 'canceled'];
+/**
+ * 状态的呈现次序：**已尘埃落定的在左，越往右越需要人管**。
+ *
+ *   已取消 → 已完成 │ 进行中 → 排队中 → 限额暂停 → 已挂起 → 失败
+ *   └── 不会再动的 ──┘ └────── 按"离完成还有多远"递增 ──────┘
+ *
+ * 进度条是一条**填充计**（像电量条），左边那截就是"已经不用再管的部分"，
+ * 于是"未完成的都堆在右侧"这个直觉才成立。旧次序把 running/queued 放最左、
+ * done 放右边第二，读起来是"进度条越长越糟"——与所有人对进度条的默认预期相反。
+ *
+ * 右半段内部按「离完成还有多远」递增：进行中(正在跑) → 排队中(等槽位) →
+ * 限额暂停(等额度) → 已挂起(等人) → 失败(坏了)。前三档机器自己会往前走，
+ * 后两档必须人介入——右端因此天然是"该看这里"。
+ *
+ * 这个次序同时管进度条分段、状态图例、页头状态芯片三处：三者是同一份读数的
+ * 三种呈现，各排各的会让芯片与它下面那条彩带对不上号。
+ *
+ * **不管 kanban 的列序**（那个在后端 boardColumnOrder）：看板是工作流看板，
+ * 卡从左往右流向"已完成"是通用惯例；把 done 挪到最左会把它读成起点。
+ * 填充计与流程板是两套不同的隐喻，各守各的惯例才对。
+ */
+const STATUS_ORDER = ['canceled', 'done', 'running', 'queued', 'limit_paused', 'held', 'failed'];
 
 const PHASE_ZH = {
   active: '进行中', blocked: '受阻', queued: '排队中',
@@ -385,6 +406,17 @@ function callout(kind, mark, ...body) {
 
 const emptyState = (msg) => h('div', { class: 'empty-state', text: msg });
 
+/**
+ * 往 DocumentFragment 上挂一个**可能为 null** 的节点。
+ *
+ * 原生 append 不像 h() 那样跳过空值——它会把 null 转成字符串 "null" 插进页面
+ * （实测两个可选横幅都不显示时，页面顶上就多出一行 "nullnull"）。
+ * 凡是"条件才出现"的区块一律走这里，别再手写 if。
+ */
+function appendMaybe(parent, node) {
+  if (node) parent.append(node);
+}
+
 /* ============================ 数据层 ============================ */
 
 async function apiGet(path) {
@@ -435,6 +467,7 @@ const AUTO_REFRESH_MS = 30000;
 // 而 const 在声明之前处于 TDZ——放到后面会抛 ReferenceError，又被那里的 try/catch
 // 吞成"读不出，按不筛选处理"。表现是筛选静默失效、localStorage 里明明存着值。
 const HIDDEN_STATUS_KEY = 'claudego.board.hiddenStatuses';
+const PROJECT_ORDER_KEY = 'claudego.board.projectOrder';
 
 const state = {
   route: null,
@@ -448,6 +481,8 @@ const state = {
   // flash 是一次性提示（归档写入失败等）。写操作失败必须看得见——
   // 只在 console 里报错等于让用户以为"点了就生效了"，而盘上什么都没变。
   flash: null,
+  // pendingGripFocus：键盘移动项目后要还回焦点的那个手柄的 project id。
+  pendingGripFocus: null,
   ui: {
     openPhases: new Set(), closedPhases: new Set(), allCollapsed: false,
     laneMode: false, burnAll: false,
@@ -455,8 +490,84 @@ const state = {
     showArchived: false,
     // hiddenStatuses：被折叠掉的状态（只影响**卡片清单**，见 statusFilterChips 的注释）。
     hiddenStatuses: loadHiddenStatuses(),
+    // projectOrder：人工拖拽出来的项目次序（project id 数组，空=用后端的默认排序）。
+    projectOrder: loadProjectOrder(),
   },
 };
+
+/* ---- 项目次序（拖拽排序）---- */
+
+/**
+ * 人工次序存 localStorage，与状态筛选同一套理由：这是**观看偏好**，
+ * 不是队列事实——不同机器/不同人盯的重点不一样，没道理互相覆盖。
+ * （归档走服务端是因为那是"这个项目还看不看"的判断，性质不同。）
+ */
+function loadProjectOrder() {
+  try {
+    const raw = localStorage.getItem(PROJECT_ORDER_KEY);
+    if (!raw) return [];
+    const arr = JSON.parse(raw);
+    return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : [];
+  } catch (_) {
+    return [];
+  }
+}
+
+function saveProjectOrder() {
+  try {
+    localStorage.setItem(PROJECT_ORDER_KEY, JSON.stringify(state.ui.projectOrder));
+  } catch (_) { /* 存不进就只在本次会话里生效 */ }
+}
+
+/**
+ * 按人工次序重排项目。
+ *
+ * 【没排到的怎么办】人工次序是一张快照，新项目不在里面。把它们**排到最前**，
+ * 不是排到最后：轨道是横向滚动的，末尾意味着要横滚好几屏才看得见——
+ * 一个刚冒出来的项目恰恰是最该被看见的。orderNote() 会把"有几个是新的"说出来，
+ * 免得用户以为自己的次序被打乱了。
+ *
+ * 【为什么不落库到服务端】见 loadProjectOrder。
+ */
+function orderProjects(projects) {
+  const order = state.ui.projectOrder;
+  if (!order.length) return projects;
+  const rank = new Map(order.map((id, i) => [id, i]));
+  const known = [];
+  const fresh = [];
+  for (const p of projects) (rank.has(p.id) ? known : fresh).push(p);
+  known.sort((a, b) => rank.get(a.id) - rank.get(b.id));
+  return fresh.concat(known);
+}
+
+/** 把当前铺出来的次序落盘。只记这一批的 id，未展示的项目次序原样保留。 */
+function commitProjectOrder(ids) {
+  const rest = state.ui.projectOrder.filter((id) => !ids.includes(id));
+  state.ui.projectOrder = ids.concat(rest);
+  saveProjectOrder();
+  load({ silent: true });
+}
+
+function clearProjectOrder() {
+  state.ui.projectOrder = [];
+  saveProjectOrder();
+  load({ silent: true });
+}
+
+/** 人工次序生效时的披露。默认排序本身带信息量（有活儿的排前面），盖掉了就得说。 */
+function orderNote(shown) {
+  if (!state.ui.projectOrder.length) return null;
+  const known = new Set(state.ui.projectOrder);
+  const freshN = shown.filter((p) => !known.has(p.id)).length;
+  return h('div', { class: 'filter-note' },
+    h('span', { class: 'fn-mark', 'aria-hidden': 'true', text: '⇅' }),
+    h('span', { class: 'fn-text' },
+      '项目按手动次序排列，已覆盖默认的「有活儿的排前面・其次按最近活动」。',
+      freshN ? h('strong', { text: `其中 ${freshN} 个是排序之后新出现的，暂列最前。` }) : null),
+    h('button', {
+      class: 'ghost-btn', type: 'button', onclick: clearProjectOrder, text: '恢复默认排序',
+    }));
+}
 
 /* ---- 状态筛选（只藏清单，不动读数）---- */
 
@@ -608,6 +719,16 @@ function mount(node) {
   // 只测一次的话会把"布局还没落定"时的位置当成最终值，列高卡在 min-height 上，
   // 外层滚动条就回来了。
   requestAnimationFrame(syncRailHeight);
+  restoreGripFocus();
+}
+
+/** 键盘移动项目后把焦点还给同一个手柄（见 dragGrip 里 pendingGripFocus 的注释）。 */
+function restoreGripFocus() {
+  const id = state.pendingGripFocus;
+  if (!id) return;
+  state.pendingGripFocus = null;
+  const grip = el.app.querySelector(`.proj[data-pid="${CSS.escape(id)}"] .drag-grip`);
+  if (grip) grip.focus();
 }
 
 /**
@@ -826,7 +947,8 @@ async function viewOverview() {
         text: state.ui.allCollapsed ? '全部展开' : '全部收起',
       }),
       statusFilterChips(totals))));
-  frag.append(filterNote());
+  appendMaybe(frag, filterNote());
+  appendMaybe(frag, orderNote(live));
 
   if (!all.length) {
     frag.append(emptyState('队列里还没有任何任务卡。'));
@@ -835,7 +957,7 @@ async function viewOverview() {
   if (!live.length) {
     frag.append(emptyState(`${archived.length} 个项目全部已归档。点右上「已归档」查看或取消归档。`));
   } else {
-    frag.append(projectRail(live));
+    frag.append(projectRail(orderProjects(live)));
   }
   if (archived.length && state.ui.showArchived) {
     frag.append(h('div', { class: 'section-head', style: 'margin:22px 0 8px' },
@@ -844,7 +966,7 @@ async function viewOverview() {
         class: 'section-note',
         text: '归档只影响本页折叠，任务卡状态与调度完全不受影响；项目一旦有新卡会自动切回活跃。',
       })));
-    frag.append(projectRail(archived));
+    frag.append(projectRail(orderProjects(archived)));
   }
   return frag;
 }
@@ -860,10 +982,92 @@ async function viewOverview() {
 function projectRail(projects) {
   const rail = h('div', {
     class: 'project-rail', role: 'region', tabindex: '0',
-    'aria-label': `项目横向滚动区，共 ${projects.length} 个项目，用左右方向键或横向滚动切换`,
+    'aria-label': `项目横向滚动区，共 ${projects.length} 个项目，用左右方向键或横向滚动切换；`
+      + '拖动列头的手柄可调整项目次序',
   });
   for (const p of projects) rail.append(projectCard(p));
+  wireRailDrag(rail);
   return rail;
+}
+
+/**
+ * 给轨道装上拖拽排序。
+ *
+ * 【为什么用专门的手柄而不是整卡可拖】项目卡里全是链接、可展开的阶段与任务卡，
+ * 整卡 draggable 会把"想选一段标题文字"变成"把整列拖走"，也会和 <details>
+ * 的点击抢事件。手柄是一小块专职区域，代价是多一个图标，换来其余交互一点不受影响。
+ *
+ * 【为什么 dragover 就重排 DOM】拖到哪就地插到哪，松手前所见即所得；
+ * 松手时只把最终次序落盘一次，中途不写 localStorage、不触发重新拉数据。
+ */
+function wireRailDrag(rail) {
+  let dragged = null;
+
+  rail.addEventListener('dragstart', (ev) => {
+    const card = ev.target.closest('.proj');
+    if (!card || !ev.target.closest('.drag-grip')) return;
+    dragged = card;
+    card.classList.add('is-dragging');
+    ev.dataTransfer.effectAllowed = 'move';
+    // Firefox 不设 data 就不触发 drag 事件流；内容本身用不上。
+    ev.dataTransfer.setData('text/plain', card.dataset.pid || '');
+  });
+
+  rail.addEventListener('dragover', (ev) => {
+    if (!dragged) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = 'move';
+    const over = ev.target.closest('.proj');
+    if (!over || over === dragged) return;
+    // 以被悬停卡片的水平中点为界：越过中点就插到它后面，否则插到前面。
+    // 用中点而不是"总是插到前面"，否则往右拖时永远差一位、拖到末尾根本到不了。
+    const box = over.getBoundingClientRect();
+    const after = ev.clientX > box.left + box.width / 2;
+    rail.insertBefore(dragged, after ? over.nextSibling : over);
+  });
+
+  const finish = () => {
+    if (!dragged) return;
+    dragged.classList.remove('is-dragging');
+    dragged = null;
+    commitProjectOrder([...rail.querySelectorAll('.proj')].map((c) => c.dataset.pid));
+  };
+  rail.addEventListener('drop', (ev) => { ev.preventDefault(); finish(); });
+  // dragend 兜底：拖到轨道外面松手不会触发 drop，不收尾的话卡片会一直挂着拖拽态。
+  rail.addEventListener('dragend', finish);
+}
+
+/**
+ * 拖拽手柄。同时是键盘通道：拖放对键盘用户完全不可用，
+ * 所以 ←/→ 直接移动本列，这不是可选的补充。
+ */
+function dragGrip(p) {
+  const move = (dir) => {
+    const rail = document.querySelector('.project-rail');
+    if (!rail) return;
+    const ids = [...rail.querySelectorAll('.proj')].map((c) => c.dataset.pid);
+    const i = ids.indexOf(p.id);
+    const j = i + dir;
+    if (i < 0 || j < 0 || j >= ids.length) return;
+    [ids[i], ids[j]] = [ids[j], ids[i]];
+    // 落盘会触发重渲染，手柄这个 DOM 节点随之被换掉、焦点掉回 body。
+    // 不记一笔的话，键盘用户每移动一格都要重新 Tab 回来——等于这条通道不可用。
+    state.pendingGripFocus = p.id;
+    commitProjectOrder(ids);
+  };
+  return h('span', {
+    class: 'drag-grip', draggable: 'true', role: 'button', tabindex: '0',
+    'aria-label': `拖动以调整「${p.name}」的位置，或用左右方向键移动`,
+    title: '拖动调整项目次序（也可聚焦后按 ←/→ 移动）。次序只存在本浏览器，不影响调度。',
+    onkeydown: (ev) => {
+      if (ev.key === 'ArrowLeft') { ev.preventDefault(); move(-1); }
+      else if (ev.key === 'ArrowRight') { ev.preventDefault(); move(1); }
+    },
+    html: '<svg viewBox="0 0 12 12" width="11" height="11" aria-hidden="true">'
+      + '<circle cx="4" cy="2.5" r="1.1" fill="currentColor"/><circle cx="8" cy="2.5" r="1.1" fill="currentColor"/>'
+      + '<circle cx="4" cy="6" r="1.1" fill="currentColor"/><circle cx="8" cy="6" r="1.1" fill="currentColor"/>'
+      + '<circle cx="4" cy="9.5" r="1.1" fill="currentColor"/><circle cx="8" cy="9.5" r="1.1" fill="currentColor"/></svg>',
+  });
 }
 
 /** 归档按钮。总览卡与项目页共用，保证两处措辞一致。 */
@@ -881,6 +1085,7 @@ function archiveBtn(p) {
 function projectCard(p) {
   const head = h('div', { class: 'proj-head' },
     h('div', { class: 'proj-titlerow' },
+      dragGrip(p),
       h('h2', { class: 'proj-name' },
         h('a', { href: `#/p/${encodeURIComponent(p.id)}`, text: p.name })),
       h('div', { class: 'proj-actions' },
@@ -908,7 +1113,10 @@ function projectCard(p) {
 
   const phases = h('div', { class: 'phases' });
   for (const ph of p.phases) phases.append(phaseBlock(ph));
-  return h('section', { class: `card proj${p.archived ? ' is-archived' : ''}` }, head, phases);
+  // data-pid 是拖拽排序读次序用的主键（querySelectorAll 之后直接取，不必回查数据）。
+  return h('section', {
+    class: `card proj${p.archived ? ' is-archived' : ''}`, 'data-pid': p.id,
+  }, head, phases);
 }
 
 function phaseBlock(ph) {
@@ -1032,7 +1240,7 @@ async function viewProject(id) {
     h('div', { class: 'head-right' },
       archiveBtn(p),
       statusFilterChips(p.stats))));
-  frag.append(filterNote());
+  appendMaybe(frag, filterNote());
 
   frag.append(h('div', { class: 'card', style: 'padding:13px 17px;margin-bottom:16px' },
     p.archive_revived

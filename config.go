@@ -23,22 +23,22 @@ type TypeDefaults struct {
 }
 
 type Config struct {
-	ClaudeBin         string                  `json:"claude_bin"`
-	PollIntervalSec   int                     `json:"poll_interval_sec"`
-	LimitFallbackMin  int                     `json:"limit_fallback_min"`
-	CooldownMarginSec int                     `json:"cooldown_margin_sec"`
-	StepTimeoutMin    int                     `json:"step_timeout_min"`
-	MaxAttempts       int                     `json:"max_attempts_per_step"`
-	RetryBackoffMin   int                     `json:"retry_backoff_min"`
+	ClaudeBin         string `json:"claude_bin"`
+	PollIntervalSec   int    `json:"poll_interval_sec"`
+	LimitFallbackMin  int    `json:"limit_fallback_min"`
+	CooldownMarginSec int    `json:"cooldown_margin_sec"`
+	StepTimeoutMin    int    `json:"step_timeout_min"`
+	MaxAttempts       int    `json:"max_attempts_per_step"`
+	RetryBackoffMin   int    `json:"retry_backoff_min"`
 	// MaxParallel: 单次 tick 内最多并行跑几个任务（同一工作目录始终串行）。1 为纯串行。
 	MaxParallel int  `json:"max_parallel"`
 	ResumeFirst bool `json:"resume_first"`
 	// DrainRescanSec: drain 等待期间的重扫周期（秒）。每周期重扫队列补派新就绪任务，
 	// 并做取消对账（running 任务的文件被标 canceled 即击杀其进程）。0 用默认 15。
-	DrainRescanSec int `json:"drain_rescan_sec,omitempty"`
-	TypeOrder         []string                `json:"type_order"`
-	ResumePrompt      string                  `json:"resume_prompt"`
-	TypeDefaults      map[string]TypeDefaults `json:"type_defaults"`
+	DrainRescanSec int                     `json:"drain_rescan_sec,omitempty"`
+	TypeOrder      []string                `json:"type_order"`
+	ResumePrompt   string                  `json:"resume_prompt"`
+	TypeDefaults   map[string]TypeDefaults `json:"type_defaults"`
 
 	// ---- 5 小时额度红线（保底额度，给交互/突发任务留余量）----
 	// QueueBudgetTokens: 滑动 5 小时窗口内，队列最多消耗的加权 token 数；0 关闭。
@@ -77,7 +77,7 @@ type Config struct {
 	// （档位对等映射：opus 档降级首选同档的 terra 而非设计档的 sol——设计档不降去干实现档活）。
 	// 空 = 沿用全局 codex_model。仅降级径生效；runner_pref=codex 主跑与远端 codex 不受影响。
 	CodexFallbackModel string `json:"codex_fallback_model,omitempty"`
-	CodexModel    string `json:"codex_model,omitempty"`
+	CodexModel         string `json:"codex_model,omitempty"`
 	// CodexReasoning 透传 -c model_reasoning_effort，空则用 codex 默认。合法档位（实测 codex 0.144.1，
 	// 由低到高）：minimal < low < medium < high < xhigh < max < ultra（ultra 是多代理委派特档）。
 	// 与 claude --effort 的 low<medium<high<xhigh<max 完全同序、同名——所以 Task.Effort 是二者共用的
@@ -167,6 +167,9 @@ type XFrozenEngine struct {
 type RemoteHostConfig struct {
 	// CodexBin 远端 codex 可执行名/路径（默认 "codex"）。
 	CodexBin string `json:"codex_bin,omitempty"`
+	// CodexOnly 禁止该主机调用 Claude。命中时即使任务带 claude 模型或属于审核类型，
+	// 也会在派发入口强制改道远端 codex；用于把主机额度边界做成机械约束而非派卡纪律。
+	CodexOnly bool `json:"codex_only,omitempty"`
 	// ClaudeBin 远端 claude 可执行名/路径（默认 "claude"）；跑远程 fable 设计等 claude 模型时用。
 	// 远端 claude 走该主机自己的账号额度，与本机 claude 独立。
 	ClaudeBin string `json:"claude_bin,omitempty"`
@@ -390,16 +393,16 @@ func defaultConfig(claudeBin string) *Config {
 	}
 }
 
-func configPath(root string) string    { return filepath.Join(root, "config.json") }
-func tasksDir(root string) string      { return filepath.Join(root, "tasks") }
-func progressDir(root string) string   { return filepath.Join(root, "progress") }
-func crosscheckDir(root string) string { return filepath.Join(root, "crosscheck") }
-func archiveDir(root string) string    { return filepath.Join(root, "archive") }
-func logsDir(root string) string       { return filepath.Join(root, "logs") }
-func templatesDir(root string) string  { return filepath.Join(root, "templates") }
-func cooldownPath(root string) string  { return filepath.Join(root, "cooldown.json") }
-func usagePath(root string) string     { return filepath.Join(root, "usage.json") }
-func lockPath(root string) string      { return filepath.Join(root, ".lock") }
+func configPath(root string) string      { return filepath.Join(root, "config.json") }
+func tasksDir(root string) string        { return filepath.Join(root, "tasks") }
+func progressDir(root string) string     { return filepath.Join(root, "progress") }
+func crosscheckDir(root string) string   { return filepath.Join(root, "crosscheck") }
+func archiveDir(root string) string      { return filepath.Join(root, "archive") }
+func logsDir(root string) string         { return filepath.Join(root, "logs") }
+func templatesDir(root string) string    { return filepath.Join(root, "templates") }
+func cooldownPath(root string) string    { return filepath.Join(root, "cooldown.json") }
+func usagePath(root string) string       { return filepath.Join(root, "usage.json") }
+func lockPath(root string) string        { return filepath.Join(root, ".lock") }
 func taskLogPath(root, id string) string { return filepath.Join(logsDir(root), id+".log") }
 
 func defaultRoot() string {

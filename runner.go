@@ -310,6 +310,10 @@ func invokeRemoteClaude(ctx context.Context, cfg *Config, t *Task, prompt string
 		return &claudeResult{Type: "result", IsError: true, Subtype: "remote_config"}, "",
 			fmt.Errorf("未配置远程主机 %q（config.remote_hosts）", t.RemoteHost)
 	}
+	if rh.CodexOnly {
+		return &claudeResult{Type: "result", IsError: true, Subtype: "remote_policy"}, "",
+			fmt.Errorf("远程主机 %q 配置为 codex_only，拒绝调用 Claude", t.RemoteHost)
+	}
 	sshBin := cfg.SSHBin
 	if sshBin == "" {
 		sshBin = "ssh"
@@ -483,6 +487,23 @@ func remoteUsesClaude(t *Task) bool {
 		return false
 	}
 	return t.Model != "" || t.Type == typeReview
+}
+
+// enforceRemoteHostPolicy 把主机级额度边界烘焙进任务现场。它在 runTask 的任何远端
+// 子进程创建之前执行，因此 review_after 自动生成、旧队列遗留和手工派卡三条入口都受约束。
+func enforceRemoteHostPolicy(cfg *Config, t *Task) {
+	if cfg == nil || t == nil || t.RemoteHost == "" {
+		return
+	}
+	rh, ok := cfg.RemoteHosts[t.RemoteHost]
+	if !ok || !rh.CodexOnly {
+		return
+	}
+	t.PreferRunner = "codex"
+	t.Model = ""
+	if t.CodexModel == "" {
+		t.CodexModel = cfg.CodexModel
+	}
 }
 
 // codexEligible 判断任务能否交给备用执行器：没有 claude 会话要延续即可——
@@ -850,6 +871,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		_ = os.Remove(progressPath(root, t.ProgressKey))
 	}
 	remote := t.RemoteHost != ""
+	enforceRemoteHostPolicy(cfg, t)
 	switch {
 	case remote:
 		t.Runner = "remote:" + t.RemoteHost
@@ -1529,15 +1551,15 @@ func crossMergeVerdictOK(result string) bool {
 }
 
 type emitTask struct {
-	Title       string   `json:"title"`
-	Type        string   `json:"type"`
-	Dir         string   `json:"dir"`
-	Priority    int      `json:"priority"`
-	Model       string   `json:"model"`
-	SessionID   string   `json:"session_id"`
-	ReviewAfter bool     `json:"review_after"`
-	FreshSteps  bool     `json:"fresh_steps"`
-	Runner      string   `json:"runner"`
+	Title       string `json:"title"`
+	Type        string `json:"type"`
+	Dir         string `json:"dir"`
+	Priority    int    `json:"priority"`
+	Model       string `json:"model"`
+	SessionID   string `json:"session_id"`
+	ReviewAfter bool   `json:"review_after"`
+	FreshSteps  bool   `json:"fresh_steps"`
+	Runner      string `json:"runner"`
 	// CodexModel 卡级钉定 codex 模型（runner=codex 时随卡生效，档位对等制下协调器可按档发 terra/luna）。
 	CodexModel string   `json:"codex_model"`
 	Prompts    []string `json:"prompts"`
@@ -1828,13 +1850,13 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		return
 	}
 	prompt := renderTemplate(tpl, map[string]string{
-		"TITLE":      base,
-		"VERDICT":    v.Verdict,
-		"ROUND":      fmt.Sprintf("%d", round),
-		"SUMMARY":    v.Summary,
-		"FINDINGS":   strings.TrimSpace(findings),
+		"TITLE":       base,
+		"VERDICT":     v.Verdict,
+		"ROUND":       fmt.Sprintf("%d", round),
+		"SUMMARY":     v.Summary,
+		"FINDINGS":    strings.TrimSpace(findings),
 		"ORIG_PROMPT": truncateRunes(strings.Join(orig.Prompts, "\n---\n"), 4000),
-		"REVIEW_LOG": filepath.Join(logsDir(root), t.ID+".log"),
+		"REVIEW_LOG":  filepath.Join(logsDir(root), t.ID+".log"),
 	})
 	title := fmt.Sprintf("修复R%d: %s [%s:%dP0+%dP1]", round, base, v.Verdict, len(v.P0), len(v.P1))
 	nt := newTask(root, cfg, typeSequence, title, orig.Dir, []string{prompt}, orig.Priority)
@@ -1982,8 +2004,12 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 		t.Effort = eng.Effort
 	case "remote-claude":
 		// SSH 远端 claude：Model 必填，否则 remoteUsesClaude 判 false 会被路由到远端 codex。
-		if _, ok := cfg.RemoteHosts[eng.Host]; !ok {
+		rh, ok := cfg.RemoteHosts[eng.Host]
+		if !ok {
 			return fmt.Errorf("remote_hosts 未配置主机 %q", eng.Host)
+		}
+		if rh.CodexOnly {
+			return fmt.Errorf("远程主机 %q 配置为 codex_only，不能选择 remote-claude", eng.Host)
 		}
 		if eng.Model == "" {
 			return fmt.Errorf("remote-claude 引擎必须指定 model（否则会被路由到远端 codex）")
@@ -2016,8 +2042,10 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 }
 
 // handleCrossStage 推进交叉验证链：
-//   A 完成 → 甲结论落隔离侧车（不进任何卡字段）→ 派引擎乙独立作答的 B 卡（prompt 与 A 相同、不含 A、无 A 指针）；
-//   B 完成 → 从侧车取甲结论 → 派引擎乙交叉查漏的 C 卡（合并模板注入完整甲+乙结论）→ 删侧车。
+//
+//	A 完成 → 甲结论落隔离侧车（不进任何卡字段）→ 派引擎乙独立作答的 B 卡（prompt 与 A 相同、不含 A、无 A 指针）；
+//	B 完成 → 从侧车取甲结论 → 派引擎乙交叉查漏的 C 卡（合并模板注入完整甲+乙结论）→ 删侧车。
+//
 // 链任一步断裂把母卡置 failed（list 对 failed 显示 LastError 且不折叠，故断裂可见），绝不让单腿结果冒充成功。
 func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
 	// breakChain 把母卡从 done 改判为 failed + 写断裂原因。runTask 在 postComplete 后 saveTask 落盘；
@@ -2057,7 +2085,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		b.XKey = t.XKey
 		b.XProfile = t.XProfile
 		b.XTask = t.XTask
-		b.XEngineB = t.XEngineB       // 冻结规格随链传递
+		b.XEngineB = t.XEngineB // 冻结规格随链传递
 		applyFrozenEngine(b, t.XEngineB)
 		if err := saveTask(root, b); err != nil {
 			breakChain("B 卡落盘失败: " + err.Error())

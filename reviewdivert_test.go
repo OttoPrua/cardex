@@ -87,6 +87,36 @@ func TestRemoteReviewRoutesToClaudeNotCodex(t *testing.T) {
 	}
 }
 
+func TestCodexOnlyRemoteHostOverridesReviewClaudeDefaults(t *testing.T) {
+	cfg := &Config{
+		CodexModel: "gpt-5.6-sol",
+		RemoteHosts: map[string]RemoteHostConfig{
+			"qmthost": {CodexOnly: true},
+			"mixed":   {},
+		},
+	}
+	task := &Task{
+		Type:       typeReview,
+		Model:      "claude-opus-5",
+		RemoteHost: "qmthost",
+	}
+
+	enforceRemoteHostPolicy(cfg, task)
+
+	if task.PreferRunner != "codex" || task.Model != "" || task.CodexModel != "gpt-5.6-sol" {
+		t.Fatalf("codex_only 主机应把远端审核机械改道到指定 Codex 模型: %+v", task)
+	}
+	if remoteUsesClaude(task) {
+		t.Fatal("codex_only 改道后的远端审核不得再命中 Claude")
+	}
+
+	mixed := &Task{Type: typeReview, Model: "claude-opus-5", RemoteHost: "mixed"}
+	enforceRemoteHostPolicy(cfg, mixed)
+	if !remoteUsesClaude(mixed) || mixed.PreferRunner != "" || mixed.Model != "claude-opus-5" {
+		t.Fatalf("未声明 codex_only 的主机必须保持既有混合路由: %+v", mixed)
+	}
+}
+
 // P1-1 类闭合：实现卡 Model 为空(典型远端 codex 实现卡)+ config type_defaults.review.model 非空(opus)时,
 // 分流审核卡不得被无条件覆写抹成空串——须保留 newTask 从 typeDefaults 烘焙的审核模型,否则远端审核落到
 // 账号默认模型、质量静默降级(相对 origin/main 的回归)。杀的突变:'if reviewHost!="" { rv.Model = t.Model }'。

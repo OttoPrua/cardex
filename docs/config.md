@@ -30,6 +30,7 @@
 | `default_review_host` | "" | 全局默认审核主机（`remote_hosts` 的键）；三键齐备时本地实现卡自动分流，见[进阶指南 · 审核分流](guide.md#审核分流把只读审核负载摊到第二台机器) |
 | `remote_mirror_root` | "" | 远端镜像根；与 `default_review_host` 成对，审核目录自动推导为 `<root>/<worktree名>` |
 | `default_review_sync` | "" | 全局默认分流前同步命令（sh -c，cwd=实现卡目录）；三键缺一不套默认 |
+| `remote_hosts.<name>.codex_only` | false | 为 true 时该主机机械禁止 Claude；带 Claude 模型及自动审核卡均在派发入口改道远端 Codex |
 
 提示词模板在 `~/.claudego/templates/*.md`，可直接修改（`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` 会被替换；
 `coordinate.md` 里的 `{{QUEUE}}` `{{PROGRESS}}` 在**派发时**替换为实时快照）。

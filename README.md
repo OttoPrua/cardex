@@ -129,6 +129,7 @@ claudego board                 # Web 看板 http://127.0.0.1:8787
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见[进阶指南](docs/guide.md#codex-备用执行器限额空窗不断档) |
 | `codex_fallback_model` | "" | claude 卡降级到 codex 时用此模型（档位对等：opus→terra，不降 sol）；空回退 `codex_model` |
 | `default_review_host` / `remote_mirror_root` / `default_review_sync` | "" | 审核分流三件套：三键齐备时本地实现卡的自动审核默认分流到远端 |
+| `remote_hosts.<name>.codex_only` | false | 主机级额度硬边界：为 true 时该远端只运行 Codex，自动审核也不会调用 Claude |
 
 提示词模板在 `~/.claudego/templates/*.md`，可直接修改（`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` 会被替换；`coordinate.md` 里的 `{{QUEUE}}` `{{PROGRESS}}` 在**派发时**替换为实时快照）。
 

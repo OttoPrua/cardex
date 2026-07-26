@@ -308,6 +308,10 @@ func TestApplyCrossEngine(t *testing.T) {
 	if tt3.RemoteHost != "h" || tt3.Model != "claude-fable-5" || !remoteUsesClaude(tt3) {
 		t.Fatalf("remote-claude 应远端 claude: %+v", tt3)
 	}
+	cfgCodexOnly := &Config{RemoteHosts: map[string]RemoteHostConfig{"h": {CodexOnly: true}}}
+	if applyCrossEngine(&Task{Prompts: []string{"x"}}, CrossEngine{Kind: "remote-claude", Host: "h", Model: "claude-fable-5"}, cfgCodexOnly) == nil {
+		t.Fatal("codex_only 主机必须拒绝 remote-claude 交叉引擎")
+	}
 
 	// remote-codex：无模型 → 远端 codex。
 	tt4 := &Task{Prompts: []string{"x"}}
@@ -391,11 +395,11 @@ func TestCmdCrossRejectsDataRootDir(t *testing.T) {
 
 func TestCrossBase(t *testing.T) {
 	cases := map[string]string{
-		"交叉A[opus-codex]: 裁决X":  "裁决X",
-		"交叉B[opus-codex]: 裁决X":  "裁决X",
+		"交叉A[opus-codex]: 裁决X":    "裁决X",
+		"交叉B[opus-codex]: 裁决X":    "裁决X",
 		"交叉C汇总[opus-codex]: 契约歧义": "契约歧义",
-		"交叉A[my-pair]: 审 R4":    "审 R4",
-		"普通标题":                  "普通标题",
+		"交叉A[my-pair]: 审 R4":      "审 R4",
+		"普通标题":                    "普通标题",
 	}
 	for in, want := range cases {
 		if got := crossBase(in); got != want {

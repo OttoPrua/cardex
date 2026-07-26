@@ -30,5 +30,6 @@
 | `default_review_host` | "" | global default review host (`remote_hosts` key); auto-diverts local impl cards when the trio is set — see [guide · review divert](guide.en.md#review-divert-offload-read-only-review-to-a-second-machine) |
 | `remote_mirror_root` | "" | remote mirror root; paired with `default_review_host`; ReviewDir auto-derived as `<root>/<worktree-name>` |
 | `default_review_sync` | "" | global default pre-divert sync command (sh -c, cwd=impl card dir); all three keys must be set for the default to apply |
+| `remote_hosts.<name>.codex_only` | false | When true, mechanically forbids Claude on that host; Claude-model and automatic review tasks are rerouted to remote Codex at dispatch |
 
 Prompt templates live in `~/.claudego/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).

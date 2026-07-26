@@ -129,6 +129,7 @@ The keys you'll actually touch; the full table lives in the [configuration refer
 | `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the [guide](docs/guide.en.md#codex-backup-executor-no-downtime-during-limit-gaps) |
 | `codex_fallback_model` | "" | model used when a claude card downgrades to codex (tier-parity: opus→terra, not sol); empty falls back to `codex_model` |
 | `default_review_host` / `remote_mirror_root` / `default_review_sync` | "" | the review-divert trio: with all three set, auto-review of local impl cards diverts to the remote host by default |
+| `remote_hosts.<name>.codex_only` | false | Host-level quota boundary: when true, the remote host runs Codex only, including automatic reviews |
 
 Prompt templates live in `~/.claudego/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).
 

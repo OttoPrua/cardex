@@ -2,6 +2,28 @@
 
 [中文](changelog.md) | **English** · back to [README](../README.en.md)
 
+## 2026-07-26 · Token curve follows the window + spend goes per-project
+
+- **The token curve follows the time window**: previously pinned at 24 hours, it now shares the
+  window tabs with queue task spend. Scan parameters scale with the window (`tokenScanPlanFor`):
+  buckets 15 min → 12 h (30 days would otherwise plot 2880 points), byte budget 512 MB → 4 GB
+  (twice the measured volume). `range=all` is capped at 90 days for transcripts and says so in
+  `basis` — that directory has no upper bound. Measured cold start: 24h/0.6s · 7d/1.3s · 30d/3.1s,
+  no window truncating; the 7-day window surfaces all 7 models. Also switched the per-line prefilter
+  from `strings.Contains(string(line),…)` to `bytes.Contains` — the former copies **every line**
+  into a fresh string, invisible at 104 MB but a gratuitous 1 GB of allocation at 30 days.
+- **Hitting the gate self-reports**: `token_series` gains `truncated` / `files_matched` /
+  `files_scanned` / `bytes_scanned`, with a red banner on truncation. A curve missing its back half
+  looks exactly like "nothing ran then" — silent truncation is a fabricated reading.
+- **`burnCache` is partitioned by window**: the scan grows from 104 MB to 1 GB across windows, and
+  a shared slot would re-run the most expensive one on every tab switch. Unknown ranges normalize
+  onto the 24h slot so `?range=garbage` cannot blow the cache up.
+- **Spend moves from per-task to per-project**: a 30-day window holds close to a thousand cards, a
+  per-task table shows only the top few dozen, and those are usually one project's consecutive fix
+  chain — you finish reading without knowing which line of work the money went to. Each row carries
+  a **"priced / total" card count** (an amount alone cannot distinguish "little work" from "cost
+  not recorded"; codex reports none) plus that project's **top model by spend**.
+
 ## 2026-07-26 · Queue task spend (windowed + per-task)
 
 **Why**: the "last 24 hours" token curve on the burndown page frequently showed a single model,

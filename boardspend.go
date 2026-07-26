@@ -2,17 +2,17 @@ package main
 
 // boardspend.go — 队列任务消耗视图：按时间窗口看「哪些模型、哪些卡烧掉了多少」。
 //
-// 【为什么要有这一块，而不是把 transcript 曲线的窗口拉长】
-// 燃尽页原有的 token 曲线扫的是 ~/.claude/projects 的 transcript，有两个硬约束：
-//   1. **窗口拉不长**。实测 30 天的 transcript 有 1.0 GB（7 天 409 MB），
-//      而扫描有 512 MB 的字节预算闸；拉到 30 天必然撞闸静默截断，
-//      "看起来是全月、其实只读了一半"比不给这个窗口更糟。
-//   2. **口径不是队列**。transcript 目录里混着人在 Claude Code 里手敲的交互会话，
-//      它们与 claudego 派发的卡在同一批文件里，分不开。
-// 于是"最近 24 小时只看得到一个模型"这件事既不是 bug 也不是数据丢了——
-// 那 24 小时里恰好只有 opus 在跑（而且多半来自交互会话，不是队列）。
+// 【与 transcript 曲线的分工】燃尽页的 token 曲线扫 ~/.claude/projects，两条曲线
+// 现在共用同一组时间窗口标签页，但它们**不是同一份账**，永远不该被读成同一个数：
+//   - transcript 曲线：绝对 token 吞吐，**不分账号也不分来源**——那个目录里混着人在
+//     Claude Code 里手敲的交互会话。窗口拉长要真金白银地扫盘（实测 24h≈104MB /
+//     7d≈419MB / 30d≈1.06GB），撞上字节预算闸就会截断，故它必须自报 truncated。
+//   - 本文件：**队列口径的花费**，一行是一张卡，交互会话根本不在里面；随卡长期留存，
+//     任何窗口都零额外扫描。
+// "最近 24 小时只看得到一个模型"当初就是这个分工没说清造成的误读——那 24 小时里
+// 恰好只有 opus 在跑，而且多半来自交互会话，不是队列。
 //
-// 本文件换一个源：**任务卡自己的账**。每张卡跑完时 runner 会把 claude CLI 回报的
+// 本文件的源是**任务卡自己的账**。每张卡跑完时 runner 会把 claude CLI 回报的
 // total_cost_usd / num_turns 写回卡上（见 runner.go），这份账：
 //   - 随卡长期留存（含 archive/），要看多久就能看多久，零额外扫描；
 //   - 天然是队列口径——一张卡就是一次派发，交互会话根本不在里面；
@@ -32,10 +32,10 @@ import (
 	"time"
 )
 
-// spendTopN 是「逐卡消耗」表回吐的条数上限。
-// 30 天窗口里有近千张卡，全吐既没人看得完，也会把响应撑大；
-// 排在前面的才是"钱花在哪"的答案。差额由 Tasks/Priced 两个计数如实交代。
-const spendTopN = 30
+// spendTopN 是「按项目」表回吐的条数上限。
+// 项目数量级远小于卡（实测十来个），这个闸基本不会触发；
+// 留着是防某天目录归并出几百个假项目时把响应撑爆。触发时由 TopTruncated 披露。
+const spendTopN = 40
 
 // ModelSpend 是一个模型在窗口内的合计。
 type ModelSpend struct {
@@ -48,18 +48,24 @@ type ModelSpend struct {
 	TurnsUsed int     `json:"turns_used"`
 }
 
-// TaskSpendEntry 是逐卡消耗表的一行。
-type TaskSpendEntry struct {
-	ID        string  `json:"id"`
-	Title     string  `json:"title"`
-	Project   string  `json:"project"`
-	Model     string  `json:"model"`
-	ModelTier string  `json:"model_tier"`
-	Status    string  `json:"status"`
-	Kind      string  `json:"kind"`
+// ProjectSpend 是一个项目在窗口内的消耗。
+//
+// 【为什么是项目维度而不是逐卡】一个 30 天窗口里有近千张卡，逐卡表只能截到前几十行，
+// 而那几十行往往是同一个项目的连续修复链——看完并不知道"钱花在哪条线上"。
+// 项目是委托人实际做取舍的粒度（哪条线该停、哪条线该加码），也天然是稳定的聚合键。
+type ProjectSpend struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	// Tasks 是窗口内该项目的卡数；Priced 是其中有花费数据的。两个都给，
+	// 否则"这个项目只花了 $3"分不清是活少还是花费没记上（codex 侧不回报）。
+	Tasks     int     `json:"tasks"`
+	Priced    int     `json:"priced"`
 	CostUSD   float64 `json:"cost_usd"`
 	TurnsUsed int     `json:"turns_used"`
-	UpdatedAt string  `json:"updated_at"`
+	// TopModel 是该项目里花得最多的模型，回答"这条线的钱主要烧在哪个档位上"。
+	TopModel     string  `json:"top_model"`
+	TopModelTier string  `json:"top_model_tier"`
+	TopModelCost float64 `json:"top_model_cost_usd"`
 }
 
 // TaskSpend 是一个时间窗口内的队列消耗视图。
@@ -70,14 +76,15 @@ type TaskSpend struct {
 	Since string `json:"since"`
 	// Tasks 是窗口内的卡数；Priced/Unpriced 把"有没有花费数据"摊开——
 	// 只给一个合计金额会让人以为那就是全部活的成本。
-	Tasks     int              `json:"tasks"`
-	Priced    int              `json:"priced"`
-	Unpriced  int              `json:"unpriced"`
-	CostUSD   float64          `json:"cost_usd"`
-	TurnsUsed int              `json:"turns_used"`
-	ByModel   []ModelSpend     `json:"by_model"`
-	Top       []TaskSpendEntry `json:"top"`
-	// TopTruncated 表示逐卡表被 spendTopN 截断了（前端必须说出来）。
+	Tasks     int            `json:"tasks"`
+	Priced    int            `json:"priced"`
+	Unpriced  int            `json:"unpriced"`
+	CostUSD   float64        `json:"cost_usd"`
+	TurnsUsed int            `json:"turns_used"`
+	ByModel   []ModelSpend   `json:"by_model"`
+	ByProject []ProjectSpend `json:"by_project"`
+	ProjectsN int            `json:"projects_n"`
+	// TopTruncated 表示按项目表被 spendTopN 截断了（前端必须说出来）。
 	TopTruncated bool `json:"top_truncated"`
 	// Basis 是口径披露，前端原样呈现。
 	Basis string `json:"basis"`
@@ -117,7 +124,7 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 	r := resolveSpendRange(key)
 	out := TaskSpend{
 		Range: r.Key, RangeLabel: r.Label,
-		ByModel: []ModelSpend{}, Top: []TaskSpendEntry{},
+		ByModel: []ModelSpend{}, ByProject: []ProjectSpend{},
 	}
 	var cut time.Time
 	if r.Hours > 0 {
@@ -125,16 +132,20 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 		out.Since = cut.Format(time.RFC3339)
 	}
 
-	// task id → 项目名。快照只有 项目→卡 的方向，逐卡表要反着查。
-	projOf := make(map[string]string, len(snap.byID))
+	// task id → 项目。快照只有 项目→卡 的方向，按卡聚合要反着查。
+	type projRef struct{ id, name string }
+	projOf := make(map[string]projRef, len(snap.byID))
 	for _, p := range snap.Projects {
 		for _, t := range snap.projTasks[p.ID] {
-			projOf[t.ID] = p.Name
+			projOf[t.ID] = projRef{p.ID, p.Name}
 		}
 	}
 
 	byModel := map[string]*ModelSpend{}
-	var rows []TaskSpendEntry
+	byProj := map[string]*ProjectSpend{}
+	// projModel 记每个项目内部的模型花费，用来挑 TopModel。
+	projModel := map[string]map[string]float64{}
+
 	for _, t := range snap.byID {
 		if r.Hours > 0 {
 			ts, ok := parseRFC3339(t.UpdatedAt)
@@ -145,6 +156,21 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 			}
 		}
 		out.Tasks++
+
+		ref := projOf[t.ID]
+		if ref.id == "" {
+			ref = projRef{"(未归入项目)", "(未归入项目)"}
+		}
+		ps := byProj[ref.id]
+		if ps == nil {
+			ps = &ProjectSpend{ID: ref.id, Name: ref.name}
+			byProj[ref.id] = ps
+			projModel[ref.id] = map[string]float64{}
+		}
+		// 卡数在有没有花费之前就记：一个项目派了 80 张 codex 卡却显示"0 张"，
+		// 会被读成这条线没在动。
+		ps.Tasks++
+
 		if t.CostUSD <= 0 {
 			out.Unpriced++
 			continue
@@ -166,14 +192,10 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 		m.CostUSD += t.CostUSD
 		m.TurnsUsed += t.TurnsUsed
 
-		rows = append(rows, TaskSpendEntry{
-			ID: t.ID, Title: t.Title, Project: projOf[t.ID],
-			Model: model, ModelTier: modelTier(model), Status: t.Status,
-			Kind:      snap.kindOf[t.ID].Kind,
-			CostUSD:   round2(t.CostUSD),
-			TurnsUsed: t.TurnsUsed,
-			UpdatedAt: t.UpdatedAt,
-		})
+		ps.Priced++
+		ps.CostUSD += t.CostUSD
+		ps.TurnsUsed += t.TurnsUsed
+		projModel[ref.id][model] += t.CostUSD
 	}
 	out.CostUSD = round2(out.CostUSD)
 
@@ -181,6 +203,21 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 		m.CostUSD = round2(m.CostUSD)
 		out.ByModel = append(out.ByModel, *m)
 	}
+	for id, ps := range byProj {
+		ps.CostUSD = round2(ps.CostUSD)
+		// 挑该项目花得最多的模型；同额时按名字定序，免得自动刷新时来回跳。
+		best, bestCost := "", -1.0
+		for m, c := range projModel[id] {
+			if c > bestCost || (c == bestCost && m < best) {
+				best, bestCost = m, c
+			}
+		}
+		if best != "" {
+			ps.TopModel, ps.TopModelTier, ps.TopModelCost = best, modelTier(best), round2(bestCost)
+		}
+		out.ByProject = append(out.ByProject, *ps)
+	}
+	out.ProjectsN = len(out.ByProject)
 	// 花得多的排前面；同额时按模型名，保证同一份数据每次的次序一致
 	// （map 遍历顺序随机，不定序的话每 30 秒自动刷新表格行都会跳一次）。
 	sort.Slice(out.ByModel, func(i, j int) bool {
@@ -189,16 +226,17 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 		}
 		return out.ByModel[i].Model < out.ByModel[j].Model
 	})
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].CostUSD != rows[j].CostUSD {
-			return rows[i].CostUSD > rows[j].CostUSD
+	// 花得多的排前面；同额时按 id，保证同一份数据每次次序一致
+	// （map 遍历顺序随机，不定序的话每 30 秒自动刷新表格行都会跳一次）。
+	sort.Slice(out.ByProject, func(i, j int) bool {
+		if out.ByProject[i].CostUSD != out.ByProject[j].CostUSD {
+			return out.ByProject[i].CostUSD > out.ByProject[j].CostUSD
 		}
-		return rows[i].ID < rows[j].ID
+		return out.ByProject[i].ID < out.ByProject[j].ID
 	})
-	if len(rows) > spendTopN {
-		rows, out.TopTruncated = rows[:spendTopN], true
+	if len(out.ByProject) > spendTopN {
+		out.ByProject, out.TopTruncated = out.ByProject[:spendTopN], true
 	}
-	out.Top = rows
 	out.Basis = spendBasis(&out)
 	return out
 }

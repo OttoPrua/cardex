@@ -970,6 +970,12 @@ table.tbl td.is-num { font-weight: 620; color: var(--ink); }
   overflow: hidden; min-width: 0;
 }
 .spend-row .sr-fill { display: block; height: 100%; border-radius: 4px; background: var(--s1); }
+/* 表格单元格里的占比条：表格 td 默认 text-align:right，条要撑满可用宽度 */
+.sr-bar-inline {
+  display: block; width: 100%; min-width: 60px;
+  height: 8px; border-radius: 4px; background: var(--surface-sunk); overflow: hidden;
+}
+table.tbl td:has(> .sr-bar-inline) { width: 22%; min-width: 90px; }
 .spend-row .sr-cost {
   font-size: 12.5px; font-weight: 680; color: var(--ink);
   font-variant-numeric: tabular-nums; min-width: 82px; text-align: right;

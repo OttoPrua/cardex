@@ -222,14 +222,30 @@ Once you have enough projects, long-finished ones still occupy a column on the o
 
 `POST /api/project/archive` is the board's only write endpoint (body `{"id":"<project id>","archived":true}`), behind three gates: POST only; `Content-Type` must be `application/json` (HTML forms cannot produce that type, which blocks cross-site auto-submitting forms); and when an `Origin` header is present its host must equal the request Host (browser cross-site fetches always send Origin). Command-line `curl` sends no Origin and is allowed through — local ops needs to be scriptable.
 
-### Queue task spend (`task_spend`, windowed)
+### One window control, two ledgers (`range=24h|7d|30d|all`)
 
-The burndown page's token curve scans transcripts under `~/.claude/projects`, which imposes two hard constraints — and together they explain **why the curve so often shows only one or two models**:
+The window tabs at the top of the burndown page drive **both** the queue task spend and the token curve. They share a window but are **not the same ledger**, and must never be read as the same number:
 
-1. **The window cannot be widened.** 30 days of transcripts measures 1.0 GB in practice (7 days: 409 MB), against a 512 MB byte budget on the scan — stretching to 30 days would silently truncate, and a "full month" that only read half the data is worse than not offering the window at all. So it is fixed at 24 hours, and a single day often only ran one or two models.
-2. **Its scope is not the queue.** That directory also holds sessions you typed by hand in Claude Code, interleaved with claudego-dispatched cards in the same files; they cannot be told apart.
+| | Queue task spend `task_spend` | Token curve `token_series` |
+|---|---|---|
+| Source | `cost_usd` / `turns_used` on task cards | transcripts under `~/.claude/projects` |
+| Scope | **the queue**: one row per card, no interactive sessions | **everything**: interleaved with hand-typed Claude Code sessions |
+| Unit | US dollars (API-equivalent cost) | absolute token throughput (equal-weight) |
+| Cost of widening | zero — the snapshot is already in memory | real disk work: 24h≈104MB / 7d≈419MB / 30d≈1.06GB |
 
-So there is a second ledger: `/api/burn?range=24h|7d|30d|all` returns `task_spend`, sourced from **the task cards' own `cost_usd` / `turns_used`** (the runner writes back the `total_cost_usd` / `num_turns` reported by the claude CLI when a card finishes). This ledger persists with the cards (including `archive/`), so any window is available at zero extra scanning — the snapshot already holds every card in memory and this just walks it again. It is queue-scoped by construction; interactive sessions are simply not in it. It yields: total spend / priced card count / unpriced card count / total turns, a per-model breakdown (resolved through `effectiveModel`, so codex-side cards go through `resolveCodexModel`), and a per-task table sorted by cost (capped at 30 rows, with the remainder disclosed).
+**"Why does the curve so often show only one or two models"** was exactly this distinction going unstated: those 24 hours happened to run only those models, mostly from interactive sessions. Widening to 7 days surfaces 7 models in practice.
+
+**The curve's scan parameters scale with the window** (`tokenScanPlanFor`): buckets coarsen from 15 minutes to 12 hours (otherwise 30 days would plot 2880 points — slow and uninformative), and the byte budget grows from 512 MB to 4 GB (twice the measured volume, since transcripts keep growing and a tight budget would start truncating silently one day). Measured cold-start: 24h/0.6s · 7d/1.3s · 30d/3.1s, with no window hitting truncation. `range=all` is **capped at 90 days** for transcripts and says so in `basis` — that directory has no upper bound, and a window that never finishes is worse than one you can explain.
+
+If the byte gate is ever hit, `token_series` self-reports `truncated` / `files_matched` / `files_scanned` / `bytes_scanned` and the frontend raises a red banner. This is not decoration: **a curve missing its back half looks exactly like "nothing ran during that period"** — silent truncation is a fabricated reading.
+
+`burnCache` is therefore **partitioned by window**: the scan grows from 104 MB to 1 GB across windows, and a shared slot would re-run the most expensive one on every tab switch. An unknown `range` normalizes onto the `24h` slot, so `?range=garbage` cannot blow the cache up.
+
+### Queue task spend (`task_spend`)
+
+Sourced from **the task cards' own `cost_usd` / `turns_used`** (the runner writes back the `total_cost_usd` / `num_turns` reported by the claude CLI when a card finishes). This ledger persists with the cards (including `archive/`), so any window is available at zero extra scanning. It yields: total spend / priced card count / unpriced card count / total turns, a **per-model** breakdown (resolved through `effectiveModel`, so codex-side cards go through `resolveCodexModel`), and a **per-project** breakdown.
+
+**Why per-project rather than per-task**: a 30-day window holds close to a thousand cards, a per-task table can only show the top few dozen rows, and those rows are usually one project's consecutive fix chain — you finish reading and still don't know which line of work the money went to. The project is the granularity at which trade-offs actually get made (which line to stop, which to double down on). Each row carries **both a "priced / total" card count** — with only an amount, "this line spent $3" cannot be distinguished between "little work" and "cost wasn't recorded" (codex reports none) — plus that project's **top model by spend**, answering "which tier is this line's money burning on".
 
 **Two boundaries that must be stated out loud** (`task_spend.basis` is rendered verbatim on the page):
 

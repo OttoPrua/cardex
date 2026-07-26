@@ -1701,6 +1701,14 @@ const SPEND_RANGES = [
   ['24h', '24 小时'], ['7d', '7 天'], ['30d', '30 天'], ['all', '全部'],
 ];
 
+/** 桶大小人话化：窗口一长桶就从 15 分钟涨到 12 小时，写"720 分钟"没人换算得过来。 */
+function fmtBucket(min) {
+  if (!isNum(min) || min <= 0) return '15 分钟';
+  if (min < 60) return `${min} 分钟`;
+  const hrs = min / 60;
+  return hrs >= 24 ? `${hrs / 24} 天` : `${hrs} 小时`;
+}
+
 /** 金额。两位小数不省——花费是钱，抹掉分位会让 $0.04 和 $0.05 看着一样。 */
 function usd(v) {
   if (!isNum(v)) return '—';
@@ -1771,30 +1779,35 @@ function spendSection(sp) {
       rows));
   }
 
-  const top = sp.top || [];
-  if (top.length) {
-    const body = h('tbody', {}, top.map((t) => h('tr', {},
-      h('td', {}, h('span', { class: 'sp-title', title: t.title, text: t.title })),
-      h('td', { class: 'is-mono', text: t.project || '—' }),
-      h('td', {}, tierBadge(t.model, t.model_tier)),
-      h('td', { text: t.kind ? (KIND_ZH[t.kind] || t.kind) : '—' }),
-      h('td', {}, statusBadge(t.status)),
-      h('td', { class: 'is-num', text: usd(t.cost_usd) }),
-      h('td', { class: 'is-num', text: t.turns_used ? String(t.turns_used) : '—' }),
-      h('td', { text: fmtTime(t.updated_at) || '—' }))));
+  const projects = sp.by_project || [];
+  if (projects.length) {
+    const maxProj = Math.max(...projects.map((p) => p.cost_usd || 0), 0.01);
+    const body = h('tbody', {}, projects.map((p) => h('tr', {},
+      h('td', {}, h('span', { class: 'sp-title', title: p.name, text: p.name })),
+      h('td', {},
+        h('span', { class: 'sr-bar sr-bar-inline', 'aria-hidden': 'true' },
+          h('span', { class: 'sr-fill', style: `width:${((p.cost_usd || 0) / maxProj) * 100}%` }))),
+      h('td', { class: 'is-num', text: usd(p.cost_usd) }),
+      // 卡数给两个：有花费的 / 窗口内全部。只给一个的话，"这条线只花了 $3"
+      // 分不清是活少还是花费没记上（codex 侧不回报）。
+      h('td', { text: `${num(p.priced || 0)} / ${num(p.tasks || 0)}` }),
+      h('td', { class: 'is-num', text: p.turns_used ? num(p.turns_used) : '—' }),
+      h('td', {}, p.top_model ? tierBadge(p.top_model, p.top_model_tier) : '—'))));
     const card = h('section', { class: 'card chart-card', style: 'margin-top:14px' },
-      h('h3', { class: 'chart-title', text: '逐卡消耗（按花费降序）' }),
+      h('h3', { class: 'chart-title', text: `按项目分（${num(sp.projects_n || projects.length)} 个）` }),
+      h('p', {
+        class: 'chart-sub',
+        text: '「计入 / 全部」两个卡数分开给：只看金额分不清"这条线活少"还是"花费没记上"（codex 侧不回报花费）。',
+      }),
       h('div', { class: 'tbl-wrap' }, h('table', { class: 'tbl' },
         h('thead', {}, h('tr', {},
-          h('th', { text: '任务' }), h('th', { text: '项目' }), h('th', { text: '模型' }),
-          h('th', { text: '性质' }), h('th', { text: '状态' }), h('th', { text: '花费' }),
-          h('th', { text: '轮数' }), h('th', { text: '完成时刻' }))),
+          h('th', { text: '项目' }), h('th', { text: '占比' }), h('th', { text: '花费' }),
+          h('th', { text: '计入 / 全部' }), h('th', { text: '轮数' }), h('th', { text: '主力模型' }))),
         body)));
-    // 截断必须说出来：只看到 30 行会被当成"这个窗口就这么多卡有花费"。
     if (sp.top_truncated) {
       card.append(h('p', {
         class: 'more-hint',
-        text: `显示花费最高的 ${top.length} 张 / 窗口内共 ${num(sp.priced || 0)} 张有花费数据的卡。`,
+        text: `显示花费最高的 ${projects.length} 个 / 窗口内共 ${num(sp.projects_n || 0)} 个项目。`,
       }));
     }
     sec.append(card);
@@ -1812,16 +1825,28 @@ function tokenSection(ts, spend) {
       h('h2', { class: 'section-title', text: 'Token 用量曲线' }),
       h('span', {
         class: 'section-note',
-        text: `最近 24 小时・${ts.bucket_minutes || 15} 分钟一桶・来自 transcript，不分账号`,
+        text: `跟随上方窗口・${fmtBucket(ts.bucket_minutes)}一桶・来自 transcript，不分账号`
+          + (ts.since ? `・自 ${fmtTime(ts.since) || ts.since} 起` : ''),
       })));
-  // 这一节最容易被误读成"看板只认识一个模型"。窗口窄 + 口径不是队列，两件事都要写明。
+  // 这一节最容易被误读成"看板只认识一个模型"。口径不是队列这件事必须写明。
   sec.append(callout('warning', 'ⓘ', h('div', {},
-    h('strong', { text: '为什么这里常常只有一两个模型：' }),
-    '窗口固定 24 小时（30 天的 transcript 实测 1 GB，扫描有字节上限，拉长必然静默截断——'
-    + '给一个只读了一半的"全月"比不给更糟），而一天里往往只跑过一两个模型；'
-    + '并且它扫的是 ~/.claude/projects，里面**混着你在 Claude Code 里手敲的交互会话**，'
-    + '不只是队列派发的卡。要看完整的模型分布与更长的窗口，用上面的「队列任务消耗」——'
-    + '那份账随卡长期留存，且是纯队列口径。')));
+    h('strong', { text: '这条曲线与上面的「队列任务消耗」不是同一份账：' }),
+    '它扫的是 ~/.claude/projects，里面**混着你在 Claude Code 里手敲的交互会话**，'
+    + '不只是队列派发的卡；纵轴是绝对 token 吞吐（等权口径），不是花费。'
+    + '窗口短时常常只看得到一两个模型，那是"这段时间只跑过这些"，不是看板漏了数据——'
+    + '把窗口拉到 30 天就能看到完整的模型分布。')));
+  // 扫描撞闸 = 曲线不完整。这条必须比图更显眼，否则少了半截的曲线
+  // 与"那段时间没跑活"在图上长得一模一样。
+  if (ts.truncated) {
+    sec.append(callout('critical', '⚠', h('div', {},
+      h('strong', { text: '本次扫描不完整：' }),
+      `匹配到 ${num(ts.files_matched || 0)} 个 transcript 文件，撞上字节预算上限后只读了 `
+      + `${num(ts.files_scanned || 0)} 个（${((ts.bytes_scanned || 0) / 1073741824).toFixed(2)} GB）。`,
+      h('p', {
+        class: 'callout-sub',
+        text: '下面的曲线与磁贴数字只覆盖读到的那部分，缩短窗口可得到完整读数。',
+      }))));
+  }
 
   const comp = ts.by_component || {};
   const total = Object.values(comp).reduce((a, b) => a + b, 0);
@@ -1843,7 +1868,7 @@ function tokenSection(ts, spend) {
 
   if (!ts.points || !ts.points.length) {
     sec.append(h('div', {
-      class: 'nodata', style: 'margin-top:12px', text: '最近 24 小时没有 transcript 用量样本。',
+      class: 'nodata', style: 'margin-top:12px', text: '这个窗口内没有 transcript 用量样本。',
     }));
     return sec;
   }
@@ -1894,7 +1919,7 @@ function tokenChart(ts) {
 
   const g = sv('svg', {
     viewBox: `0 0 ${W} ${H}`, role: 'img',
-    'aria-label': `最近 24 小时按模型分的 token 用量堆叠面积图，峰值 ${num(vMax)}`,
+    'aria-label': `所选窗口内按模型分的 token 用量堆叠面积图，峰值 ${num(vMax)}`,
   });
   for (let i = 0; i <= 4; i++) {
     const v = (vMax / 4) * i;

@@ -68,6 +68,8 @@ func main() {
 		err = cmdLog(os.Args[2:])
 	case "clean":
 		err = cmdClean(os.Args[2:])
+	case "migrate":
+		err = cmdMigrate(os.Args[2:])
 	case "install-launchd":
 		err = cmdInstallLaunchd(os.Args[2:])
 	case "uninstall-launchd":
@@ -136,6 +138,10 @@ func printUsage() {
 系统
   init                             # 初始化数据目录（默认 ~/.cardex，可用 CARDEX_ROOT / -root 覆盖；
                                    # 旧根 ~/.claudego 仍兼容读，迁移见 migrate）
+  migrate   [-root 源] [-to 目标] [-dry-run]
+                                   # 把数据根从改名前的旧根整体搬到 ~/.cardex（fail-closed：
+                                   # 目标非空/有 running 卡/拿不到实例锁一律拒绝；搬完做零丢失
+                                   # 对账，不符即回滚）。不代建 symlink、不代卸 launchd
   install-launchd [-interval 300]  # 安装 macOS 定时器，开机自动调度
   uninstall-launchd
   doctor                           # 自检环境

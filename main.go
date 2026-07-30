@@ -420,7 +420,7 @@ func cmdCross(args []string) error {
 		// 解符号链接后比对（否则 /tmp→/private/tmp 或软链数据根可绕过守卫）。
 		cleanWd, cleanRoot := resolveSymPath(wd), resolveSymPath(root)
 		sep := string(os.PathSeparator)
-		// 拒：数据根本身、其子目录、或其**父目录**（-dir=$HOME 时 cwd 直接包含 $HOME/.claudego）。
+		// 拒：数据根本身、其子目录、或其**父目录**（-dir=$HOME 时 cwd 直接包含 $HOME/<数据根>）。
 		if cleanWd == cleanRoot || strings.HasPrefix(cleanWd, cleanRoot+sep) || strings.HasPrefix(cleanRoot, cleanWd+sep) {
 			return fmt.Errorf("-dir 不能是 cardex 数据根、其子目录或其父目录（数据根 %s）：交叉卡工作目录会包含/暴露编排态", cleanRoot)
 		}

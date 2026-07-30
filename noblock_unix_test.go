@@ -295,7 +295,7 @@ func TestCodexReviewCopyGuardsMarkerNamespace(t *testing.T) {
 	if err != nil {
 		t.Fatalf("untracked 面冒名 marker 不得让建副本失败: %v", err)
 	}
-	// marker 必须是 ClaudeGo 自己写的那份真货(内容对得上),而不是被业务仓的同名链接顶掉。
+	// marker 必须是 cardex 自己写的那份真货(内容对得上),而不是被业务仓的同名链接顶掉。
 	m, ok := readCodexWorkMarker(copyDir)
 	if !ok {
 		t.Fatal("marker 必须建齐并可读(否则崩溃对账把活副本当半成品清掉)")

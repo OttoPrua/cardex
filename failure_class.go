@@ -22,7 +22,7 @@ package main
 //      （回归基线断言把这条钉死）。
 //
 // 【为什么不做自动 replan/decompose】
-// CAMEL 的 retry→decompose→replan 想法漂亮但需求未证：ClaudeGo 现状 held 升级人工的路径已够用
+// CAMEL 的 retry→decompose→replan 想法漂亮但需求未证：cardex 现状 held 升级人工的路径已够用
 // （人工看清楚再 release/cancel），自动 replan 一旦误判就是"任务被 AI 悄悄改写"，与"完整任务
 // 血缘可审计"的诚实性纪律冲突。CG-3 只做分类分流，不动 replan——真需要时再单独立卡。
 

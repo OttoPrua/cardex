@@ -377,7 +377,7 @@ func TestCmdCrossRejectsCrossLocationProfile(t *testing.T) {
 	}
 }
 
-// B1：-dir 不能是 claudego 数据根（否则交叉卡 cwd 直接含 tasks/，B 一读就见 A）。
+// B1：-dir 不能是 cardex 数据根（否则交叉卡 cwd 直接含 tasks/，B 一读就见 A）。
 func TestCmdCrossRejectsDataRootDir(t *testing.T) {
 	root := t.TempDir()
 	for _, d := range []string{"tasks", "logs"} {
@@ -578,10 +578,10 @@ func TestCrossCVerdictBeforePublish(t *testing.T) {
 	}
 }
 
-// -dir 不能是数据根的**父目录**(-dir=$HOME → cwd 含 $HOME/.claudego)。
+// -dir 不能是数据根的**父目录**(-dir=$HOME → cwd 含 $HOME/<数据根>)。
 func TestCmdCrossRejectsParentDir(t *testing.T) {
 	base := t.TempDir()
-	root := filepath.Join(base, ".claudego")
+	root := filepath.Join(base, rootDirName)
 	for _, d := range []string{"tasks", "logs"} {
 		os.MkdirAll(filepath.Join(root, d), 0o755)
 	}

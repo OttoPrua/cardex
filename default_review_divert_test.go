@@ -8,7 +8,7 @@ func TestApplyDefaultReviewDivert(t *testing.T) {
 	full := &Config{
 		DefaultReviewHost: "qmthost",
 		RemoteMirrorRoot:  "D:/Project/PO-lanes",
-		DefaultReviewSync: "bash ~/.claudego/sync-lane-to-5090.sh",
+		DefaultReviewSync: "bash ~/.cardex/sync-lane-to-5090.sh",
 	}
 
 	t.Run("本地卡+config齐备→自动分流+推导镜像目录", func(t *testing.T) {

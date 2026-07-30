@@ -11,7 +11,7 @@ package main
 // 推导都是启发式，所以每一处都带 *_source 字段或 basis 文案如实说明来源，
 // 不确定时宁可标「未分阶段 / 数据不足」，不编一个看起来合理的答案。
 //
-// 只读纪律：本文件只用 os.ReadFile / os.ReadDir 读 ~/.claudego，
+// 只读纪律：本文件只用 os.ReadFile / os.ReadDir 读数据根，
 // 绝不写入任何文件——看板挂在生产队列数据上，任何写入都可能污染真实队列。
 
 import (

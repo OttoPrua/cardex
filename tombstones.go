@@ -164,7 +164,7 @@ func writeTombstoneJournal(root, id string, j tombstoneJournal) error {
 // 【为什么 final 回写要"entry-gone/nonce-mismatch 即放弃"】
 // CG-4 R2 P1-1 审查证伪场景:CLI 侧 resetTombstoneKind(main.go retry/release)与 tick 的
 // injectAtMostOnce 首次并发读-改-写同一墓碑账本. 无该防御下,自动化 ops 监听 saveTask(failed) 即
-// claudego retry, reset 落在 pending 与 final 之间(inject 内 emitTaskEvent 取事件锁+fsync 隔出数十
+// cardex retry, reset 落在 pending 与 final 之间(inject 内 emitTaskEvent 取事件锁+fsync 隔出数十
 // ms 窗口), final 回写重读发现条目已被并发 reset 删除后会走"attempt<newAttempt 分支以 attempt=
 // newAttempt 重建条目",把 reset 静默覆盖——retry 承诺的"清墓碑重新起 bound=2 自动再裁决"被作废.
 // 视作并发 reset 胜出=不重建 final:业务已完成一次注入, bound 从零起算, 这才是 retry 语义的正确终态.

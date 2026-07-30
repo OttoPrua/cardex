@@ -13,7 +13,7 @@ package main
 // gitdir file(逻辑指回父仓 worktree registry)——一旦 codex 复审在副本内跑 `git commit`/`git gc`
 // 等罕见但可能的操作,不慎写到共享 objects/refs 就污染父仓。委托人硬语义"原仓保护",在收益-风险
 // 上倾向浅 clone:copy-once,完全独立 .git,副本随删,父仓无任何注册项,反例注入①的断言更硬。
-// 缺点是磁盘/时间开销略大;ClaudeGo/中型仓可接受,大仓可回退 readonly。
+// 缺点是磁盘/时间开销略大;cardex/中型仓可接受,大仓可回退 readonly。
 //
 // 【为什么覆盖未提交面】
 // 复审卡的语义是"审现在的代码",不是"审 HEAD"。修复卡纪律恰是"不 commit、workspace 待复审"
@@ -27,8 +27,8 @@ package main
 // 对称落 fingerprint,无对称问题。
 //
 // 【为什么把副本放到 <root>/tmp/codex-review-work/ 而非 os.TempDir()】
-// os.TempDir() 是 OS 级别的墓地,ClaudeGo 无对账权限,崩溃残留可能与其它系统进程的临时目录混在
-// 一起。放到 <root>/tmp/ 下 ClaudeGo 自管,tick 每轮扫这一个目录即可对账清理孤儿。委托人硬语义
+// os.TempDir() 是 OS 级别的墓地,cardex 无对账权限,崩溃残留可能与其它系统进程的临时目录混在
+// 一起。放到 <root>/tmp/ 下 cardex 自管,tick 每轮扫这一个目录即可对账清理孤儿。委托人硬语义
 // "副本路径必须在原仓目录树之外"由 root 通常就在 ~/.claudego(与业务仓 <root_of_repo>/ 无关)
 // 天然满足;测试用 t.TempDir() 时更是明确隔离。
 //
@@ -415,7 +415,7 @@ func copyUntrackedList(ctx context.Context, src, copyDir string, rels []string) 
 //
 // 【留档·非本卡裁量】链接本体复制意味着副本内可能存在指向原仓的 symlink。这不是本修法引入的新面:
 // tracked symlink 早已由 clone 原样带过去(已实测),写穿与否的实际闸门在 codex 沙箱侧
-// (workspace-write 按真实路径授权 writable_roots)。若要在 ClaudeGo 侧再加一道"越界链接过滤",
+// (workspace-write 按真实路径授权 writable_roots)。若要在 cardex 侧再加一道"越界链接过滤",
 // 必须 tracked/untracked 一视同仁,属独立设计决策,不在本卡私自扩围。
 func copyUntrackedPath(src, dst string) error {
 	fi, err := os.Lstat(src)

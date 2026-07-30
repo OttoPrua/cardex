@@ -2,7 +2,7 @@ package main
 
 // saferead.go —— CG-R3b R1:"阻塞式 open"统一闸门(按类闭合)。
 //
-// 【缺陷类定义】当一条路径来自 ClaudeGo 控制域**之外**——业务仓工作树枚举(git ls-files)、
+// 【缺陷类定义】当一条路径来自 cardex 控制域**之外**——业务仓工作树枚举(git ls-files)、
 // 模型输出里指名的文件、外部 CLI 自己写的 transcript 目录——它可能是 FIFO、设备节点,或指向
 // 这两者的 symlink。对这类路径直接 os.Open / os.ReadFile 有两重致命性:
 //   ① 打开**无写端的 FIFO** 按 POSIX 永久阻塞(实测 `timeout 2 cat link-to-pipe` → 124);
@@ -20,9 +20,9 @@ package main
 //      并报 errNotRegularFile,让调用侧按"跳过"而不是"读到脏数据"处理。
 // 对普通文件 O_NONBLOCK 是 no-op(POSIX 规定其只影响管道/终端/设备),故正常路径零行为变化。
 //
-// 【域内路径(<root> 下 ClaudeGo 自建的 events/tasks/progress/tombstones 等)为何不在本类】
-// 那些文件的唯一写者是 ClaudeGo 自己,且一律 atomicWrite(tmp+rename)落盘,不可能是 FIFO;
-// 要在那里出现管道只能是有人蓄意破坏 ClaudeGo 自有状态目录——那种威胁模型下 config.json 与任务
+// 【域内路径(<root> 下 cardex 自建的 events/tasks/progress/tombstones 等)为何不在本类】
+// 那些文件的唯一写者是 cardex 自己,且一律 atomicWrite(tmp+rename)落盘,不可能是 FIFO;
+// 要在那里出现管道只能是有人蓄意破坏 cardex 自有状态目录——那种威胁模型下 config.json 与任务
 // JSON 每一处读都同形,得靠统一 read 门面一次性收(另卡)。本卡按"路径来源是否可信"划线,
 // 见收工汇报的位点表。例外:副本目录 <root>/tmp/codex-review-work/**/ 的内容**部分来自业务仓
 // untracked 面**,故它虽在 <root> 下仍属域外,marker 读取也走本文件(见 readCodexWorkMarker)。

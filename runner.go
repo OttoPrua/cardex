@@ -64,7 +64,7 @@ var (
 	codexNoiseRe = regexp.MustCompile(`(?i)^(reading additional input|openai codex v|-{3,}$|workdir:|model:|provider:|approval:|sandbox:|reasoning|session id:|user$|codex$|assistant$|tokens used|deprecated:|enable it with|hook:|see https?://|[\d,]+$)`)
 	// codexHardErrRe：codex/上游服务端「硬错误」明确措辞（区别于泛化 codexErrRe：只认这些具体标识、
 	// 不会误命中审查正文里的 "cannot/error"）。含 OpenAI 网络安全审查闸——账号跑对抗性安全复审多了会被
-	// 累计打标、开额外安全检查甚至整请求拦截（"flagged for possible cybersecurity risk"），这不是 claudego
+	// 累计打标、开额外安全检查甚至整请求拦截（"flagged for possible cybersecurity risk"），这不是 cardex
 	// 能修的，但要让它清晰上报，别被吞成"无最终消息"。非瞬时，走 attempts 退避后可见失败。
 	codexHardErrRe = regexp.MustCompile(`(?i)flagged for possible cybersecurity|access blocked by cloudflare|openai-authorization-error|authorization error|experiencing high load|goal budget reached|conversation interrupted|usage limit|quota exceeded|401 unauthorized|403 forbidden|invalid api key`)
 	fencedRe       = regexp.MustCompile("(?s)```json\\s*(.*?)```")
@@ -125,7 +125,7 @@ func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*cl
 // codexSubagentPreamble 前置到每个 codex 卡的 prompt。根因：本机 codex 环境装了 superpowers /
 // gsd(get-shit-done) 框架，会话启动被注入"必须先用 using-superpowers 确认纪律、按 gsd-code-review
 // 流程组织"——gpt-5.6-sol 在 codex exec 单回合里先花预算读框架文档、走重流程，常在落最终消息前
-// 就把回合耗尽 → -o 终稿为空 → claudego 把已完成的审核判成失败（实测 wave-3 复审腿间歇性空终稿）。
+// 就把回合耗尽 → -o 终稿为空 → cardex 把已完成的审核判成失败（实测 wave-3 复审腿间歇性空终稿）。
 // superpowers 自身认 <SUBAGENT-STOP> 且"用户指令高于框架"，故显式声明 subagent + 跳过框架 + 强制
 // 回合末尾落最终消息，即可让 codex 直奔任务、稳定产出终稿。对实现卡同样有益（终稿=交付报告）。
 const codexSubagentPreamble = "[SUBAGENT · 直接执行] 你是被任务队列派发来完成下面这一个任务的子代理(subagent)。" +
@@ -865,7 +865,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		_ = resetTombstoneKind(root, t.ID, resumeKind(t.Step))
 	}
 	t.Status = statusRunning
-	// 交叉 C 重跑（如 claudego retry）先撤下旧的终局报告：否则若这次在执行器层就失败（未进 postComplete），
+	// 交叉 C 重跑（如 cardex retry）先撤下旧的终局报告：否则若这次在执行器层就失败（未进 postComplete），
 	// 上一轮的旧报告仍会被 progress -show 当成当前终局。首跑时无报告可删，无害。
 	if t.XRole == "C" {
 		_ = os.Remove(progressPath(root, t.ProgressKey))

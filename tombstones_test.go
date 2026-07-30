@@ -766,7 +766,7 @@ func TestReconcileCrossChainsHoldsOnBoundExhausted(t *testing.T) {
 
 // TestCmdRetryResetsReconcileCrossTombstone (Round-1 P1-1 no-reset-on-retry 类反例)
 // 验证 main.go 的 cmdSetStatus retry 分支必须显式重置 reconcile:cross 墓碑:
-// 场景 A 卡已被 reconcile 判 failed(final 墓碑落盘)→ 人工 claudego retry → 期望:reconcile:cross
+// 场景 A 卡已被 reconcile 判 failed(final 墓碑落盘)→ 人工 cardex retry → 期望:reconcile:cross
 // 墓碑被清空 → 下一轮孤儿判可以重新起 bound=2 保护。
 //
 // 【反例】去掉 main.go retry 分支的 resetTombstoneKind(reconcileCrossKind()) 那行:
@@ -918,7 +918,7 @@ func TestReconcileCrossChainsAfterRetryReAdjudicates(t *testing.T) {
 // 证伪场景直接落地:模拟 CLI 侧 resetTombstoneKind 在 inject 回调运行到一半时执行——阶段 3 重读
 // 应发现条目已被删除,放弃 final 重建,让 reset 语义(重新起 bound=2)保持有效。
 //
-// 【为什么这条测试关键】审查证伪场景明写:自动化 ops 监听 saveTask(failed) 即 claudego retry,
+// 【为什么这条测试关键】审查证伪场景明写:自动化 ops 监听 saveTask(failed) 即 cardex retry,
 // reset 恰落在阶段 1 的 pending 写与阶段 3 的 final 回写之间;R1 的 final 回写走
 // "final.Attempt<newAttempt 分支以 final(attempt=newAttempt) 重建条目",把 reset 静默覆盖 →
 // retry 承诺的"清墓碑重新起 bound=2 自动再裁决"被作废. 本测试用 inject 回调内嵌 reset 精确复现
@@ -932,7 +932,7 @@ func TestInjectAtMostOnceFinalYieldsToConcurrentReset(t *testing.T) {
 	inject := func() error {
 		calls++
 		// 模拟"CLI 侧 resetTombstoneKind 在阶段 2 无锁窗口内执行":inject 回调内直接调 reset,
-		// 与生产 ops 脚本"监听到卡转 failed 立即 claudego retry"的时序等价 (阶段 1 已释锁,
+		// 与生产 ops 脚本"监听到卡转 failed 立即 cardex retry"的时序等价 (阶段 1 已释锁,
 		// reset 可拿到锁; inject 结束后阶段 3 重取锁重读).
 		if err := resetTombstoneKind(root, "task-race", reconcileCrossKind()); err != nil {
 			return err

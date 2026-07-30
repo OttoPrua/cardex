@@ -3,7 +3,7 @@ package main
 // board.go — Web 看板的 HTTP 层。
 //
 // 三条纪律：
-//  1. **队列数据只读**。所有 handler 读 ~/.claudego 只经 os.ReadFile / os.ReadDir，
+//  1. **队列数据只读**。所有 handler 读数据根只经 os.ReadFile / os.ReadDir，
 //     tasks/ / archive/ / events/ / 任务 JSON 一个字节都不写、任何任务状态都不改。
 //     看板挂在生产队列数据上，误写会污染真实队列。
 //     唯一的例外是**看板自己的视图状态**：POST /api/project/archive 写

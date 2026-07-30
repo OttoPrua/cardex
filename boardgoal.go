@@ -313,7 +313,7 @@ func buildGoalMilestone(m boardOverrideMilestone, root, asOf string, now time.Ti
 // evidence.path 强制要求绝对路径（round-3 加固）：相对路径无论解析到进程 CWD 还是
 // board.json 所在目录，都存在「同名文件静默读错」的兜底路径——
 //   - CWD：launchd 从 / 起、shell 从项目目录起，同一配置读数「时有时无」；
-//   - boardRoot：默认 ~/.claudego 里若存在同名脚手架/临时文件也会零告警读错。
+//   - boardRoot：默认数据根里若存在同名脚手架/临时文件也会零告警读错。
 // 两者都把「配错的路径」伪装成"数据不足"或"读到值"，无诊断可查。绝对路径是唯一
 // 能让读数出处一目了然的选项——若配错就当场 insufficient 报出来。
 // boardRoot 参数保留是为了 API 稳定性（其它调用点已透传），但内部不再回退到它。

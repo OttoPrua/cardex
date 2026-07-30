@@ -26,7 +26,7 @@ func rescueWaitDelay(err error, cmd *exec.Cmd) error {
 }
 
 // 在跑执行器的进程登记簿。执行器自成进程组（见 setupProcGroup）后不再随
-// claudego 的前台进程组收到终端信号——Ctrl-C/SIGTERM 若不接管，claudego 一死
+// cardex 的前台进程组收到终端信号——Ctrl-C/SIGTERM 若不接管，cardex 一死
 // 它们就孤儿化继续烧额度、占工作目录（与 cancel 不杀进程是同一类病）。
 var (
 	procMu          sync.Mutex

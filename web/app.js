@@ -1,4 +1,4 @@
-// app.js — ClaudeGo 看板前端。零依赖、零构建步骤，直接被 //go:embed 打进二进制。
+// app.js — cardex 看板前端。零依赖、零构建步骤，直接被 //go:embed 打进二进制。
 //
 // 三条纪律（后端 boardeta.go / boardburn.go 立的规矩，前端必须接住）：
 //
@@ -466,8 +466,33 @@ const AUTO_REFRESH_MS = 30000;
 // HIDDEN_STATUS_KEY 必须声明在 state 之前：state 的初始化会调 loadHiddenStatuses()，
 // 而 const 在声明之前处于 TDZ——放到后面会抛 ReferenceError，又被那里的 try/catch
 // 吞成"读不出，按不筛选处理"。表现是筛选静默失效、localStorage 里明明存着值。
-const HIDDEN_STATUS_KEY = 'claudego.board.hiddenStatuses';
-const PROJECT_ORDER_KEY = 'claudego.board.projectOrder';
+const HIDDEN_STATUS_KEY = 'cardex.board.hiddenStatuses';
+const PROJECT_ORDER_KEY = 'cardex.board.projectOrder';
+
+// 【BD-44 改名】旧键名。localStorage 按 origin 存活，改名当天每个开着看板的浏览器里都躺着
+// 一份旧键——不搬的话，用户的筛选与项目次序会在某次刷新后"无缘无故复位"。这类丢失最烦人的
+// 地方是它不报错、也不可逆（用户只能重排一遍），所以搬一次比留个 TODO 划算得多。
+const LEGACY_KEY_PREFIX = 'claudego.board.';
+
+/**
+ * readMigratedKey 读新键；新键为空且旧键有值时，把旧值搬过来（写新键 + 删旧键）后返回。
+ *
+ * 【为什么是"新键为空才搬"而不是无条件搬】用户在新版上已经调过一次筛选，旧键还躺在那儿；
+ * 无条件搬会用一份陈旧偏好覆盖刚设好的。新键有值即视为已迁移，旧键此后只是垃圾。
+ * 【为什么搬完就删旧键】留着的话下次仍要走这条判断，而且旧键会永远显示在 devtools 里
+ * 让人怀疑"到底哪份生效"。搬完即删，一次性。
+ * 整个过程包在调用方的 try/catch 里：隐私模式下 localStorage 会抛，读不出就按无偏好处理。
+ */
+function readMigratedKey(key) {
+  const cur = localStorage.getItem(key);
+  if (cur !== null) return cur;
+  const legacyKey = LEGACY_KEY_PREFIX + key.slice(key.lastIndexOf('.') + 1);
+  const old = localStorage.getItem(legacyKey);
+  if (old === null) return null;
+  localStorage.setItem(key, old);
+  localStorage.removeItem(legacyKey);
+  return old;
+}
 
 const state = {
   route: null,
@@ -508,7 +533,7 @@ const state = {
  */
 function loadProjectOrder() {
   try {
-    const raw = localStorage.getItem(PROJECT_ORDER_KEY);
+    const raw = readMigratedKey(PROJECT_ORDER_KEY);
     if (!raw) return [];
     const arr = JSON.parse(raw);
     return Array.isArray(arr) ? arr.filter((x) => typeof x === 'string') : [];
@@ -584,7 +609,7 @@ function orderNote(shown) {
  */
 function loadHiddenStatuses() {
   try {
-    const raw = localStorage.getItem(HIDDEN_STATUS_KEY);
+    const raw = readMigratedKey(HIDDEN_STATUS_KEY);
     if (!raw) return new Set();
     const arr = JSON.parse(raw);
     // 过一遍白名单：手改过的 localStorage 不该往状态集里塞未知键。
@@ -1718,7 +1743,7 @@ function usd(v) {
 /**
  * 队列任务消耗。与上面的 transcript 曲线**不是同一个源、也不是同一个口径**，
  * 所以单独成节而不是并进那张图：
- *   - 这里一行是一张卡，只含 claudego 派发的活（交互会话不在内）；
+ *   - 这里一行是一张卡，只含 cardex 派发的活（交互会话不在内）；
  *   - 曲线扫的是 ~/.claude/projects，里面混着人手敲的会话，且只能回看 24 小时
  *     （30 天的 transcript 有 1 GB，扫描字节闸必然截断）。
  * 两者并排放着不说清楚，就会被读成"同一个数怎么对不上"。
@@ -1861,7 +1886,7 @@ function tokenSection(ts, spend) {
     tile('额度口径折算', compact(ts.weighted_total || 0), 'token',
       '按 budget.go 权重（cache_read 计 0.1）折算'),
     tile(`队列账本近 ${spend.window_hours || 5} 小时`, compact(spend.weighted_tokens || 0), 'token',
-      '来自 ~/.claudego/usage.json，只含本队列派发的 claude 调用')));
+      '来自数据根下的 usage.json，只含本队列派发的 claude 调用')));
 
   // 口径披露原样呈现：两个数字口径差一个数量级，不说清楚就是误导。
   if (ts.basis) sec.append(h('div', { style: 'margin-top:12px' }, callout('warning', 'ⓘ', ts.basis)));

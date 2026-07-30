@@ -255,7 +255,7 @@ func TestCodexReviewCopySurvivesUntrackedSymlinkToFifo(t *testing.T) {
 
 // TestCodexReviewCopyGuardsMarkerNamespace 是本轮自查发现的兄弟洞:marker 命名空间被 untracked 面污染。
 //
-// 【病】副本内容部分来自业务仓 untracked 面(域外输入)。若那边有个名叫 .claudego-codex-work.json.tmp
+// 【病】副本内容部分来自业务仓 untracked 面(域外输入)。若那边有个名叫 .cardex-codex-work.json.tmp
 // 的 symlink→FIFO 被投影进副本,随后 writeCodexWorkMarker → atomicWrite → os.WriteFile 会**以写端
 // 打开无读端 FIFO**,同样按 POSIX 永久阻塞——与 P1-1 同类,只是方向从读换成了写,且照样把泳道占死。
 // 【杀的突变】删掉 copyUntrackedList 里的 marker 命名空间跳过 **且** 删掉 writeCodexWorkMarker 里的
@@ -269,7 +269,12 @@ func TestCodexReviewCopyGuardsMarkerNamespace(t *testing.T) {
 	root := testRoot(t)
 	src := mkCodexReviewSrcRepo(t)
 	fifo := mkFifo(t, filepath.Join(src, "pipe"))
-	for _, name := range []string{codexWorkMarkerName, codexWorkMarkerName + ".tmp"} {
+	// 【BD-44】旧名一并投毒:兼容读让 .claudego-codex-work.json 重新成为"会被当 marker 读"的名字,
+	// 命名空间保护必须覆盖被读的全部名字,否则兼容读本身就是新开的注入口。
+	for _, name := range []string{
+		codexWorkMarkerName, codexWorkMarkerName + ".tmp",
+		legacyCodexWorkMarkerName, legacyCodexWorkMarkerName + ".tmp",
+	} {
 		if err := os.Symlink(fifo, filepath.Join(src, name)); err != nil {
 			t.Fatal(err)
 		}
@@ -306,7 +311,7 @@ func TestCodexReviewCopyGuardsMarkerNamespace(t *testing.T) {
 // TestCleanupCodexReviewOrphansNeverBlocksOnFifoMarker 类闭合:tick 的孤儿对账读 marker 也是域外读。
 //
 // 【病】崩溃点若落在"untracked 拷贝完成、marker 未写"之间,残留副本里就可能有个名叫
-// .claudego-codex-work.json 的 symlink→FIFO(来自业务仓 untracked 面)。readCodexWorkMarker 若用
+// .cardex-codex-work.json(或过渡期兼容读的旧名) 的 symlink→FIFO(来自业务仓 untracked 面)。readCodexWorkMarker 若用
 // os.ReadFile,tick 每轮扫到它就永久阻塞——整条对账线程占死,比被清理的残留严重得多。
 // 【杀的突变】readCodexWorkMarker 改回 os.ReadFile → 本测试挂死在 20s 红。
 func TestCleanupCodexReviewOrphansNeverBlocksOnFifoMarker(t *testing.T) {
@@ -317,8 +322,12 @@ func TestCleanupCodexReviewOrphansNeverBlocksOnFifoMarker(t *testing.T) {
 		t.Fatal(err)
 	}
 	mkFifo(t, filepath.Join(copyDir, "pipe"))
-	if err := os.Symlink("pipe", filepath.Join(copyDir, codexWorkMarkerName)); err != nil {
-		t.Fatal(err)
+	// 【BD-44】新旧两个 marker 名都摆成 FIFO 链接:readCodexWorkMarker 过渡期两个名字都读,
+	// 只把新名做成 FIFO 的话,新名读失败后回落读旧名(不存在)即返回,阻塞路径根本走不到旧名那一支。
+	for _, name := range []string{codexWorkMarkerName, legacyCodexWorkMarkerName} {
+		if err := os.Symlink("pipe", filepath.Join(copyDir, name)); err != nil {
+			t.Fatal(err)
+		}
 	}
 	// 半成品分支要求目录 mtime 老于 5 分钟(防误清正在建的副本),这里把它做旧。
 	old := time.Now().Add(-30 * time.Minute)
@@ -378,7 +387,7 @@ func TestExtractEmitTasksSkipsNonRegularRescueFile(t *testing.T) {
 
 // TestSessionTitleSkipsNonRegular 类闭合:sessions 腿读的是 claude CLI 自己的目录(域外)。
 // 【病】listSessions 只滤 IsDir + .jsonl 后缀,而 DirEntry.IsDir() 对 symlink 恒为 false——
-// 一条 <id>.jsonl → FIFO 的链接就能让 `claudego sessions` 整条命令挂死。
+// 一条 <id>.jsonl → FIFO 的链接就能让 `cardex sessions` 整条命令挂死。
 // 【杀的突变】sessionTitle 改回 os.Open → 第一子例挂死红;第二子例保证没把功能整条关掉。
 func TestSessionTitleSkipsNonRegular(t *testing.T) {
 	dir := t.TempDir()

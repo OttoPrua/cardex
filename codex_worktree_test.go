@@ -16,6 +16,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -304,6 +305,85 @@ func TestCleanupCodexReviewOrphansSkipsActive(t *testing.T) {
 
 	if _, err := os.Stat(copyDir); err != nil {
 		t.Fatalf("活任务的副本不应被清: %v", err)
+	}
+}
+
+// TestCleanupCodexReviewOrphansRecognizesLegacyMarker 【BD-44 改名过渡期反例】
+// 副本里只有**旧名** marker(.claudego-codex-work.json,改名前的二进制留下的残留),
+// 对账必须照样把它认成 marker——认出 TaskID 和 PID,而不是退化成"marker 缺失"。
+//
+// 【为什么这条值钱】两个方向都会真出事:
+// ① 活任务方向(本用例的 skip 断言):旧名 marker 读不出 TaskID → activeIDs 保护失效 →
+// 一个**正在跑**的旧版副本只要建成超过 5 分钟,就会被新版 tick 当半成品删掉,毁执行数据;
+// ② 崩溃残留方向(本用例的 clean 断言):事件账本会落 reason=no_marker_or_corrupt + 空 taskID,
+// 人事后回查"这坨副本原属哪张卡"线索全无。
+//
+// 【杀的突变】把 readCodexWorkMarker 的回落循环改回只读 codexWorkMarkerName → 两段断言都红。
+func TestCleanupCodexReviewOrphansRecognizesLegacyMarker(t *testing.T) {
+	root := testRoot(t)
+	src := mkCodexReviewSrcRepo(t)
+	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
+	task := &Task{ID: "bd44-legacy-marker", Type: typeReview, Dir: src}
+
+	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
+	if err != nil {
+		t.Fatalf("prepare copy: %v", err)
+	}
+	_ = cleanup // 同 RemovesCrashed:测的就是残留,defer 会遮蔽判据
+
+	// 把新名 marker 换成旧名 marker,精确模拟"改名前的二进制建的副本"。
+	data, err := os.ReadFile(filepath.Join(copyDir, codexWorkMarkerName))
+	if err != nil {
+		t.Fatalf("读新名 marker: %v", err)
+	}
+	if err := os.Remove(filepath.Join(copyDir, codexWorkMarkerName)); err != nil {
+		t.Fatalf("删新名 marker: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(copyDir, legacyCodexWorkMarkerName), data, 0o644); err != nil {
+		t.Fatalf("写旧名 marker: %v", err)
+	}
+
+	// ① 活任务保护必须靠旧名 marker 的 TaskID 生效:副本不能被清。
+	// 【为什么要把 mtime 拨老】不拨的话,退化成"marker 缺失"分支时还有 5 分钟 mtime 兜底挡着,
+	// 副本照样活下来——断言就成了空过。拨到 10 分钟前,兜底窗口失效,只剩"能不能读出 TaskID"这一道,
+	// 正是真事故的形状:一个跑了十几分钟的旧版副本被新版 tick 当半成品删掉。
+	old := time.Now().Add(-10 * time.Minute)
+	if err := os.Chtimes(copyDir, old, old); err != nil {
+		t.Fatal(err)
+	}
+	cleanupCodexReviewOrphans(root, map[string]bool{task.ID: true})
+	if _, err := os.Stat(copyDir); err != nil {
+		t.Fatalf("旧名 marker 的活任务副本被误清(TaskID 没读出来 → activeIDs 保护失效): %v", err)
+	}
+
+	// ② 转成崩溃残留(pid 死透 + 不在 activeIDs):必须清,且事件带得出 TaskID。
+	marker := codexWorkMarker{
+		TaskID: task.ID, PID: 2147483646, Src: src, CreatedAt: time.Now().Format(time.RFC3339),
+	}
+	blob, err := json.MarshalIndent(marker, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(copyDir, legacyCodexWorkMarkerName), append(blob, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cleanupCodexReviewOrphans(root, map[string]bool{})
+	if _, err := os.Stat(copyDir); !os.IsNotExist(err) {
+		t.Fatalf("旧名 marker 的崩溃残留应被清, stat err=%v", err)
+	}
+	events, _, err := readEvents(eventsPath(root, task.ID))
+	if err != nil {
+		t.Fatalf("读事件账本: %v", err)
+	}
+	found := false
+	for _, ev := range events {
+		if reason, _ := ev.Detail["reason"].(string); reason == "codex_review_orphan_cleanup" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("旧名 marker 被清时事件应落 codex_review_orphan_cleanup 且绑到 %s(而非空 taskID 兜底桶), events=%+v",
+			task.ID, events)
 	}
 }
 

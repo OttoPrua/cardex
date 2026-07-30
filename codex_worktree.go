@@ -126,8 +126,20 @@ func runCopyGit(ctx context.Context, taskID string, s copyGitStep) (stdout, stde
 func codexWorkRoot(root string) string { return filepath.Join(root, "tmp", "codex-review-work") }
 
 // codexWorkMarkerName 是每个副本目录内的元信息文件名,含 taskID/pid/created_at/src。
-// 前缀 `.claudego-` 与 CG-R2 fingerprint(.claudego-fingerprint)保持家族一致,便于人工识别。
-const codexWorkMarkerName = ".claudego-codex-work.json"
+const codexWorkMarkerName = ".cardex-codex-work.json"
+
+// legacyCodexWorkMarkerName 是 BD-44 改名前的 marker 名,**只读不写**。
+//
+// 【为什么必须留】marker 是崩溃残留副本的唯一身份凭据。改名当天 <root>/tmp/codex-review-work/
+// 下完全可能躺着上一版二进制留下的副本,里面是旧名 marker。若对账只认新名,这些残留会被判成
+// "marker 缺失 → 半成品",走 5 分钟 mtime 兜底删除——听着也删掉了,但删的路径丢了 TaskID:
+// 事件账本记的是 reason=no_marker_or_corrupt + 空 taskID(落进 codex-review-orphans 兜底桶),
+// 人事后回查"这坨副本原属哪张卡"就没了线索。更坏的是活任务分支:旧名 marker 读不出 TaskID/PID,
+// activeIDs 与 processAlive 两道保护全部失效,一个**正在跑**的旧版副本只要建成超过 5 分钟就会被
+// 新版 tick 当半成品删掉——直接毁掉在跑任务的执行数据。
+//
+// 【什么时候能删掉这行】<root>/tmp/codex-review-work/ 被清空一次(或确认没有旧版二进制在跑)之后。
+const legacyCodexWorkMarkerName = ".claudego-codex-work.json"
 
 // codexWorkMarker 是副本的元信息载体。清理侧只需 TaskID(反查 activeIDs)与 PID(processAlive
 // 判活),Src/CreatedAt 便于人工审计"这坨副本原属谁、什么时候建的"。
@@ -361,12 +373,17 @@ func copyUntrackedList(ctx context.Context, src, copyDir string, rels []string) 
 		if rel == "" {
 			continue
 		}
-		// marker 命名空间归 ClaudeGo:副本根下的 .claudego-codex-work.json(及 atomicWrite 的 .tmp
+		// marker 命名空间归 cardex:副本根下的 .cardex-codex-work.json(及 atomicWrite 的 .tmp
 		// 中间文件)是崩溃对账的凭据,不接受来自业务仓 untracked 面的同名投影。不跳的话,一个名叫
-		// `.claudego-codex-work.json.tmp` 的 symlink→FIFO 会让随后 writeCodexWorkMarker 的
+		// `.cardex-codex-work.json.tmp` 的 symlink→FIFO 会让随后 writeCodexWorkMarker 的
 		// os.WriteFile **以写端打开无读端 FIFO**——同样永久阻塞,与本卡要闭的病同类只是换了个方向;
 		// 且该名字的普通文件会在崩溃残留里冒充 marker 干扰孤儿判据。反正它下一步就会被真 marker 覆盖。
-		if rel == codexWorkMarkerName || rel == codexWorkMarkerName+".tmp" {
+		//
+		// 【旧名同样拦】readCodexWorkMarker 在新名缺失时会回落读旧名(见那里的过渡期说明),所以业务仓
+		// 里一个名叫 .claudego-codex-work.json 的文件投影进来同样能冒充 marker——命名空间保护必须
+		// 覆盖被读的全部名字,否则兼容读就成了新开的注入口。
+		if rel == codexWorkMarkerName || rel == codexWorkMarkerName+".tmp" ||
+			rel == legacyCodexWorkMarkerName || rel == legacyCodexWorkMarkerName+".tmp" {
 			continue
 		}
 		srcPath := filepath.Join(src, rel)
@@ -439,7 +456,7 @@ func copyUntrackedPath(src, dst string) error {
 	return nil
 }
 
-// writeCodexWorkMarker 落 marker 到副本内 <copyDir>/.claudego-codex-work.json。
+// writeCodexWorkMarker 落 marker 到副本内 <copyDir>/.cardex-codex-work.json。
 // 原子写(tmp+rename)避免半截 marker 骗过对账。
 //
 // 【为什么先 Remove 两条路径(CG-R3b R1 类闭合)】副本内容部分来自业务仓 untracked 面,是域外输入。
@@ -460,20 +477,28 @@ func writeCodexWorkMarker(copyDir string, m codexWorkMarker) error {
 // readCodexWorkMarker 读副本目录内的 marker;文件不存在/损坏/非普通文件视作"半成品",返回 (nil,false)。
 // 对账侧据此把无 marker 的目录也当孤儿清(clone 中崩溃/apply 中崩溃的残留兜底)。
 //
+// 【BD-44 过渡期:新名缺失时回落旧名】改名前建的副本里躺的是 .claudego-codex-work.json。
+// 只认新名的话,那些残留(乃至旧版二进制正在用的活副本)会退化成"marker 缺失"分支——见
+// legacyCodexWorkMarkerName 处的完整说明。回落只发生在**新名读不出来**时,新名永远优先。
+//
 // 【为什么走 readRegularFileNoBlock(CG-R3b R1 类闭合)】本函数由 tick 的孤儿对账调用,读的是
 // **副本目录**——其内容部分来自业务仓 untracked 面(域外)。崩溃点若落在"拷贝完成、marker 未写"之间,
-// 残留里就可能有个名叫 .claudego-codex-work.json 的 symlink→FIFO:os.ReadFile 会在此永久阻塞,
+// 残留里就可能有个名叫 .cardex-codex-work.json 的 symlink→FIFO:os.ReadFile 会在此永久阻塞,
 // 把 tick 整条对账线程占死。改用不阻塞的读法后,它被判成"损坏 marker"→ 按半成品清掉,正是我们要的。
+// 旧名回落走同一个读法,同样不会阻塞。
 func readCodexWorkMarker(copyDir string) (*codexWorkMarker, bool) {
-	data, err := readRegularFileNoBlock(filepath.Join(copyDir, codexWorkMarkerName))
-	if err != nil {
-		return nil, false
+	for _, name := range []string{codexWorkMarkerName, legacyCodexWorkMarkerName} {
+		data, err := readRegularFileNoBlock(filepath.Join(copyDir, name))
+		if err != nil {
+			continue
+		}
+		var m codexWorkMarker
+		if err := json.Unmarshal(data, &m); err != nil {
+			continue
+		}
+		return &m, true
 	}
-	var m codexWorkMarker
-	if err := json.Unmarshal(data, &m); err != nil {
-		return nil, false
-	}
-	return &m, true
+	return nil, false
 }
 
 // cleanupCodexReviewOrphans 扫 <root>/tmp/codex-review-work/,把崩溃残留副本清掉。

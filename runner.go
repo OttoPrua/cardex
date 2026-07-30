@@ -57,6 +57,15 @@ var (
 	// resetTimeRe 只认紧跟 reset 的钟点、跨不过中间的 "Jul 16 at" → 落 30min 回退，
 	// 之后每 30min 醒来再 429 再暂停空转到真解冻。这里带月+日先解析，覆盖多日窗口。
 	resetDateRe = regexp.MustCompile(`(?i)reset[s]?\s+(?:on\s+)?(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
+	// resetTryAgainRe：codex 远端限额措辞用 "try again at <英文月份> <日>[, <年份>] <时>[:<分>][am/pm]"
+	// 而非 "reset[s]"（BD-42/CG-1c 实战坑：原文 "...or try again at Aug 5th, 2026 12:0…" 被截断，
+	// 旧解析完全不认此形态 → 落 cfg.LimitFallbackMin 回退 → 每 30min 空撞到真解冻，跨天限额尤其致命）。
+	// 时(hour)必须解出，分钟/am-pm/年份均可选——覆盖 "Aug 5th, 2026 12:07am" / "August 5 at 9:30 PM" 等变体。
+	resetTryAgainRe = regexp.MustCompile(`(?i)try again at\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s*(?:(\d{4}),?\s*)?(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?`)
+	// resetTryAgainDateOnlyRe：同前缀但连"时"都拿不到（截断更狠/格式外变体）——只有月+日可信。
+	// 跨天限额场景下"多等一天"代价远小于"cfg.LimitFallbackMin 高频空撞到真解冻"，命中时保守退避到
+	// "明日同时刻"而非默认回退分钟数。
+	resetTryAgainDateOnlyRe = regexp.MustCompile(`(?i)try again at\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)`)
 	// transientRe：可退避重试的瞬时错误。补齐 codex/上游常见网络形态——否则真错误被误判为硬失败，
 	// 烧完 attempts 直接 failed（单腿审核一挂就没了）。
 	transientRe = regexp.MustCompile(`(?i)rate.?limit|overloaded|internal server error|api error 5\d\d|econnre|network error|timed? ?out|stream (?:error|disconnect)|disconnected before|connection (?:reset|refused|closed|error)|error sending request|temporarily unavailable|502|503|read tcp|i/o timeout`)
@@ -772,6 +781,53 @@ func parseResetEpoch(text string, cfg *Config, now time.Time) int64 {
 				}
 			}
 		}
+	}
+	// "try again at <英文月份日期>" 形态：与 resetDateRe 的 "reset[s]" 前缀互不相干，先于纯钟点
+	// resetTimeRe 解析，避免被后者的宽松 "reset[s]?...(\d{1,2})" 抢先误吃（虽然此形态压根不含
+	// "reset" 字样，但保持解析优先级与 resetDateRe 一致，便于后续维护理解顺序）。
+	if m := resetTryAgainRe.FindStringSubmatch(text); m != nil {
+		if mon := monthNum(m[1]); mon != 0 {
+			day, _ := strconv.Atoi(m[2])
+			hour, _ := strconv.Atoi(m[4])
+			minute := 0
+			if m[5] != "" {
+				minute, _ = strconv.Atoi(m[5])
+			}
+			switch strings.ToLower(m[6]) {
+			case "pm":
+				if hour < 12 {
+					hour += 12
+				}
+			case "am":
+				if hour == 12 {
+					hour = 0
+				}
+			}
+			if day >= 1 && day <= 31 && hour < 24 {
+				year := now.Year()
+				hasYear := m[3] != ""
+				if hasYear {
+					year, _ = strconv.Atoi(m[3])
+				}
+				cand := time.Date(year, mon, day, hour, minute, 0, 0, now.Location())
+				if !hasYear && cand.Before(now.Add(-24*time.Hour)) {
+					cand = cand.AddDate(1, 0, 0)
+				}
+				// 年份显式给出时不靠猜——放宽可信窗口，仍设边界防解析异常炸出离谱远期。
+				maxWindow := 14 * 24 * time.Hour
+				if hasYear {
+					maxWindow = 370 * 24 * time.Hour
+				}
+				if cand.After(now) && cand.Before(now.Add(maxWindow)) {
+					return clampEpoch(cand.Unix()+margin, now)
+				}
+			}
+		}
+	}
+	if resetTryAgainDateOnlyRe.MatchString(text) {
+		// 日期形态命中但拿不到时:分（截断/格式外变体）：置信不足，保守退避到"明日同时刻"，
+		// 不落 cfg.LimitFallbackMin 高频空撞——跨天限额空撞代价远大于多等一天。
+		return clampEpoch(now.Add(24*time.Hour).Unix()+margin, now)
 	}
 	if m := resetTimeRe.FindStringSubmatch(text); m != nil {
 		hour, _ := strconv.Atoi(m[1])

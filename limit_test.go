@@ -360,3 +360,54 @@ func TestLimitHitForEngineRoutesByFlags(t *testing.T) {
 		}
 	}
 }
+
+// TestParseResetEpochTryAgainAtPhrase (BD-42/CG-1c 回归)
+// 实战场景：codex 远端限额错误原文用 "try again at <英文月份日期>" 措辞而非 "reset[s]"，且远端
+// 输出常被截断（分钟位只剩半截数字）。旧解析（resetDateRe/resetTimeRe 均只认 "reset[s]" 前缀）
+// 完全不识别此形态 → 落 cfg.LimitFallbackMin 回退 → 每 30min 空撞到真解冻（跨天限额，代价远大于
+// 多等）。t0730-2007-5b2f 实测：从 03:05 起已空撞多轮，直到 8 月 5 日才能真正解冻。
+//
+// 【反例】把 parseResetEpoch 里 resetTryAgainRe/resetTryAgainDateOnlyRe 两段解析删掉（回退到
+// 修复前状态），本测试第一个 case 报红：resume 时间落在 31min 后而非 8 月 5 日。
+func TestParseResetEpochTryAgainAtPhrase(t *testing.T) {
+	cfg := &Config{LimitFallbackMin: 31, CooldownMarginSec: 90}
+	loc := time.UTC
+	now := time.Date(2026, 7, 31, 3, 5, 0, 0, loc)
+
+	// 实战原文：远端输出在分钟位被截断（"12:0…"），年份显式给出。
+	realWorld := "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage " +
+		"to purchase more credits or try again at Aug 5th, 2026 12:0…"
+	got := parseResetEpoch(realWorld, cfg, now)
+	gotTime := time.Unix(got, 0).In(loc)
+	if gotTime.Year() != 2026 || gotTime.Month() != time.August || gotTime.Day() != 5 {
+		t.Fatalf("截断实战原文应解出 8 月 5 日，got %s (raw=%d)", gotTime, got)
+	}
+	// 反证：不得落回 31min 回退（跨天限额下这是空撞的根因）。
+	if fallback := now.Add(31 * time.Minute).Unix() + 90; got == fallback {
+		t.Fatalf("不得回退到 cfg.LimitFallbackMin, got 与 31min 回退值相同: %d", got)
+	}
+
+	// 完整变体：带分钟与 am/pm、"August"全称、无逗号——解析应精确到分钟。
+	full := "Sorry, please try again at August 5 2026 at 9:30pm"
+	got = parseResetEpoch(full, cfg, now)
+	want := time.Date(2026, 8, 5, 21, 30, 0, 0, loc).Unix() + 90
+	if got != want {
+		t.Errorf("完整变体应精确解析: got %s, want %s", time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+
+	// 仅月+日、完全无时刻（更狠的截断/格式外变体）：置信不足，保守退避到"明日同时刻"而非 31min。
+	dateOnly := "usage limit reached, try again at Sep"
+	got = parseResetEpoch(dateOnly, cfg, now)
+	want = now.Add(24 * time.Hour).Unix() + 90
+	if got != want {
+		t.Errorf("日期不完整时应退避到明日同时刻: got %s, want %s", time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+
+	// 反例（保持现行为）：不含日期的限额文本，仍应落 cfg.LimitFallbackMin 回退，不受本次改动影响。
+	noDate := "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage"
+	got = parseResetEpoch(noDate, cfg, now)
+	want = now.Add(31 * time.Minute).Unix() + 90
+	if got != want {
+		t.Errorf("无日期文本应保持原 31min 回退: got %s, want %s", time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+}

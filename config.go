@@ -73,8 +73,8 @@ type Config struct {
 	// 带会话的多步任务仍等 claude 重置（跨 CLI 无法延续上下文）。
 	CodexBin      string `json:"codex_bin"`
 	CodexFallback bool   `json:"codex_fallback"`
-	// CodexFallbackModel 降级专用模型：claude 卡经 codex_fallback 改道 codex 时用它
-	// （档位对等映射：opus 档降级首选同档的 terra 而非设计档的 sol——设计档不降去干实现档活）。
+	// CodexFallbackModel 降级专用模型：claude 卡经 codex_fallback 改道 codex 时用它。
+	// 生产配置应选择已授权且适合落地实现的模型；不要把未授权/禁用模型当隐式回退。
 	// 空 = 沿用全局 codex_model。仅降级径生效；runner_pref=codex 主跑与远端 codex 不受影响。
 	CodexFallbackModel string `json:"codex_fallback_model,omitempty"`
 	CodexModel         string `json:"codex_model,omitempty"`
@@ -347,6 +347,8 @@ func defaultConfig(claudeBin string) *Config {
 		TypeDefaults: map[string]TypeDefaults{
 			typeReview: {
 				PermissionMode: "default",
+				Model:          "claude-fable-5",
+				Effort:         "high",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob",
 					"Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(ls:*)",
@@ -354,16 +356,19 @@ func defaultConfig(claudeBin string) *Config {
 			},
 			typeAssembly: {
 				PermissionMode: "default",
+				Model:          "claude-fable-5",
+				Effort:         "high",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob",
 					"Bash(git log:*)", "Bash(git status:*)", "Bash(ls:*)",
 				},
 			},
-			// 协调是全队列的编排大脑：小 token 量、高杠杆，用最强模型（预算紧可改 sonnet）；
+			// 协调需要较强规划能力，但默认使用 Fable 高档即可；只有明确的复杂仲裁才单卡升 Opus。
 			// 进度回收是机械总结，haiku 即可。
 			typeCoordinate: {
 				PermissionMode: "default",
-				Model:          "opus",
+				Model:          "claude-fable-5",
+				Effort:         "high",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob",
 					"Bash(git log:*)", "Bash(git status:*)", "Bash(ls:*)",
@@ -387,6 +392,8 @@ func defaultConfig(claudeBin string) *Config {
 			},
 			typeSequence: {
 				PermissionMode: "acceptEdits",
+				Model:          "claude-fable-5",
+				Effort:         "high",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "Task",
 					"Bash(git add:*)", "Bash(git commit:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",

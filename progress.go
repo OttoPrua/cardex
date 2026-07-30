@@ -154,7 +154,7 @@ func queueSnapshot(root, selfID string) string {
 func progressSnapshot(root string) string {
 	entries := loadProgressEntries(root)
 	if len(entries) == 0 {
-		return "（暂无进度报告。可先用 claudego brief 回收各会话进度再运行协调。）"
+		return "（暂无进度报告。可先用 cardex brief 回收各会话进度再运行协调。）"
 	}
 	var sb strings.Builder
 	for _, e := range entries {

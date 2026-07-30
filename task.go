@@ -213,7 +213,7 @@ func loadTasks(root string) ([]*Task, error) {
 	entries, err := os.ReadDir(tasksDir(root))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("找不到 %s，请先运行: claudego init", tasksDir(root))
+			return nil, fmt.Errorf("找不到 %s，请先运行: cardex init", tasksDir(root))
 		}
 		return nil, err
 	}

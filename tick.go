@@ -16,7 +16,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	killHandlerOnce.Do(installKillHandler) // 子进程自成进程组后，Ctrl-C/SIGTERM 需接管连坐
 	if !acquireLock(root, lockTTL(cfg)) {
 		if !quiet {
-			fmt.Println("已有另一个 claudego 实例在运行，跳过本轮。")
+			fmt.Println("已有另一个 cardex 实例在运行，跳过本轮。")
 		}
 		return nil
 	}
@@ -59,7 +59,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		case statusLimitPaused:
 			fmt.Printf("⏸ %s 撞到用量限额，%s 自动续跑。\n", t.ID, fmtClock(t.ResumeAtEpoch))
 		case statusFailed:
-			fmt.Printf("✖ %s 失败: %s（claudego log %s 查看详情）\n", t.ID, t.LastError, t.ID)
+			fmt.Printf("✖ %s 失败: %s（cardex log %s 查看详情）\n", t.ID, t.LastError, t.ID)
 		case statusQueued:
 			fmt.Printf("↻ %s 让位/重试，%s 后再跑（第 %d 次）: %s\n", t.ID, fmtClock(t.NotBeforeEpoch), t.Attempts, t.LastError)
 		case statusCanceled:
@@ -193,7 +193,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 					if wake := nextWake(tasks, time.Now()); !wake.IsZero() {
 						fmt.Printf("暂无可运行任务，下一个将在 %s 就绪。\n", wake.Format("15:04"))
 					} else {
-						fmt.Println("队列为空。用 claudego add / assemble / review 添加任务。")
+						fmt.Println("队列为空。用 cardex add / assemble / review 添加任务。")
 					}
 				default:
 					fmt.Printf("本轮共处理 %d 个任务。\n", launched)
@@ -233,7 +233,7 @@ func noFallback(cfg *Config, model string) bool {
 }
 
 func daemonLoop(root string, cfg *Config) error {
-	fmt.Printf("claudego daemon 启动，每 %d 秒轮询一次，最多 %d 路并行（Ctrl-C 退出）。\n",
+	fmt.Printf("cardex daemon 启动，每 %d 秒轮询一次，最多 %d 路并行（Ctrl-C 退出）。\n",
 		cfg.PollIntervalSec, cfg.MaxParallel)
 	for {
 		if err := tick(root, cfg, false, false); err != nil {

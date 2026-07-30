@@ -70,7 +70,7 @@ func listSessions(dir string) ([]sessionInfo, string, error) {
 func sessionTitle(path string) string {
 	// 【CG-R3b R1 类闭合】path 来自 ~/.claude/projects/<proj>/ 的目录枚举(claude CLI 的地盘,
 	// 属域外):listSessions 只滤了 IsDir + .jsonl 后缀,而 DirEntry.IsDir() 对 symlink 恒为 false
-	// ——一条 <id>.jsonl → FIFO 的链接就能让 os.Open 永久阻塞,`claudego sessions` 整条命令挂死。
+	// ——一条 <id>.jsonl → FIFO 的链接就能让 os.Open 永久阻塞,`cardex sessions` 整条命令挂死。
 	f, _, err := openRegularFileNoBlock(path)
 	if err != nil {
 		return "-"
@@ -129,7 +129,7 @@ func cmdSessions(args []string) error {
 		fmt.Fprintf(w, "%s\t%s\t%s\n", s.ID, s.Modified.Format("01-02 15:04"), s.Title)
 	}
 	w.Flush()
-	fmt.Println("\n回收进度: claudego brief -session <会话ID> -dir", wd, "-auto")
-	fmt.Println("接管续跑: claudego adopt <会话ID> -dir", wd)
+	fmt.Println("\n回收进度: cardex brief -session <会话ID> -dir", wd, "-auto")
+	fmt.Println("接管续跑: cardex adopt <会话ID> -dir", wd)
 	return nil
 }

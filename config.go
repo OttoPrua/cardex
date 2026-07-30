@@ -42,7 +42,7 @@ type Config struct {
 
 	// ---- 5 小时额度红线（保底额度，给交互/突发任务留余量）----
 	// QueueBudgetTokens: 滑动 5 小时窗口内，队列最多消耗的加权 token 数；0 关闭。
-	// 只统计 claudego 自己派发的调用（桌面端消耗不可见），本质是"队列预算上限"。
+	// 只统计 cardex 自己派发的调用（桌面端消耗不可见），本质是"队列预算上限"。
 	QueueBudgetTokens int64 `json:"queue_budget_tokens"`
 	// RedlinePercent + UsageFeed: 外部全局用量源（CodexBar usage-history.jsonl 格式），
 	// 最新 claude 5h 窗口样本 usedPercent 达到红线即停止派发；样本过期则放行（fail-open）。
@@ -102,7 +102,7 @@ type Config struct {
 	// CrossProfiles 键 = profile 名（如 "opus-codex"），值为一对引擎：甲先独立出结论，乙独立出结论后
 	// 再拿甲的结论对抗式交叉查漏。引擎来源可切换——换 profile 即换模型对，无需改任何代码。
 	CrossProfiles map[string]CrossProfile `json:"cross_profiles,omitempty"`
-	// DefaultCrossProfile: `claudego cross` 未指定 -profile 时用的 profile 名。
+	// DefaultCrossProfile: `cardex cross` 未指定 -profile 时用的 profile 名。
 	DefaultCrossProfile string `json:"default_cross_profile,omitempty"`
 
 	// ---- 默认复审分流（把只读复审负载默认压到第二台机器，均衡两侧额度）----
@@ -483,7 +483,7 @@ func loadConfig(root string) (*Config, error) {
 	data, err := os.ReadFile(configPath(root))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("找不到 %s，请先运行: claudego init", configPath(root))
+			return nil, fmt.Errorf("找不到 %s，请先运行: cardex init", configPath(root))
 		}
 		return nil, err
 	}

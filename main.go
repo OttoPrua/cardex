@@ -75,7 +75,7 @@ func main() {
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "version", "-v", "--version":
-		fmt.Println("claudego", version)
+		fmt.Println("cardex", version)
 	case "help", "-h", "--help":
 		printUsage()
 	default:
@@ -90,9 +90,9 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Print(`claudego — 围绕 Claude 5 小时用量限额的本地任务队列
+	fmt.Print(`cardex — 围绕 Claude 5 小时用量限额的本地任务队列
 
-用法: claudego <命令> [选项]
+用法: cardex <命令> [选项]
 
 添加任务
   add       [-type sequence|design-review|prompt-assembly|coordinate|progress-pull]
@@ -134,7 +134,7 @@ func printUsage() {
   clean                            # 把 done/failed/canceled 归档到 archive/
 
 系统
-  init                             # 初始化数据目录（默认 ~/.bide，可用 BIDE_ROOT / -root 覆盖；
+  init                             # 初始化数据目录（默认 ~/.cardex，可用 CARDEX_ROOT / -root 覆盖；
                                    # 旧根 ~/.claudego 仍兼容读，迁移见 migrate）
   install-launchd [-interval 300]  # 安装 macOS 定时器，开机自动调度
   uninstall-launchd
@@ -170,9 +170,9 @@ func cmdInit(args []string) error {
 	fmt.Printf(`初始化完成: %s
 
 下一步:
-  1. claudego add -title "..." -dir <项目目录> "你的 prompt"   # 或 assemble / review
-  2. claudego run                                            # 手动跑一轮验证
-  3. claudego install-launchd                                # 安装后台定时调度
+  1. cardex add -title "..." -dir <项目目录> "你的 prompt"   # 或 assemble / review
+  2. cardex run                                            # 手动跑一轮验证
+  3. cardex install-launchd                                # 安装后台定时调度
 配置: %s
 `, root, configPath(root))
 	return nil
@@ -385,7 +385,7 @@ func cmdCross(args []string) error {
 	}
 	prof, ok := cfg.CrossProfiles[name]
 	if !ok {
-		return fmt.Errorf("未知 profile %q（claudego cross -list 查看可用引擎对）", name)
+		return fmt.Errorf("未知 profile %q（cardex cross -list 查看可用引擎对）", name)
 	}
 	// 甲乙必须同执行位置：交叉链 A/B/C 共用一个工作目录，跨机/本机-远端混排会让 B/C 拿错目录。
 	if la, lb := crossEngineLoc(prof.A), crossEngineLoc(prof.B); la != lb {
@@ -410,13 +410,13 @@ func cmdCross(args []string) error {
 		if err != nil {
 			return err
 		}
-		// 工作目录不得是（或位于）claudego 数据根——否则交叉卡的 cwd 直接含 tasks/，B 一读就看到 A 卡。
+		// 工作目录不得是（或位于）cardex 数据根——否则交叉卡的 cwd 直接含 tasks/，B 一读就看到 A 卡。
 		// 解符号链接后比对（否则 /tmp→/private/tmp 或软链数据根可绕过守卫）。
 		cleanWd, cleanRoot := resolveSymPath(wd), resolveSymPath(root)
 		sep := string(os.PathSeparator)
 		// 拒：数据根本身、其子目录、或其**父目录**（-dir=$HOME 时 cwd 直接包含 $HOME/.claudego）。
 		if cleanWd == cleanRoot || strings.HasPrefix(cleanWd, cleanRoot+sep) || strings.HasPrefix(cleanRoot, cleanWd+sep) {
-			return fmt.Errorf("-dir 不能是 claudego 数据根、其子目录或其父目录（数据根 %s）：交叉卡工作目录会包含/暴露编排态", cleanRoot)
+			return fmt.Errorf("-dir 不能是 cardex 数据根、其子目录或其父目录（数据根 %s）：交叉卡工作目录会包含/暴露编排态", cleanRoot)
 		}
 		// 若工作目录是 git 仓，注入 HEAD 作代码评审锚点。**这是非强制 advisory**：本工具不做工作树
 		// 快照/checkout，未提交改动 HEAD 不变——故若工作树脏，额外警告"链执行期间勿改动"。（诚实降级，
@@ -466,7 +466,7 @@ func cmdCross(args []string) error {
   B      引擎乙独立作答（不见甲结论、无 A 指针）
   ↓ 完成后自动派：
   C      引擎乙拿甲结论对抗式交叉查漏 → 结论落进度报告
-链 ID: %s   最终结论: claudego progress -show %s   A 卡日志: claudego log %s
+链 ID: %s   最终结论: cardex progress -show %s   A 卡日志: cardex log %s
 工作目录: %s
 `, name, crossEngineLabel(prof.A), crossEngineLabel(prof.B), a.ID, a.XKey, a.XKey, a.ID, wd)
 	return nil
@@ -534,7 +534,7 @@ func cmdAssemble(args []string) error {
 
 	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if goal == "" {
-		return fmt.Errorf("用法: claudego assemble [-dir D] \"目标描述\"")
+		return fmt.Errorf("用法: cardex assemble [-dir D] \"目标描述\"")
 	}
 	root := resolveRoot(*rootFlag)
 	cfg, err := loadConfig(root)
@@ -620,7 +620,7 @@ func cmdAdopt(args []string) error {
 
 	rest := fs.Args()
 	if len(rest) < 1 {
-		return fmt.Errorf("用法: claudego adopt <session-id> [-dir D] [\"续跑提示\"]")
+		return fmt.Errorf("用法: cardex adopt <session-id> [-dir D] [\"续跑提示\"]")
 	}
 	sessionID := rest[0]
 	root := resolveRoot(*rootFlag)
@@ -670,7 +670,7 @@ func cmdPlan(args []string) error {
 
 	goal := strings.TrimSpace(strings.Join(fs.Args(), " "))
 	if goal == "" {
-		return fmt.Errorf("用法: claudego plan [-dir D] \"总体目标\"")
+		return fmt.Errorf("用法: cardex plan [-dir D] \"总体目标\"")
 	}
 	root := resolveRoot(*rootFlag)
 	cfg, err := loadConfig(root)
@@ -701,13 +701,13 @@ func cmdPlan(args []string) error {
 		"type": t.Type, "emit_hold": t.EmitHold,
 	})
 	if *holdOut {
-		fmt.Printf("已入队协调任务 %s：分工产出的任务将挂起等待人工放行（claudego release）。\n", t.ID)
+		fmt.Printf("已入队协调任务 %s：分工产出的任务将挂起等待人工放行（cardex release）。\n", t.ID)
 	} else {
 		fmt.Printf("已入队协调任务 %s：运行时注入实时队列与进度报告，分工产出的任务自动入队。\n", t.ID)
 	}
-	fmt.Printf("分工说明（各任务的模型与手动接管命令）留在日志里: claudego log %s\n", t.ID)
+	fmt.Printf("分工说明（各任务的模型与手动接管命令）留在日志里: cardex log %s\n", t.ID)
 	if ids := activeSessionTasks(root, t.ID); len(ids) > 0 {
-		fmt.Printf("提示: %d 个未结束任务带有在途会话，可先回收进度让分工更准: claudego brief -id %s -auto\n", len(ids), ids[0])
+		fmt.Printf("提示: %d 个未结束任务带有在途会话，可先回收进度让分工更准: cardex brief -id %s -auto\n", len(ids), ids[0])
 	}
 	return nil
 }
@@ -829,7 +829,7 @@ func cmdBrief(args []string) error {
 		return err
 	}
 	prompt := renderTemplate(tpl, map[string]string{"OUT": progressPath(root, key), "KEY": key})
-	fmt.Printf("把下面内容整段贴到目标会话里（报告会写入 %s，之后 claudego plan 直接可用）：\n\n", progressPath(root, key))
+	fmt.Printf("把下面内容整段贴到目标会话里（报告会写入 %s，之后 cardex plan 直接可用）：\n\n", progressPath(root, key))
 	fmt.Println(strings.TrimSpace(prompt))
 	return nil
 }
@@ -903,7 +903,7 @@ func cmdProgress(args []string) error {
 
 	entries := loadProgressEntries(root)
 	if len(entries) == 0 {
-		fmt.Println("还没有进度报告。用 claudego brief 生成整理 prompt，或 brief -id <任务> -auto 自动回收。")
+		fmt.Println("还没有进度报告。用 cardex brief 生成整理 prompt，或 brief -id <任务> -auto 自动回收。")
 		return nil
 	}
 	w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
@@ -914,7 +914,7 @@ func cmdProgress(args []string) error {
 			reportCounts(e.Report), truncate(reportStatus(e.Report), 44), filepath.Base(e.Dir))
 	}
 	w.Flush()
-	fmt.Println("\n详情: claudego progress -show <KEY>；基于进度分工: claudego plan \"目标\"")
+	fmt.Println("\n详情: cardex progress -show <KEY>；基于进度分工: cardex plan \"目标\"")
 	return nil
 }
 
@@ -1084,7 +1084,7 @@ func cmdCmd(args []string) error {
 	rootFlag := fs.String("root", "", "数据目录")
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
-		return fmt.Errorf("用法: claudego cmd <任务ID>")
+		return fmt.Errorf("用法: cardex cmd <任务ID>")
 	}
 	root := resolveRoot(*rootFlag)
 	cfg, err := loadConfig(root)
@@ -1117,7 +1117,7 @@ func cmdCmd(args []string) error {
 	} else {
 		fmt.Printf("\n# 进入后粘贴当前步骤的 prompt：\n%s\n", injectLiveContext(root, t.ID, t.Prompts[step]))
 	}
-	fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: claudego hold %s\n", t.ID)
+	fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
 	return nil
 }
 
@@ -1316,7 +1316,7 @@ func cmdList(args []string) error {
 		fmt.Printf("⛔ 额度红线生效中：%s\n\n", reason)
 	}
 	if len(tasks) == 0 {
-		fmt.Println("队列为空。用 claudego add / assemble / review 添加任务。")
+		fmt.Println("队列为空。用 cardex add / assemble / review 添加任务。")
 		return nil
 	}
 
@@ -1399,7 +1399,7 @@ func cmdSetStatus(args []string, action string) error {
 	rootFlag := fs.String("root", "", "数据目录")
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
-		return fmt.Errorf("用法: claudego %s <任务ID>", action)
+		return fmt.Errorf("用法: cardex %s <任务ID>", action)
 	}
 	root := resolveRoot(*rootFlag)
 	t, err := findTask(root, fs.Arg(0))
@@ -1496,7 +1496,7 @@ func cmdLog(args []string) error {
 	n := fs.Int("n", 60, "显示最后 N 行")
 	_ = fs.Parse(args)
 	if fs.NArg() < 1 {
-		return fmt.Errorf("用法: claudego log <任务ID> [-n 60]")
+		return fmt.Errorf("用法: cardex log <任务ID> [-n 60]")
 	}
 	root := resolveRoot(*rootFlag)
 	t, err := findTask(root, fs.Arg(0))
@@ -1570,11 +1570,11 @@ func cmdDoctor(args []string) error {
 			fmt.Printf("  ✖ %s: %v\n      %s\n", name, err, hint)
 		}
 	}
-	fmt.Println("claudego doctor")
+	fmt.Println("cardex doctor")
 	fmt.Println("数据目录:", root)
 
 	cfg, err := loadConfig(root)
-	check("配置文件", err, "运行 claudego init")
+	check("配置文件", err, "运行 cardex init")
 	if cfg != nil {
 		_, err = os.Stat(cfg.ClaudeBin)
 		if err != nil {
@@ -1583,13 +1583,13 @@ func cmdDoctor(args []string) error {
 		check("claude 可执行文件 ("+cfg.ClaudeBin+")", err, "确认 claude CLI 已安装，或修改 config.json 的 claude_bin")
 	}
 	_, err = os.Stat(tasksDir(root))
-	check("任务目录", err, "运行 claudego init")
+	check("任务目录", err, "运行 cardex init")
 
 	if pp, err := plistPath(); err == nil {
 		if _, err := os.Stat(pp); err == nil {
 			fmt.Printf("  ✔ launchd 定时器已安装 (%s)\n", pp)
 		} else {
-			fmt.Println("  - launchd 定时器未安装（可运行 claudego install-launchd）")
+			fmt.Println("  - launchd 定时器未安装（可运行 cardex install-launchd）")
 		}
 	}
 	if fi, err := os.Stat(lockPath(root)); err == nil {

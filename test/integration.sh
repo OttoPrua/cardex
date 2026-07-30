@@ -9,7 +9,7 @@ BIN="$PWD/bin/bide"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
-export BIDE_ROOT="$TMP/root"
+export CARDEX_ROOT="$TMP/root"
 export MOCK_DIR="$TMP/mock"
 mkdir -p "$MOCK_DIR"
 PROJ="$TMP/proj" && mkdir -p "$PROJ"
@@ -36,7 +36,7 @@ assert $expr
 
 echo "== init =="
 "$BIN" init >/dev/null
-python3 - "$BIDE_ROOT/config.json" "$PWD/test/mock-claude.sh" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" "$PWD/test/mock-claude.sh" <<'EOF'
 import json,sys
 p,mock=sys.argv[1],sys.argv[2]
 cfg=json.load(open(p))
@@ -63,7 +63,7 @@ L2=$(grep -n "step one of A" "$MOCK_DIR/calls.log" | head -1 | cut -d: -f1)
 assert "低优先级任务在同一次 run 内接续执行并撞限额暂停" "one(title='low-prio')['status']=='limit_paused'"
 assert "步骤停在 1/2 且标记中断" "one(title='low-prio')['step']==1 and one(title='low-prio')['mid_step']==True"
 assert "resume_at 在未来约1小时内" "0 < one(title='low-prio')['resume_at_epoch']-now < 3700"
-test -f "$BIDE_ROOT/cooldown.json" && echo "  ✔ 冷却文件已写入" && pass=$((pass+1)) || { echo "  ✖ 缺少冷却文件"; fail=$((fail+1)); }
+test -f "$CARDEX_ROOT/cooldown.json" && echo "  ✔ 冷却文件已写入" && pass=$((pass+1)) || { echo "  ✖ 缺少冷却文件"; fail=$((fail+1)); }
 
 echo "== 场景3: 冷却期内不派发 =="
 calls_before=$(cat "$MOCK_DIR/n")
@@ -72,7 +72,7 @@ calls_after=$(cat "$MOCK_DIR/n")
 if [ "$calls_before" = "$calls_after" ]; then echo "  ✔ 冷却期内未调用 claude"; pass=$((pass+1)); else echo "  ✖ 冷却期内仍调用了 claude"; fail=$((fail+1)); fi
 
 echo "== 场景4: 到点自动续跑（同会话 --resume + 续跑提示）=="
-python3 - "$BIDE_ROOT" <<'EOF'
+python3 - "$CARDEX_ROOT" <<'EOF'
 import json,glob,sys,time,os
 root=sys.argv[1]
 past=int(time.time())-5
@@ -117,7 +117,7 @@ printf 'progress\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 assert "回收任务完成且默认 haiku" "one(title='进度: probe')['status']=='done' and one(title='进度: probe')['type']=='progress-pull' and one(title='进度: probe')['model']=='haiku'"
 grep -q -- "--resume sess-42" "$MOCK_DIR/calls.log" && echo "  ✔ 回收任务续接了目标会话" && pass=$((pass+1)) || { echo "  ✖ 未 --resume 目标会话"; fail=$((fail+1)); }
 grep -q -- "--model haiku" "$MOCK_DIR/calls.log" && echo "  ✔ 回收任务用 haiku 模型" && pass=$((pass+1)) || { echo "  ✖ 未用 haiku"; fail=$((fail+1)); }
-test -f "$BIDE_ROOT/progress/s-sess-42.json" && echo "  ✔ 进度报告已落盘" && pass=$((pass+1)) || { echo "  ✖ 进度报告未落盘"; fail=$((fail+1)); }
+test -f "$CARDEX_ROOT/progress/s-sess-42.json" && echo "  ✔ 进度报告已落盘" && pass=$((pass+1)) || { echo "  ✖ 进度报告未落盘"; fail=$((fail+1)); }
 plist=$("$BIN" progress)
 echo "$plist" | grep -q "s-sess-42" && echo "  ✔ progress 列表可见" && pass=$((pass+1)) || { echo "  ✖ progress 列表不可见"; fail=$((fail+1)); }
 # 8b: 会话不按 JSON 格式回复时，原文兜底落盘（不丢已花额度换来的汇报）
@@ -128,7 +128,7 @@ assert "非 JSON 汇报的回收任务不失败" "one(title='进度: rawprobe')[
 "$BIN" brief -session sess-88 -dir "$PROJ" -title modelprobe -model sonnet -auto >/dev/null
 assert "brief -model 覆盖回收模型" "one(title='进度: modelprobe')['model']=='sonnet'"
 "$BIN" cancel "$("$BIN" list -json | python3 -c "import json,sys;print([t['id'] for t in json.load(sys.stdin) if t['title']=='进度: modelprobe'][0])")" >/dev/null
-grep -q '"raw"' "$BIDE_ROOT/progress/s-sess-77.json" && echo "  ✔ 散文汇报以原文兜底落盘" && pass=$((pass+1)) || { echo "  ✖ 原文兜底未生效"; fail=$((fail+1)); }
+grep -q '"raw"' "$CARDEX_ROOT/progress/s-sess-77.json" && echo "  ✔ 散文汇报以原文兜底落盘" && pass=$((pass+1)) || { echo "  ✖ 原文兜底未生效"; fail=$((fail+1)); }
 
 echo "== 场景9: plan 分工协调（实时快照注入 + 产出任务带模型自动入队）=="
 fid=$("$BIN" list -json | python3 -c "import json,sys;print([t['id'] for t in json.load(sys.stdin) if t['title']=='flaky'][0])")
@@ -170,7 +170,7 @@ assert "审核任务挂上既有审核会话" "one(title='attach-review')['sessi
 assert "装配任务挂上既有装配会话" "one(title='attach-asm')['session_id']=='role-asm-1'"
 
 echo "== 场景13: 队列预算红线（本地加权账本）=="
-python3 - "$BIDE_ROOT/config.json" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" <<'EOF'
 import json,sys
 p=sys.argv[1]; c=json.load(open(p)); c["queue_budget_tokens"]=1
 json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
@@ -187,7 +187,7 @@ echo "== 场景14: 外部用量源红线（CodexBar usage-history 格式）=="
 FEED="$TMP/usage-history.jsonl"
 NOWISO=$(python3 -c "import datetime;print(datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))")
 printf '{"provider":"claude","sampledAt":"%s","resetsAt":"2026-12-31T00:00:00Z","usedPercent":93,"windowKind":"primary","windowMinutes":300}\n' "$NOWISO" > "$FEED"
-python3 - "$BIDE_ROOT/config.json" "$FEED" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" "$FEED" <<'EOF'
 import json,sys
 p,feed=sys.argv[1],sys.argv[2]; c=json.load(open(p))
 c["queue_budget_tokens"]=0; c["redline_percent"]=90; c["usage_feed"]=feed
@@ -205,7 +205,7 @@ echo "== 场景15: 分时段红线（每日窗口内覆盖阈值，窗口外回�
 "$BIN" add -dir "$PROJ" -title windowed -priority 3 "wnd step" >/dev/null
 IN_FROM=$(python3 -c "import datetime;print((datetime.datetime.now()-datetime.timedelta(minutes=10)).strftime('%H:%M'))")
 IN_TO=$(python3 -c "import datetime;print((datetime.datetime.now()+datetime.timedelta(minutes=50)).strftime('%H:%M'))")
-python3 - "$BIDE_ROOT/config.json" "$IN_FROM" "$IN_TO" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" "$IN_FROM" "$IN_TO" <<'EOF'
 import json,sys
 p,f,t=sys.argv[1:4]; c=json.load(open(p))
 c["queue_budget_tokens"]=0; c["redline_percent"]=0; c["usage_feed"]=""
@@ -218,7 +218,7 @@ printf 'ok\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 qout=$("$BIN" quota); echo "$qout" | grep -q "当前时段生效" && echo "  ✔ quota 标记当前时段" && pass=$((pass+1)) || { echo "  ✖ quota 未标记时段"; fail=$((fail+1)); }
 OUT_FROM=$(python3 -c "import datetime;print((datetime.datetime.now()+datetime.timedelta(hours=2)).strftime('%H:%M'))")
 OUT_TO=$(python3 -c "import datetime;print((datetime.datetime.now()+datetime.timedelta(hours=3)).strftime('%H:%M'))")
-python3 - "$BIDE_ROOT/config.json" "$OUT_FROM" "$OUT_TO" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" "$OUT_FROM" "$OUT_TO" <<'EOF'
 import json,sys
 p,f,t=sys.argv[1:4]; c=json.load(open(p))
 c["redline_windows"]=[{"from":f,"to":t,"queue_budget_tokens":1}]
@@ -229,7 +229,7 @@ assert "时段外回落全局（无红线）正常执行" "one(title='windowed')
 
 echo "== 场景16: 单次 run 排空队列 + 跨目录并行 =="
 PROJ2="$TMP/proj2" && mkdir -p "$PROJ2"
-python3 - "$BIDE_ROOT/config.json" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" <<'EOF'
 import json,sys
 p=sys.argv[1]; c=json.load(open(p))
 c["max_parallel"]=2; c["redline_windows"]=[]
@@ -255,7 +255,7 @@ assert "同目录两任务都完成（仍在一次 run 内）" "one(title='ser-a
 python3 -c "import sys;sys.exit(0 if $EL > 2.2 else 1)" && echo "  ✔ 同目录串行执行（${EL%.*}s > 2.2s）" && pass=$((pass+1)) || { echo "  ✖ 同目录被并行了（耗时 ${EL}s）"; fail=$((fail+1)); }
 
 echo "== 场景18: claude 冷却期 codex 备用执行器接管单步任务 =="
-python3 - "$BIDE_ROOT/config.json" "$PWD/test/mock-codex.sh" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" "$PWD/test/mock-codex.sh" <<'EOF'
 import json,sys,time
 p,mock=sys.argv[1],sys.argv[2]
 c=json.load(open(p))
@@ -278,7 +278,7 @@ assert "多步任务不切 codex，等待 claude 重置" "one(title='cx-multi')[
 [ "$(cat "$MOCK_DIR/n")" = "0" ] && echo "  ✔ 冷却期未调用 claude" && pass=$((pass+1)) || { echo "  ✖ 冷却期调用了 claude"; fail=$((fail+1)); }
 grep -q "sandbox read-only" "$MOCK_DIR/codex-calls.log" 2>/dev/null || grep -q -- "--sandbox workspace-write" "$MOCK_DIR/codex-calls.log" && echo "  ✔ codex 以受限沙箱执行" && pass=$((pass+1)) || { echo "  ✖ codex 沙箱参数缺失"; fail=$((fail+1)); }
 grep -q "writable_roots.*\.git" "$MOCK_DIR/codex-calls.log" && echo "  ✔ codex 放行 .git 供收工 commit" && pass=$((pass+1)) || { echo "  ✖ 缺 .git writable_roots"; fail=$((fail+1)); }
-rm -f "$BIDE_ROOT/cooldown.json"
+rm -f "$CARDEX_ROOT/cooldown.json"
 printf 'ok\nok\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 "$BIN" run -quiet
 assert "冷却解除后多步任务由 claude 执行完成" "one(title='cx-multi')['status']=='done' and one(title='cx-multi').get('runner') is None"
@@ -304,7 +304,7 @@ hid=$("$BIN" list -json | python3 -c "import json,sys;print([t['id'] for t in js
 assert "release 放行进入排队" "one(title='held-task')['status']=='queued'"
 
 echo "== 场景19: runner=codex 常态钉定（claude 空闲也走 codex）+ 思考等级透传 =="
-python3 - "$BIDE_ROOT/config.json" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" <<'EOF'
 import json,sys
 p=sys.argv[1]; c=json.load(open(p))
 c["thinking_tokens"]=12345; c["codex_reasoning"]="high"
@@ -327,7 +327,7 @@ EOF
 echo "== 场景20: 红线前置缓冲（踩线起跑防护，codex 钉定不受影响）=="
 LEAD_FROM=$(python3 -c "import datetime;print((datetime.datetime.now()+datetime.timedelta(minutes=10)).strftime('%H:%M'))")
 LEAD_TO=$(python3 -c "import datetime;print((datetime.datetime.now()+datetime.timedelta(minutes=70)).strftime('%H:%M'))")
-python3 - "$BIDE_ROOT/config.json" "$LEAD_FROM" "$LEAD_TO" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" "$LEAD_FROM" "$LEAD_TO" <<'EOF'
 import json,sys
 p,f,t=sys.argv[1:4]; c=json.load(open(p))
 c["redline_windows"]=[{"from":f,"to":t,"queue_budget_tokens":1}]
@@ -342,7 +342,7 @@ printf 'ok\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 [ "$(cat "$MOCK_DIR/n")" = "0" ] && echo "  ✔ 缓冲期内 claude 任务不起跑" && pass=$((pass+1)) || { echo "  ✖ 缓冲期未生效"; fail=$((fail+1)); }
 assert "codex 钉定任务缓冲期照跑" "one(title='lead-codex')['status']=='done' and one(title='lead-codex')['runner']=='codex'"
 qout=$("$BIN" quota); echo "$qout" | grep -q "缓冲期生效中" && echo "  ✔ quota 显示缓冲状态" && pass=$((pass+1)) || { echo "  ✖ quota 未显示缓冲"; fail=$((fail+1)); }
-python3 - "$BIDE_ROOT/config.json" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" <<'EOF'
 import json,sys
 p=sys.argv[1]; c=json.load(open(p)); c["redline_lead_min"]=0
 json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
@@ -351,7 +351,7 @@ EOF
 assert "关闭缓冲后 claude 任务正常执行" "one(title='lead-claude')['status']=='done'"
 
 echo "== 场景21: 设计模型不降级（no_fallback_models）=="
-python3 - "$BIDE_ROOT/config.json" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" <<'EOF'
 import json,sys,time
 p=sys.argv[1]; c=json.load(open(p))
 json.dump({"until_epoch":int(time.time())+3600,"reason":"mock limit","set_at":"t"},
@@ -364,7 +364,7 @@ echo 0 > "$MOCK_DIR/n"
 "$BIN" run -quiet
 assert "fable 设计卡冷却期不降级,继续排队" "one(title='nf-fable')['status']=='queued'"
 assert "sonnet 卡照常 fallback 到 codex" "one(title='nf-sonnet')['status']=='done' and one(title='nf-sonnet')['runner']=='codex'"
-rm -f "$BIDE_ROOT/cooldown.json"
+rm -f "$CARDEX_ROOT/cooldown.json"
 printf 'ok\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 "$BIN" run -quiet
 assert "冷却解除后 fable 卡由 claude 执行" "one(title='nf-fable')['status']=='done' and one(title='nf-fable').get('runner') is None"
@@ -394,7 +394,7 @@ assert "自造 batch 类型被回退为 sequence" "one(title='badtype-task')['ty
 assert "回退后烘焙了 sequence 权限（非空工具）" "len(one(title='badtype-task').get('allowed_tools') or [])>0 and one(title='badtype-task').get('permission_mode')=='acceptEdits'"
 
 echo "== 场景24: 远端执行器（SSH → 远端 codex；prompt 走 stdin + marker 回捕；非零退出不误判）=="
-python3 - "$BIDE_ROOT/config.json" "$PWD/test/mock-ssh.sh" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" "$PWD/test/mock-ssh.sh" <<'EOF'
 import json,sys
 p,mock=sys.argv[1],sys.argv[2]
 c=json.load(open(p))
@@ -421,15 +421,15 @@ assert "远端 claude 结果走 parseClaudeJSON（非 marker 路径）" "one(tit
 
 echo "== 场景26: 远端账号限额→按 resume_at 挂起（无损接力，不写全局冷却）=="
 echo "claude-limit" > "$MOCK_DIR/ssh-behavior"
-rm -f "$BIDE_ROOT/cooldown.json"
+rm -f "$CARDEX_ROOT/cooldown.json"
 "$BIN" add -dir "D:/Project/MyApp" -host rhost -model claude-fable-5 -fresh -title r-limit -priority 9 "remote step hits limit" >/dev/null
 "$BIN" run -quiet
 assert "远端限额任务挂起 limit_paused 且 resume_at 在未来" "one(title='r-limit')['status']=='limit_paused' and one(title='r-limit')['resume_at_epoch']>now"
-test ! -f "$BIDE_ROOT/cooldown.json" && echo "  ✔ 未写全局冷却（远端账号与本机独立）" && pass=$((pass+1)) || { echo "  ✖ 误写了全局冷却"; fail=$((fail+1)); }
+test ! -f "$CARDEX_ROOT/cooldown.json" && echo "  ✔ 未写全局冷却（远端账号与本机独立）" && pass=$((pass+1)) || { echo "  ✖ 误写了全局冷却"; fail=$((fail+1)); }
 echo "codex" > "$MOCK_DIR/ssh-behavior"
 
 echo "== 场景27: cancel 运行中任务 → 击杀进程组、≤1 重扫周期释放同目录槽位 =="
-python3 - "$BIDE_ROOT/config.json" <<'EOF'
+python3 - "$CARDEX_ROOT/config.json" <<'EOF'
 import json,sys
 p=sys.argv[1]; c=json.load(open(p)); c["drain_rescan_sec"]=1
 json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
@@ -458,8 +458,8 @@ else
 fi
 { kill $WDPID && wait $WDPID; } 2>/dev/null || true
 assert "同目录后继任务在 cancel 后被派发完成" "one(title='cxl-heir')['status']=='done'"
-test ! -f "$BIDE_ROOT/tasks/$vid.json" && test -f "$BIDE_ROOT/archive/$vid.json" && echo "  ✔ 被取消任务已归档（tasks/ 已清）" && pass=$((pass+1)) || { echo "  ✖ 被取消任务未归档"; fail=$((fail+1)); }
-python3 -c "import json,sys;sys.exit(0 if json.load(open('$BIDE_ROOT/archive/$vid.json'))['status']=='canceled' else 1)" \
+test ! -f "$CARDEX_ROOT/tasks/$vid.json" && test -f "$CARDEX_ROOT/archive/$vid.json" && echo "  ✔ 被取消任务已归档（tasks/ 已清）" && pass=$((pass+1)) || { echo "  ✖ 被取消任务未归档"; fail=$((fail+1)); }
+python3 -c "import json,sys;sys.exit(0 if json.load(open('$CARDEX_ROOT/archive/$vid.json'))['status']=='canceled' else 1)" \
   && echo "  ✔ 归档状态为 canceled" && pass=$((pass+1)) || { echo "  ✖ 归档状态不是 canceled"; fail=$((fail+1)); }
 cpid=$(cat "$MOCK_DIR/hang-child.pid" 2>/dev/null || echo "")
 if [ -n "$cpid" ] && ! kill -0 "$cpid" 2>/dev/null; then
@@ -490,7 +490,7 @@ else
   echo "  ✖ run 未正常退出（被看门狗击杀？）"; fail=$((fail+1))
 fi
 { kill $WDPID && wait $WDPID; } 2>/dev/null || true
-test ! -f "$BIDE_ROOT/tasks/$rid.json" && test -f "$BIDE_ROOT/archive/$rid.json" && echo "  ✔ 远端卡已归档" && pass=$((pass+1)) || { echo "  ✖ 远端卡未归档"; fail=$((fail+1)); }
+test ! -f "$CARDEX_ROOT/tasks/$rid.json" && test -f "$CARDEX_ROOT/archive/$rid.json" && echo "  ✔ 远端卡已归档" && pass=$((pass+1)) || { echo "  ✖ 远端卡未归档"; fail=$((fail+1)); }
 spid=$(cat "$MOCK_DIR/ssh-hang-child.pid" 2>/dev/null || echo "")
 if [ -n "$spid" ] && ! kill -0 "$spid" 2>/dev/null; then
   echo "  ✔ ssh 进程组已整组击杀（本地槽位与目录锁释放）"; pass=$((pass+1))
@@ -514,7 +514,7 @@ grep -q -- "--effort high" "$MOCK_DIR/calls.log" && echo "  ✔ 修复调用传�
 
 echo "== 场景30: 修复闭环——超轮限挂 held 升级卡不再自动修 =="
 # 手工造一张已到第 3 轮的修复卡(带 review-after),模拟循环打转到轮限
-python3 - "$BIDE_ROOT" "$PROJ" <<'PYEOF'
+python3 - "$CARDEX_ROOT" "$PROJ" <<'PYEOF'
 import json,sys,os
 root,proj=sys.argv[1],sys.argv[2]
 tid="t9999-0000-fx03"
@@ -540,7 +540,7 @@ assert "交叉B 独立性(不持甲结论字段)+与甲同题" "one(x_role='B').
 assert "交叉A 结论不落 LastSummary(不暴露 list 摘要)" "one(x_role='A')['status']=='done' and (one(x_role='A').get('last_summary') in (None,''))"
 # B1 被动暴露最小化:甲结论从 A 的日志抹除(codex read-only 读全盘,logs/<A>.log 是最直白的被动泄漏面)
 AID=$("$BIN" list -json | python3 -c "import json,sys;print([t['id'] for t in json.load(sys.stdin) if t.get('x_role')=='A'][0])")
-grep -q "已隔离" "$BIDE_ROOT/logs/$AID.log" && ! grep -q "step ok" "$BIDE_ROOT/logs/$AID.log" && echo "  ✔ 交叉A 结论已从日志抹除(被动暴露最小化)" && pass=$((pass+1)) || { echo "  ✖ 交叉A 结论仍暴露在 logs/<A>.log"; fail=$((fail+1)); }
+grep -q "已隔离" "$CARDEX_ROOT/logs/$AID.log" && ! grep -q "step ok" "$CARDEX_ROOT/logs/$AID.log" && echo "  ✔ 交叉A 结论已从日志抹除(被动暴露最小化)" && pass=$((pass+1)) || { echo "  ✖ 交叉A 结论仍暴露在 logs/<A>.log"; fail=$((fail+1)); }
 assert "交叉C 自动派出并由 codex(引擎乙)完成" "one(x_role='C')['status']=='done' and one(x_role='C')['runner']=='codex'"
 assert "交叉C 合并注入 甲结论+乙结论+任务" "'step ok' in one(x_role='C')['prompts'][0] and 'codex done' in one(x_role='C')['prompts'][0] and 'XCHECK_TASK_MARKER' in one(x_role='C')['prompts'][0]"
 assert "交叉C 落进度报告(键=不透明链ID,非A卡ID)" "one(x_role='C')['progress_key']==one(x_role='A')['x_key'] and one(x_role='A')['x_key']!=one(x_role='A')['id'] and one(x_role='C')['emit_progress']==True"
@@ -553,7 +553,7 @@ else echo "  ✖ B7:prompt 未经 stdin 送达 codex"; fail=$((fail+1)); fi
 
 echo "== 场景32: 交叉A(claude引擎)在 claude 冷却 + codex_fallback 下绝不降级 codex(独立性护栏) =="
 # 若 A 被降级到 codex,则甲乙同引擎、交叉验证形同虚设——A 必须排队等 claude 窗口。
-python3 - "$BIDE_ROOT/config.json" <<'PYEOF'
+python3 - "$CARDEX_ROOT/config.json" <<'PYEOF'
 import json,sys,time
 p=sys.argv[1]; c=json.load(open(p))
 c["codex_fallback"]=True; c["codex_model"]="codex-test-model"
@@ -568,9 +568,9 @@ grep -q "codex call" "$MOCK_DIR/codex-calls.log" && { echo "  ✖ 交叉A 被错
 
 echo "== 场景33: codex 钉定卡在 codex 不可用时绝不 fail-open 到 claude(引擎身份冻结) =="
 # codex_bin 就位时入队钉定卡→抽走 codex_bin→清冷却让 claude 可用→跑一轮：卡须排队,绝不落 claude。
-rm -f "$BIDE_ROOT/cooldown.json"
+rm -f "$CARDEX_ROOT/cooldown.json"
 "$BIN" add -dir "$PROJ" -runner codex -title pin-freeze -priority 9 "codex-only frozen work" >/dev/null
-python3 - "$BIDE_ROOT/config.json" <<'PYEOF'
+python3 - "$CARDEX_ROOT/config.json" <<'PYEOF'
 import json,sys
 p=sys.argv[1]; c=json.load(open(p)); c["codex_bin"]=""  # 抽走 codex
 json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
@@ -582,13 +582,13 @@ grep -q "codex-only frozen work" "$MOCK_DIR/calls.log" && { echo "  ✖ 钉定�
 
 echo "== 场景34: codex 瞬时网络失败——取真错误(跨过横幅)+判 transient 退避重试,不烧成硬失败 =="
 # 单腿审核可靠性的根:codex 失败别一律显示 "Reading additional input from stdin"(横幅),别把瞬时网络当硬失败。
-python3 - "$BIDE_ROOT/config.json" "$PWD/test/mock-codex.sh" <<'PYEOF'
+python3 - "$CARDEX_ROOT/config.json" "$PWD/test/mock-codex.sh" <<'PYEOF'
 import json,sys
 p,mock=sys.argv[1],sys.argv[2]; c=json.load(open(p))
 c["codex_bin"]=mock; c["codex_model"]="codex-test-model"
 json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
 PYEOF
-rm -f "$BIDE_ROOT/cooldown.json"
+rm -f "$CARDEX_ROOT/cooldown.json"
 echo 0 > "$MOCK_DIR/codex-n"; touch "$MOCK_DIR/codex-fail-all"   # 本轮所有 codex 调用一律网络失败(确定性,不受 drain 顺序影响)
 "$BIN" add -dir "$PROJ" -runner codex -title codex-netfail -priority 9 "codex single-leg work" >/dev/null
 "$BIN" run -quiet >/dev/null 2>&1

@@ -10,8 +10,8 @@ import (
 
 // 【BD-44 改名】数据根解析顺序与 env 双读的回归。
 //
-// 为什么这组用例值钱：改名当天全世界的数据都还在 ~/.claudego。解析顺序写错一格，bide 就会在
-// 一个空的 ~/.bide 上开张——队列看着零卡、launchd 照常 tick、旧根里在跑的活没人管。这是"看起来
+// 为什么这组用例值钱：改名当天全世界的数据都还在 ~/.claudego。解析顺序写错一格，cardex 就会在
+// 一个空的 ~/.cardex 上开张——队列看着零卡、launchd 照常 tick、旧根里在跑的活没人管。这是"看起来
 // 正常、实则整队丢失"的失败模式，比崩掉难查得多。故逐档钉死顺序，每一档配一个反例。
 
 // captureStderr 跑 fn 并返回它写到 os.Stderr 的内容。
@@ -62,8 +62,8 @@ func clearRootEnv(t *testing.T) {
 }
 
 func TestDefaultRootResolutionOrder(t *testing.T) {
-	// ① BIDE_ROOT 最高优先：即便旧名也设了、即便 home 下两个根都在，也认它。
-	t.Run("BIDE_ROOT 优先于 CLAUDEGO_ROOT", func(t *testing.T) {
+	// ① CARDEX_ROOT 最高优先：即便旧名也设了、即便 home 下两个根都在，也认它。
+	t.Run("CARDEX_ROOT 优先于 CLAUDEGO_ROOT", func(t *testing.T) {
 		resetLegacyWarnState()
 		home := t.TempDir()
 		t.Setenv("HOME", home)
@@ -72,7 +72,7 @@ func TestDefaultRootResolutionOrder(t *testing.T) {
 		t.Setenv(envRoot, "/tmp/new-root")
 		t.Setenv(envRootLegacy, "/tmp/old-root")
 		if got := defaultRoot(); got != "/tmp/new-root" {
-			t.Fatalf("BIDE_ROOT 必须压过 CLAUDEGO_ROOT 与 home 探测, got %q", got)
+			t.Fatalf("CARDEX_ROOT 必须压过 CLAUDEGO_ROOT 与 home 探测, got %q", got)
 		}
 	})
 
@@ -93,7 +93,7 @@ func TestDefaultRootResolutionOrder(t *testing.T) {
 		}
 	})
 
-	// ③ 无 env + ~/.bide 存在 → 用新根（哪怕旧根也在）。
+	// ③ 无 env + ~/.cardex 存在 → 用新根（哪怕旧根也在）。
 	t.Run("两根都在时优先新根", func(t *testing.T) {
 		resetLegacyWarnState()
 		home := t.TempDir()
@@ -103,12 +103,12 @@ func TestDefaultRootResolutionOrder(t *testing.T) {
 		mustMkdir(t, newRoot)
 		mustMkdir(t, filepath.Join(home, legacyRootDirName))
 		if got := defaultRoot(); got != newRoot {
-			t.Fatalf("~/.bide 存在时必须用它, got %q want %q", got, newRoot)
+			t.Fatalf("~/.cardex 存在时必须用它, got %q want %q", got, newRoot)
 		}
 	})
 
 	// ④ 无 env + 只有 ~/.claudego → 认旧根并提示 migrate。
-	//    这是本组最关键的一条：若这里返回 ~/.bide，改名当天就是整队"消失"。
+	//    这是本组最关键的一条：若这里返回 ~/.cardex，改名当天就是整队"消失"。
 	t.Run("只有旧根则认旧根并提示 migrate", func(t *testing.T) {
 		resetLegacyWarnState()
 		home := t.TempDir()
@@ -122,12 +122,12 @@ func TestDefaultRootResolutionOrder(t *testing.T) {
 			t.Fatalf("只有 ~/.claudego 时必须认它(否则改名当天整队看着为空), got %q want %q", got, legacy)
 		}
 		if !strings.Contains(errOut, "migrate") {
-			t.Fatalf("用 legacy root 必须提示 bide migrate, stderr=%q", errOut)
+			t.Fatalf("用 legacy root 必须提示 cardex migrate, stderr=%q", errOut)
 		}
 	})
 
 	// ⑤ 全新装机（两个都不存在）→ 新名默认。
-	t.Run("全新装机落 ~/.bide", func(t *testing.T) {
+	t.Run("全新装机落 ~/.cardex", func(t *testing.T) {
 		resetLegacyWarnState()
 		home := t.TempDir()
 		t.Setenv("HOME", home)
@@ -151,7 +151,7 @@ func TestDefaultRootResolutionOrder(t *testing.T) {
 		}
 	})
 
-	// ⑦ 同名文件（非目录）不算"存在"：~/.bide 若是个文件，必须继续往下认旧根，
+	// ⑦ 同名文件（非目录）不算"存在"：~/.cardex 若是个文件，必须继续往下认旧根，
 	//    否则会把数据根指到一个 MkdirAll 必然失败的路径上。
 	t.Run("同名文件不算数据根", func(t *testing.T) {
 		resetLegacyWarnState()
@@ -166,7 +166,7 @@ func TestDefaultRootResolutionOrder(t *testing.T) {
 		var got string
 		_ = captureStderr(t, func() { got = defaultRoot() })
 		if got != legacy {
-			t.Fatalf("~/.bide 是普通文件时应继续认旧根, got %q", got)
+			t.Fatalf("~/.cardex 是普通文件时应继续认旧根, got %q", got)
 		}
 	})
 }

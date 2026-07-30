@@ -421,20 +421,20 @@ func taskLogPath(root, id string) string { return filepath.Join(logsDir(root), i
 
 // rootDirName / legacyRootDirName 是数据根在 $HOME 下的目录名（BD-44 改名）。
 const (
-	rootDirName       = ".bide"
+	rootDirName       = ".cardex"
 	legacyRootDirName = ".claudego"
 )
 
 // defaultRoot 解析数据根，顺序（-root flag 由 resolveRoot 在更外层优先处理）：
 //
-//	$BIDE_ROOT > $CLAUDEGO_ROOT(兼容读,提示一次) > ~/.bide(存在则用) > ~/.claudego(存在则用+提示) > ~/.bide(全新默认)
+//	$CARDEX_ROOT > $CLAUDEGO_ROOT(兼容读,提示一次) > ~/.cardex(存在则用) > ~/.claudego(存在则用+提示) > ~/.cardex(全新默认)
 //
-// 【为什么"存在才用"而不是无条件切到 ~/.bide】改名当天所有人的数据都还在 ~/.claudego。
-// 无条件切新路径会让 bide 在一个空目录上开张：队列看着一张卡都没有、launchd 照常 tick、
+// 【为什么"存在才用"而不是无条件切到 ~/.cardex】改名当天所有人的数据都还在 ~/.claudego。
+// 无条件切新路径会让 cardex 在一个空目录上开张：队列看着一张卡都没有、launchd 照常 tick、
 // 旧根里在跑的活没人管——这是最坏的失败模式（看起来正常，实则整队丢失）。所以新根不存在时
-// 认旧根，并明说"legacy root，建议 bide migrate"，把切换点交给人。
+// 认旧根，并明说"legacy root，建议 cardex migrate"，把切换点交给人。
 //
-// 【为什么两个都不存在时落 ~/.bide】那是全新装机，没有历史包袱，直接用新名。
+// 【为什么两个都不存在时落 ~/.cardex】那是全新装机，没有历史包袱，直接用新名。
 func defaultRoot() string {
 	if v := getenvCompat(envRoot, envRootLegacy); v != "" {
 		return v
@@ -463,7 +463,7 @@ var legacyRootWarnOnce sync.Once
 
 func warnLegacyRootOnce(legacy string) {
 	legacyRootWarnOnce.Do(func() {
-		fmt.Fprintf(os.Stderr, "提示: 正在使用改名前的数据根 %s（legacy root）。迁移到 %s 请运行: bide migrate\n",
+		fmt.Fprintf(os.Stderr, "提示: 正在使用改名前的数据根 %s（legacy root）。迁移到 %s 请运行: cardex migrate\n",
 			legacy, filepath.Join(filepath.Dir(legacy), rootDirName))
 	})
 }

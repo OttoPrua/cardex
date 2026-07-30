@@ -33,8 +33,8 @@ import (
 // syncScriptsRoot 返回 ~/.claudego 绝对路径。所有脚本共用一份装机版,测试与生产同源。
 //
 // 【CG-R2 R1·2026-07-23】环境变量升级门:
-//   - 缺省(未设 CLAUDEGO_REQUIRE_SYNC_SCRIPTS):脚本缺失 → t.Skipf 兜底(CI/异环境不报红)。
-//   - CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1:脚本缺失 → t.Fatal 显式红,防上一轮"装机缺失全跳过、
+//   - 缺省(未设 CARDEX_REQUIRE_SYNC_SCRIPTS):脚本缺失 → t.Skipf 兜底(CI/异环境不报红)。
+//   - CARDEX_REQUIRE_SYNC_SCRIPTS=1:脚本缺失 → t.Fatal 显式红,防上一轮"装机缺失全跳过、
 //     套件仍绿、对护栏部署状态零证明力"的静默漂绿。已装机机器/装机验收流水必设此变量。
 //   - 【R2·P1-3】仓内验收入口 `make accept-sync` 硬编码 env=1,收工汇报引用其实跑输出;
 //     另有 TestSyncScriptsInstalled 哨兵测试,不依赖装机,单独探测装机情况;env=1 时它就是最后的红线。
@@ -46,7 +46,7 @@ func syncScriptsRoot(t *testing.T) string {
 		t.Fatalf("UserHomeDir: %v", err)
 	}
 	d := filepath.Join(home, ".claudego")
-	requireEnv := os.Getenv("CLAUDEGO_REQUIRE_SYNC_SCRIPTS") == "1"
+	requireEnv := getenvCompat(envRequireSyncScripts, envRequireSyncScriptsLegacy) == "1"
 	// .sh 系必须可执行;.ps1 只需存在(PowerShell 靠扩展名调用,无执行位)。
 	needExec := map[string]bool{
 		"sync-lane-to-5090.sh":          true,
@@ -59,9 +59,9 @@ func syncScriptsRoot(t *testing.T) string {
 		fi, err := os.Stat(p)
 		if err != nil {
 			if requireEnv {
-				t.Fatalf("装机脚本 %s 缺失 (%v)——CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 下必须存在", p, err)
+				t.Fatalf("装机脚本 %s 缺失 (%v)——CARDEX_REQUIRE_SYNC_SCRIPTS=1 下必须存在", p, err)
 			}
-			t.Skipf("跳过:装机脚本 %s 缺失 (%v)——本卡验收依赖 ~/.claudego 就位;要在目标环境显式红请设 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1", p, err)
+			t.Skipf("跳过:装机脚本 %s 缺失 (%v)——本卡验收依赖 ~/.claudego 就位;要在目标环境显式红请设 CARDEX_REQUIRE_SYNC_SCRIPTS=1", p, err)
 		}
 		if needExec[name] && fi.Mode()&0o111 == 0 {
 			t.Fatalf("装机脚本 %s 无执行权限(chmod +x)", p)
@@ -71,7 +71,7 @@ func syncScriptsRoot(t *testing.T) string {
 }
 
 // TestSyncScriptsInstalled 哨兵:不依赖装机脚本本体运行,单独探测装机情况。
-// 缺省报告缺失清单但不 fail(避免异环境噪音);CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 时缺失即红。
+// 缺省报告缺失清单但不 fail(避免异环境噪音);CARDEX_REQUIRE_SYNC_SCRIPTS=1 时缺失即红。
 //
 // 【R1 目的】上一轮 P1-1 的根因是"5 个装机依赖用例在缺失时全部 Skip 但套件绿,对护栏部署状态零证明力"。
 // 该哨兵在装机验收流水(设 env=1)下能捕获脚本漂移/漏装/权限漂;缺省仍不吵闹。
@@ -82,7 +82,7 @@ func TestSyncScriptsInstalled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UserHomeDir: %v", err)
 	}
-	requireEnv := os.Getenv("CLAUDEGO_REQUIRE_SYNC_SCRIPTS") == "1"
+	requireEnv := getenvCompat(envRequireSyncScripts, envRequireSyncScriptsLegacy) == "1"
 	needExec := map[string]bool{
 		"sync-lane-to-5090.sh":          true,
 		"workspace-fingerprint.sh":      true,
@@ -117,7 +117,7 @@ func TestSyncScriptsInstalled(t *testing.T) {
 		t.Fatal(msg)
 	}
 	// 未设 env=1 只作提示,不 fail(异环境如未装机 CI 不吵)。
-	t.Log("提示(非致命):" + msg + " —— 要目标环境显式红请设 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1")
+	t.Log("提示(非致命):" + msg + " —— 要目标环境显式红请设 CARDEX_REQUIRE_SYNC_SCRIPTS=1")
 }
 
 // mkSyncSourceRepo 造一个含"已提交 + dirty tracked + untracked + gitignored"四类文件的源仓,
@@ -174,9 +174,15 @@ func runSyncLocal(t *testing.T, src, mroot string) (stdout, stderr string, exitC
 	scripts := syncScriptsRoot(t)
 	cmd := exec.Command("bash", filepath.Join(scripts, "sync-lane-to-5090.sh"))
 	cmd.Dir = src
+	// 【BD-44 改名过渡期:新旧名同时下发】被调方 ~/.claudego/sync-lane-to-5090.sh 属"跨机指纹
+	// 工件族",本轮 qmthost/5090 镜像端零改动(BD-44 §2.2),脚本里仍只读 CLAUDEGO_* 旧名。
+	// 只发新名 = 脚本读不到 MODE → 走 ssh 默认分支去连真镜像机,本地模拟用例当场崩;
+	// 只发旧名 = 脚本改名那天这里又得回来改。两个都发,任一侧先改都不断。
 	cmd.Env = append(os.Environ(),
-		"CLAUDEGO_SYNC_MIRROR_MODE=local",
-		"CLAUDEGO_SYNC_LOCAL_MIRROR_ROOT="+mroot,
+		envSyncMirrorMode+"=local",
+		envSyncLocalMirrorRoot+"="+mroot,
+		envSyncMirrorModeLegacy+"=local",
+		envSyncLocalMirrorRootLegacy+"="+mroot,
 	)
 	var outBuf, errBuf bytes.Buffer
 	cmd.Stdout = &outBuf
@@ -363,8 +369,11 @@ func TestSyncFailsWhenFingerprintScriptMissing(t *testing.T) {
 	cmd.Env = []string{
 		"HOME=" + fakeHome,
 		"PATH=" + os.Getenv("PATH"),
-		"CLAUDEGO_SYNC_MIRROR_MODE=local",
-		"CLAUDEGO_SYNC_LOCAL_MIRROR_ROOT=" + mroot,
+		// 新旧名同时下发,理由同 runSyncLocal(镜像端脚本本轮冻在旧名)。
+		envSyncMirrorMode + "=local",
+		envSyncLocalMirrorRoot + "=" + mroot,
+		envSyncMirrorModeLegacy + "=local",
+		envSyncLocalMirrorRootLegacy + "=" + mroot,
 	}
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
@@ -820,14 +829,14 @@ func TestSyncDistributesPowerShellVerifyScript(t *testing.T) {
 }
 
 // ⑭ 【R2 P1-3 反例·仓内验收入口】仓内必须有 `make accept-sync` 目标,把
-// CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 硬编码到验收路径 —— 否则 Skip 静默漂绿在缺省路径原样存在。
+// CARDEX_REQUIRE_SYNC_SCRIPTS=1 硬编码到验收路径 —— 否则 Skip 静默漂绿在缺省路径原样存在。
 //
 // 【R1 遗漏】env=1 只是"约定俗成设一下"，无仓内验收入口挂钩,收工汇报无法引用具体命令的实跑输出。
 // 【R2 修法】Makefile 提供 accept-sync 目标,go test 假 Skip 无处遁形。
 // 本用例断言 Makefile 含该目标及必需 env 硬编码。
 //
 // 【杀的突变】① 删掉 Makefile 里 accept-sync 段 → 本用例红;
-// ② 该目标里去掉 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 → 关键字缺失红。
+// ② 该目标里去掉 CARDEX_REQUIRE_SYNC_SCRIPTS=1 → 关键字缺失红。
 func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 	// 定位仓根:测试文件位于 <repo>/reviewsync_workspace_test.go,cwd 就是 <repo>。
 	repoRoot, err := os.Getwd()
@@ -864,7 +873,7 @@ func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 
 	must := []string{
 		"accept-sync:",                    // 目标声明
-		"CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1", // 硬编码 env
+		"CARDEX_REQUIRE_SYNC_SCRIPTS=1", // 硬编码 env
 		"go test",                         // 触发验收测试
 		// 【CG-R2b R2·2026-07-24】pattern 必须覆盖 DesignReview 类装机模板断言;
 		// 首证 t0724-2033-0a20 P1-1:pattern 仅 'Sync|Verify' 时
@@ -886,7 +895,7 @@ func TestVerifyAcceptSyncMakefileTargetExists(t *testing.T) {
 // 【为什么单独立测】TestVerifyAcceptSyncMakefileTargetExists 只锁"pattern 里含 DesignReview 字面",
 // 未来若新增第 4/5 个 env=1-gated 测试(名字不带 Sync/Verify/DesignReview),仍会静默漂绿
 // (复刻本轮 P1-1 病类)。本挡动态枚举文件里所有 Test* 函数,只要函数体或其传递依赖的助手
-// (syncScriptsRoot/runSyncLocal/runVerify)引用了 CLAUDEGO_REQUIRE_SYNC_SCRIPTS,就必须能被
+// (syncScriptsRoot/runSyncLocal/runVerify)引用了 CARDEX_REQUIRE_SYNC_SCRIPTS,就必须能被
 // Makefile 的 -run pattern 匹上;匹不上 → 红。加装机测试却忘同步 pattern → 本挡红。
 //
 // 【R3 兄弟洞闭合】旧版 FindStringSubmatch 只取第一处出现位——若 accept-sync:26 是 @echo 展示行
@@ -944,10 +953,10 @@ func TestAcceptSyncMakefilePatternCoversAllEnvGatedTests(t *testing.T) {
 	}
 	src := string(self)
 
-	// 已知 env=1-gated 助手(引用 CLAUDEGO_REQUIRE_SYNC_SCRIPTS,或传递依赖它的 helper):
+	// 已知 env=1-gated 助手(引用 CARDEX_REQUIRE_SYNC_SCRIPTS,或传递依赖它的 helper):
 	// syncScriptsRoot 直接读 env;runSyncLocal 与 runVerify 传递调用 syncScriptsRoot。
 	envGatedHelpers := []string{
-		"CLAUDEGO_REQUIRE_SYNC_SCRIPTS",
+		"CARDEX_REQUIRE_SYNC_SCRIPTS",
 		"syncScriptsRoot(",
 		"runSyncLocal(",
 		"runVerify(",
@@ -1014,7 +1023,7 @@ func TestAcceptSyncMakefilePatternCoversAllEnvGatedTests(t *testing.T) {
 
 // ⑱ 【CG-R2b R3·2026-07-24 类闭合】accept-sync 目标的 exec 执行行本身必须携带完整 -run pattern——
 // "非执行位满足护栏"病类的正面锚定挡:直接锁定"tab-indented 且非 @echo/@printf 展示位"的
-// 那一行,断言它自带 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 与 -run '<全 pattern>' 的完整表达。
+// 那一行,断言它自带 CARDEX_REQUIRE_SYNC_SCRIPTS=1 与 -run '<全 pattern>' 的完整表达。
 //
 // 【为什么再加一挡】⑯ 靠"全量提取 -run 出现位并断言一致"消灭分裂,但若把 exec 行整段 -run 拆走
 // (只留 @echo 展示行) → 全量提取只剩 @echo 里那一处 → 一致性成立 → coverage 检查仍绿 → 逃逸。
@@ -1023,7 +1032,7 @@ func TestAcceptSyncMakefilePatternCoversAllEnvGatedTests(t *testing.T) {
 // 【exec 行识别规则】
 //   - Makefile recipe 行必须以 tab 起头;
 //   - 剥 tab + 可选 `@` 后,首命令 token 若为 echo/printf,是展示位,跳过;
-//   - 剩下的 recipe 行,若含 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 与 `go test`,即为 exec 执行行;
+//   - 剩下的 recipe 行,若含 CARDEX_REQUIRE_SYNC_SCRIPTS=1 与 `go test`,即为 exec 执行行;
 //   - 该行必须整体含 `-run '<pattern>'` 且 pattern 与全量首匹配一致。
 //
 // 【杀的突变】
@@ -1062,13 +1071,13 @@ func TestAcceptSyncExecutionLineCarriesRunPattern(t *testing.T) {
 			cmd == "echo" || cmd == "printf" {
 			continue // 展示位,跳过
 		}
-		if strings.Contains(trimmed, "CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1") &&
+		if strings.Contains(trimmed, "CARDEX_REQUIRE_SYNC_SCRIPTS=1") &&
 			strings.Contains(trimmed, "go test") {
 			execLines = append(execLines, trimmed)
 		}
 	}
 	if len(execLines) == 0 {
-		t.Fatalf("找不到 accept-sync 的 exec 执行行(tab-indented 非-@echo 且含 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 与 go test) ——\n"+
+		t.Fatalf("找不到 accept-sync 的 exec 执行行(tab-indented 非-@echo 且含 CARDEX_REQUIRE_SYNC_SCRIPTS=1 与 go test) ——\n"+
 			"可能 recipe 被拆走了或被伪装成 @echo 展示位;R3 类闭合逃逸场景③命中。Makefile body:\n%s", string(mkBody))
 	}
 	// exec 行必须自带完整 -run '<pattern>' 且 pattern 与全量首匹配一致。
@@ -1415,11 +1424,11 @@ func TestDesignReviewAndFixCycleTemplatesEmbedContractContent(t *testing.T) {
 		}
 	}
 
-	// (c) CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 下再断言装机副本 ~/.claudego/templates/*.md 也含上述片段
+	// (c) CARDEX_REQUIRE_SYNC_SCRIPTS=1 下再断言装机副本 ~/.claudego/templates/*.md 也含上述片段
 	//    (装机验收流水的显式红线;缺省不吵异环境)。
-	requireEnv := os.Getenv("CLAUDEGO_REQUIRE_SYNC_SCRIPTS") == "1"
+	requireEnv := getenvCompat(envRequireSyncScripts, envRequireSyncScriptsLegacy) == "1"
 	if !requireEnv {
-		t.Log("提示(非致命):设 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 可对 ~/.claudego 装机副本追加同源断言")
+		t.Log("提示(非致命):设 CARDEX_REQUIRE_SYNC_SCRIPTS=1 可对 ~/.claudego 装机副本追加同源断言")
 		return
 	}
 	home, err := os.UserHomeDir()
@@ -1430,7 +1439,7 @@ func TestDesignReviewAndFixCycleTemplatesEmbedContractContent(t *testing.T) {
 		p := filepath.Join(home, ".claudego", "templates", name+".md")
 		body, err := os.ReadFile(p)
 		if err != nil {
-			t.Fatalf("装机模板 %s 缺失或不可读 (%v) —— CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 下必须存在", p, err)
+			t.Fatalf("装机模板 %s 缺失或不可读 (%v) —— CARDEX_REQUIRE_SYNC_SCRIPTS=1 下必须存在", p, err)
 		}
 		var must []string
 		if name == "design-review" {

@@ -26,13 +26,13 @@ install-shim: install
 	ln -sf $(PREFIX)/bide $(PREFIX)/claudego
 	@echo "已建兼容软链 $(PREFIX)/claudego -> $(PREFIX)/bide（过渡期用;改名收尾后可 rm 掉）"
 
-# 【CG-R2 R2·P1-3】仓内验收入口:硬编码 CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 下跑同步/指纹用例。
+# 【CG-R2 R2·P1-3】仓内验收入口:硬编码 CARDEX_REQUIRE_SYNC_SCRIPTS=1 下跑同步/指纹用例。
 # 缺省 go test 在未装机机器上会 Skip → 套件绿但对护栏部署状态零证明力(上一轮 P1 静默漂绿)。
 # 装机验收流水/收工汇报请引用 `make accept-sync` 的实跑输出而非 `go test ./...` 的绿。
 # 【CG-R2b R2·2026-07-24】pattern 追加 DesignReview,覆盖 TestDesignReviewAndFixCycleTemplatesEmbedContractContent
 # 的 (c) 段装机副本断言;pattern 覆盖度由 TestAcceptSyncMakefilePatternCoversAllEnvGatedTests 动态自校。
 accept-sync:
-	@echo "==> accept-sync: CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify|DesignReview' -count=1 -v"
-	CLAUDEGO_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify|DesignReview' -count=1 -v ./...
+	@echo "==> accept-sync: CARDEX_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify|DesignReview' -count=1 -v"
+	CARDEX_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify|DesignReview' -count=1 -v ./...
 
 .PHONY: build test vet install install-shim accept-sync

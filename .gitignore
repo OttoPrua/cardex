@@ -1,8 +1,8 @@
 bin/
 .serena/
 tmp/
-/bide
-/bide.exe
+/cardex
+/cardex.exe
 /claudego
 /claudego.exe
 .DS_Store

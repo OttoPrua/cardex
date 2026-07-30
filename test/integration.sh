@@ -4,8 +4,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-go build -o bin/bide .
-BIN="$PWD/bin/bide"
+go build -o bin/cardex .
+BIN="$PWD/bin/cardex"
 
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT

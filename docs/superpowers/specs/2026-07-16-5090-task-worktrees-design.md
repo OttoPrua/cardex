@@ -1,5 +1,7 @@
 # 5090 独立任务 Worktree 设计
 
+> 注：产品已于 2026-07-31 更名 cardex（BD-44）；下文 claudego/ClaudeGo 均指现 cardex。
+
 ## 目标
 
 把尚未启动及后续适合远端执行的 ClaudeGo 卡放到 win5090 的独立 Git worktree 中运行，允许同一 Mac lane 的任务并行协作，同时保证：

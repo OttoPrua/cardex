@@ -1,4 +1,4 @@
-# ClaudeGo 进阶指南
+# cardex 进阶指南
 
 **中文** | [English](guide.en.md) · 返回 [README](../README.md)
 
@@ -11,27 +11,27 @@
 
 ```bash
 # 0) 找会话：列出某项目最近的 claude 会话（桌面端 + CLI 同池），拿到会话 ID
-claudego sessions -dir ~/Projects/myapp
+cardex sessions -dir ~/Projects/myapp
 
-# 1) 回收进度。交互式会话（含桌面端）：打印"整理进度"prompt，贴进去后报告自动写回 ~/.claudego/progress/
-claudego brief -dir ~/Projects/myapp -title 鉴权重构
+# 1) 回收进度。交互式会话（含桌面端）：打印"整理进度"prompt，贴进去后报告自动写回 ~/.cardex/progress/
+cardex brief -dir ~/Projects/myapp -title 鉴权重构
 #    有会话 ID 的（队列任务 / sessions 列出的桌面会话）：入队 haiku 回收任务，全自动
-claudego brief -id t0705-xxxx -auto
-claudego brief -session <session-id> -dir ~/Projects/myapp -auto
+cardex brief -id t0705-xxxx -auto
+cardex brief -session <session-id> -dir ~/Projects/myapp -auto
 
 # 2) 分工。协调任务运行时注入实时队列快照 + 全部进度报告，
 #    产出：人话分工说明（每个任务做什么/建议模型/手动接管命令，留在 log 里）
 #    + 分工任务自动入队（带 model 字段，被依赖的 priority 更高，可续跑的带 session_id）
-claudego plan -dir ~/Projects/myapp "本周把上传模块收尾并补齐测试"
+cardex plan -dir ~/Projects/myapp "本周把上传模块收尾并补齐测试"
 
 # 3) 自动推进：launchd/daemon 照常 tick，按模型建议逐个执行；随时查看与接管
-claudego list                 # 看分工执行到哪了（标题列＝“标题 ▸ 最新进度”）
-claudego log <协调任务ID>      # 看人话分工说明
-claudego cmd <id>             # 想手动接管某任务：打印 claude 命令 + 当前步骤 prompt（先 hold）
-claudego progress             # 进度一览（“现状”列看进展）；-show <KEY> 人读渲染、-in 手动导入
+cardex list                 # 看分工执行到哪了（标题列＝“标题 ▸ 最新进度”）
+cardex log <协调任务ID>      # 看人话分工说明
+cardex cmd <id>             # 想手动接管某任务：打印 claude 命令 + 当前步骤 prompt（先 hold）
+cardex progress             # 进度一览（“现状”列看进展）；-show <KEY> 人读渲染、-in 手动导入
 ```
 
-**看板即进度**：`claudego list` 的标题列显示每个任务的「标题 ▸ 最新进度」（优先取已回收进度报告的现状，没有则回落到最近一步输出的自动摘要）；`claudego progress` 列表带独立的「现状」列，`progress -show <KEY>` 改为人读渲染（目标/进行中/完成/剩余/阻塞/关键文件，几千字接力 prompt 默认折叠、`-full` 展开）——一眼读出进展，不再是静态标题。
+**看板即进度**：`cardex list` 的标题列显示每个任务的「标题 ▸ 最新进度」（优先取已回收进度报告的现状，没有则回落到最近一步输出的自动摘要）；`cardex progress` 列表带独立的「现状」列，`progress -show <KEY>` 改为人读渲染（目标/进行中/完成/剩余/阻塞/关键文件，几千字接力 prompt 默认折叠、`-full` 展开）——一眼读出进展，不再是静态标题。
 
 **模型路由**：任务带 `model` 字段则以 `--model` 执行（订阅限额按模型加权，例行工作路由到
 sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-model`，协调任务的分工输出里
@@ -55,7 +55,7 @@ sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-mode
   协调模板已内建三段式规约：开工读状态文件 → 只做一个增量 → 收工更新状态文件与任务清单。
 - 好处：永不撞会话上下文上限（"Prompt is too long" 类失败绝迹）、限额中断后直接重发本步开新会话
   （无需续跑提示）、codex 备用执行器可接管**任意一步**（不再限单步任务）、审计友好（状态变更全在 git 里）。
-- `plan -hold` / `assemble -hold`：分工产出的任务先挂起（held），人工审完 `claudego release <id>` 放行——
+- `plan -hold` / `assemble -hold`：分工产出的任务先挂起（held），人工审完 `cardex release <id>` 放行——
   "拆分 → 把关 → 推进 → 审核 → 更新状态" 的完整循环。
 
 ### 审核分流（把只读审核负载摊到第二台机器）
@@ -78,16 +78,16 @@ sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-mode
 设计档模型（fable）撞周限额时，用两个**不同**引擎对同一 fable 级任务（设计/审核/裁决/追认）各自独立作答，再让第二个引擎拿第一个的结论对抗式查漏——两份独立视角比一个更难被同一盲点带偏：
 
 ```bash
-claudego cross -dir ~/Projects/myapp "某配置键缺省时的契约语义，请裁决"   # 用默认引擎对
-claudego cross -profile my-pair -dir ~/Projects/myapp "..."             # 换成你在 cross_profiles 里自定义的对
-claudego cross -list                                                     # 看可用引擎对
+cardex cross -dir ~/Projects/myapp "某配置键缺省时的契约语义，请裁决"   # 用默认引擎对
+cardex cross -profile my-pair -dir ~/Projects/myapp "..."             # 换成你在 cross_profiles 里自定义的对
+cardex cross -list                                                     # 看可用引擎对
 ```
 
 事件驱动三卡链，只需入队 A，B/C 自动衔接：
 
 - **A**：引擎甲独立作答（第一性原理 + 对抗式自审），产出结论 A；
-- **B**：A 完成后自动派出，引擎乙独立作答——**prompt 与 A 完全相同、不含 A 的结论**。甲结论落进 `~/.claudego/crosscheck/<链ID>.a` 隔离侧车（只由编排进程读写、`0600`、C 用完即删），既不进 B 的卡字段、也**不写进 A 或 B 的日志**（A 的结论日志被抹）；B 用的是与 A 卡 ID 无关的不透明链 ID，solo 模板还明令 B 不得读编排/状态目录。默认下 B 拿不到 A，是因为它**没被给、被明令别找**——**但这不是硬沙箱**：诚实说，B 卡里带着链 ID，而侧车路径由链 ID 确定性推导，所以那本质上是一个指向侧车的键；codex `--sandbox read-only` 又能读全盘，一个刻意搜索的执行器仍可能找到侧车。这里做到的是**被动暴露最小化 + 行为护栏**，真正的强隔离需限制执行器读权限（本工具不提供）；
-- **C**：B 完成后自动派出，引擎乙从侧车取回 A、连同 B **对抗式交叉查漏**（谁遗漏了什么 / 分歧点裁断 / 仅一方发现的盲点），产出合并结论并落进度报告（`claudego progress -show <链ID>` 取回，交你综合定稿）。
+- **B**：A 完成后自动派出，引擎乙独立作答——**prompt 与 A 完全相同、不含 A 的结论**。甲结论落进 `~/.cardex/crosscheck/<链ID>.a` 隔离侧车（只由编排进程读写、`0600`、C 用完即删），既不进 B 的卡字段、也**不写进 A 或 B 的日志**（A 的结论日志被抹）；B 用的是与 A 卡 ID 无关的不透明链 ID，solo 模板还明令 B 不得读编排/状态目录。默认下 B 拿不到 A，是因为它**没被给、被明令别找**——**但这不是硬沙箱**：诚实说，B 卡里带着链 ID，而侧车路径由链 ID 确定性推导，所以那本质上是一个指向侧车的键；codex `--sandbox read-only` 又能读全盘，一个刻意搜索的执行器仍可能找到侧车。这里做到的是**被动暴露最小化 + 行为护栏**，真正的强隔离需限制执行器读权限（本工具不提供）；
+- **C**：B 完成后自动派出，引擎乙从侧车取回 A、连同 B **对抗式交叉查漏**（谁遗漏了什么 / 分歧点裁断 / 仅一方发现的盲点），产出合并结论并落进度报告（`cardex progress -show <链ID>` 取回，交你综合定稿）。
 
 **模型来源可切换** = `config.cross_profiles` 里的命名引擎对（`default_cross_profile` 定默认）。默认 `opus-codex` = 甲 `claude opus·max` + 乙 `codex·max`（乙的具体模型由你的 `codex_model` 决定；两侧都跑各自最高标准思考档）。每个引擎的 `kind` 可选 `claude` / `codex` / `remote-claude` / `remote-codex`：
 
@@ -103,7 +103,7 @@ claudego cross -list                                                     # 看�
 
 - 引擎的 `effort` 是 claude / codex 共用的思考等级（claude → `--effort`，codex → `model_reasoning_effort`，同名同序 `low<medium<high<xhigh<max`），任务级覆盖全局 `codex_reasoning`；
 - `claude` 引擎要求指定 `model`、`codex` 引擎要求配好 `codex_bin` + `codex_model`（否则会跑成账号/CLI 默认模型、与 profile 宣称不符，命令直接报错，杜绝静默降级）；
-- 交叉卡是**只读分析**（读契约/源码/改动、不写业务仓）；**本机** codex 侧默认走一次性隔离副本 + `--sandbox workspace-write`（副本随卡即建即删,原仓永不受写污染,见"沙箱"段的 CG-R3 `codex_review_sandbox`）；**远端** codex 侧只在目录位于 `remote_mirror_root` 之下（sync-lane 分发的一次性镜像）时才放宽为 `workspace-write`,跑在真实业务仓（三卡共用工作目录时的常态）维持 `--sandbox read-only` 硬保证（CG-R3 R1 P0-1）；`-dir` 不能是 claudego 数据根或其子目录；
+- 交叉卡是**只读分析**（读契约/源码/改动、不写业务仓）；**本机** codex 侧默认走一次性隔离副本 + `--sandbox workspace-write`（副本随卡即建即删,原仓永不受写污染,见"沙箱"段的 CG-R3 `codex_review_sandbox`）；**远端** codex 侧只在目录位于 `remote_mirror_root` 之下（sync-lane 分发的一次性镜像）时才放宽为 `workspace-write`,跑在真实业务仓（三卡共用工作目录时的常态）维持 `--sandbox read-only` 硬保证（CG-R3 R1 P0-1）；`-dir` 不能是 cardex 数据根或其子目录；
 - 甲乙必须**同执行位置**（都在本机，或都在同一台 `remote_hosts` 主机）——三卡共用一个工作目录，跨机引擎对会被 `cross` 直接拒绝；
 - **护栏**：claude 冷却期即便开了 `codex_fallback`，claude 引擎的交叉卡也**绝不**被降级偷换成 codex，codex 钉定卡在 codex 不可用时也**绝不** fail-open 到 claude（否则甲乙同引擎、验证形同虚设）——引擎身份冻结，宁可排队等对应窗口。链任一步断裂会在母卡留痕（`list` 可见），不让单腿结果冒充终局。
 
@@ -114,22 +114,22 @@ claudego cross -list                                                     # 看�
 一个项目文件夹里已经养了一批长驻角色会话时，按角色分流：
 
 ```bash
-claudego sessions -dir ~/Projects/myapp        # 认领：按首条消息识别各角色会话，拿到 ID
+cardex sessions -dir ~/Projects/myapp        # 认领：按首条消息识别各角色会话，拿到 ID
 
 # 有在途工作的（执行/细化 session）→ 先收进度，再决定续跑还是重开
-claudego brief -session <ID> -auto             # 存量上下文提炼成进度报告（含 next_prompt）
-claudego adopt <ID> -dir ~/Projects/myapp      # 没做完的直接接管续跑
+cardex brief -session <ID> -auto             # 存量上下文提炼成进度报告（含 next_prompt）
+cardex adopt <ID> -dir ~/Projects/myapp      # 没做完的直接接管续跑
 
 # 角色会话本身 → 对应类型命令 + -session 挂载，新一轮工作续用老会话的积累
-claudego review   -session <老审核会话ID> "审查本周改动"
-claudego assemble -session <老装配会话ID> "下一个目标"
-claudego add -type sequence -session <老执行会话ID> -file 下一批步骤.md
+cardex review   -session <老审核会话ID> "审查本周改动"
+cardex assemble -session <老装配会话ID> "下一个目标"
+cardex add -type sequence -session <老执行会话ID> -file 下一批步骤.md
 
 # 或者放弃挂载：把老会话里沉淀的角色要求改进 templates/*.md，以后每轮全新开（上下文更便宜）
 ```
 
 注意：headless 续跑既有会话是**分叉**（fork 出新 session id，原桌面会话不受影响）；任务首轮跑完后，
-后续轮次应挂任务里最新的 session_id（`claudego list -json` 可见），或直接对同一任务追加步骤。
+后续轮次应挂任务里最新的 session_id（`cardex list -json` 可见），或直接对同一任务追加步骤。
 长驻会话上下文会越滚越贵，一般建议：知识沉淀进模板/进度报告，执行用短会话。
 
 ## Web 看板（board 命令）
@@ -137,13 +137,13 @@ claudego add -type sequence -session <老执行会话ID> -file 下一批步骤.m
 实时只读 kanban，本机浏览器访问。
 
 ```bash
-claudego board               # 默认 http://127.0.0.1:8787
-claudego board -port 9000    # 自定义端口
-claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
+cardex board               # 默认 http://127.0.0.1:8787
+cardex board -port 9000    # 自定义端口
+cardex board -ttl 30       # 任务快照缓存秒数（默认 10）
 ```
 
 三条纪律（不可破）：
-- **队列数据只读**：所有接口读 `~/.claudego` 仅经 `os.ReadFile` / `os.ReadDir`，`tasks/` / `archive/` / `events/` / 任务 JSON 一个字节都不写，绝不改任何任务状态。看板挂在生产队列数据上，误写会污染真实队列。唯一的写入是**看板自己的视图状态**：`POST /api/project/archive` 写 `~/.claudego/board_archive.json`（项目折叠状态，见下文「项目归档」）——它不参与调度、runner/tick/patrol 一概不读、删掉也不丢任何队列数据，所有 GET 路径仍是零写入。
+- **队列数据只读**：所有接口读 `~/.cardex` 仅经 `os.ReadFile` / `os.ReadDir`，`tasks/` / `archive/` / `events/` / 任务 JSON 一个字节都不写，绝不改任何任务状态。看板挂在生产队列数据上，误写会污染真实队列。唯一的写入是**看板自己的视图状态**：`POST /api/project/archive` 写 `~/.cardex/board_archive.json`（项目折叠状态，见下文「项目归档」）——它不参与调度、runner/tick/patrol 一概不读、删掉也不丢任何队列数据，所有 GET 路径仍是零写入。
 - **只听 127.0.0.1**：响应含 prompt 全文、目录路径、账号额度，不应出本机。`-addr` 可显式覆盖，但默认永远是回环，非回环地址会打印警告——不建议外放。
 - **TTL 缓存**：任务快照与燃尽视图各有独立 TTL（燃尽 TTL = 任务快照 TTL × 3，至少 30s），防止每次请求全盘扫 tasks/ + transcript。`/api/*` 带 gzip 压缩（实测单次响应 2.5MB → 320KB）。
 
@@ -159,7 +159,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 
 **额度显示口径 = 剩余**：顶部额度条与燃尽页的主读数一律是**剩余额度**（`BurnSource.remaining_percent`，后端算并钳在 [0,100]），燃尽曲线也是往下走、触底即耗尽。源数据（CodexBar）给的是已用 %，`used_percent` 原样保留在响应里、并在悬停/副标题/样本表里同时展示——两个口径同屏时永远标明是哪一个。用户在这一屏做的决定（还能不能再派一批卡）是"还剩多少"的直接函数，"已经烧了多少"要先在脑子里做一次减法。
 
-**项目覆盖块 `~/.claudego/board.json`**：项目/阶段自动推导的介绍难免干瘪，可人工写一份更准的；文件缺失就全部走自动推导。允许字段：`name` / `desc` / `phases.<name>` / `goal` / `kind_rules`。
+**项目覆盖块 `~/.cardex/board.json`**：项目/阶段自动推导的介绍难免干瘪，可人工写一份更准的；文件缺失就全部走自动推导。允许字段：`name` / `desc` / `phases.<name>` / `goal` / `kind_rules`。
 
 **`goal` 字段（CG-8「落地进度」）**：项目"离目标多远"的机械化视图，与卡片进度**并列**呈现（不替换）。V1 只做合成，不做历史/趋势。
 
@@ -173,7 +173,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
     {"id":"M1","title":"设计收口","weight":1,"done_percent":100,"basis":"REVIEW Go"},
     {"id":"M4","title":"test-ready gates","weight":1,
      "evidence": {                     // 有 evidence 就用它覆盖人工 done_percent
-       "path":"/Users/you/.claudego/logs/check.json", // **必须**绝对路径；相对路径直接判"数据不足"，不做 CWD/boardRoot 兜底
+       "path":"/Users/you/.cardex/logs/check.json", // **必须**绝对路径；相对路径直接判"数据不足"，不做 CWD/boardRoot 兜底
        "numerator":"gate_counts.pass",  // 点分路径，取到的必须是 JSON 数值
        "denominator":["gate_counts.pass","gate_counts.blocked"],
        "max_age_hours": 24              // 超龄→里程碑标 stale + 数据不足；负值判配置错误
@@ -190,7 +190,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 - 权重和 ≤ 0 或任一 weight<0 → 整块标"数据不足"，`landed_percent` 为 `null`（不出 NaN/Inf/任何数字）；权重出现非有限数（`NaN`/`±Inf`，如 `MaxFloat64` 相乘溢出、`NaN` 权重绕过 `<0` 判断）→ 合成前 `math.IsNaN`/`IsInf` 守护同样整块"数据不足"（否则 `round1(Inf)` 转 int64 是"实现相关"，前端会渲染出 0% 或天文级负数——比缺数糟糕）；
 - 人工 `done_percent` 越界（<0 或 >100）→ 里程碑判"数据不足"，不得直出负数百分数或 250%（教训：round1 的 int64 截断会把 -50 算成 -49.9，直渲成"-49.9%"是造读数）；
 - evidence 折算结果超 100%（如 pointer 配错让 `num=30, den=[10]` 算出 300%）或折算为负（分子/分母有一个是负）→ 同样"数据不足"，不直出 300% 或 -30%；防线放在 `num` 与 `den` 各自的绝对值上——`num<0` 拒、`den` **分量级 `v<0` 拒**（`{pass:5, blocked:10, adjustment:-3}` 求和为 12>0 但 adjustment 分量为负，若只挡求和会零告警渗出 41.7%）、`den` 求和 `≤0` 拒（除零守护 + 全零分量兜底）；只挡 `pct<0` 会被"双负相消"绕过（如 `{pass:-9, blocked:-2}` 会算出 +81.8%）；
-- **evidence.path 强制绝对路径**：相对路径无论解析到进程 CWD 还是 `board.json` 所在目录，都存在"同名文件静默兜底"的兜底路径（`~/.claudego` 里常有同名脚手架/临时文件），配错时零告警读错——直接判"数据不足"是唯一让读数出处可追溯的做法；
+- **evidence.path 强制绝对路径**：相对路径无论解析到进程 CWD 还是 `board.json` 所在目录，都存在"同名文件静默兜底"的兜底路径（`~/.cardex` 里常有同名脚手架/临时文件），配错时零告警读错——直接判"数据不足"是唯一让读数出处可追溯的做法；
 - evidence 文件缺失 / 超 `max_age_hours` / pointer 取不到 **JSON 数值类型**（如字段是字符串 `"9/21"`）→ 该里程碑标"数据不足"，合成值仅基于可用里程碑并标 `partial`——**evidence 存在即独占**，失败/超龄一律"数据不足"，**绝不回退到人工值**（读数含义漂移就是造假）；
 - `board.json` 存在但 JSON 语法非法（含 jsonc 注释、尾逗号、括号不闭合等）→ `OverviewResp.board_override_error` 挂出错误，前端顶部红色告警常驻，**整个 override 块**全部失效并回落自动推导；**字段类型手误**（`"weight":"1"`、`"done_percent":"50%"` 等 `*json.UnmarshalTypeError`）→ 同样挂 `board_override_error` 披露，但 **保留 Unmarshal 已尽力填充的其它字段**（其它无手误项目的 name/desc/phases/goal 仍生效）——一处手误不连坐吃掉整个覆盖块。两种降级都**不静默吞**。
 
@@ -232,7 +232,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 
 项目多了以后，早就收尾的项目仍常年占着总览的一列。项目卡与项目页上的「归档」按钮把它折叠掉：
 
-- 归档状态写在 `~/.claudego/board_archive.json`，**任务卡一个字节都不动**，调度、ETA、状态计数全都不受影响；顶部状态计数仍含已归档项目的卡，页头会写明「已归档 N 个项目（下方状态计数仍含它们的卡）」。
+- 归档状态写在 `~/.cardex/board_archive.json`，**任务卡一个字节都不动**，调度、ETA、状态计数全都不受影响；顶部状态计数仍含已归档项目的卡，页头会写明「已归档 N 个项目（下方状态计数仍含它们的卡）」。
 - 已归档项目默认不铺在总览轨道上，右上角「已归档 N」可临时展开、就地取消归档。
 - **有新卡自动切回活跃**：归档时记下当时的 (卡数, 最新 `created_at`)，之后卡数变多、或出现更新的 `created_at`，即判定有新卡并自动恢复活跃，卡上标出「已自动恢复活跃」+ 原因（不说明原因，用户会以为自己没点上归档）。两条判据是 OR：只看卡数会被"删一张加一张"骗过，只看时间会被 `created_at` 缺失的卡漏过。
 - **卡状态变化不触发复活**（queued→done、running→failed 都不算）。手动归档表达的是"这个项目我暂时不看了"，已知卡跑完并不构成"有新东西要看"；若按 `updated_at` 判，归档一个仍在跑的项目下一次 tick 就会自己弹回来。
@@ -273,7 +273,7 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 
 时间维度用卡的 **`updated_at`（跑完那一刻）**而非 `created_at`：花费是在卡跑完时产生并写回的，按创建时间归档会把一张上周入队、今天才跑完的卡算进上周——那笔钱是今天花的。`range` 取未知值时回落 `24h`，不报错也不猜。窗口由请求参数决定，所以 `task_spend` **不进 `burnCache`**（那份缓存装的是与窗口无关的 transcript 扫描，混在一起会让每个窗口各占一份昂贵缓存），改为逐请求现算。
 
-**燃尽视图三源**（`/api/burn`）：三源中 `usage-history.jsonl`（即 `usage_feed`）与 `claudego quota` 共用同源；`claude.json` 与 transcript 扫描为 board 独有读数，`claudego quota` 不读这两源：
+**燃尽视图三源**（`/api/burn`）：三源中 `usage-history.jsonl`（即 `usage_feed`）与 `cardex quota` 共用同源；`claude.json` 与 transcript 扫描为 board 独有读数，`cardex quota` 不读这两源：
 1. **CodexBar `claude.json`**：claude 侧各账号 session / weekly / opus 窗口的百分比时间序列；
 2. **CodexBar `usage-history.jsonl`**（= `usage_feed`）：codex 侧 primary（5h）/ secondary（周）百分比时间序列；
 3. **`~/.claude/projects/*/*.jsonl` transcript**：每条 assistant 消息的绝对 token 用量（四类等权相加，附额度口径折算）。
@@ -282,10 +282,10 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 
 ## 5 小时额度红线（保底额度）
 
-给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。三条通道，`claudego quota` 随时查看：
+给突发/交互任务留余量：红线生效时队列停止派发（多步任务也会在步骤间让位），`-force` 可越线。三条通道，`cardex quota` 随时查看：
 
 ```jsonc
-// ~/.claudego/config.json
+// ~/.cardex/config.json
 "queue_budget_tokens": 2000000,  // ① 本地账本：滑动 5h 窗口内队列最多消耗的加权 token，0 关
 "redline_percent": 85,           // ②③ 百分比通道共享红线：任一源 usedPercent 达线即停，0 关
 "usage_feed": "/Users/you/Library/Application Support/CodexBar/usage-history.jsonl",
@@ -297,10 +297,10 @@ claudego board -ttl 30       # 任务快照缓存秒数（默认 10）
 "model_weights": {"default":1,"opus":5,"sonnet":1,"haiku":0.2}   // 账本的模型加权
 ```
 
-- ① 只统计 claudego 自己的调用（桌面端消耗不可见），语义是"队列预算上限"——保底 = 总额度 − 队列预算。先跑几天 `claudego quota` 看典型消耗再定值。
+- ① 只统计 cardex 自己的调用（桌面端消耗不可见），语义是"队列预算上限"——保底 = 总额度 − 队列预算。先跑几天 `cardex quota` 看典型消耗再定值。
 - ② 是全局视角，样本格式兼容 CodexBar 的 usage-history.jsonl（需在 CodexBar 里开启 Claude 用量探测）；任何工具按同格式落一行 JSONL 都能接。
 - ③ 直读 `api.anthropic.com/api/oauth/usage`（`anthropic-beta: oauth-2025-04-20` 头 + 复用 `~/.claude/.credentials.json` 或 macOS keychain 的 OAuth accessToken），取 5h 窗口 utilization。**端点未文档化、可随时变更**——任何异常（网络/凭据/HTTP 4xx-5xx/字段缺失/字段值歧义/格式漂移）一律按"数据不足"→ fail-open 放行；实现只信响应 body，绝不解析响应头（响应头容易被中间层伪造/覆盖，且核验已推翻"响应头带 unified 限流数值"之说）。`utilization` 实测 0-100 百分域原样取整（实样：端点回 31.0 即 31%，与 `limits[].percent=31` 互证）、`used_percent/percent` 同为 0-100 域原样取，**任一自动归一都是假触线温床**（教训：老版 `utilization:1`→100%、`used_percent:0.8`→80% 都能锁死队列）；`utilization` 落在 (0,1] 区间判为刻度歧义（旧分数写法 vs 新百分写法两判均可能错）拒判为数据不足，>100 域外同拒。`oauth_usage_creds_path` 非空即**硬隔离**——只读该文件，不再兜底 `~/.claude`/keychain（避免 Windows `UserHomeDir` 兜底摸真实凭据造成测试隔离失效或权限漂移）。端点结果自带**进程级缓存**（TTL=`oauth_usage_max_age_min` 或默认 15 min），tick 每 15s 重扫不会每次都打端点、也不会重复触发 macOS keychain 弹窗；缓存过期后重抓失败会保留旧样本并披露"已过期+重抓失败"两要素，让 `quota` 能诚实展示。
-- ②③ 合并规则=**最保守值优先**（可用样本里 percent 最大者判线）——观测口径不一致时,最坏假设兜住,而不是投票或平均。`claudego quota` 会并列展示三源读数并在分歧 ≥5% 时明确披露区间。
+- ②③ 合并规则=**最保守值优先**（可用样本里 percent 最大者判线）——观测口径不一致时,最坏假设兜住,而不是投票或平均。`cardex quota` 会并列展示三源读数并在分歧 ≥5% 时明确披露区间。
 - 真正耗尽时仍有限额冷却兜底（解析重置时间、到点续跑），红线只是提前让路。
 
 **分时段红线**（`redline_windows`）：时段内非零字段覆盖全局阈值，时段外回落全局；跨零点用 from > to。

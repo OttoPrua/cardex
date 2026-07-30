@@ -1,19 +1,21 @@
-# ClaudeGo
+# cardex
 
 [中文](README.md) | **English**
 
 [![LINUX DO](https://img.shields.io/badge/LINUX%20DO-community-ffb003?logo=discourse&logoColor=white)](https://linux.do)
 
+> This project was formerly named ClaudeGo; renamed to cardex on 2026-07-31 (the old `claudego` command name still works via a compatibility symlink — see "Quick start" below).
+
 **Wring every Claude 5-hour usage window dry.** A local task queue and scheduler: when a task hits the limit it auto-pauses, records the reset time, and at reset reconnects to the *same* session via `--resume` to keep going. A single Go binary, no external dependencies, and **the orchestration itself costs zero quota**.
 
 ```bash
-claudego add -title "refactor auth" -dir ~/Projects/myapp -file steps.md   # drop work in the queue
-claudego install-launchd                                                   # it runs itself from here
+cardex add -title "refactor auth" -dir ~/Projects/myapp -file steps.md   # drop work in the queue
+cardex install-launchd                                                   # it runs itself from here
 ```
 
 ## What it does for you
 
-| Your situation | What ClaudeGo does |
+| Your situation | What cardex does |
 |---|---|
 | Hit the limit and you have to babysit the window | Auto-pause + remember the reset instant, then resume the same session on time — **the queue runs while you sleep** |
 | One goal means hand-writing a dozen prompts | `assemble`: Claude researches the project first, then decomposes the goal into a prompt sequence that **auto-enqueues** |
@@ -21,40 +23,42 @@ claudego install-launchd                                                   # it 
 | Everything runs on the priciest model | Per-task model routing: haiku for mechanical work, sonnet for regular implementation, the top tier for high-risk work — expensive models only orchestrate and arbitrate |
 | Cooldown means total downtime | During cooldown, single-step orchestration cards divert to `codex exec` (a separate quota), so the pipeline never stalls |
 | You still have to review the changes yourself | An adversarial review card is auto-dispatched on completion; read-only reviews can even be offloaded to a second machine |
-| "Where is any of this right now?" | `claudego list` + a web board (kanban / quota burndown / landed progress) + a per-task event ledger |
+| "Where is any of this right now?" | `cardex list` + a web board (kanban / quota burndown / landed progress) + a per-task event ledger |
 
 ## Quick start
 
 ```bash
 make build && make install     # compile and install to /opt/homebrew/bin
-claudego init                  # initialize ~/.claudego (override the data dir with CLAUDEGO_ROOT)
-claudego doctor                # self-check: claude CLI, directories, config
+cardex init                    # initialize ~/.cardex (override the data dir with CARDEX_ROOT; the legacy CLAUDEGO_ROOT is still read once, with a warning)
+cardex doctor                  # self-check: claude CLI, directories, config
 ```
+
+Still need the old `claudego` command name? `make install install-shim` also lays down a `claudego → cardex` compatibility symlink (`ln -sf`, tracks the binary as it upgrades) — a transition-period aid, removable once the rename is finished.
 
 Three common ways to enqueue — pick one to start:
 
 ```bash
 # 1) You already know the steps: split them in steps.md with a lone --- line
-claudego add -title "refactor auth" -dir ~/Projects/myapp -priority 5 -review-after -file steps.md
+cardex add -title "refactor auth" -dir ~/Projects/myapp -priority 5 -review-after -file steps.md
 
 # 2) You only have a goal: have Claude research first, then auto-generate and enqueue a task sequence
-claudego assemble -dir ~/Projects/myapp "add resumable uploads to the upload module, with tests"
+cardex assemble -dir ~/Projects/myapp "add resumable uploads to the upload module, with tests"
 
 # 3) A session in front of you just got cut off by a limit: take it over and continue
-claudego adopt <session-id> -dir ~/Projects/myapp     # find the id with claudego sessions
+cardex adopt <session-id> -dir ~/Projects/myapp     # find the id with cardex sessions
 ```
 
 Let it run on its own:
 
 ```bash
-claudego run                   # run one round manually to verify
-claudego install-launchd       # background scheduling: ticks every 5 min, starts at login (macOS)
-claudego list                  # board; the title column is "title ▸ latest progress"
-claudego log <id>              # detail for one card; cmd <id> prints the manual-takeover command
-claudego board                 # web board at http://127.0.0.1:8787
+cardex run                   # run one round manually to verify
+cardex install-launchd       # background scheduling: ticks every 5 min, starts at login (macOS)
+cardex list                  # board; the title column is "title ▸ latest progress"
+cardex log <id>              # detail for one card; cmd <id> prints the manual-takeover command
+cardex board                 # web board at http://127.0.0.1:8787
 ```
 
-Not on macOS: run `claudego daemon` as a foreground resident, or have systemd timers / cron / Windows Task Scheduler invoke `claudego run` every 5 minutes. The core is pure Go and builds on all three platforms; the single-instance lock is cross-platform, so scheduled runs won't collide.
+Not on macOS: run `cardex daemon` as a foreground resident, or have systemd timers / cron / Windows Task Scheduler invoke `cardex run` every 5 minutes. The core is pure Go and builds on all three platforms; the single-instance lock is cross-platform, so scheduled runs won't collide.
 
 ## The five task types
 
@@ -74,7 +78,7 @@ Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs t
 
 ```
                  ┌──────────────────────────────────────────────┐
-   claudego add  │  Task queue  (~/.claudego/tasks)             │
+   cardex add    │  Task queue  (~/.cardex/tasks)               │
    assemble ────▶│  queued ──▶ running ──▶ done                 │
    review  plan  │              │  └──▶ failed (after backoff)  │
    adopt  brief  │              ▼                               │
@@ -89,7 +93,7 @@ Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs t
 
 Four things hold the loop together:
 
-1. **Zero-quota orchestration** — the scheduler is pure local Go that only reads and writes JSON under `~/.claudego`; it never calls a model itself. Dispatch, backoff, the board, and the ledgers are all free; `claude -p` runs only when a task actually executes.
+1. **Zero-quota orchestration** — the scheduler is pure local Go that only reads and writes JSON under `~/.cardex`; it never calls a model itself. Dispatch, backoff, the board, and the ledgers are all free; `claude -p` runs only when a task actually executes.
 2. **A limit is a recoverable state, not a failure** — on a limit hit the reset timestamp is parsed out of the error and written to a global cooldown (`cooldown.json`); no probe calls are wasted during it. At reset, a resume prompt goes to the *same* session so work continues from the interruption point — the original prompt is never re-sent and the work is never redone.
 3. **Ordered dispatch, safe on disk** — resume first → higher `priority` → type order (review is cheap and returns feedback fast; assembly spawns new work so it goes last) → FIFO within a tier. Every successful step is written atomically, so a killed process loses no progress; a single-instance lock keeps repeated launchd triggers from running concurrently.
 4. **Classified failures instead of blind retries** — auth/permission failures go straight to `held` for a human, over-long input goes straight to `failed` (the same prompt will overflow again), and only the unclassifiable falls back to backoff retries — quota never gets burned on retries that are certain to fail.
@@ -109,7 +113,7 @@ Once it's running, pick what you need — each of these is covered in full in th
 
 For what happens on the failure paths (full dispatch rules, limit recovery, failure classification, stall patrol, the event ledger, idempotent tombstones, permission boundaries) → [runtime internals](docs/internals.en.md).
 
-## Config quick reference (~/.claudego/config.json)
+## Config quick reference (~/.cardex/config.json)
 
 The keys you'll actually touch; the full table lives in the [configuration reference](docs/config.en.md):
 
@@ -131,7 +135,7 @@ The keys you'll actually touch; the full table lives in the [configuration refer
 | `default_review_host` / `remote_mirror_root` / `default_review_sync` | "" | the review-divert trio: with all three set, auto-review of local impl cards diverts to the remote host by default |
 | `remote_hosts.<name>.codex_only` | false | Host-level quota boundary: when true, the remote host runs Codex only, including automatic reviews |
 
-Prompt templates live in `~/.claudego/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).
+Prompt templates live in `~/.cardex/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).
 
 **Permissions stay tight by default**: tasks do **not** use `--dangerously-skip-permissions` — review/assembly get a read-only tool allowlist, and `sequence` defaults to `acceptEdits` plus an allowlist of common build/test commands. Add `-skip-permissions` to a single card when full autonomy is needed; details in [runtime internals · permissions and safety](docs/internals.en.md#permissions-and-safety).
 
@@ -141,7 +145,7 @@ Prompt templates live in `~/.claudego/templates/*.md` and can be edited directly
 |---|---|
 | [Advanced guide](docs/guide.en.md) | Coordination loop, file-based state, review divert, cross-verification, web board, quota redline, codex backup executor |
 | [Runtime internals](docs/internals.en.md) | Dispatch rules, limit recovery, failure classification, stall patrol, event ledger, idempotent tombstones, permissions |
-| [Configuration reference](docs/config.en.md) | The full `~/.claudego/config.json` key table + templates |
+| [Configuration reference](docs/config.en.md) | The full `~/.cardex/config.json` key table + templates |
 | [Changelog](docs/changelog.en.md) | Version changes grouped by theme |
 
 ## Testing

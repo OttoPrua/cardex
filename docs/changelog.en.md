@@ -1,6 +1,24 @@
-# ClaudeGo changelog
+# cardex changelog
 
 [中文](changelog.md) | **English** · back to [README](../README.en.md)
+
+## 2026-07-31 · Project renamed ClaudeGo → cardex
+
+- **Rename decision**: the product is renamed from ClaudeGo to cardex (decision BD-44). Command name
+  `claudego` → `cardex`; default data directory `~/.claudego` → `~/.cardex`; environment variable
+  `CLAUDEGO_ROOT` → `CARDEX_ROOT`.
+- **Old name still works**: `make install install-shim` lays down a `claudego → cardex` compatibility
+  symlink (transition-period aid, removable once the rename is finished); when `CARDEX_ROOT` is unset,
+  the legacy `CLAUDEGO_ROOT` is still read once, with a warning.
+- **Data migration**: a new `cardex migrate` subcommand moves the old data root (`tasks`/`events`/
+  `progress`/`archive`) to the new root, fail-closed (does nothing at all if any precondition fails)
+  with zero-loss reconciliation (per-directory file-count/byte-count tally before and after), then
+  prints the remaining manual steps (reinstall the scheduler, old symlink, re-approving TCC/keychain
+  access, etc.).
+- **Out of scope for this entry**: in-repo artifact/sync-script names such as `.claudego-fingerprint` /
+  `.claudego-scripts` stay frozen under the old name (per decision BD-44 §2.2); entries above this one
+  are left as originally written, and any `claudego`/`~/.claudego` in them refers to the product/path
+  as it was before the rename.
 
 ## 2026-07-26 · Token curve follows the window + spend goes per-project
 

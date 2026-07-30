@@ -10,4 +10,4 @@
    - key_files: 涉及的关键文件路径
    - next_prompt: 假如由一个全新会话接手剩余工作，给它的完整开工 prompt（自带上下文与验收标准）
 2. 用 Write 工具把这个 JSON 原样写入：{{OUT}}
-3. 同时在回复末尾用一个 ```json 代码块输出同样的内容（备用：如果写文件失败，我会复制它用 `claudego progress -in -key {{KEY}}` 导入）。
+3. 同时在回复末尾用一个 ```json 代码块输出同样的内容（备用：如果写文件失败，我会复制它用 `cardex progress -in -key {{KEY}}` 导入）。

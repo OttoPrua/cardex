@@ -1,4 +1,4 @@
-# ClaudeGo 运行时内核
+# cardex 运行时内核
 
 **中文** | [English](internals.en.md) · 返回 [README](../README.md)
 
@@ -18,7 +18,7 @@
 - 步骤执行中撞限额：任务标记 `limit_paused` 并记录 `mid_step`。到点续跑时不会重发原 prompt，而是向**同一个会话**发送续跑提示（`config.json` 的 `resume_prompt`），让 Claude 从中断处接着做，避免重复劳动。
 - 每一步成功后立刻落盘（任务文件原子写入），进程被杀也不丢进度。
 - 单实例锁（`.lock`）保证 launchd 的多次触发不会并发跑任务；持锁进程死掉会自动清锁。
-- 其他错误（网络、超时等）按 `retry_backoff_min` 退避重试，超过 `max_attempts_per_step` 次标记失败，`claudego retry <id>` 可带着会话与进度重新入队。
+- 其他错误（网络、超时等）按 `retry_backoff_min` 退避重试，超过 `max_attempts_per_step` 次标记失败，`cardex retry <id>` 可带着会话与进度重新入队。
 
 ## 失败分类分流（CG-3）
 
@@ -61,7 +61,7 @@
 两测试锁定该分流；反向对照 `TestRunTaskClaudeStructuredAuth_StillHeld` 证明 claude 结构化 JSON 的
 真 401（`ResultFromTranscript=false`）仍走 held 不误伤。
 
-**不做**：不做自动 replan/decompose——已被 CAMEL 类工作验证但 ClaudeGo 现状 held 升级人工的路径已够用，
+**不做**：不做自动 replan/decompose——已被 CAMEL 类工作验证但 cardex 现状 held 升级人工的路径已够用，
 自动 replan 一旦误判等于"任务被 AI 悄悄改写"，与"完整任务血缘可审计"的诚实性纪律冲突。真需要时单独立卡。
 
 ## drain 内巡逻 + review sync 竞态根修（CG-5）
@@ -72,7 +72,7 @@
 **drain 内巡逻（patrol）**——`tick` 循环里已经在跑的取消对账每 `drain_rescan_sec`（默认 15s）扫一轮；
 `patrolOnce` 贴附同一循环节奏，对每张在跑卡查两条信号：
 - **进程组存活**：`taskPG` 登记表 + `processAlive(pid)` 双查（伪存活/死 pid 残留不骗过巡逻）。
-- **心跳**：任务日志 `~/.claudego/logs/<id>.log` 文件 size 是否增长（多步任务的步骤边界才有增长）。
+- **心跳**：任务日志 `~/.cardex/logs/<id>.log` 文件 size 是否增长（多步任务的步骤边界才有增长）。
 
 判据（CG-5 R2.2 修订，触发面严格单一条件）：**只**看 `pgDeadTooLong = pgSeenAlive && !alive && dead-since ≥
 `patrolPGGrace`（默认 60s）——`patrol` 只处理"执行器进程组已死透且死超 pgGrace"的收尾僵态。心跳
@@ -119,7 +119,7 @@ exit 2 → marker 不写 → 每次同步必失败 → divert 永久静默回退
 看板"活动流"由每张卡的事件账本驱动，不再拿 `task.Status` 反推伪造历史（把
 `queued→running→limit_paused→running→done` 压平成一句"当前 running"违反诚实性纪律）。
 
-- 位置：活动卡在 `~/.claudego/events/<id>.jsonl`，随 `clean` 归档到 `archive/events/<id>.jsonl`；
+- 位置：活动卡在 `~/.cardex/events/<id>.jsonl`，随 `clean` 归档到 `archive/events/<id>.jsonl`；
 - 每条事件是一行 JSON：`seq`（卡内单调递增）+ `ts`（RFC3339Nano）+ `type` + `actor`（谁触发）
   + `status`（迁移后的状态快照）+ `step` + `detail`（如恢复时间戳、错误摘要、下游派生卡 ID 等）；
 - `type` 枚举与状态机迁移一一对应：`queued` / `dispatched` / `step_ok` / `limit_paused` / `held`

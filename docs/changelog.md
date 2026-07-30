@@ -1,6 +1,19 @@
-# ClaudeGo 更新记录
+# cardex 更新记录
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
+
+## 2026-07-31 · 项目更名 ClaudeGo → cardex
+
+- **改名裁决**：产品由 ClaudeGo 更名为 cardex（裁决 BD-44）。命令名 `claudego` → `cardex`；
+  数据目录默认 `~/.claudego` → `~/.cardex`；环境变量 `CLAUDEGO_ROOT` → `CARDEX_ROOT`。
+- **旧名仍可用**：`make install install-shim` 铺一条 `claudego → cardex` 的兼容软链（过渡期用，
+  收尾后可移除）；`CARDEX_ROOT` 未设时仍兼容读一次 `CLAUDEGO_ROOT` 并提示。
+- **数据搬迁**：新增 `cardex migrate` 子命令，把旧数据根（`tasks`/`events`/`progress`/`archive`）
+  搬到新根，fail-closed（前置不满足即整体不动）+ 零丢失对账（迁移前后逐目录文件数/字节数核对），
+  搬完打印仍需人工完成的后续步骤（重装定时器、旧 symlink、TCC 授权重批准等）。
+- **本条不涉及**：仓内 `.claudego-fingerprint` / `.claudego-scripts` 等跨机指纹/同步工件名一律
+  冻结不改（按裁决 BD-44 §2.2）；本条以上的历史条目原文不改，其中出现的 `claudego`/`~/.claudego`
+  均指改名前的产品/路径。
 
 ## 2026-07-26 · token 曲线跟随窗口 + 消耗改按项目维度
 

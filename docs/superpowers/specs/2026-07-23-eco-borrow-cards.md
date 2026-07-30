@@ -1,5 +1,7 @@
 # ClaudeGo 开发任务卡草案（2026-07-23）
 
+> 注：产品已于 2026-07-31 更名 cardex（BD-44）；下文 claudego/ClaudeGo 均指现 cardex。
+
 > 依据：同目录 `2026-07-23-agent-collab-landscape.md` 可借鉴清单 × ClaudeGo v0.10.0 已知局限。
 > 第一性纪律：每张卡动机锚定已证缺口；验收全部可证伪且含反例注入应报红条目。共 6 张，宁缺毋滥。
 > 状态：**已裁决入队**（2026-07-23 委托人对话直裁，立据 PerlicaOptimize design-blueprint/_DECISIONS.md BD-39）。

@@ -1,5 +1,7 @@
 # ClaudeGo 定位、护城河与非目标（产品叙事素材）
 
+> 注：产品已于 2026-07-31 更名 cardex（BD-44）；下文 claudego/ClaudeGo 均指现 cardex。
+
 > 用途：设计立据 + 未来开源时的产品叙事素材（README 的 "Why ClaudeGo" / "Non-goals" 节可直接取材）。
 > 依据：2026-07-23 生态对标（同目录 `2026-07-23-agent-collab-landscape.md`，约 50 条主张独立核验）。
 > 裁决立据：PerlicaOptimize design-blueprint/_DECISIONS.md BD-39 及附记。

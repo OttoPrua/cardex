@@ -1,4 +1,4 @@
-# ClaudeGo runtime internals
+# cardex runtime internals
 
 [中文](internals.md) | **English** · back to [README](../README.en.md)
 
@@ -18,7 +18,7 @@ Limits are global: whenever any task hits a limit, a global cooldown is written 
 - Hitting a limit mid-step: the task is marked `limit_paused` and records `mid_step`. On resume it doesn't replay the original prompt — it sends a resume prompt (config.json's `resume_prompt`) into the **same session** so Claude continues from where it stopped, avoiding duplicate work.
 - Every step is written to disk the moment it succeeds (the task file is written atomically), so no progress is lost even if the process is killed.
 - A single-instance lock (`.lock`) keeps launchd's repeated triggers from running tasks concurrently; the lock is cleared automatically if the holding process dies.
-- Other errors (network, timeout, etc.) back off and retry per `retry_backoff_min`; past `max_attempts_per_step` the task is marked failed, and `claudego retry <id>` re-enqueues it with session and progress intact.
+- Other errors (network, timeout, etc.) back off and retry per `retry_backoff_min`; past `max_attempts_per_step` the task is marked failed, and `cardex retry <id>` re-enqueues it with session and progress intact.
 
 ## Failure classification triage (CG-3)
 
@@ -70,7 +70,7 @@ claude's structured JSON (with `ResultFromTranscript=false`) still lands `held` 
 softening.
 
 **Not doing**: no automatic replan/decompose — a CAMEL-style retry→decompose→replan is validated in
-other work but ClaudeGo's `held`-to-human path is sufficient today; automatic replan on misclassification
+other work but cardex's `held`-to-human path is sufficient today; automatic replan on misclassification
 means "the AI silently rewrote the task", which conflicts with the "complete task lineage must be
 auditable" honesty discipline. If it's ever needed, a separate card.
 
@@ -83,7 +83,7 @@ the "invisible" hang axis that `harvest`'s early reap (visible-completion axis) 
 15s); `patrolOnce` rides the same tick. For each running card it checks two signals:
 - **Procgroup liveness**: `taskPG` registry + `processAlive(pid)` double-check (stale dead-pid entries
   in the registry can't fake liveness — the double-check is the counter-example defense).
-- **Heartbeat**: whether the task log `~/.claudego/logs/<id>.log` file size is growing (only crosses
+- **Heartbeat**: whether the task log `~/.cardex/logs/<id>.log` file size is growing (only crosses
   step boundaries — within a single step nothing appends).
 
 Verdict (CG-5 R2.2 revision, single strict trigger face): **only** `pgDeadTooLong = pgSeenAlive && !alive
@@ -149,7 +149,7 @@ The board's activity stream is driven by each card's event ledger; it no longer 
 inferring from `task.Status` (which flattens the real `queued→running→limit_paused→running→done`
 trajectory into a single "currently running", contradicting the board's honesty-first discipline).
 
-- Location: `~/.claudego/events/<id>.jsonl` while the card is live; `clean` moves it to
+- Location: `~/.cardex/events/<id>.jsonl` while the card is live; `clean` moves it to
   `archive/events/<id>.jsonl` alongside the archived card.
 - Each event is one JSON line: `seq` (monotonic per card) + `ts` (RFC3339Nano) + `type` +
   `actor` (who triggered it) + `status` (post-transition snapshot) + `step` + `detail` (e.g.

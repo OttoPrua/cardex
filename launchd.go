@@ -7,12 +7,12 @@ import (
 	"path/filepath"
 )
 
-const launchdLabel = "com.bide.tick"
+const launchdLabel = "com.cardex.tick"
 
 // legacyLaunchdLabel 是 BD-44 改名前的 label。本文件**不自动卸载**它——launchd 的卸载属
 // cutover 操作员的动作(与 migrate 同一窗口),代码擅自 launchctl unload 会在人还没准备好时
 // 停掉正在跑的调度。但装新定时器时必须**报**它还在:两份 plist 同时 load 会有两个 tick 各自
-// 起 bide/claudego 二进制、各自打各自的数据根,双调度器抢同一队列锁是真事故。
+// 起 cardex/claudego 二进制、各自打各自的数据根,双调度器抢同一队列锁是真事故。
 const legacyLaunchdLabel = "com.claudego.tick"
 
 const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>

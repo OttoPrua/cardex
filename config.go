@@ -12,6 +12,13 @@ import (
 )
 
 // TypeDefaults 是某一任务类型的默认执行参数，在 add/emit 时烘焙进任务。
+//
+// 【覆写合并粒度】与 stakes_policy 同类：JSON 的合并粒度只到**键**，用户写
+// `"type_defaults": {"design-review": {"model": "opus"}}`（只想换个复审模型）会把整条规则替换成
+// `{Model:"opus"}`——allowed_tools 变 nil、permission_mode/effort 变空串。下游 runner.go:92/344 是
+// `len(AllowedTools) > 0` 才下发 --allowedTools，于是复审卡的只读工具集**静默消失**，卡面看不出差别。
+// 实证：本机 ~/.cardex/config.json 的 prompt-assembly 条目缺 `effort`（内置表为 "high"），
+// 装配卡因此长期跑在空 effort。补齐由 typeDefaultsFor 完成。
 type TypeDefaults struct {
 	PermissionMode  string   `json:"permission_mode,omitempty"`
 	AllowedTools    []string `json:"allowed_tools,omitempty"`
@@ -117,8 +124,10 @@ type Config struct {
 	// StakesPolicy 是 stakes 档位 → 复核深度的查表（键 = low/normal/high）。
 	// **只在 add 入队时查一次并把结果固化到卡面**（ReviewAfter/Effort），运行期不再回查——
 	// 否则入队后改这张表会让在队卡的复核深度静默漂移（与 XFrozenEngine "入队即钉引擎身份" 同一纪律）。
-	// 用户 config.json 里只写部分档位时，其余档位沿用内置默认：json.Unmarshal 往非 nil map 里按键
-	// 合并，不会整表顶掉（loadConfig 从 defaultConfig 起手）。
+	// 【覆写合并粒度】只写部分档位时其余档位沿用内置默认（json.Unmarshal 往非 nil map 按键合并，
+	// loadConfig 从 defaultConfig 起手）；**档内留空的字段也逐个回落内置同档位的值**——JSON 的合并
+	// 粒度只到键，只写 `{"high":{"default_effort":"xhigh"}}` 会把 review 打成空串，若按 follow 处理
+	// 就等于静默解除 high 档的强制复审。补齐由 stakesRule 完成，要 follow 必须显式写 "follow"。
 	StakesPolicy map[string]StakesRule `json:"stakes_policy,omitempty"`
 
 	// RetroEveryNDone: 每累计 N 张卡进入 done 终态，自动入队一张 haiku 复盘卡
@@ -146,10 +155,12 @@ type StakesRule struct {
 	// Review 决定该档位是否配对抗复审：
 	//   "on"     强制配（高价值卡不许省这一刀）
 	//   "off"    强制不配（低价值卡不烧复审额度）
-	//   "follow" 跟随 -review-after 的显式指定（空值同义，即不干预）
+	//   "follow" 跟随 -review-after 的显式指定（不干预）
+	//   ""(不写) 继承内置表同档位的值——**不等于 follow**（见 stakesRule）
 	Review string `json:"review,omitempty"`
 	// DefaultEffort 是该档位的思考等级地板：**未显式 -effort 时**，卡上 effort 低于它就抬到它。
 	// 只抬不降——已经是更高档（如类型默认给了 max）的卡不会被这张表拉低。
+	// 不写 = 继承内置表同档位的地板。
 	DefaultEffort string `json:"default_effort,omitempty"`
 }
 
@@ -336,6 +347,47 @@ func remoteCodexReviewSandbox(cfg *Config, t *Task) string {
 		return "workspace-write"
 	}
 	return "read-only"
+}
+
+// typeDefaultsFor 取某任务类型的默认执行参数：用户 config 写了该类型条目就用它，
+// **条目内留空的字段逐个回落内置表同类型的值**（见 TypeDefaults 的【覆写合并粒度】）。
+//
+// 【为什么"类型整条缺失"不在这里回落】那是另一种意图："这个类型没配默认参数"。
+// newTask 对缺失类型不烘焙任何参数（reviewdivert_test.go 的远端 codex 实现卡场景就靠这个：
+// type_defaults 无 sequence 条目 → 实现卡 Model 为空）；旧 config 缺新类型的兼容回落由
+// applyLegacyTypeFallback 在更外层单独处理。两种回落粒度不同，不合并。
+// 靶：TestTypeDefaultsAbsentTypeStaysAbsent。
+func typeDefaultsFor(cfg *Config, typ string) (TypeDefaults, bool) {
+	if cfg == nil {
+		return TypeDefaults{}, false
+	}
+	td, ok := cfg.TypeDefaults[typ]
+	if !ok {
+		return TypeDefaults{}, false
+	}
+	base, ok := defaultConfig(cfg.ClaudeBin).TypeDefaults[typ]
+	if !ok {
+		return td, true
+	}
+	if td.PermissionMode == "" {
+		td.PermissionMode = base.PermissionMode
+	}
+	if len(td.AllowedTools) == 0 {
+		// 想"不下发 --allowedTools"应当写 skip_permissions:true（runner.go:344 在该模式下本就忽略
+		// 工具清单），而不是把 allowed_tools 留空——留空与"没写"在 JSON 里不可区分。
+		td.AllowedTools = base.AllowedTools
+	}
+	if td.Model == "" {
+		td.Model = base.Model
+	}
+	if td.Effort == "" {
+		td.Effort = base.Effort
+	}
+	// SkipPermissions 是 bool：JSON 里 false 与"没写"不可区分，做不了字段级回落。
+	// 内置表现在每一档都是 false（靶：TestBuiltinTypeDefaultsSkipPermissionsAllFalse），
+	// 所以"回落它"与"不回落它"结果相同；一旦有人给内置表加 skip_permissions:true，
+	// 那条测试会红，逼人在这里补一个可表达三态的类型（如 *bool）而不是继续默认丢弃。
+	return td, true
 }
 
 func defaultConfig(claudeBin string) *Config {

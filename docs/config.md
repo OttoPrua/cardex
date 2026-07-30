@@ -16,6 +16,7 @@
 | `type_order` | 进度回收>协调>审核>序列>装配 | 同优先级时的类型顺序 |
 | `resume_prompt` | … | 限额中断后的续跑提示词 |
 | `type_defaults.*.model` | 协调 opus；回收 haiku | 各类型默认模型（--model 值），空用账号默认 |
+| `type_defaults.<类型>` | 见内置表 | 类型默认执行参数。**条目内没写的字段沿用内置同类型的值**：JSON 只按键合并，只写 `{"design-review": {"model": "opus"}}` 会把整条替换成"只有 model"，`allowed_tools` 变空——复审卡的只读工具集就此静默消失。想彻底不下发工具白名单请写 `skip_permissions: true`，不要把 `allowed_tools` 留空（留空与"没写"在 JSON 里不可区分）。整个类型条目缺失则不烘焙任何参数（那是"该类型没配"这另一种意图） |
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `thinking_tokens` | 0 | >0 时给 claude 调用设 MAX_THINKING_TOKENS（设计活加大思考预算） |
 | `stakes_policy` | low=不复审 / normal=跟随 / high=强制复审+抬 high | 卡级投入产出分档查表（`add -stakes`），**入队即钉到卡面**、运行期不回查；见[进阶指南 · 投入产出分档](guide.md#卡级投入产出分档-stakes--复核深度查表) |

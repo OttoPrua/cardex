@@ -684,7 +684,10 @@ func effectiveModel(cfg *Config, t *Task) (model, source string) {
 	if t.Model != "" {
 		return t.Model, "task"
 	}
-	if td, ok := cfg.TypeDefaults[t.Type]; ok && td.Model != "" {
+	// 走 typeDefaultsFor 而非裸查表：用户部分覆写该类型（只写 allowed_tools 之类）时，
+	// 裸查表拿到的 Model 是空串，看板会把这张卡显示成"无模型"，而 newTask 烘焙进卡的是内置模型——
+	// 展示与实际不一致。靶：TestEffectiveModelUsesMergedTypeDefault。
+	if td, ok := typeDefaultsFor(cfg, t.Type); ok && td.Model != "" {
 		return td.Model, "type_default"
 	}
 	return "", "task"

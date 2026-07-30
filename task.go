@@ -165,7 +165,7 @@ func newTask(root string, cfg *Config, typ, title, dir string, prompts []string,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
-	if td, ok := cfg.TypeDefaults[typ]; ok {
+	if td, ok := typeDefaultsFor(cfg, typ); ok {
 		t.PermissionMode = td.PermissionMode
 		t.AllowedTools = append([]string(nil), td.AllowedTools...)
 		t.SkipPermissions = td.SkipPermissions

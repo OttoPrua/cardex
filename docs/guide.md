@@ -362,6 +362,12 @@ cardex add -dir ~/proj "常规改动"                                  # 缺省 
 - `default_effort` 是**地板不是覆盖**：只在没显式给 `-effort` 时生效，且只抬不降——类型默认已经是 `max` 的卡不会被拉低到 `high`；
 - `-effort` 显式指定恒优先于地板（`-stakes high -effort low` 就是 `low`）：命令行说了算，否则命令行不再可信；
 - 只写部分档位也可以，没写的档位沿用内置默认（按键合并，不是整表顶掉）；
+- **档内没写的字段也沿用内置同档位的值**——JSON 的合并粒度只到键，`{"high": {"default_effort": "xhigh"}}`
+  会把整条 high 规则替换成"只有 default_effort"，`review` 变成空串。若把空串当 `follow` 处理，
+  这一行"我只想抬思考地板"就会顺带**解除所有 `-stakes high` 卡的强制复审**，而且不报任何错。
+  所以留空 = 继承，**要"不干预"必须显式写 `"review": "follow"`**；
+- 已知缺口：`default_effort` 同理留空即继承，因此"high 档但不要思考地板"在 high 档表达不出来
+  （没有代表"无地板"的合法档位字面量），只能显式写一个更低的档位；
 - 查表值写错（`review: "yes"`、`default_effort: "ultra"`）**在 add 时直接报错**，不静默按默认放行——一张写错的表静默失效比报错贵得多。
 
 **入队即钉（防漂移）**：查表**只在 `add` 时执行一次**，结果固化到卡面（`review_after` / `effort` 两个字段），

@@ -16,6 +16,7 @@
 | `type_order` | progress-pull > coordinate > review > sequence > assembly | type order at equal priority |
 | `resume_prompt` | … | resume prompt sent after a limit interruption |
 | `type_defaults.*.model` | coordinate opus; progress-pull haiku | default model per type (--model value); empty uses the account default |
+| `type_defaults.<type>` | see built-in table | Per-type execution defaults. **Fields you omit inside an entry fall back to the built-in value for that type**: JSON merges by key only, so writing `{"design-review": {"model": "opus"}}` replaces the whole entry with one that has nothing but `model`, emptying `allowed_tools` — which silently removes the review card's read-only tool set. To genuinely ship no tool allowlist, write `skip_permissions: true`; do not leave `allowed_tools` empty (empty and "not written" are indistinguishable in JSON). If the whole type entry is missing, no defaults are baked in at all — that is the different intent "this type has no defaults configured" |
 | `no_fallback_models` | ["claude-fable-5","fable"] | design-tier models never downgraded to the codex backup — they wait for Claude |
 | `thinking_tokens` | 0 | when >0, sets MAX_THINKING_TOKENS on Claude calls (larger thinking budget for design work) |
 | `stakes_policy` | low=no review / normal=follow / high=force review + raise to high | per-card stakes → review-depth lookup (`add -stakes`); **frozen onto the card at enqueue**, never re-read at run time — see [guide · stakes tiering](guide.en.md#per-card-stakes-tiering--stakes--review-depth-lookup-table) |

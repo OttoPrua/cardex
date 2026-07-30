@@ -337,6 +337,14 @@ The table lives in `config.json`, with defaults for all three tiers:
 - `default_effort` is a **floor, not an override**: it only applies when `-effort` was not given explicitly, and it only raises — a card whose type default is already `max` is never pulled down to `high`;
 - an explicit `-effort` always wins over the floor (`-stakes high -effort low` really is `low`): the command line has the final say, otherwise the command line stops being trustworthy;
 - you may specify only some tiers — the rest keep the built-in defaults (keys are merged, the table is not replaced wholesale);
+- **fields you omit inside a tier also fall back to the built-in value for that tier** — JSON merges at key
+  granularity only, so `{"high": {"default_effort": "xhigh"}}` replaces the whole `high` rule with one that has
+  nothing but `default_effort`, leaving `review` an empty string. Were the empty string treated as `follow`,
+  that one line — "I just want to raise the thinking floor" — would also **lift the forced review off every
+  `-stakes high` card**, with no error anywhere. So omitted means inherited, and expressing "don't interfere"
+  requires writing `"review": "follow"` explicitly;
+- known gap: `default_effort` inherits on omission the same way, so "high tier but no thinking floor" cannot be
+  expressed at the `high` tier (there is no literal meaning "no floor"); write a lower tier explicitly instead;
 - a malformed table value (`review: "yes"`, `default_effort: "ultra"`) **errors out at `add` time** instead of silently falling back to a default — a misspelled guardrail that silently does nothing is far more expensive than an error.
 
 **Frozen at enqueue (drift protection)**: the lookup runs **exactly once, at `add`**, and the result is baked onto the card (the `review_after` / `effort` fields). Nothing is re-read from `config.json` at run time. Otherwise a single edit to `stakes_policy` would silently change the review depth of every queued and running card, with nothing visible on the card itself. The `stakes` field on the card is an audit record only, never a runtime predicate (same discipline as cross-verification freezing engine identity at enqueue).

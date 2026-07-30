@@ -876,8 +876,11 @@ func TestTaskSpendByProjectSeparatesProjects(t *testing.T) {
 	if err := saveConfig(root, defaultConfig("claude")); err != nil {
 		t.Fatal(err)
 	}
+	// 两个项目各一张卡：卡少到不足以自证是项目（BD-45 的「未分类」门槛），
+	// 故显式钉 -project——本用例要测的是"按项目聚合花费"，不是归组推导本身。
 	mk := func(dir string, cost float64) {
 		tk := newTask(root, testCfg(), typeSequence, "活", dir, []string{"干活"}, 5)
+		tk.Project = dirBase(dir)
 		tk.Status = statusDone
 		tk.Model = "opus"
 		tk.CostUSD = cost

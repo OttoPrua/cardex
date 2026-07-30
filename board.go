@@ -55,6 +55,10 @@ type OverviewResp struct {
 	// 上一轮 review-divert P1-2 根因就是横幅无条件写 syntax 文案——name/desc 明明还生效,
 	// 披露自身失实即 fail-honest 卡自身破线。契约字段名不得擅改(app.js grep 有依赖)。
 	BoardOverrideErrorKind string `json:"board_override_error_kind,omitempty"`
+	// ProjectAliasError 是 board.json project_aliases 里被跳过的规则的披露串
+	// （BD-45，见 boardproject.go parseProjectAliases）。坏规则逐条跳过、其余仍生效，
+	// 但必须说出来：静默跳过时"登记了别名"与"别名写错了"在界面上完全一样。
+	ProjectAliasError string `json:"project_alias_error,omitempty"`
 	// ArchiveStateError 是 board_archive.json 读失败的诊断串（有则挂前端告警）。
 	// 与 override 同理：读不出归档状态时**必须**说出来——静默当成"没有任何项目被归档"
 	// 会让用户手动折叠的十个项目一次性全部冒出来，且界面上零提示。
@@ -292,6 +296,7 @@ func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 		Quota:                  quotaSummary(burn.Sources),
 		BoardOverrideError:     snap.BoardOverrideError,
 		BoardOverrideErrorKind: snap.BoardOverrideErrorKind,
+		ProjectAliasError:      snap.ProjectAliasError,
 		ArchivedCount:          archivedN,
 	}
 	if arcErr != nil {

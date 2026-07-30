@@ -219,6 +219,10 @@ type boardSnapshot struct {
 	// 上层 handler 会把它塞进 /api/overview 顶层，前端显式挂告警——
 	// **不能**静默返回空 override，那等同"造读数"。
 	BoardOverrideError string
+	// ProjectAliasError 是 board.json project_aliases 里被跳过的规则的披露串（无问题时为空）。
+	// 与 kind_rules 同一纪律：坏规则逐条跳过而非整表拒，但必须说出来——
+	// 静默跳过会让用户以为"登记过了"，而看板照旧把那些目录散着放。
+	ProjectAliasError string
 	// 【R3·P1-2】BoardOverrideErrorKind ∈ {"", "type", "syntax"}：
 	//   type 时 name/desc/phases 覆盖仍生效(Unmarshal skip 掉出错字段继续填充),
 	//        前端应写"部分覆盖仍生效,出错字段已跳过"；
@@ -826,7 +830,12 @@ func round1(f float64) float64 { return float64(int64(f*10+0.5)) / 10 }
 // 不进 JSON，也不对外暴露；因此 struct tag 用 `json:"-"`。
 type boardOverride struct {
 	Projects map[string]boardOverrideProject `json:"projects"`
-	root     string                          `json:"-"`
+	// ProjectAliases 是有序的目录→项目归组规则表（BD-45，见 boardproject.go）。
+	// 放在**顶层**而不是某个项目下：它的作用正是决定"这个目录属于哪个项目"，
+	// 挂进项目块就成了先有鸡再有蛋。改这张表不动任何任务卡，下次快照重建全量追溯生效
+	// ——这就是存量野项目的整理机制。
+	ProjectAliases []boardProjectAlias `json:"project_aliases,omitempty"`
+	root           string              `json:"-"`
 }
 
 // boardOverrideProject 是 board.json 里单个项目的覆盖块。
@@ -942,39 +951,35 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 			dirCount[d]++
 		}
 	}
-	rep := groupDirs(tasks)
+	// 归属判定（BD-45）：显式 > 别名 > 模式 > 启发式 > 未分类，见 boardproject.go。
+	// 分组的键从"启发式分量代表"改成了**项目名**——显式字段与别名表给出的是名字，
+	// 只有按名字分组，「-project PerlicaHermes 的卡」与「~/Projects/PerlicaHermes 的卡」
+	// 才会落进同一个项目而不是两个同名项目。
+	res := newProjectResolver(tasks, ov.ProjectAliases)
 
-	// 分量 → 该分量下的卡
-	compTasks := map[string][]*Task{}
-	compDirs := map[string]map[string]bool{}
-	var noDir []*Task
-	for _, t := range tasks {
-		d := normDir(t.Dir)
-		if d == "" {
-			noDir = append(noDir, t)
-			continue
-		}
-		r := rep[d]
-		compTasks[r] = append(compTasks[r], t)
-		if compDirs[r] == nil {
-			compDirs[r] = map[string]bool{}
-		}
-		compDirs[r][d] = true
-		// ReviewDir 也要登记：groupDirs 已经把它并进同一个分量（这是盘上的事实），
-		// 但只登记 Dir 的话，「只作为 review_dir 出现」的远端镜像目录
-		// ——也就是复审分流真正落地执行的那个目录——在整个 API 里一处都看不到。
-		if rd := normDir(t.ReviewDir); rd != "" {
-			if rr, ok := rep[rd]; ok {
-				if compDirs[rr] == nil {
-					compDirs[rr] = map[string]bool{}
-				}
-				compDirs[rr][rd] = true
-			}
+	projTaskList := map[string][]*Task{}
+	projDirs := map[string]map[string]bool{}
+	var names []string
+	touchProject := func(name string) {
+		if _, ok := projDirs[name]; !ok {
+			projDirs[name] = map[string]bool{}
+			names = append(names, name)
 		}
 	}
-	if len(noDir) > 0 {
-		compTasks["(无目录)"] = noDir
-		compDirs["(无目录)"] = map[string]bool{}
+	// 兜底桶恒存在：0 张卡时也要出现在总览里（空收件箱本身就是信息）。
+	touchProject(unclassifiedProject)
+	for _, t := range tasks {
+		name, _ := res.resolve(t)
+		touchProject(name)
+		projTaskList[name] = append(projTaskList[name], t)
+		if d := normDir(t.Dir); d != "" {
+			projDirs[name][d] = true
+		}
+		// ReviewDir 也要登记：只登记 Dir 的话，「只作为 review_dir 出现」的远端镜像目录
+		// ——也就是复审分流真正落地执行的那个目录——在整个 API 里一处都看不到。
+		if rd := normDir(t.ReviewDir); rd != "" {
+			projDirs[name][rd] = true
+		}
 	}
 
 	snap := &boardSnapshot{
@@ -983,44 +988,32 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 		Cfg:                    cfg,
 		BoardOverrideError:     ovErr,
 		BoardOverrideErrorKind: ovErrKind,
+		ProjectAliasError:      res.aliasErr,
 		byID:                   byID,
 		projTasks:              map[string][]*Task{},
 		phaseOf:                map[string]string{},
 		kindOf:                 map[string]kindMark{},
 	}
 
-	// 分量必须按稳定键遍历：Go 的 map 迭代顺序是随机化的，
+	// 项目必须按稳定键遍历：Go 的 map 迭代顺序是随机化的，
 	// 而下面的 slug 冲突消解依赖遍历顺序。不排序的话，两个 slugify 到同一个串的项目
 	// 每次重建快照都可能互换 id —— 而 id 是 /api/project?id= 的主键，
 	// 前端书签、刷新、跨缓存代的两个请求会静默指向另一个项目。
-	comps := make([]string, 0, len(compTasks))
-	for comp := range compTasks {
-		comps = append(comps, comp)
-	}
-	sort.Strings(comps)
+	sort.Strings(names)
 
-	// 先数一遍每个 slug 被几个分量占用：只要有冲突，**所有**冲突方都带内容哈希后缀。
+	// 先数一遍每个 slug 被几个项目占用：只要有冲突，**所有**冲突方都带内容哈希后缀。
 	// 不能只给「后来者」加后缀——那样新项目一旦排到前面，老项目的 id 就会被挤走。
-	compName := make(map[string]string, len(comps))
+	// 例外是兜底桶：它的 id 固定为 unclassifiedProjectID，冲突时让**对方**带后缀——
+	// 收件箱的 id 一旦漂移，board_archive.json 里的归档记录与前端书签就集体失联。
 	slugUsers := map[string]int{}
-	for _, comp := range comps {
-		name := "(无目录)"
-		if len(compDirs[comp]) > 0 {
-			dirs := make([]string, 0, len(compDirs[comp]))
-			for d := range compDirs[comp] {
-				dirs = append(dirs, d)
-			}
-			sort.Strings(dirs)
-			name = dirBase(pickProjectDir(dirs, dirCount))
-		}
-		compName[comp] = name
-		slugUsers[slugify(name)]++
+	for _, name := range names {
+		slugUsers[projectSlug(name)]++
 	}
 
-	for _, comp := range comps {
-		ts := compTasks[comp]
-		dirs := make([]string, 0, len(compDirs[comp]))
-		for d := range compDirs[comp] {
+	for _, name := range names {
+		ts := projTaskList[name]
+		dirs := make([]string, 0, len(projDirs[name]))
+		for d := range projDirs[name] {
 			dirs = append(dirs, d)
 		}
 		sort.Slice(dirs, func(i, j int) bool {
@@ -1030,13 +1023,15 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 			return dirs[i] < dirs[j]
 		})
 
-		name := compName[comp]
-		id := slugify(name)
-		if slugUsers[id] > 1 {
-			id += "-" + shortHash(comp)
+		id := projectSlug(name)
+		if slugUsers[id] > 1 && name != unclassifiedProject {
+			id += "-" + shortHash(name)
 		}
 
 		p := buildProject(cfg, ov, id, name, dirs, ts, byID, now, snap.phaseOf, snap.kindOf)
+		if name == unclassifiedProject && p.DescSource != "override" {
+			p.Desc = unclassifiedDesc + "（当前 " + p.Desc + "）"
+		}
 		snap.Projects = append(snap.Projects, p)
 		snap.projTasks[id] = ts
 	}

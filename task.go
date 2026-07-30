@@ -23,14 +23,20 @@ const (
 )
 
 type Task struct {
-	ID       string   `json:"id"`
-	Title    string   `json:"title"`
-	Type     string   `json:"type"`
-	Priority int      `json:"priority"`
-	Status   string   `json:"status"`
-	Dir      string   `json:"dir"`
-	Prompts  []string `json:"prompts"`
-	Step     int      `json:"step"`
+	ID       string `json:"id"`
+	Title    string `json:"title"`
+	Type     string `json:"type"`
+	Priority int    `json:"priority"`
+	Status   string `json:"status"`
+	Dir      string `json:"dir"`
+	// Project 是显式钉定的项目归属（add -project，入队即钉）。空 = 由看板反推
+	// （别名表 → 内建模式 → 目录并查集启发式 → 未分类，见 boardproject.go）。
+	// 非空时是**最强**归组证据，压过全部启发式：派卡人知道这卡属于哪个项目，
+	// 而目录只是它当下碰巧落脚的地方（任务级工作树、日期镜像目录都会骗过启发式）。
+	// 与 Stakes 同一纪律：入队即钉，之后改配置/改别名表都不会让它漂移。
+	Project string   `json:"project,omitempty"`
+	Prompts []string `json:"prompts"`
+	Step    int      `json:"step"`
 
 	SessionID string `json:"session_id,omitempty"`
 	// Model 非空时以 --model 传给 claude（如 haiku/sonnet/opus），用于按任务难度路由模型。

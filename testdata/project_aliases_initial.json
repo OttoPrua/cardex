@@ -1,0 +1,27 @@
+[
+  {"match": "/Users/ottoprua/Projects/PH-lanes/*", "project": "PerlicaHermes"},
+
+  {"match": "D:/Project/PO-tasks/HB-*", "project": "PerlicaHermes"},
+  {"match": "D:/Project/PO-tasks/S3-*", "project": "PerlicaHermes"},
+  {"match": "D:/Project/PO-tasks/card-*", "project": "PerlicaHermes"},
+  {"match": "D:/Project/PO-tasks/*", "title": "Hermes", "project": "PerlicaHermes"},
+  {"match": "D:/Project/PO-tasks/*", "title": "TrackA-S3", "project": "PerlicaHermes"},
+  {"match": "D:/Project/PO-tasks/*", "title": "Card A", "project": "PerlicaHermes"},
+  {"match": "D:/Project/PO-tasks/*", "title": "Optimize", "project": "PerlicaOptimize"},
+
+  {"match": "D:/Project/PO-worktrees/*", "project": "PerlicaOptimize"},
+
+  {"match": "D:/tmp/qmt-*", "project": "Trading"},
+  {"match": "D:/tmp/4a-*", "project": "Trading"},
+
+  {"match": "/Users/ottoprua/Projects/Trading-docs", "project": "Trading-docs"},
+  {"match": "/Users/ottoprua/Project/Trading-docs", "project": "Trading-docs"},
+  {"match": "D:/Project/Trading-docs", "project": "Trading-docs"},
+
+  {"match": "/Users/ottoprua/Projects/ClaudeGo", "project": "cardex"},
+  {"match": "D:/Project/PO-lanes/ClaudeGo", "project": "cardex"},
+  {"match": "/Users/ottoprua/Projects/cardex", "project": "cardex"},
+  {"match": "D:/Project/PO-lanes/cardex", "project": "cardex"},
+
+  {"match": "/Users/ottoprua/Projects", "project": "未分类"}
+]

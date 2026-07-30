@@ -374,17 +374,24 @@ func TestGoalMixedManualAndEvidenceGoalSource(t *testing.T) {
 
 // ---- 集成层：走完整 buildSnapshot，确认 omitempty 与 JSON 契约 ----
 
-// bootBoardRoot 构造一个含 config.json + 一张任务卡的 root，供 buildSnapshot 调用。
+// bootBoardRoot 构造一个含 config.json + 若干任务卡的 root，供 buildSnapshot 调用。
 // 项目目录（/tmp/goalproj）走归并，最终生成一个 project.id="goalproj"。
+//
+// 【为什么是 minSoloProjectCards 张卡而不是一张】BD-45 起，只有一个目录、卡数又低于
+// minSoloProjectCards 的分量会被判为"无归组证据"而进「未分类」收件箱（见 boardproject.go）。
+// 这里刻意仍走**目录推导**而不是给卡钉 -project：这批 goal 用例要覆盖的是
+// "board.json 按项目 id 覆盖"这条链路，id 必须由目录推导出来才算真的测到。
 func bootBoardRoot(t *testing.T, boardJSON string) string {
 	t.Helper()
 	root := testRoot(t)
 	if err := saveConfig(root, defaultConfig("claude")); err != nil {
 		t.Fatal(err)
 	}
-	tk := newTask(root, testCfg(), typeSequence, "落地进度", "/tmp/goalproj", []string{"跑一步"}, 5)
-	if err := saveTask(root, tk); err != nil {
-		t.Fatal(err)
+	for i := 0; i < minSoloProjectCards; i++ {
+		tk := newTask(root, testCfg(), typeSequence, "落地进度", "/tmp/goalproj", []string{"跑一步"}, 5)
+		if err := saveTask(root, tk); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if boardJSON != "" {
 		if err := os.WriteFile(filepath.Join(root, "board.json"), []byte(boardJSON), 0o644); err != nil {

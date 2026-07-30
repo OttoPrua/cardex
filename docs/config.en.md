@@ -35,4 +35,17 @@
 | `default_review_sync` | "" | global default pre-divert sync command (sh -c, cwd=impl card dir); all three keys must be set for the default to apply |
 | `remote_hosts.<name>.codex_only` | false | When true, mechanically forbids Claude on that host; Claude-model and automatic review tasks are rerouted to remote Codex at dispatch |
 
+## Board config quick reference (~/.cardex/board.json)
+
+The board **only reads** this file, never writes it; a missing file simply means "derive everything".
+
+| Key | Where | Description |
+|---|---|---|
+| `projects.<project-id>.name` / `.desc` / `.phases.<phase>` | project block | hand-written text overriding the derived project/phase blurbs |
+| `projects.<project-id>.goal` | project block | goal-anchored "landed progress" (shown alongside card progress, never replacing it) — see [guide](guide.en.md#project-override-cardexboardjson) |
+| `projects.<project-id>.kind_rules` | project block | manual classification rules (title substring or full task ID → kind); bad rules are skipped individually and disclosed via `kind_rule_error` |
+| `project_aliases` | **top level** | ordered directory → project grouping table: `[{"match":"<exact dir or glob>","title":"<optional title substring>","project":"<project name>"}]`. First match wins; attribution priority is **explicit (`add -project`) > alias > built-in pattern > directory heuristic > "未分类" (unclassified)**. Editing this table touches no task card and applies retroactively on the next snapshot rebuild — this is how you clean up a backlog of wild projects. Bad rules are skipped individually and disclosed via `project_alias_error`. See [guide · project attribution](guide.en.md#project-attribution-explicit--alias--pattern--heuristic--unclassified) |
+
+A `match` without wildcards is an **exact directory match** (so that one rule on a container directory cannot swallow every project underneath it); write `X/*` to cover a subtree (the glob is matched against the directory or any ancestor, hence any depth). Matching is case-insensitive.
+
 Prompt templates live in `~/.cardex/templates/*.md` and can be edited directly (`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` are substituted; `{{QUEUE}}` `{{PROGRESS}}` in `coordinate.md` are replaced with a live snapshot **at dispatch time**).

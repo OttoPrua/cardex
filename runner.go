@@ -1499,6 +1499,9 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 			rv := newTask(root, cfg, typeReview, "审核: "+t.Title, reviewDir, []string{prompt}, t.Priority)
 			// 修复闭环谱系：审核卡记住被审卡，并继承其循环轮次与（分流后的）执行位置。
 			rv.ReviewOf = t.ID
+			// 显式项目归属随派生卡继承：审核卡的 dir 常是**审核主机上的镜像目录**，
+			// 不继承的话，一张钉了 -project 的实现卡派出的审核卡会掉进「未分类」。
+			rv.Project = t.Project
 			rv.FixRound = t.FixRound
 			rv.RemoteHost = reviewHost
 			// 远程审核（分流或远程实现卡回退）的模型选取：非空烘焙值恒优先，空才继承实现卡模型。
@@ -1770,6 +1773,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 			if orig, err := findTaskAnywhere(root, t.ReviewOf); err == nil && strings.TrimSpace(orig.Closeout) != "" {
 				co := newTask(root, cfg, typeSequence, "收口: "+baseFixTitle(orig.Title), orig.Dir, []string{orig.Closeout}, orig.Priority)
 				co.Model = "haiku"
+				co.Project = orig.Project // 显式归属随派生卡继承（收口卡属于被收口卡的项目）
 				co.SkipPermissions = orig.SkipPermissions
 				co.RemoteHost = orig.RemoteHost
 				if saveTask(root, co) == nil {
@@ -1831,6 +1835,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		// 远端链的升级卡必须继承执行主机：dir 是远端路径（如 D:/...），缺 remote_host
 		// 会在 release 后被派到本机、cd 直接失败（实测远端 R4 卡两张踩中）。
 		esc.RemoteHost = orig.RemoteHost
+		esc.Project = orig.Project // 显式归属随派生卡继承（升级卡属于原卡的项目）
 		esc.FixRound = round
 		if saveTask(root, esc) == nil {
 			// 父审核卡 closeout：超轮限 held 卡是审核链的显式终点，父卡账本必须留指针。
@@ -1866,6 +1871,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	nt := newTask(root, cfg, typeSequence, title, orig.Dir, []string{prompt}, orig.Priority)
 	nt.ReviewAfter = true
 	nt.FixRound = round
+	nt.Project = orig.Project // 显式归属随修复链继承
 	nt.Model = orig.Model
 	nt.SkipPermissions = orig.SkipPermissions
 	nt.PermissionMode = orig.PermissionMode
@@ -2086,6 +2092,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		// B 用与 A 完全相同的独立作答 prompt（公平 + 独立），套**冻结**的乙引擎。
 		b := newTask(root, cfg, typeCrossCheck, "交叉B["+t.XProfile+"]: "+base, t.Dir, []string{t.Prompts[0]}, t.Priority)
 		b.XRole = "B"
+		b.Project = t.Project // 显式归属随交叉链继承
 		b.XKey = t.XKey
 		b.XProfile = t.XProfile
 		b.XTask = t.XTask
@@ -2122,6 +2129,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		})
 		c := newTask(root, cfg, typeCrossCheck, "交叉C汇总["+t.XProfile+"]: "+base, t.Dir, []string{prompt}, t.Priority)
 		c.XRole = "C"
+		c.Project = t.Project // 显式归属随交叉链继承
 		c.XKey = t.XKey
 		c.XProfile = t.XProfile
 		c.XEngineB = t.XEngineB
@@ -2360,6 +2368,9 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 			title = "由 " + parent.ID + " 生成"
 		}
 		nt := newTask(root, cfg, typ, title, dir, s.Prompts, s.Priority)
+		// 显式归属随 emit 继承：协调/装配产出的子卡属于同一个项目，
+		// 哪怕它们各自跑在不同的子目录/车道里（那正是启发式会散架的地方）。
+		nt.Project = parent.Project
 		nt.ReviewAfter = s.ReviewAfter
 		// 协调链：产出的 coordinate 任务同样具备 emit 能力（自愈式续排——每批收尾排下一批）。
 		// 递归有界：每次 emit ≤10 张、每张协调都消耗额度且受红线节流，模板负责终止条款。

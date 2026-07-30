@@ -140,7 +140,7 @@ One inviolable rule: **filtering never changes any reading**. The chip counts, t
 
 **Quota is shown as remaining**: the headline reading in both the top quota strip and the burndown page is **remaining quota** (`BurnSource.remaining_percent`, computed server-side and clamped to [0,100]); the burndown curve descends and hitting zero means exhausted. The source data (CodexBar) reports used %, so `used_percent` is preserved verbatim in the response and shown alongside in tooltips / subtitles / the sample table — whenever both appear on screen, which one you're looking at is always labelled. The decision you make on this screen ("can I dispatch another batch?") is a direct function of what's left; "how much has burned" requires a subtraction first.
 
-**Project override `~/.cardex/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Allowed fields: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules`.
+**Project override `~/.cardex/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Fields allowed inside a project block: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules`; the file also has a top-level `project_aliases` grouping table (see below).
 
 **`goal` field (CG-8 "landed progress")**: a mechanized "how far from the project goal" view, displayed **alongside** the card-based `progress_percent` (never replacing it). V1 does synthesis only — no history/trend.
 
@@ -176,6 +176,54 @@ Synthesis: `landed_percent = Σ(weight × done_percent) / Σweight`, shown next 
 - `board.json` present but syntactically invalid (jsonc comments, trailing commas, unclosed braces) → `OverviewResp.board_override_error` is populated, the red banner stays up, and **the entire override block** drops back to auto-derivation; **field-type typos** (`"weight":"1"` / `"done_percent":"50%"`, i.e. `*json.UnmarshalTypeError`) → the banner is populated too, but **the partial-fill result is preserved** (other projects' unaffected name/desc/phases/goal still apply) — one typo does not collectively erase the whole override. Neither shape is **ever silently swallowed**.
 
 **The board only reads evidence files, never executes commands**: producing that JSON is the job of the orchestration session/card (e.g. `ops/test-ready/check`); the board only consumes what has been written to disk.
+
+### Project attribution: explicit > alias > pattern > heuristic > unclassified
+
+Task cards have **no** project field; the board infers projects from the working directory. Inference holds while each project has one stable directory. Once a lot of cards run in **task-scoped temporary directories** (one directory per card on the remote — `D:/Project/PO-tasks/<taskid>` — dated worktrees like `Trading-<slug>-20260730`, scattered re-review dirs `HB-*`/`S3-*`/`card-*`), every one of those directories becomes its own "project". A real inventory rendered **80 projects where only 9 were real**, which destroys the whole point of "conclusions findable per project".
+
+Attribution runs in five layers; **the first layer that matches wins**:
+
+| Layer | Evidence | Source tag | Lives where |
+|---|---|---|---|
+| 1 | `add -project <name>` explicit pin | `explicit` | on the card (frozen at enqueue) |
+| 2 | first matching rule in top-level `project_aliases` of `board.json` | `alias` | config (one edit applies retroactively to everything) |
+| 3 | the directory's (or any ancestor's) basename starts with a known project name + `-` | `pattern` | built into the code |
+| 4 | working-directory union-find component (mirror pairs / lanes / same basename / ancestor containment) | `heuristic` | built into the code |
+| 5 | nothing matched | `unclassified` | the "未分类" (unclassified) inbox |
+
+**`add -project` (frozen at enqueue)**: whoever dispatches the card knows which project it belongs to; the directory is merely where it happens to land. The field is written onto the card, so later config or alias-table edits can never make it drift (same discipline as `-stakes`). Derived cards — review cards, fix cards, closeout cards, over-round escalations, cross-check B/C, and children emitted by coordinators — **inherit it automatically**; without inheritance, the review card of a `-project`-pinned impl card (running in a mirror directory on the review host) would drop into the inbox.
+
+**`project_aliases` (the mechanism for cleaning up the backlog)**: an ordered rule list, first match wins. Editing this table **touches not a single byte of any task card**; the next snapshot rebuild applies it retroactively to the entire history — that is how you clean up existing wild projects.
+
+```jsonc
+"project_aliases": [
+  {"match": "/Users/you/Projects/PH-lanes/*", "project": "PerlicaHermes"},
+  {"match": "D:/Project/PO-tasks/*", "title": "Hermes", "project": "PerlicaHermes"},
+  {"match": "D:/tmp/qmt-*", "project": "Trading"},
+  {"match": "D:/Project/Trading-docs", "project": "Trading-docs"},  // alias > pattern: stops "Trading-" from folding it into Trading
+  {"match": "/Users/you/Projects", "project": "未分类"}              // the container directory itself goes to the inbox
+]
+```
+
+- A `match` **without wildcards matches that exact directory only**; with `*` `?` `[` it is a glob matched against **the directory or any of its ancestors**, so `X/*` covers X at **any depth**. Matching is case-insensitive throughout (the same remote directory often differs in case between the two machines' cards).
+- **Why a bare path is not a prefix**: writing a prefix rule for a container directory (e.g. `~/Projects`) would swallow every project underneath it into one project, with nothing on screen to show for it. The two mistakes are not symmetric — under-configuring leaves a few directories in the inbox (visible, fixable); over-configuring collapses the whole board. Write `/*` explicitly to cover a subtree.
+- `title` is a case-insensitive substring of the card title. Remote task-scoped directories are named after a random task ID, so **the directory carries no project information at all** and only the title can decide. When written together with `match`, **both** must match (AND) — this keeps a title rule from leaking board-wide.
+- Bad rules (missing `project`, neither `match` nor `title`, invalid glob) are **skipped one by one and disclosed** (`OverviewResp.project_alias_error`); one typo never invalidates the table — same discipline as `kind_rules`.
+
+**Built-in pattern rule (layer 3)**: a directory whose basename — or any ancestor's basename — starts with a known project name followed by `-` belongs to that project. This is what tames dated worktrees: `Trading-paper-strategy-envelope-20260730` → `Trading`, `PerlicaHermes-cmp-sol` → `PerlicaHermes`, `Trading-strategy-research-20260726/c-etf-regime` → `Trading` (the evidence sits on the ancestor). "Known project name" = **the representative names of projects that already stand on their own in this batch** + names registered in the alias table + names explicitly pinned on cards; generic directory names (`docs`/`src`/`config`, …) are excluded. When several known names match, the **longest** one wins (`Trading-docs-mirror` goes to `Trading-docs`, not `Trading`).
+
+**The "未分类" (unclassified) inbox**: directories that fail attribution **no longer each become a project**; they all land in one project named 未分类 (fixed id `unclassified`, **always shown**, even with 0 cards — an empty inbox is itself information). Two things land there: cards with no working directory, and components that have a single directory and fewer than 3 cards. Components corroborated by a cross-machine mirror (the card carries a `review_dir`) are exempt from the card-count threshold — two mutually corroborating directories are strong evidence on their own.
+
+A genuinely new project's first card **does land in the inbox**: at that moment it truly has no grouping evidence. That is intended, not a defect — the bucket means "to be triaged", and promotion happens via `-project` or an alias registration rather than by accumulating cards (reaching 3 cards also promotes it, but only as a backstop so small projects don't sit in the bucket forever).
+
+**Soft constraint at `add` time**: when a new card would land in 未分类 under the current ledger, `add` prints one line to stderr and **enqueues the card anyway**:
+
+```
+警告: 目录 /Users/you/Projects/NewThing 未匹配任何显式/别名/模式/启发式归组，该卡将落入看板「未分类」；
+      如属既有项目请用 -project 指定，或在 board.json 的 project_aliases 登记。
+```
+
+Not blocking is deliberate: dispatching a legitimately new project should still take one command; a hard gate would force you to edit a config file before you can start work.
 
 ### Progress split by kind of work (`Project.kinds`)
 

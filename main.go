@@ -205,6 +205,7 @@ func cmdAdd(args []string) error {
 	typ := fs.String("type", typeSequence, "任务类型")
 	title := fs.String("title", "", "任务标题")
 	dir := fs.String("dir", "", "工作目录（默认当前目录）")
+	project := fs.String("project", "", "显式钉定项目归属（入队即钉，看板归组的最强证据；空=按目录反推）")
 	priority := fs.Int("priority", 0, "优先级，越大越先跑")
 	file := fs.String("file", "", "从文件读取 prompt，--- 行分隔步骤")
 	reviewAfter := fs.Bool("review-after", false, "完成后自动入队设计审核")
@@ -268,6 +269,14 @@ func cmdAdd(args []string) error {
 		}
 	}
 	t := newTask(root, cfg, *typ, orDefaultTitle(*title, prompts[0]), wd, prompts, *priority)
+	// -project 显式归组：只 trim，不做白名单校验——新项目的第一张卡本来就没有"已知项目"
+	// 可查，校验会把"开新项目"这条正常路径堵死。写错名字的后果是看板多一个项目，
+	// 可见、可自查、改一次别名表即可收拢，不值得用一道硬闸换。
+	if p := strings.TrimSpace(*project); p != "" {
+		t.Project = p
+	} else if *project != "" {
+		return fmt.Errorf("-project 不能只有空白字符")
+	}
 	t.ReviewAfter = *reviewAfter
 	t.EmitTasks = *emit || *typ == typeAssembly || *typ == typeCoordinate
 	t.SessionID = *session
@@ -348,10 +357,14 @@ func cmdAdd(args []string) error {
 	if *hold {
 		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step, map[string]any{"reason": "add -hold"})
 	}
-	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d，stakes=%s%s%s）\n",
+	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d，stakes=%s%s%s%s）\n",
 		t.ID, t.Type, t.Title, len(t.Prompts), t.Priority, t.Stakes,
 		map[bool]string{true: "，自动复审", false: ""}[t.ReviewAfter],
-		map[bool]string{true: "，effort=" + t.Effort, false: ""}[t.Effort != ""])
+		map[bool]string{true: "，effort=" + t.Effort, false: ""}[t.Effort != ""],
+		map[bool]string{true: "，project=" + t.Project, false: ""}[t.Project != ""])
+	// 软约束：这卡按当前账本会落进「未分类」时提示一行（不阻断，见 boardproject.go）。
+	// 放在成功回执之后：先确认卡已入队，再给整理建议——顺序反了会读成"入队失败"。
+	warnIfUnclassified(root, t)
 	return nil
 }
 

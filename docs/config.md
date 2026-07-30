@@ -35,5 +35,18 @@
 | `default_review_sync` | "" | 全局默认分流前同步命令（sh -c，cwd=实现卡目录）；三键缺一不套默认 |
 | `remote_hosts.<name>.codex_only` | false | 为 true 时该主机机械禁止 Claude；带 Claude 模型及自动审核卡均在派发入口改道远端 Codex |
 
+## 看板配置速查（~/.cardex/board.json）
+
+看板**只读**这个文件，永不写它；文件缺失 = 全部走自动推导。
+
+| 键 | 位置 | 说明 |
+|---|---|---|
+| `projects.<项目id>.name` / `.desc` / `.phases.<阶段名>` | 项目块 | 人工文案覆盖自动推导的项目/阶段介绍 |
+| `projects.<项目id>.goal` | 项目块 | 目标锚定的「落地进度」（与卡片进度并列，不替换），见[进阶指南](guide.md#项目覆盖块-cardexboardjson) |
+| `projects.<项目id>.kind_rules` | 项目块 | 人工分类规则（标题子串或任务 ID 全串 → kind）；坏规则逐条跳过并挂 `kind_rule_error` |
+| `project_aliases` | **顶层** | 有序的「目录 → 项目」归组规则表 `[{"match":"<精确目录或 glob>","title":"<标题子串，可选>","project":"<项目名>"}]`。首条命中即用；归组优先级 **显式(`add -project`) > 别名 > 内建模式 > 目录启发式 > 「未分类」**。改这张表不动任何任务卡，下次快照重建全量追溯生效——这是整理存量野项目的手段。坏规则逐条跳过并挂 `project_alias_error`。详见[进阶指南 · 项目归属](guide.md#项目归属显式--别名--模式--启发式--未分类) |
+
+`match` 不含通配符时是**精确匹配该目录**（防止给容器目录写一条规则就吞掉它下面所有项目）；要覆盖子树写 `X/*`（glob 匹配该目录或其任一祖先，故覆盖任意深度）。大小写不敏感。
+
 提示词模板在 `~/.cardex/templates/*.md`，可直接修改（`{{GOAL}}` `{{DIR}}` `{{FOCUS}}` 会被替换；
 `coordinate.md` 里的 `{{QUEUE}}` `{{PROGRESS}}` 在**派发时**替换为实时快照）。

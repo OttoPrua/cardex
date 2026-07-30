@@ -224,7 +224,7 @@ func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt 
 		sandbox = "workspace-write"
 		extra = []string{"-c", fmt.Sprintf(`sandbox_workspace_write.writable_roots=["%s"]`, filepath.Join(workDir, ".git"))}
 	}
-	outFile := filepath.Join(os.TempDir(), "claudego-codex-"+t.ID+".txt")
+	outFile := filepath.Join(os.TempDir(), "cardex-codex-"+t.ID+".txt")
 	defer os.Remove(outFile)
 	args := []string{"exec", "-C", workDir, "--sandbox", sandbox, "--skip-git-repo-check",
 		"--color", "never", "-o", outFile}
@@ -412,7 +412,7 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	if tmp == "" {
 		tmp = "."
 	}
-	outFile := tmp + "/claudego-remote-" + t.ID + ".txt"
+	outFile := tmp + "/cardex-remote-" + t.ID + ".txt"
 
 	const marker = "===CARDEX_REMOTE_RESULT==="
 	// 远端 shell 差异：cmd（Windows，默认）用 & 分隔 + type + 反斜杠路径；posix 用 ; + cat + 正斜杠。
@@ -1301,7 +1301,7 @@ var (
 // (10s)或 ctx 超时(120s)。marker 一见即 killProcGroup 让 wait 立刻收——上层从"我知道退出码但还得等
 // 10s"提速到"知道退出码且 wait 立刻返回"。killProcGroup 幂等,若 wait 已提前返回也无害。
 func runReviewSync(t *Task, lg *os.File) error {
-	marker := filepath.Join(os.TempDir(), fmt.Sprintf("claudego-reviewsync-%s-%d.ec", t.ID, os.Getpid()))
+	marker := filepath.Join(os.TempDir(), fmt.Sprintf("cardex-reviewsync-%s-%d.ec", t.ID, os.Getpid()))
 	_ = os.Remove(marker) // 前置清理:防同 ID 上次残留骗过 watcher 立即误杀
 	defer os.Remove(marker)
 

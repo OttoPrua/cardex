@@ -27,7 +27,7 @@ case "$beh" in
     ;;
   *)
     echo "OpenAI Codex 执行日志噪声（marker 之前，应被解析器忽略）"
-    echo "===CLAUDEGO_REMOTE_RESULT==="
+    echo "===CARDEX_REMOTE_RESULT==="
     echo "remote step done"
     exit 3
     ;;

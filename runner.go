@@ -414,7 +414,7 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	}
 	outFile := tmp + "/claudego-remote-" + t.ID + ".txt"
 
-	const marker = "===CLAUDEGO_REMOTE_RESULT==="
+	const marker = "===CARDEX_REMOTE_RESULT==="
 	// 远端 shell 差异：cmd（Windows，默认）用 & 分隔 + type + 反斜杠路径；posix 用 ; + cat + 正斜杠。
 	sep, catCmd, printPath := "&", "type", strings.ReplaceAll(outFile, "/", `\`)
 	if rh.Shell == "posix" {

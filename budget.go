@@ -304,7 +304,7 @@ func readCredsFile(path string) string {
 }
 
 // readKeychainCreds 走 macOS `security` 工具读 "Claude Code-credentials" 项；-w 打印明文。
-// 该项由 Claude Code 桌面端写入，用户已在系统里授权 claudego 二进制访问时才能读到。
+// 该项由 Claude Code 桌面端写入，用户已在系统里授权本二进制访问时才能读到；改名换了二进制路径 = 钥匙串 ACL 要重批（cutover 步骤）。
 // 未授权/未登录 → 返回 ""，fail-open。
 func readKeychainCreds() string {
 	out, err := exec.Command("security", "find-generic-password", "-w", "-s", "Claude Code-credentials").Output()
@@ -354,7 +354,7 @@ func fetchOAuthUsage(cfg *Config, now time.Time) (*oauthUsageSample, error) {
 	}
 	req.Header.Set("Authorization", "Bearer "+tok)
 	req.Header.Set("anthropic-beta", "oauth-2025-04-20")
-	req.Header.Set("User-Agent", "claudego/"+version)
+	req.Header.Set("User-Agent", "cardex/"+version)
 	client := &http.Client{Timeout: time.Duration(timeout) * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {

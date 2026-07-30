@@ -134,7 +134,8 @@ func printUsage() {
   clean                            # 把 done/failed/canceled 归档到 archive/
 
 系统
-  init                             # 初始化数据目录（默认 ~/.claudego，可用 CLAUDEGO_ROOT / -root 覆盖）
+  init                             # 初始化数据目录（默认 ~/.bide，可用 BIDE_ROOT / -root 覆盖；
+                                   # 旧根 ~/.claudego 仍兼容读，迁移见 migrate）
   install-launchd [-interval 300]  # 安装 macOS 定时器，开机自动调度
   uninstall-launchd
   doctor                           # 自检环境

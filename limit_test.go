@@ -411,3 +411,64 @@ func TestParseResetEpochTryAgainAtPhrase(t *testing.T) {
 		t.Errorf("无日期文本应保持原 31min 回退: got %s, want %s", time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
 	}
 }
+
+// TestParseResetEpochTryAgainNearMissDoesNotOversleep (CG-1c 修复轮1 P1-1 核心反例)
+// 复审 t0731-0424-f127 发现：实战截断文案 "try again at Aug 5th, 2026 12:0…" 里的分钟位
+// 只截出一个 "0"，resetTryAgainRe 的 (?::(\d{2}))? 吃不满 2 位数字，minute 回落成 0，于是精确
+// 解成 "12:00" ——而实际分钟可能是 00~09 里的任意值。如果唤醒发生在真实重置点前后几分钟内
+// （比如 12:03 复撞重解析），此时 cand(12:00) 已 <= now(12:03)，旧法会贯穿到 resetTryAgainDateOnlyRe
+// 分支——它与 resetTryAgainRe 共享 "try again at <month>" 前缀且无条件命中——返回 now+24h。
+// 于是本该几分钟内解冻的限额被错判过睡近 24 小时（修复前基线：此路径只需承担 cfg.LimitFallbackMin
+// 的短回退代价，即 31min）。
+//
+// 【反例】把 runner.go parseResetEpoch 里 resetTryAgainDateOnlyRe 分支的 `!tryAgainFullMatched &&`
+// 门槛去掉（或把完整形态分支里 `if !cand.After(now) { return ...LimitFallbackMin... }` 短回退删掉），
+// 本测试报红：返回值会变成 now+24h 而非 now+31min。
+func TestParseResetEpochTryAgainNearMissDoesNotOversleep(t *testing.T) {
+	cfg := &Config{LimitFallbackMin: 31, CooldownMarginSec: 90}
+	loc := time.UTC
+	// 复撞重解析发生在真实重置点（12:00~12:09 之间某刻）之后几分钟：now=12:03。
+	now := time.Date(2026, 8, 5, 12, 3, 0, 0, loc)
+
+	realWorld := "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage " +
+		"to purchase more credits or try again at Aug 5th, 2026 12:0…"
+	got := parseResetEpoch(realWorld, cfg, now)
+	want := now.Add(31 * time.Minute).Unix() + 90
+	if got != want {
+		t.Fatalf("cand(12:00) <= now(12:03) 应落 cfg.LimitFallbackMin 短回退, got %s (resume=%s), want %s (resume=%s)",
+			time.Unix(got, 0).In(loc), time.Unix(got, 0).In(loc),
+			time.Unix(want, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+	// 反证：不得过睡到 24h 兜底——这正是复审揪出的过睡放大。
+	oversleep := now.Add(24 * time.Hour).Unix() + 90
+	if got == oversleep {
+		t.Fatalf("不得落 24h 过睡兜底: got 与 24h 过睡值相同 %d", got)
+	}
+}
+
+// TestParseResetEpochDateRecentlyPassedFallsBackShort (CG-1c 修复轮1 · 按类审计)
+// 复审要求按类排查同构缺陷：resetDateRe（"resets <month> <day> at <time>" 措辞）与
+// resetTryAgainRe 结构相同（月+日+时精确解析、window 校验失败/cand<=now 时会 fall through），
+// 但 resetDateRe **没有**配对的宽松 date-only 兜底正则（本仓只有 resetTryAgainDateOnlyRe，
+// 专配 resetTryAgainRe），所以 resetDateRe 分支 fall through 之后既不匹配 resetTryAgainRe/
+// resetTryAgainDateOnlyRe（前缀是 "try again at" 不是 "reset[s]"），也不会误配 resetTimeRe
+// （"reset[s]?" 后必须紧跟空白+可选 "at"+数字，中间的月份日期文本挡住），最终会安全落到
+// cfg.LimitFallbackMin 短回退——本测试钉住这条审计结论，防止未来有人给 resetDateRe 也加一条
+// 无条件的 date-only 兜底、复现同一 class 的过睡缺陷。
+//
+// 【反例】若未来给 resetDateRe 配一条无条件 "resets <month>" 宽松兜底（重现 P1-1 那种耦合），
+// 本测试会报红：返回值从 now+31min 变成某个远期兜底值。
+func TestParseResetEpochDateRecentlyPassedFallsBackShort(t *testing.T) {
+	cfg := &Config{LimitFallbackMin: 31, CooldownMarginSec: 90}
+	loc := time.UTC
+	now := time.Date(2026, 8, 5, 12, 3, 0, 0, loc)
+
+	// 与 resetTryAgainRe 场景对称构造：分钟位截断到只剩一位，精确解析早判为 12:00。
+	truncated := "You've hit your limit · resets Aug 5 at 12:0"
+	got := parseResetEpoch(truncated, cfg, now)
+	want := now.Add(31 * time.Minute).Unix() + 90
+	if got != want {
+		t.Fatalf("resetDateRe 的 cand<=now 场景应安全落短回退（无配对 date-only 兜底可贯穿）, got %s, want %s",
+			time.Unix(got, 0).In(loc), time.Unix(want, 0).In(loc))
+	}
+}

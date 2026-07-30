@@ -785,7 +785,9 @@ func parseResetEpoch(text string, cfg *Config, now time.Time) int64 {
 	// "try again at <英文月份日期>" 形态：与 resetDateRe 的 "reset[s]" 前缀互不相干，先于纯钟点
 	// resetTimeRe 解析，避免被后者的宽松 "reset[s]?...(\d{1,2})" 抢先误吃（虽然此形态压根不含
 	// "reset" 字样，但保持解析优先级与 resetDateRe 一致，便于后续维护理解顺序）。
+	tryAgainFullMatched := false
 	if m := resetTryAgainRe.FindStringSubmatch(text); m != nil {
+		tryAgainFullMatched = true
 		if mon := monthNum(m[1]); mon != 0 {
 			day, _ := strconv.Atoi(m[2])
 			hour, _ := strconv.Atoi(m[4])
@@ -821,10 +823,21 @@ func parseResetEpoch(text string, cfg *Config, now time.Time) int64 {
 				if cand.After(now) && cand.Before(now.Add(maxWindow)) {
 					return clampEpoch(cand.Unix()+margin, now)
 				}
+				// cand ≤ now（重置点刚过/被截断的分钟位造成精确解析早判几分钟）：CG-1c 修复轮1
+				// 实锤——旧法会继续贯穿到下面 resetTryAgainDateOnlyRe 分支，同前缀无条件命中，
+				// 把本应几分钟内解冻的限额错判成 +24h（见 TestParseResetEpochTryAgainNearMissDoesNotOversleep）。
+				// 完整形态已命中说明分钟位是可信的（哪怕只差几分钟），按短回退重试而非整天等待。
+				if !cand.After(now) {
+					return now.Add(time.Duration(cfg.LimitFallbackMin)*time.Minute).Unix() + margin
+				}
 			}
 		}
 	}
-	if resetTryAgainDateOnlyRe.MatchString(text) {
+	// 仅在完整形态（resetTryAgainRe）未命中时才落地这条更宽松的 date-only 兜底——两条正则共享
+	// "try again at <month>" 前缀，完整形态命中但因 cand ≤ now 提前 return 短回退（见上）之后，
+	// 若这里不加 !tryAgainFullMatched 门槛，会对同一段文本重复匹配、贯穿到 24h 兜底，把几分钟的
+	// 误差放大成一整天过睡。
+	if !tryAgainFullMatched && resetTryAgainDateOnlyRe.MatchString(text) {
 		// 日期形态命中但拿不到时:分（截断/格式外变体）：置信不足，保守退避到"明日同时刻"，
 		// 不落 cfg.LimitFallbackMin 高频空撞——跨天限额空撞代价远大于多等一天。
 		return clampEpoch(now.Add(24*time.Hour).Unix()+margin, now)

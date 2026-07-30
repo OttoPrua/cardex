@@ -227,9 +227,14 @@ cardex board -ttl 30       # 任务快照缓存秒数（默认 10）
 - `match` **不含通配符 = 精确匹配该目录本身**；含 `*` `?` `[` 时按 glob 匹配「该目录或它的任一祖先」，故 `X/*` 覆盖 X 下**任意深度**。一律大小写不敏感（同一个远端目录在两台机器的卡上大小写常不一致）。
 - **为什么裸路径不做前缀语义**：给容器目录（如 `~/Projects`）写一条前缀规则，会把它下面所有项目一次性吞进同一个项目，且账面完全看不出来。两种误用代价不对称——漏配只是几个目录留在收件箱（可见可改），过配是整块看板塌成一个项目。要覆盖子树请显式写 `/*`。
 - `title` 是标题子串（大小写不敏感）。远端任务级目录名是随机任务 ID，**目录本身不含任何项目信息**，只能靠标题判归属。与 `match` 同写 = 必须**同时**命中（AND），防止标题规则泄漏到全盘。
-- 坏规则（缺 `project`、`match` 与 `title` 都缺、glob 语法非法）**逐条跳过并披露**（`OverviewResp.project_alias_error`），不连坐整表——与 `kind_rules` 同一纪律。
+- 坏规则（缺 `project`、`match` 与 `title` 都缺、glob 语法非法）**逐条跳过并披露**（`OverviewResp.project_alias_error`，看板总览顶部渲染成黄色告警），不连坐整表——与 `kind_rules` 同一纪律。
 
 **内建模式规则（第 3 层）**：目录或其祖先的 basename 以「已知项目名 + `-`」开头即归该项目，专治日期工作树野化：`Trading-paper-strategy-envelope-20260730` → `Trading`、`PerlicaHermes-cmp-sol` → `PerlicaHermes`、`Trading-strategy-research-20260726/c-etf-regime` → `Trading`（证据在祖先上）。「已知项目名」= **当批任务里已经站住脚的项目代表名** + 别名表登记的名字 + 卡上显式钉的名字；通用目录名（`docs`/`src`/`config` 等）排除在外。同时有多个已知名可匹配时取**最长**的那个（`Trading-docs-mirror` 归 `Trading-docs` 而不是 `Trading`）。
+
+**等值优先于前缀**：basename **恰好等于**某个已知项目名时，等值先判，不会再被更短的已知名以前缀吞掉。
+- 祖先等值 → 直接归那个名字：`~/Projects/Trading-docs/notes` 归 `Trading-docs`（不是 `Trading`）。
+- 目录**自身**等值且该名字被**声明**过（登记在 `project_aliases`，或有卡用 `-project` 钉过），或它有**跨根同名证据**（如本机 `~/Projects/Trading-docs` 与远端 `D:/Project/mirrors/Trading-docs` 两条独立路径同名）→ 交回启发式，由同名/镜像证据并进正确项目。
+- 目录自身等值、但那个名字只是「某个单目录工作树碰巧攒够了卡」→ 仍按前缀收拢（`Alpha-cmp` → `Alpha`）。想让这种目录稳定成为独立项目，用 `-project` 钉一次或登记进 `project_aliases`；在此之前，它自身与它的子目录可能分属两个项目（已知不对称，登记待裁）。
 
 **「未分类」收件箱**：归组失败的目录**不再各自成项目**，统一进名为「未分类」的项目（固定 id `unclassified`，**恒显示**，哪怕 0 张卡——空收件箱本身就是信息）。进桶的有两类：没有工作目录的卡；以及只有一个目录、卡数又不足 3 张的分量。跨机镜像互证的分量（卡上有 `review_dir`）不受卡数门槛限制——两个互证目录本身就是强证据。
 

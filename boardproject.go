@@ -183,6 +183,14 @@ type projectResolver struct {
 	// known 是 pattern 层的已知项目名，**按长度降序**：
 	// "Trading" 与 "Trading-docs" 同时已知时，Trading-docs-xxx 必须归给更长的那个。
 	known []string
+	// authoritative 是「这个名字确实是一个**地方**，不是某个项目的工作树标签」的已知名集合
+	// （键为小写名）。两种证据，任一即可：
+	//   - 声明：别名表里写了它，或有卡用 -project 钉了它（人明说的，最强）；
+	//   - 跨根：它的启发式分量里有 ≥2 个**互不为祖先**的目录（跨机镜像 D:/…/X 与本机 /w/X、
+	//     或两条独立路径同名）——同一棵树下的父子目录不算，因为子目录不为"这个名字是项目"
+	//     提供任何独立证据。
+	// 只用于 matchPattern 的链首等值判定，见那里的说明。
+	authoritative map[string]bool
 }
 
 func newProjectResolver(tasks []*Task, rawAliases []boardProjectAlias) *projectResolver {
@@ -223,6 +231,18 @@ func newProjectResolver(tasks []*Task, rawAliases []boardProjectAlias) *projectR
 		// 它算作分量的一个目录：这正是"跨机互证"这条强证据的物证。
 		addDir(normDir(t.ReviewDir))
 	}
+	r.authoritative = map[string]bool{}
+	declare := func(n string) {
+		if n = strings.TrimSpace(n); n != "" {
+			r.authoritative[strings.ToLower(n)] = true
+		}
+	}
+	for _, a := range aliases {
+		declare(a.Project)
+	}
+	for _, t := range tasks {
+		declare(t.Project)
+	}
 	for c, dirs := range compDirs {
 		ds := make([]string, 0, len(dirs))
 		for d := range dirs {
@@ -231,9 +251,32 @@ func newProjectResolver(tasks []*Task, rawAliases []boardProjectAlias) *projectR
 		sort.Strings(ds) // pickProjectDir 同分时取字典序小者，先排序保证结果与遍历顺序无关
 		r.compName[c] = dirBase(pickProjectDir(ds, dirCount))
 		r.compOK[c] = len(ds) >= 2 || compCards[c] >= minSoloProjectCards
+		if r.compOK[c] && countIndependentRoots(ds) >= 2 {
+			declare(r.compName[c])
+		}
 	}
 	r.known = knownNames(tasks, aliases, r.compName, r.compOK)
 	return r
+}
+
+// countIndependentRoots 数一个分量里**互不为祖先**的目录个数。
+// /w/X 与 /w/X/sub 只算 1 个（子目录是同一棵树的一部分，不构成独立证据）；
+// /w/X 与 D:/mirror/X 算 2 个（两条独立路径都叫 X，这才说明 X 是个项目名）。
+func countIndependentRoots(ds []string) int {
+	n := 0
+	for _, d := range ds {
+		isDesc := false
+		for _, e := range ds {
+			if e != d && strings.HasPrefix(d, e+"/") {
+				isDesc = true
+				break
+			}
+		}
+		if !isDesc {
+			n++
+		}
+	}
+	return n
 }
 
 // knownNames 汇总 pattern 层可用的「已知项目名」：够格分量的代表名 + 别名表登记的项目名
@@ -309,10 +352,48 @@ func (r *projectResolver) resolve(t *Task) (string, string) {
 //
 // 要求 '-' 后面**至少还有一个字符**：项目根目录自身（basename 恰等于已知名）不该被
 // 这条规则接管——它本来就该走启发式，走 pattern 只是绕了一圈得到同一个答案。
+//
+// 【等值必须先于前缀判（BD-45 R1·P1-1）】上一版只用 len(b) > len(k)+1 把「等长自吞」排除掉，
+// 但排除的只是那一个 k：'Trading-docs' 这个 basename 与已知名 'Trading-docs' 等值时被跳过，
+// 循环继续走到更短的已知名 'Trading'，于是以 'Trading-' 前缀把它吞进 Trading。
+// 后果是 ~/Projects/Trading-docs/notes（子目录）、D:/Project/mirrors/Trading-docs（跨机新根）
+// 这类卡被判给**错误的项目**，且判定来源仍是 pattern——界面上看不出任何异常。
+// 靶子：TestProjectPatternEqualNameBeatsShorterPrefix / …NewRootWithKnownNameNotSwallowed。
+//
+// known 已按长度降序（见 knownNames），故对同一个 basename，等值候选（len(k)==len(b)）
+// 必然排在所有前缀候选（len(k)<len(b)-1）之前——一层循环里先判等值即可，无需二次扫描。
+//
+// 等值命中分两种，处理不同，差别只在**链首**（目录自身）：
+//
+//   - 真祖先等值 → 直接归该已知名。~/Projects/Trading-docs/notes 的祖先 basename 就是
+//     Trading-docs 本人，没有比这更具体的证据，绝不能再往下用 'Trading-' 前缀去吞。
+//
+//   - 链首等值 → 仅当该名字是 authoritative（人明确声明过，或有跨根同名证据；见字段说明）
+//     才返回**不命中**、把这个目录交回启发式（groupDirs 的证据 (3)「同名目录」会把跨机新根
+//     并进正确分量）。不 authoritative 时**继续走前缀**——这是刻意保留的既有契约：
+//     Alpha-cmp 这种「只在一个目录上攒了几张卡」的对照工作树，名字虽然进了 known（分量够格），
+//     但它本来就该被 pattern 收回 Alpha（TestProjectPriorityChain 的「模式 > 启发式」用例）。
+//
+// 【已知不对称，登记待裁】未声明、单根、但分量够格的 X-suffix 工作树：它自身 → X（前缀），
+// 它的子目录 → X-suffix（祖先等值）——父子分属两个项目。消除它要么让链首等值一律不命中
+// （会打掉上面那条「模式 > 启发式」契约），要么让祖先等值也要求 authoritative
+// （会让本轮 P1-1 的头号场景 Trading-docs/notes 继续被吞）。两条都动到卡的核心契约，
+// 故此处按"少吞并、可见优先"取当前解，差异登记到复盘由设计权威裁定。
+// 规避方式与本功能一贯的出口一致：把该名字登记进 project_aliases 或用 -project 钉一次即可
+// （登记后两侧一致，靶子：TestProjectPatternDeclaredRootIsNotSwallowed）。
 func (r *projectResolver) matchPattern(d string) (string, bool) {
-	for _, c := range dirSelfAndAncestors(d) {
+	for i, c := range dirSelfAndAncestors(d) {
 		b := dirBase(c)
 		for _, k := range r.known {
+			if strings.EqualFold(b, k) {
+				if i > 0 {
+					return k, true
+				}
+				if r.authoritative[strings.ToLower(k)] {
+					return "", false
+				}
+				continue // 非权威的链首等值：按既有契约继续用更短的已知名做前缀收拢
+			}
 			if len(b) > len(k)+1 && b[len(k)] == '-' && strings.EqualFold(b[:len(k)], k) {
 				return k, true
 			}

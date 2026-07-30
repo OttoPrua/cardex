@@ -144,6 +144,146 @@ func TestProjectPatternWalksAncestors(t *testing.T) {
 	}
 }
 
+// ---- 等值必须先于前缀（BD-45 R1·P1-1 的靶子）----
+//
+// 缺陷形态：'Trading-docs' 与更短的 'Trading' 同时是已知名时，前一版 matchPattern 只把
+// **等长**的那个候选排除掉，循环继续走到 'Trading'，用 'Trading-' 前缀把 Trading-docs
+// 的子目录/新根静默判给 Trading（来源仍显示 pattern，界面无从察觉）。
+// 下面两个用例分别钉住「真祖先等值」与「链首等值」两条路径。
+
+// TestProjectPatternEqualNameBeatsShorterPrefix —— 祖先 basename 与长已知名等值时，
+// 必须归长的那个，绝不能被短已知名以前缀吞并。
+func TestProjectPatternEqualNameBeatsShorterPrefix(t *testing.T) {
+	var ts []*Task
+	for i := 0; i < 3; i++ {
+		n := string(rune('0' + i))
+		ts = append(ts, pcard("/w/Trading", "t"+n), pcard("/w/Trading-docs", "d"+n))
+	}
+	sub := pcard("/w/Trading-docs/notes", "子目录卡")
+	ts = append(ts, sub)
+	res := newProjectResolver(ts, nil)
+
+	name, src := res.resolve(sub)
+	if name == "Trading" {
+		t.Fatalf("Trading-docs 的子目录被短已知名 'Trading' 前缀吞并（来源 %s）", src)
+	}
+	if name != "Trading-docs" {
+		t.Fatalf("/w/Trading-docs/notes 应归 Trading-docs，got (%q,%s)", name, src)
+	}
+}
+
+// TestProjectPatternNewRootWithKnownNameNotSwallowed —— 目录**自身** basename 就等于已知名
+// （未登记的新根，如跨机镜像 D:/Project/mirrors/Trading-docs）时：
+//  1. 不得被更短的已知名吞并；
+//  2. 交回启发式后，groupDirs 的「同名目录」证据把它并进正确的项目；
+//  3. 连同名证据都没有时落「未分类」（可见）——而不是被静默判给隔壁项目。
+func TestProjectPatternNewRootWithKnownNameNotSwallowed(t *testing.T) {
+	var ts []*Task
+	for i := 0; i < 3; i++ {
+		n := string(rune('0' + i))
+		ts = append(ts, pcard("/w/Trading", "t"+n), pcard("/w/Trading-docs", "d"+n))
+	}
+	mirror := pcard("D:/Project/mirrors/Trading-docs", "镜像上的卡")
+	ts = append(ts, mirror)
+	res := newProjectResolver(ts, nil)
+
+	name, src := res.resolve(mirror)
+	if name == "Trading" {
+		t.Fatalf("未登记的新根被短已知名 'Trading' 吞并（来源 %s）", src)
+	}
+	if name != "Trading-docs" || src != projSourceHeuristic {
+		t.Fatalf("同名目录证据应把新根并进 Trading-docs（启发式），got (%q,%s)", name, src)
+	}
+
+}
+
+// TestProjectPatternDeclaredRootIsNotSwallowed —— 名字一旦被**声明**过（别名表登记或 -project 钉过），
+// 它的新根与子目录都不得再被更短的已知名前缀吞掉，且两侧结论一致。
+// 这是 matchPattern 注释里给出的规避出口，必须真的可用（否则那句注释就是空头支票）。
+func TestProjectPatternDeclaredRootIsNotSwallowed(t *testing.T) {
+	var ts []*Task
+	for i := 0; i < 3; i++ {
+		n := string(rune('0' + i))
+		ts = append(ts, pcard("/w/Trading", "t"+n), pcard("/newroot/Trading-docs", "d"+n))
+	}
+	sub := pcard("/newroot/Trading-docs/notes", "子目录卡")
+	ts = append(ts, sub)
+	// 声明来源一：别名表里出现过这个项目名（match 指向别处，只贡献"这是个项目"这条信息）。
+	res := newProjectResolver(ts, []boardProjectAlias{{Match: "/nowhere", Project: "Trading-docs"}})
+	root := pcard("/newroot/Trading-docs", "根上的卡")
+	if name, src := res.resolve(root); name != "Trading-docs" {
+		t.Fatalf("已声明的项目根不得被 'Trading-' 吞并，got (%q,%s)", name, src)
+	}
+	if name, src := res.resolve(sub); name != "Trading-docs" {
+		t.Fatalf("已声明项目的子目录应与根同项目，got (%q,%s)", name, src)
+	}
+
+	// 声明来源二：某张卡用 -project 钉过这个名字，效果相同。
+	var ts2 []*Task
+	for i := 0; i < 3; i++ {
+		n := string(rune('0' + i))
+		ts2 = append(ts2, pcard("/w/Trading", "t"+n), pcard("/newroot/Trading-docs", "d"+n))
+	}
+	pinned := pcard("D:/anywhere", "钉过的卡")
+	pinned.Project = "Trading-docs"
+	ts2 = append(ts2, pinned)
+	res2 := newProjectResolver(ts2, nil)
+	if name, src := res2.resolve(pcard("/newroot/Trading-docs", "x")); name != "Trading-docs" {
+		t.Fatalf("-project 钉过的名字应同样免于前缀吞并，got (%q,%s)", name, src)
+	}
+}
+
+// TestLaneSuffixesLongestFirst —— 同类位点：groupDirs 证据 (2) 的车道后缀表也是
+// 「多候选、break 取首个」的匹配（boardmodel.go:421）。一旦某个后缀是另一个的真后缀
+// （如将来补进 "-tree" 与 "-worktree"），短的排在前面就会先命中、把项目名截错。
+// 这里钉住表的排序契约：**真后缀者必须排在被包含者之前**。
+// 现表 {-lanes,-worktrees,-worktree,-lane,-wt} 两两互不为后缀，本用例当前是"守门"性质；
+// 它杀死的突变是"未来新增/重排后缀时把短的写在前面"。
+func TestLaneSuffixesLongestFirst(t *testing.T) {
+	for i := 0; i < len(laneSuffixes); i++ {
+		for j := i + 1; j < len(laneSuffixes); j++ {
+			a, b := laneSuffixes[i], laneSuffixes[j]
+			if len(a) < len(b) && strings.HasSuffix(b, a) {
+				t.Errorf("laneSuffixes[%d]=%q 是 laneSuffixes[%d]=%q 的真后缀，短的排在前会先命中：应把 %q 提前",
+					i, a, j, b, b)
+			}
+		}
+	}
+	// 行为桩：车道目录确实并进项目根（证明这条证据本身活着，不只是表的形状对）。
+	var ts []*Task
+	for i := 0; i < 3; i++ {
+		ts = append(ts, pcard("/w/Proj", "p"+string(rune('0'+i))))
+	}
+	ts = append(ts, pcard("/w/Proj-lanes/a", "车道卡"))
+	rep := groupDirs(ts)
+	if rep["/w/Proj-lanes/a"] != rep["/w/Proj"] {
+		t.Fatalf("车道目录应与项目根同分量，got %q vs %q", rep["/w/Proj-lanes/a"], rep["/w/Proj"])
+	}
+}
+
+// TestGroupDirsPrefixNeedsSeparator —— 同类位点：groupDirs 证据 (4)「祖先包含」是启发式层里
+// 另一处"短名可能吞长名"的入口。它现在靠**按 '/' 分段**取祖先（dirParent 链）来避免：
+// '/w/Trading-docs' 的父目录是 '/w'，永远不会是 '/w/Trading'。
+//
+// 实测（本轮跑过的突变）：把 descendants 计数里的 HasPrefix(d, o+"/") 改成 HasPrefix(d, o)
+// **杀不死**本用例——那行只喂容器护栏的计数，不参与并入判定；写注释时别把它当成防线。
+// 真正被本用例杀死的突变：把这段父链遍历改写成对 observed 的裸前缀扫描
+// （for o := range observed { if HasPrefix(d, o) { union } }）——一改即红。
+func TestGroupDirsPrefixNeedsSeparator(t *testing.T) {
+	ts := []*Task{
+		pcard("/w/Trading", "a"),
+		pcard("/w/Trading-docs", "b"),
+		pcard("/w/Trading/sub", "c"), // 真子目录：这个才该并进去
+	}
+	rep := groupDirs(ts)
+	if rep["/w/Trading-docs"] == rep["/w/Trading"] {
+		t.Fatalf("同级的 Trading-docs 不得被当成 Trading 的子孙并入同一分量")
+	}
+	if rep["/w/Trading/sub"] != rep["/w/Trading"] {
+		t.Fatalf("真子目录应并入父分量，got %q vs %q", rep["/w/Trading/sub"], rep["/w/Trading"])
+	}
+}
+
 // TestSoloProjectCardThreshold —— 单目录分量的卡数门槛两侧各钉一根桩。
 //
 // 卡数刻意写**字面量 2 / 3** 而不是 minSoloProjectCards±1：用常量表达就成了自我循环，

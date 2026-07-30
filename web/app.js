@@ -933,6 +933,15 @@ async function viewOverview() {
         h('code', { text: d.board_override_error }),
         h('p', { class: 'callout-sub', text: subText }))));
   }
+  // project_aliases 里被跳过的坏规则必须显式披露：后端逐条跳过、其余仍生效，
+  // 但界面上"登记成功"与"规则写错了"长得一模一样时，用户会以为存量已经整理过了，
+  // 实则那些卡还散在「未分类」里。与 kind_rule_error 同一款式（黄色告警，不阻断）。
+  // 靶子：TestDisclosureFieldsReachUI（Go 侧枚举 *_error 契约字段，缺一处即红）。
+  if (d.project_alias_error) {
+    frag.append(callout('warning', '⚠', h('div', {},
+      h('strong', { text: '别名规则部分未生效：' }),
+      h('code', { text: d.project_alias_error }))));
+  }
   const totals = d.totals || {};
   const activeN = (totals.queued || 0) + (totals.running || 0) +
     (totals.limit_paused || 0) + (totals.held || 0);

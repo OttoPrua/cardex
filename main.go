@@ -99,8 +99,11 @@ func printUsage() {
 添加任务
   add       [-type sequence|design-review|prompt-assembly|coordinate|progress-pull]
             [-title T] [-dir D] [-priority N] [-model haiku|sonnet|opus] [-file steps.md]
-            [-review-after] [-emit] [-hold] [-skip-permissions] [-tools "A,B"] "prompt..."
+            [-stakes low|normal|high] [-review-after] [-emit] [-hold] [-skip-permissions]
+            [-tools "A,B"] "prompt..."
             -file 中用单独一行 --- 分隔多个步骤（预设 prompt 序列）
+            -stakes 查 config.stakes_policy 决定复核深度（low 不配复审 / high 强制复审+抬思考档），
+                    入队即固化到卡面，运行期不再回查
   assemble  [-dir D] [-priority N] [-model M] [-session S] "目标描述"
             prompt 装配：调研后产出任务序列并自动入队；-session 挂到既有装配角色会话
   review    [-dir D] [-priority N] [-model M] [-session S] ["关注点"]
@@ -214,6 +217,7 @@ func cmdAdd(args []string) error {
 	permMode := fs.String("permission-mode", "", "覆盖权限模式")
 	model := fs.String("model", "", "覆盖模型（haiku/sonnet/opus 或完整模型名）")
 	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
+	stakes := fs.String("stakes", "", "投入产出档位（low|normal|high，缺省 normal）：按 config.stakes_policy 查表决定是否配对抗复审/抬思考档，入队即固化到卡面")
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
 	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
 	codexModel := fs.String("codex-model", "", "钉定经 codex 执行时的模型（如 gpt-5.6-terra）：配 -runner codex 主跑生效；不配 runner 时作为本卡 codex_fallback 降级模型")
@@ -288,6 +292,11 @@ func cmdAdd(args []string) error {
 		}
 		t.Effort = *effort
 	}
+	// stakes 查表：入队即钉，把"这卡多重要"翻译成复核深度固化到卡面（见 stakes.go 文件头）。
+	// 必须排在 -review-after / -effort 赋值之后——查表是在显式意图之上做的决定。
+	if err := applyStakes(t, cfg, *stakes, *effort != ""); err != nil {
+		return err
+	}
 	t.Closeout = *closeout
 	t.FreshSteps = *fresh
 	if *runner == "codex" {
@@ -334,11 +343,15 @@ func cmdAdd(args []string) error {
 	// -hold 直入 held 的卡也从 queued 记起,再补一条 held——诚实历史"入了队但立刻被人挂"。
 	emitTaskEvent(root, t.ID, evQueued, "cli:add", statusQueued, t.Step, map[string]any{
 		"type": t.Type, "priority": t.Priority, "prompts": len(t.Prompts),
+		"stakes": t.Stakes, "review_after": t.ReviewAfter, "effort": t.Effort,
 	})
 	if *hold {
 		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step, map[string]any{"reason": "add -hold"})
 	}
-	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d）\n", t.ID, t.Type, t.Title, len(t.Prompts), t.Priority)
+	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d，stakes=%s%s%s）\n",
+		t.ID, t.Type, t.Title, len(t.Prompts), t.Priority, t.Stakes,
+		map[bool]string{true: "，自动复审", false: ""}[t.ReviewAfter],
+		map[bool]string{true: "，effort=" + t.Effort, false: ""}[t.Effort != ""])
 	return nil
 }
 

@@ -18,6 +18,7 @@
 | `type_defaults.*.model` | 协调 opus；回收 haiku | 各类型默认模型（--model 值），空用账号默认 |
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `thinking_tokens` | 0 | >0 时给 claude 调用设 MAX_THINKING_TOKENS（设计活加大思考预算） |
+| `stakes_policy` | low=不复审 / normal=跟随 / high=强制复审+抬 high | 卡级投入产出分档查表（`add -stakes`），**入队即钉到卡面**、运行期不回查；见[进阶指南 · 投入产出分档](guide.md#卡级投入产出分档-stakes--复核深度查表) |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见[进阶指南 · 额度红线](guide.md#5-小时额度红线保底额度) |
 | `oauth_usage` / `oauth_usage_*` | false | 订阅端点直读（第三用量源），端点未文档化——异常按数据不足处理 |
 | `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行；design-review/progress-pull 只读类型豁免，可同仓并发） |

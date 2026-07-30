@@ -113,6 +113,14 @@ type Config struct {
 	RemoteMirrorRoot  string `json:"remote_mirror_root,omitempty"`
 	DefaultReviewSync string `json:"default_review_sync,omitempty"`
 
+	// ---- 卡级投入产出分档（BD-44，承 2026-07-31 委托人指示）----
+	// StakesPolicy 是 stakes 档位 → 复核深度的查表（键 = low/normal/high）。
+	// **只在 add 入队时查一次并把结果固化到卡面**（ReviewAfter/Effort），运行期不再回查——
+	// 否则入队后改这张表会让在队卡的复核深度静默漂移（与 XFrozenEngine "入队即钉引擎身份" 同一纪律）。
+	// 用户 config.json 里只写部分档位时，其余档位沿用内置默认：json.Unmarshal 往非 nil map 里按键
+	// 合并，不会整表顶掉（loadConfig 从 defaultConfig 起手）。
+	StakesPolicy map[string]StakesRule `json:"stakes_policy,omitempty"`
+
 	// CodexReviewSandbox 控制本机 codex 只读分析卡(design-review/crosscheck/coordinate 等,
 	// 非 sequence)的沙箱策略——CG-R3(承 BD-36 工具链③终裁 b/BD-39 附记):
 	//
@@ -125,6 +133,18 @@ type Config struct {
 	// 远端 codex 复审受同键控制:默认放开为 workspace-write(远端镜像本身已是 sync-lane
 	// 分发的隔离副本,原仓保护语义等价);"readonly" 时仍强制 read-only。
 	CodexReviewSandbox string `json:"codex_review_sandbox,omitempty"`
+}
+
+// StakesRule 是一个 stakes 档位的复核深度规则（config.stakes_policy 的值）。
+type StakesRule struct {
+	// Review 决定该档位是否配对抗复审：
+	//   "on"     强制配（高价值卡不许省这一刀）
+	//   "off"    强制不配（低价值卡不烧复审额度）
+	//   "follow" 跟随 -review-after 的显式指定（空值同义，即不干预）
+	Review string `json:"review,omitempty"`
+	// DefaultEffort 是该档位的思考等级地板：**未显式 -effort 时**，卡上 effort 低于它就抬到它。
+	// 只抬不降——已经是更高档（如类型默认给了 max）的卡不会被这张表拉低。
+	DefaultEffort string `json:"default_effort,omitempty"`
 }
 
 // CrossEngine 描述交叉验证链中一个引擎的执行位置（模型来源可切换的落点）。
@@ -333,6 +353,7 @@ func defaultConfig(claudeBin string) *Config {
 			"default": 1, "opus": 5, "sonnet": 1, "haiku": 0.2, "claude-fable-5": 10, "fable": 10,
 		},
 		NoFallbackModels: []string{"claude-fable-5", "fable"},
+		StakesPolicy:     defaultStakesPolicy(),
 		// 交叉验证默认引擎对：设计档模型撞限时，用两个不同引擎独立作答再交叉查漏顶替。
 		// 甲=本机 claude opus（最高档 max）；乙=本机 codex，具体模型/推理档来自全局 codex_model/codex_reasoning
 		// （乙的 Effort=max 覆盖为最高档）。换 profile 即换模型来源，无需改代码；档位改一个 Effort 字段即可。

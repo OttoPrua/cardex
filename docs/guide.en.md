@@ -312,3 +312,42 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 **Downgrade-specific model and tier-parity rule (`codex_fallback_model`)**: when `codex_fallback` is active and a claude card is rerouted to codex, `codex_fallback_model` takes priority over the global `codex_model`. Tier-parity mapping: **opus-tier cards downgrade to the same-tier terra (o3), not the design-tier sol (GPT-5)** — design-tier doesn't go fill implementation-tier roles. Empty falls back to `codex_model`; this key only applies to the downgrade path (task `runner_pref≠codex` and not remote) — codex-primary cards and remote codex are unaffected.
 
 **Pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
+
+## Per-card stakes tiering (`-stakes` → review-depth lookup table)
+
+"Is this card worth a round of adversarial review? Worth raising the thinking tier?" is a **cost/benefit** judgment. It used to live only in the discipline of whoever filed the card: forget `-review-after` and a high-risk card walks into main unreviewed; add it reflexively and a typo fix burns a full fable review. `-stakes` collapses that judgment into one question — **how much does this card matter** — and lets a table decide the depth:
+
+```bash
+cardex add -stakes low  -dir ~/proj "fix the typo in README"          # no review
+cardex add -stakes high -dir ~/proj "rework session expiry in authz"  # forced review + effort floor at high
+cardex add -dir ~/proj "routine change"                               # default normal: unchanged behavior
+```
+
+The table lives in `config.json`, with defaults for all three tiers:
+
+```jsonc
+"stakes_policy": {
+  "low":    {"review": "off"},                            // never attach a review
+  "normal": {"review": "follow"},                          // follow the explicit -review-after (default tier)
+  "high":   {"review": "on", "default_effort": "high"}     // force a review + thinking-tier floor
+}
+```
+
+- `review` takes `on` / `off` / `follow` (`follow` = don't interfere; keep whatever `-review-after` said);
+- `default_effort` is a **floor, not an override**: it only applies when `-effort` was not given explicitly, and it only raises — a card whose type default is already `max` is never pulled down to `high`;
+- an explicit `-effort` always wins over the floor (`-stakes high -effort low` really is `low`): the command line has the final say, otherwise the command line stops being trustworthy;
+- you may specify only some tiers — the rest keep the built-in defaults (keys are merged, the table is not replaced wholesale);
+- a malformed table value (`review: "yes"`, `default_effort: "ultra"`) **errors out at `add` time** instead of silently falling back to a default — a misspelled guardrail that silently does nothing is far more expensive than an error.
+
+**Frozen at enqueue (drift protection)**: the lookup runs **exactly once, at `add`**, and the result is baked onto the card (the `review_after` / `effort` fields). Nothing is re-read from `config.json` at run time. Otherwise a single edit to `stakes_policy` would silently change the review depth of every queued and running card, with nothing visible on the card itself. The `stakes` field on the card is an audit record only, never a runtime predicate (same discipline as cross-verification freezing engine identity at enqueue).
+
+### Review-seat quality floor (review cards are never downgraded or rerouted)
+
+`no_fallback_models` is a blocklist **by model name**. It cannot stop this: someone switches the review card's model from fable to opus or sonnet (`type_defaults.design-review.model`, or `-model` at file time) and the guardrail silently stops applying — and the way it fails is that the review still runs and still emits a verdict, just from a different engine, with less depth. **A shallow review is not the same as no review**: the ledger still says pass, the loop still lets the change through, and nothing signals otherwise.
+
+So on top of the model-name blocklist there is a floor **by card role**:
+
+- `design-review` cards (the single quality-adjudication point in the implement → review → fix loop)
+- cross-verification merge/adjudication cards (`x_role = C`, the `crosscheck-merge` template)
+
+These two **never participate in codex divert/downgrade** during a claude cooldown or redline, regardless of which model they carry. The cost is that they queue and wait through a claude gap — which is exactly what this buys: **better a late review than a shallow one**.

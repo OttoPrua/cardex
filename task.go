@@ -64,6 +64,10 @@ type Task struct {
 	ReviewAfter bool `json:"review_after,omitempty"`
 	// Effort 非空时以 --effort 传给 claude（low/medium/high/xhigh/max），按任务难度调思考等级。
 	Effort string `json:"effort,omitempty"`
+	// Stakes 是本卡的投入产出档位（low|normal|high，缺省 normal）。**只作审计留档**：
+	// add 时按 config.stakes_policy 查表，把复核深度固化进 ReviewAfter/Effort，运行期不再据本字段
+	// 判定任何行为（入队即钉，防"改配置让在队卡的复核深度静默漂移"）。见 stakes.go 文件头。
+	Stakes string `json:"stakes,omitempty"`
 	// ReviewOf: 本卡是审核卡时指向被审卡 ID；修复闭环靠它取被审卡的 prompt/参数做继承。
 	ReviewOf string `json:"review_of,omitempty"`
 	// FixRound: "实现→对抗审核→修复"循环轮次。实现卡 0，第 n 轮自动修复卡为 n；审核卡继承被审卡轮次。

@@ -143,10 +143,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						continue
 					case blockReason == "":
 						// claude 可用，正常走
-					case cfg.CodexFallback && cfg.CodexBin != "" && codexEligible(t) && !noFallback(cfg, t.Model) && t.Type != typeCrossCheck:
-						// 交叉验证卡的引擎身份就是交付物：claude 引擎的交叉卡(如甲=opus)绝不能被通用 codex
-						// 降级偷换成 codex——否则甲乙同引擎,交叉验证形同虚设。它宁可排队等 claude 窗口。
-						// (乙的 B/C 卡带 PreferRunner=codex,走上面首个 case,不受此影响。)
+					case codexDivertOK(cfg, t):
 						viaCodex[t.ID] = true
 					default:
 						continue // claude 被拦且没有 codex 出路
@@ -230,6 +227,49 @@ func noFallback(cfg *Config, model string) bool {
 		}
 	}
 	return false
+}
+
+// qualityFloorCard 判断该卡是否占"复审位"——恒不参与 claude 冷却/红线期的 codex 改道降级。
+//
+// BD-44 承 2026-07-31 委托人指示（吸纳 PerlicaOptimize L1.9 no_downgrade_below 思想）。
+//
+// 【为什么 no_fallback_models 不够】那是一张**按模型名**的黑名单（默认 fable 系）。复审卡的模型
+// 是可配的（config.type_defaults.design-review.model / 派卡时 -model），有人把复审卡换成 opus、
+// sonnet 或任何不在名单里的模型，护栏就静默失效——而失效的表现恰恰是"复审照跑、照出 verdict"，
+// 只是换了个引擎、审得更浅。审得浅 ≠ 没审：账面仍然 pass，闭环仍然放行，没有任何信号。
+// 所以这里按**卡的角色**再兜一层，与模型名无关：
+//   - design-review：实现→复审→修复闭环里唯一的质量裁决点；
+//   - XRole=="C"：交叉验证链的合并/裁决卡（crosscheck-merge 模板），交叉链的终局裁决位。
+//
+// 代价是这两类卡在 claude 空窗期只能排队等——这正是本条要买的东西：宁可复审晚做，不要复审做浅。
+func qualityFloorCard(t *Task) bool {
+	return t != nil && (t.Type == typeReview || t.XRole == "C")
+}
+
+// codexDivertOK 判断 claude 被冷却/红线拦住时，该卡是否允许改道备用执行器 codex。
+// 抽成独立谓词（而非内联在 tick 的 switch 里）是为了可直测：改道护栏是"静默失效才是事故"
+// 的那类逻辑，必须有能直接构造场景断言的入口。
+func codexDivertOK(cfg *Config, t *Task) bool {
+	if cfg == nil || t == nil || !cfg.CodexFallback || cfg.CodexBin == "" {
+		return false
+	}
+	if !codexEligible(t) {
+		return false
+	}
+	if noFallback(cfg, t.Model) {
+		return false
+	}
+	// 交叉验证卡的引擎身份就是交付物：claude 引擎的交叉卡(如甲=opus)绝不能被通用 codex
+	// 降级偷换成 codex——否则甲乙同引擎,交叉验证形同虚设。它宁可排队等 claude 窗口。
+	// (乙的 B/C 卡带 PreferRunner=codex,走 tick 的 PreferRunner case,不受此影响。)
+	if t.Type == typeCrossCheck {
+		return false
+	}
+	// 复审位质量地板：见 qualityFloorCard。
+	if qualityFloorCard(t) {
+		return false
+	}
+	return true
 }
 
 func daemonLoop(root string, cfg *Config) error {

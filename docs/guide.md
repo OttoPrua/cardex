@@ -335,3 +335,49 @@ cardex board -ttl 30       # 任务快照缓存秒数（默认 10）
 **降级专用模型与档位对等规则（`codex_fallback_model`）**：`codex_fallback` 生效时若 claude 卡被改道 codex，优先用 `codex_fallback_model`，而非全局 `codex_model`。档位对等映射：**opus 档降级首选同档的 terra（o3），不降设计档的 sol（GPT-5）**——设计档不去干实现档的活。空值回退 `codex_model`；此键仅对降级径（任务 `runner_pref≠codex` 且非远端）生效，codex 主跑卡与远端 codex 不受影响。
 
 **钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
+
+## 卡级投入产出分档（`-stakes` → 复核深度查表）
+
+"这张卡值不值得配一轮对抗复审、值不值得抬思考档"是**投入产出**判断。以前它只活在派卡人的纪律里：
+忘了加 `-review-after`，一张高风险卡就裸奔进主干；顺手加上 `-review-after`，一张改错别字的卡也要烧一轮 fable 复审。
+`-stakes` 把这个判断收敛成一个问题——**这卡多重要**——深度由查表决定：
+
+```bash
+cardex add -stakes low  -dir ~/proj "把 README 里的拼写改一下"      # 不配复审
+cardex add -stakes high -dir ~/proj "改鉴权中间件的会话失效逻辑"      # 强制复审 + 思考档抬到 high
+cardex add -dir ~/proj "常规改动"                                  # 缺省 normal：保持既有行为
+```
+
+查表在 `config.json` 里，三档带默认值：
+
+```jsonc
+"stakes_policy": {
+  "low":    {"review": "off"},                            // 强制不配复审
+  "normal": {"review": "follow"},                         // 跟随 -review-after 的显式指定（缺省档）
+  "high":   {"review": "on", "default_effort": "high"}    // 强制配复审 + 思考档地板
+}
+```
+
+- `review` 取值 `on` / `off` / `follow`（`follow` = 不干预，保留 `-review-after` 的原值）；
+- `default_effort` 是**地板不是覆盖**：只在没显式给 `-effort` 时生效，且只抬不降——类型默认已经是 `max` 的卡不会被拉低到 `high`；
+- `-effort` 显式指定恒优先于地板（`-stakes high -effort low` 就是 `low`）：命令行说了算，否则命令行不再可信；
+- 只写部分档位也可以，没写的档位沿用内置默认（按键合并，不是整表顶掉）；
+- 查表值写错（`review: "yes"`、`default_effort: "ultra"`）**在 add 时直接报错**，不静默按默认放行——一张写错的表静默失效比报错贵得多。
+
+**入队即钉（防漂移）**：查表**只在 `add` 时执行一次**，结果固化到卡面（`review_after` / `effort` 两个字段），
+运行期一律不再回查 `config.json`。否则改一次 `stakes_policy`，队列里所有在跑/在等的卡的复核深度都会静默变化，
+而卡面看不出任何差别。卡上的 `stakes` 字段只作审计留档，不是运行期判据（与交叉验证"入队即钉引擎身份"同一纪律）。
+
+### 复审位质量地板（复审卡恒不被降级改道）
+
+`no_fallback_models` 是一张**按模型名**的黑名单。它挡不住这种情况：有人把复审卡的模型从 fable 换成 opus 或 sonnet
+（`type_defaults.design-review.model` 或派卡时 `-model`），护栏就静默失效——而失效的表现恰恰是"复审照跑、照出 verdict"，
+只是换了个引擎、审得更浅。**审得浅 ≠ 没审**：账面仍然 pass，闭环仍然放行，没有任何信号。
+
+所以在模型名黑名单之上补一条**按卡的角色**的地板：
+
+- `design-review` 卡（实现→复审→修复闭环里唯一的质量裁决点）
+- 交叉验证的合并/裁决卡（`x_role = C`，`crosscheck-merge` 模板）
+
+这两类卡在 claude 冷却/红线期**恒不参与 codex 改道降级**，与它们挂的是什么模型无关。
+代价是它们在 claude 空窗期只能排队等——这正是本条要买的东西：**宁可复审晚做，不要复审做浅**。

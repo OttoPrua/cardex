@@ -19,6 +19,7 @@
 | `no_fallback_models` | ["claude-fable-5","fable"] | design-tier models never downgraded to the codex backup — they wait for Claude |
 | `thinking_tokens` | 0 | when >0, sets MAX_THINKING_TOKENS on Claude calls (larger thinking budget for design work) |
 | `stakes_policy` | low=no review / normal=follow / high=force review + raise to high | per-card stakes → review-depth lookup (`add -stakes`); **frozen onto the card at enqueue**, never re-read at run time — see [guide · stakes tiering](guide.en.md#per-card-stakes-tiering--stakes--review-depth-lookup-table) |
+| `retro_every_n_done` | 0 (off) | every N cards reaching `done`, auto-enqueue a haiku retrospective card (read-only tally, proposal-only); 10 is a reasonable start — see [guide · retrospective cards](guide.en.md#automatic-retrospective-cards-retro_every_n_done) |
 | `queue_budget_tokens` etc. | 0 (off) | 5-hour quota redline — see [guide · quota redline](guide.en.md#5-hour-quota-redline-reserve-headroom) |
 | `oauth_usage` / `oauth_usage_*` | false | subscription endpoint (third source); undocumented endpoint — anomalies treated as insufficient data |
 | `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types like design-review / progress-pull are exempt and may run concurrently in the same repo) |

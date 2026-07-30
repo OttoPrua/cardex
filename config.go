@@ -121,6 +121,12 @@ type Config struct {
 	// 合并，不会整表顶掉（loadConfig 从 defaultConfig 起手）。
 	StakesPolicy map[string]StakesRule `json:"stakes_policy,omitempty"`
 
+	// RetroEveryNDone: 每累计 N 张卡进入 done 终态，自动入队一张 haiku 复盘卡
+	// （只读统计归档卡的失败类/修复轮数/成本/复审 verdict/改道事件，**proposal-only 不改配置**）。
+	// 0 = 关闭（默认）；建议 10。计数器持久化在 <root>/retro_counter.json，单写点 = 本二进制。
+	// 不带 omitempty：让 `cardex init` 生成的 config.json 里显式出现这一行，开关可被发现。
+	RetroEveryNDone int `json:"retro_every_n_done"`
+
 	// CodexReviewSandbox 控制本机 codex 只读分析卡(design-review/crosscheck/coordinate 等,
 	// 非 sequence)的沙箱策略——CG-R3(承 BD-36 工具链③终裁 b/BD-39 附记):
 	//
@@ -354,6 +360,7 @@ func defaultConfig(claudeBin string) *Config {
 		},
 		NoFallbackModels: []string{"claude-fable-5", "fable"},
 		StakesPolicy:     defaultStakesPolicy(),
+		RetroEveryNDone:  0,
 		// 交叉验证默认引擎对：设计档模型撞限时，用两个不同引擎独立作答再交叉查漏顶替。
 		// 甲=本机 claude opus（最高档 max）；乙=本机 codex，具体模型/推理档来自全局 codex_model/codex_reasoning
 		// （乙的 Effort=max 覆盖为最高档）。换 profile 即换模型来源，无需改代码；档位改一个 Effort 字段即可。

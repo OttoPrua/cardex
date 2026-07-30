@@ -930,6 +930,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			t.touch()
 			// 无 prompt 可跑的空转 done(如 retry 后 Step 已越界的兜底路径):也是"终态"必须留事件。
 			emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, map[string]any{"reason": "no_more_prompts"})
+			noteTaskDoneLogged(root, cfg, t, lg) // 复盘计数器:两条 done 出口都要记,漏一条 N 就永远偏小
 			return saveTask(root, t)
 		}
 
@@ -1209,6 +1210,9 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, map[string]any{
 					"turns_total": t.TurnsUsed, "cost_total": t.CostUSD,
 				})
+				// 复盘计数器：只数真 done。上面交叉 C 契约违规改判 failed 的分支不该计入
+				// "产能"，否则复盘窗口里混进从未交付的卡。
+				noteTaskDoneLogged(root, cfg, t, lg)
 			} else {
 				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, map[string]any{
 					"err": t.LastError, "reason": "cross_merge_contract_violation",

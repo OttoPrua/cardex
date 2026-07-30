@@ -351,3 +351,26 @@ So on top of the model-name blocklist there is a floor **by card role**:
 - cross-verification merge/adjudication cards (`x_role = C`, the `crosscheck-merge` template)
 
 These two **never participate in codex divert/downgrade** during a claude cooldown or redline, regardless of which model they carry. The cost is that they queue and wait through a claude gap — which is exactly what this buys: **better a late review than a shallow one**.
+
+## Automatic retrospective cards (`retro_every_n_done`)
+
+After the queue has chewed through a few dozen cards, nobody is doing the books on "which card types keep failing, how many fix rounds they take, which model the money went to, what the reviews actually caught." Nobody voluntarily digs through `archive/` and `events.jsonl`, so the same template defect and the same class of divert incident keep recurring. Flip this switch and "settle the books every N done cards" becomes a mechanical action:
+
+```jsonc
+"retro_every_n_done": 10    // 0 = off (default); 10 is a reasonable starting point
+```
+
+Every N cards that reach the `done` terminal state, a `progress-pull` + `haiku` retrospective card is enqueued automatically (template `templates/retro.md`, editable). Its working directory is pinned to the data root, and it read-only tallies the most recent N archived cards along:
+
+1. Failure-class distribution (reasons on `failed`/`retry` events plus each card's `last_error`)
+2. Fix-round distribution (`fix_round`)
+3. Per-card cost and model distribution (`cost_usd` grouped by `model` / `runner`)
+4. Review verdict distribution (`design-review` and `x_role=C` outcomes)
+5. Round-limit and divert events (cards escalated past `max_fix_rounds`, `limit_paused` counts, `runner=codex` diverted cards)
+6. **At most 3** actionable recommendations (e.g. "file this card class with `-stakes low`", "template X lacks Y, causing repeated rework")
+
+The report lands in `progress/retro-<watermark>.json`; read it with `cardex progress -show retro-<watermark>`.
+
+**Proposal-only (standing rule D11)**: the retrospective card is **read-only analysis** — it does not touch `config.json`, templates, or any card. Recommendations are consumed by a human or a monitoring session. Letting automation edit automation's own parameters turns a wrong recommendation directly into a wrong production config.
+
+**Idempotent (a crash never double-enqueues)**: the counter lives in `<root>/retro_counter.json` (single writer = this binary; in-process mutex plus the tick single-instance lock). It records two numbers: `done_total` (cumulative terminal cards) and `triggered_at` (**the watermark already triggered**). The watermark is advanced and persisted *before* the retro card is enqueued — so a crash in between costs you **one missing** retro card and can never produce a duplicate. That direction is deliberate: a duplicate retro burns quota, pushes a duplicate report into `progress/`, and pollutes the next retro's own statistics; one missing retro is far cheaper (same discipline as the tombstone mechanism's "better one missed injection than a duplicate one"). While the switch is off (0) the counter **still counts**, so the moment you turn it on there is already a historical baseline — you don't restart from zero. A retrospective card's own completion is not counted.

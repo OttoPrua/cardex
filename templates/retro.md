@@ -15,9 +15,13 @@
   `detail` 里常见 `reason` / `err`；成本遥测分两组键：
   - 步进事件（`step_ok`）：`cost_usd` / `turns` = **该步**用量
   - 终态事件（`done` / `failed` / `canceled`，以及 `held`）：`cost_total` / `turns_total` = **该卡累计**用量；
-    若这两个键缺席，必定同时带 `cost_unavailable: true` 与 `cost_unavailable_reason`
-  - 超轮限升级卡的 `held` 事件另带 `chain_cost_total` / `chain_turns_total` = 被审链撞墙前的累计开销
-    （升级卡自身是刚出生的壳卡，它的 `cost_total` 与链账**不是一回事**，求和时切勿混用）
+    这两个键缺席时会同时带 `cost_unavailable: true` 与 `cost_unavailable_reason`。
+    若你真读到一条**三个键都没有**的终态事件，那是遥测漏接：按缺口记进 `gaps`（点名文件里的 `actor` 与卡数），不要当 0
+  - 超轮限升级卡的 `held` 事件另带 `chain_cost_total` / `chain_turns_total` = **整条修复链**撞墙前的累计开销
+    （= 实现卡 + 各轮修复卡 + 各轮审核卡各自的 `cost_usd` 之和；旁支如收口卡/交叉链不入账）。
+    升级卡自身是刚出生的壳卡，它的 `cost_total` 与链账**不是一回事**，按卡求和时只取 `cost_total`，链账另算——
+    否则链上每张卡的开销会被重复计一次。
+    注意：`chain_cost_usd` 字段是 2026-08-02 起才有的，此前入队的旧链只从升级点起累计，链账会偏低，遇到时在 `gaps` 说明
 - 进度报告：`{{PROGRESS_DIR}}/*.json`（复审结论、交叉验证链的 verdict）
 - 若归档不足 {{N}} 张，可用 `{{TASKS_DIR}}/*.json` 里已是终态的卡补齐，并在 `gaps` 里说明
 
@@ -30,9 +34,11 @@
    取数口径：每张卡只认**最后一条终态事件**的 `cost_total`（同一张卡可能先 `held` 后 `failed`，逐条相加会重复计账）；该事件缺终态遥测时回落卡上的 `cost_usd` 字段。
 
    **`cost_unavailable` 标记必须如实分列，绝不当 0 计入总额** —— "这张卡没花钱"与"这张卡花没花钱我们不知道"是两件事，混同会让总额系统性偏低且偏低多少无从得知。带该标记的卡计入 `cost.unavailable_cards`，并在 `gaps` 里按 `actor` 分列成因，例如：
-   - `runner:escalation` 的 `held` —— 升级壳卡刚出生就挂起，**从未执行，零用量是真实的**，不是账本缺陷
+   - `runner:escalation` / `cli:add` / `runner:emit` 的 `held` —— 刚出生就挂起的壳卡（超轮限升级卡、`add -hold`、
+     `emit_hold` 派生子卡），**从未执行，零用量是真实的**，不是账本缺陷
    - `cli:cancel` / `runner` 的 `canceled` —— 卡在产出任何一步结果之前被取消，同样是真实零用量
-   - 其余 actor 带此标记 —— 才是需要查的遥测缺口，在 `gaps` 里点名 actor 与卡数
+   - 其余 actor 带此标记 —— 才是需要查的遥测缺口，在 `gaps` 里点名 actor 与卡数。
+     尤其 `runner:tombstone` / `cli:hold` 的 `held`：这两类卡通常**已经跑过步**，带此标记多半意味着卡面用量本身就丢了
 4. **复审 verdict 分布** — `design-review` 卡与交叉合并卡（`x_role` = `C`）的结论按 `pass` / `fail` / 其它 计数。
 5. **超轮限与改道事件** — 因超轮限被挂起升级的卡数（`held` 事件 `reason` = `over_max_fix_rounds`，其 `detail.max_rounds` 是该链实际适用的上限，按 `stakes` 分档、卡面钉死，不一定等于全局 `max_fix_rounds`）；`limit_paused` 事件次数；`runner` = `codex` 的改道卡数。
 6. **建议** — **最多 3 条**，每条必须可执行且指向具体对象。合格示例："`docs` 类卡 12 张全部一轮过审，建议派卡时用 `-stakes low`"、"`fix-cycle` 模板未要求贴测试输出，导致 4 张卡二轮返工"。不合格示例："建议提升代码质量"。

@@ -1059,9 +1059,12 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				t.Status = statusHeld
 				t.LastError = "CG-4 墓碑至多一次已耗尽:同一步续跑注入达上限(bound=2)"
 				t.touch()
-				emitTaskEvent(root, t.ID, evHeld, "runner:tombstone", statusHeld, t.Step, map[string]any{
-					"reason": "resume_tombstone_exhausted", "kind": resumeKind(t.Step),
-				})
+				// 墓碑耗尽挂 held 是 runner 内真实的提前退出点：这张卡此前已跑过若干步，卡面有累计
+				// cost/turns。不接遥测的话，一条崩溃风暴链的开销在事件账本里彻底查不到（本轮复审证伪点）。
+				emitTaskEvent(root, t.ID, evHeld, "runner:tombstone", statusHeld, t.Step,
+					withCostTelemetry(map[string]any{
+						"reason": "resume_tombstone_exhausted", "kind": resumeKind(t.Step),
+					}, t))
 				return saveTask(root, t)
 			}
 		} else {
@@ -1880,6 +1883,14 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	// 见 stakes.go:taskMaxFixRounds【为什么以卡面为准】。审核卡 t 本身也继承了同一值，用 orig
 	// 是因为它才是修复链的谱系承载者（审核卡是链上的旁支）。
 	maxRounds := taskMaxFixRounds(orig, cfg)
+	// 链累计用量：上一环带来的链账（orig 之前的所有轮次）+ 被审卡自身 + 本轮审核卡自身。
+	// 三项缺一不可：只取 orig.CostUSD 得到的是"最后一张修复卡的账"而不是链账（修复卡由 newTask
+	// 全新建卡，CostUSD 从 0 起算）；漏掉 t 则每轮审核卡的开销白白蒸发。t.CostUSD 在此已是终值——
+	// handleReviewVerdict 由 postComplete 调用，而步用量在 postComplete 之前就已累加进卡面
+	// （见上方成功分支 t.CostUSD += res.TotalCostUSD）。
+	// 覆盖边界与存量卡降级见 task.go:ChainCostUSD 注释。靶：TestChainCostAccumulatesAcrossFixRounds。
+	chainCost := orig.ChainCostUSD + orig.CostUSD + t.CostUSD
+	chainTurns := orig.ChainTurnsUsed + orig.TurnsUsed + t.TurnsUsed
 	base := baseFixTitle(orig.Title)
 	findings := ""
 	for i, p := range v.P0 {
@@ -1914,6 +1925,9 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		esc.Project = orig.Project // 显式归属随派生卡继承（升级卡属于原卡的项目）
 		esc.FixRound = round
 		esc.MaxFixRounds = orig.MaxFixRounds // 轮限随谱系留档：人裁后 release 续跑不该换上限
+		// 链账随谱系留档：人裁后若从升级卡续出新一轮审核，链账不该从 0 重新起算。
+		esc.ChainCostUSD = chainCost
+		esc.ChainTurnsUsed = chainTurns
 		if saveTask(root, esc) == nil {
 			// 父审核卡 closeout：超轮限 held 卡是审核链的显式终点，父卡账本必须留指针。
 			emitTaskEvent(root, t.ID, evCloseout, "runner:escalation", statusDone, t.Step, map[string]any{
@@ -1924,13 +1938,14 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 				"parent": t.ID, "review_of": t.ReviewOf, "round": round,
 			})
 			// 超轮限升级卡的 held 是这条修复链的显式终点。遥测按**升级卡自身**的用量落（新卡从未
-			// 执行 → cost_unavailable），并另记被审链累计开销 chain_cost_total/chain_turns_total：
+			// 执行 → cost_unavailable），并另记链累计开销 chain_cost_total/chain_turns_total：
 			// 复盘要回答的是"这条链撞墙前烧了多少"，而不是"这张刚出生的壳卡花了多少"。两组键分开，
 			// 谁也不冒充谁——按卡求和时只取 cost_total，链账另算。
+			// 链账覆盖实现卡 + 各轮修复卡 + 各轮审核卡；旁支与存量卡降级见 task.go:ChainCostUSD。
 			emitTaskEvent(root, esc.ID, evHeld, "runner:escalation", statusHeld, 0,
 				withCostTelemetry(map[string]any{
 					"reason": "over_max_fix_rounds", "max_rounds": maxRounds,
-					"chain_cost_total": orig.CostUSD, "chain_turns_total": orig.TurnsUsed,
+					"chain_cost_total": chainCost, "chain_turns_total": chainTurns,
 				}, esc))
 			logBlock(lg, "FIXLOOP", fmt.Sprintf("超轮限（R%d>上限%d），已挂 held 升级卡 %s 交人工裁定", round, maxRounds, esc.ID))
 		}
@@ -1958,6 +1973,10 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	// 轮限随修复链继承：下一轮的 handleReviewVerdict 读的是**下一张卡**的卡面，不继承就会在
 	// R2 静默掉回全局值——一张 -stakes high 的卡只有第一轮享受 4 轮上限，后面又按 3 轮截断。
 	nt.MaxFixRounds = orig.MaxFixRounds
+	// 链账随修复链继承：不继承的话每张修复卡的链账都从 0 起算，撞墙时落盘的 chain_cost_total
+	// 就退化成"最后一轮那张卡的账"——正是本键此前口径撒谎的成因。
+	nt.ChainCostUSD = chainCost
+	nt.ChainTurnsUsed = chainTurns
 	nt.Stakes = orig.Stakes // 审计留档随链传递（非运行期判据，见 stakes.go 文件头）
 	nt.Model = orig.Model
 	nt.SkipPermissions = orig.SkipPermissions
@@ -2499,9 +2518,12 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		})
 		if parent.EmitHold {
 			// EmitHold 意味着新卡立即置 held——先 queued 后 held 忠实反映状态起点与人工待放行的实际语义。
-			emitTaskEvent(root, nt.ID, evHeld, "runner:emit", statusHeld, 0, map[string]any{
-				"reason": "emit_hold", "parent": parent.ID,
-			})
+			// 新生子卡零用量是**真实的**（还没跑过），但仍走 withCostTelemetry 落显式标记：
+			// 终态事件二选一没有第三种，静默缺字段与"确实没花钱"在账面上不可区分。
+			emitTaskEvent(root, nt.ID, evHeld, "runner:emit", statusHeld, 0,
+				withCostTelemetry(map[string]any{
+					"reason": "emit_hold", "parent": parent.ID,
+				}, nt))
 		}
 		ids = append(ids, nt.ID)
 	}

@@ -356,7 +356,9 @@ func cmdAdd(args []string) error {
 		"max_fix_rounds": t.MaxFixRounds,
 	})
 	if *hold {
-		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step, map[string]any{"reason": "add -hold"})
+		// 新生卡零用量是真实的，但仍落显式 cost_unavailable 标记：终态事件二选一没有第三种。
+		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step,
+			withCostTelemetry(map[string]any{"reason": "add -hold"}, t))
 	}
 	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d，stakes=%s%s%s%s）\n",
 		t.ID, t.Type, t.Title, len(t.Prompts), t.Priority, t.Stakes,
@@ -1510,7 +1512,10 @@ func cmdSetStatus(args []string, action string) error {
 	// hold/release/retry 事件:诚实历史需要人工介入的每次动作都留痕。
 	switch action {
 	case "hold":
-		emitTaskEvent(root, t.ID, evHeld, "cli:hold", statusHeld, t.Step, nil)
+		// hold 只禁 running：一张 limit_paused/queued 且**已烧过钱**的卡可被人工 hold，
+		// 裸 nil detail 会让这笔累计开销在事件账本里消失（本轮同类位点普查发现）。
+		emitTaskEvent(root, t.ID, evHeld, "cli:hold", statusHeld, t.Step,
+			withCostTelemetry(map[string]any{"reason": "cli hold"}, t))
 	case "release":
 		// release 是 held→queued 的"重新入队":用 evQueued 保持类型枚举与状态一致(活动流才能标"入队")。
 		emitTaskEvent(root, t.ID, evQueued, "cli:release", statusQueued, t.Step, map[string]any{"reason": "release"})

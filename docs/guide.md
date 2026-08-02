@@ -497,6 +497,22 @@ cardex add -dir ~/proj "常规改动"                                  # 缺省 
 成本——正常完成路径写了，但取消、超轮限升级、分类器直判 failed/held 这些**提前退出**路径只写 `reason` 就收工。
 静默缺字段让不完整的统计看起来完整，与事件账本"缺口显式披露、绝不靠反推伪造完整历史"的第一性纪律直接冲突。
 
+**覆盖面（可现算，别按数量词记）**：本仓所有 `emitTaskEvent` 的终态事件（`done`/`failed`/`canceled`/`held`）
+调用点，其 `detail` 都必须包一层 `withCostTelemetry`——这条全称声称由 `TestEveryTerminalEmitSiteWrapsCostTelemetry`
+机械钉住：它解析本包非测试源码的 AST，逐个 emit 点核对，漏一个就报红并点名文件:行号。
+新增终态 emit 点忘了接遥测，不必等复盘丢账才发现。
+
 同一张卡可能先 `held` 后 `failed`，各带一条当时的累计值：算账时**每张卡只认最后一条终态事件**，逐条相加会重复计账。
-超轮限升级卡的 `held` 另带 `chain_cost_total` / `chain_turns_total`——那是被审链撞墙前的开销；
-升级卡自身是刚出生的壳卡（`cost_unavailable` 是真实的零用量，不是账本缺陷），两组键分开，谁也不冒充谁。
+
+**链累计口径（`chain_cost_total` / `chain_turns_total`）**：超轮限升级卡的 `held` 另带这两个键，
+它们是**整条修复链**撞墙前的累计开销 = 实现卡 + 各轮修复卡 + 各轮审核卡各自的 `cost_usd` 之和。
+链账逐轮沿卡面 `chain_cost_usd` / `chain_turns_used` 继承（`handleReviewVerdict` 派下一轮修复卡时
+按 `上一环链账 + 被审卡自身 + 本轮审核卡自身` 累加），不是"最后一张修复卡的账"——修复卡由新建卡起算，
+只取它自己的 `cost_usd` 会把 $5.85 的链报成 $0.50。靶：`TestChainCostAccumulatesAcrossFixRounds`。
+
+链账的**边界，勿超范围引用**：只覆盖"实现→审核→修复"这条链上的卡；pass 后的收口卡、`emit` 派生子卡、
+交叉验证链等旁支不入账。**存量卡**（升级前入队、卡面无 `chain_cost_usd`）从升级点起累计，
+升级之前已跑过的轮次没有链账可继承、会让旧链偏低——这是已知且有意接受的降级，不靠反推补数。
+
+升级卡自身是刚出生的壳卡（`cost_unavailable` 是真实的零用量，不是账本缺陷），两组键分开，谁也不冒充谁：
+按卡求和只取 `cost_total`，链账另算，否则同一笔开销会被链上每张卡各记一次。

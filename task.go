@@ -84,6 +84,17 @@ type Task struct {
 	// 与 ReviewAfter/Effort 同属"入队即钉"字段：运行期只读卡面，不回查 config——否则改配置会让
 	// 在队修复链静默换上限而卡面无差别。经修复链/审核卡/升级卡继承。0 = 存量卡，回落全局值。
 	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
+	// ChainCostUSD / ChainTurnsUsed: 本卡**之前**整条修复链已烧掉的累计用量，**不含本卡自身**。
+	// 由 handleReviewVerdict 在派下一轮修复卡时按 上一环链账 + 被审卡自身 + 本轮审核卡自身 累加；
+	// 超轮限升级时同一公式算出的值落进 held 事件的 chain_cost_total/chain_turns_total——复盘要回答的
+	// 是"这条链撞墙前一共烧了多少"，而不是"最后一张修复卡花了多少"。
+	//
+	// 【口径边界，勿超范围引用】只覆盖**被审卡**（实现卡 + 各轮修复卡）与**各轮审核卡**自身的用量；
+	// pass 后的收口卡、emit 派生子卡、交叉验证链等旁支不入账（它们不在"实现→审核→修复"这条链上）。
+	// 存量卡该字段为 0：本次升级之前已跑过的轮次没有链账可继承，从升级点起累计——旧链的链账会偏低，
+	// 这是已知且有意接受的降级，不靠反推补数。靶：TestChainCostAccumulatesAcrossFixRounds。
+	ChainCostUSD   float64 `json:"chain_cost_usd,omitempty"`
+	ChainTurnsUsed int     `json:"chain_turns_used,omitempty"`
 	// Closeout: 收口回写指令（opt-in）。非空时，本卡的对抗复审 verdict=pass 后，自动入队一张
 	// 廉价（haiku）收口卡跑此 prompt——把"done"回写权威账本的动作绑定到 pass 事件而非实现卡自评，
 	// 根治"实现卡提前自标 done / 老实等审却 pass 后没人翻"的双真相源漂移。经修复链继承。

@@ -586,6 +586,13 @@ const costUnavailNoUsage = "no_usage_recorded"
 //
 // 【口径】取 Task.CostUSD/TurnsUsed，即**该卡累计至今**的用量（跨限额中断续跑仍累加在卡面上），
 // 不是本次派发单步的用量。终态事件问的是"这张卡一共花了多少"，累计值才是那个答案。
+//
+// 【覆盖面：全称声称已挂靶】本包**每一个** emitTaskEvent 的终态事件（evDone/evFailed/evCanceled/
+// evHeld）调用点，其 detail 实参都必须是 withCostTelemetry(...) 的返回值。这条声称由
+// TestEveryTerminalEmitSiteWrapsCostTelemetry 机械钉住——它解析本包非测试源码的 AST 逐点核对，
+// 漏一个就报红并点名文件:行号。行为测试只能覆盖它恰好跑到的路径，正是那个盲区让上一轮漏了
+// runner:tombstone / cli:hold / cli:add / runner:emit 四处。
+// 它**不**校验拿到的是不是"对的那张卡"（如升级卡该记壳账而非链账）——那由各条行为测试负责。
 func withCostTelemetry(detail map[string]any, t *Task) map[string]any {
 	if detail == nil {
 		detail = map[string]any{}

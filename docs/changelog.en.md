@@ -1,5 +1,17 @@
 # cardex changelog
 
+## 2026-08-03 · License change: MIT → PolyForm Noncommercial 1.0.0
+
+Personal use, study and research, hobby projects, and charitable/educational/public-research
+organizations: use it freely, no need to ask. Internal production use at a company, delivering
+paid client work with it, or shipping it (or a derivative) as part of a product or service:
+requires a separate license (open an issue describing the intended use).
+
+Two boundaries stated in both README and LICENSE: this is **not** an OSI-approved open-source
+license (it restricts commercial use), so it should not pass a dependency-compliance review as
+"open source"; and versions published before 2026-08-03 (through commit `b1ed92b`) **remain
+MIT** — that grant is irrevocable for those versions, and the change applies only to what follows.
+
 ## 2026-08-03 · Board: scroll position survives refresh, orphan grouping, a third「工时进度」scale
 
 - **Auto-refresh no longer resets scroll**: mount replaces the whole DOM, so the 30-second

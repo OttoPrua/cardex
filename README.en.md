@@ -159,6 +159,21 @@ Prompt templates live in `~/.cardex/templates/*.md` and can be edited directly (
 make test   # a mock claude drives the full state machine: dispatch / limit pause / cooldown / resume / assembly enqueue / failure backoff / model routing / progress pull / coordination
 ```
 
+## License
+
+[PolyForm Noncommercial 1.0.0](LICENSE) — **free for personal use, commercial use needs a license**.
+
+- **No need to ask**: personal use, study and research, hobby projects, and use by charitable,
+  educational, or public research organizations.
+- **Needs a license**: internal production use at a company, using it to deliver paid client
+  work, or shipping it (or a derivative) as part of a product or service. Open an
+  [issue](https://github.com/OttoPrua/cardex/issues) describing the intended use.
+
+Two caveats: this is **not** an OSI-approved open-source license (it restricts commercial use),
+so don't wave it through your company's dependency compliance as "open source"; and versions
+published before 2026-08-03 (through commit `b1ed92b`) remain MIT — that grant is irrevocable
+for those versions, and this change applies only to what follows. See [LICENSE](LICENSE).
+
 ## Acknowledgements
 
 This project is shared with the [LINUX DO](https://linux.do) community — thanks to everyone there for the feedback.

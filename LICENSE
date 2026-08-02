@@ -1,21 +1,165 @@
-MIT License
+Required Notice: Copyright 2026 OttoPrua (https://github.com/OttoPrua/cardex)
 
-Copyright (c) 2026 OttoPrua
+# PolyForm Noncommercial License 1.0.0
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+## Acceptance
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
+
+## Copyright License
+
+The licensor grants you a copyright license for the
+software to do everything you might do with the software
+that would otherwise infringe the licensor's copyright
+in it for any permitted purpose.  However, you may
+only distribute the software according to [Distribution
+License](#distribution-license) and make changes or new works
+based on the software according to [Changes and New Works
+License](#changes-and-new-works-license).
+
+## Distribution License
+
+The licensor grants you an additional copyright license to
+distribute copies of the software.  Your license to distribute
+covers distributing the software with changes and new works
+permitted by [Changes and New Works
+License](#changes-and-new-works-license).
+
+## Notices
+
+You must ensure that anyone who gets a copy of any part of
+the software from you also gets a copy of these terms or the
+URL for them above, as well as copies of any plain-text lines
+beginning with `Required Notice:` that the licensor provided
+with the software.  For example:
+
+> Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
+
+## Changes and New Works License
+
+The licensor grants you an additional copyright license to
+make changes and new works based on the software for any
+permitted purpose.
+
+## Patent License
+
+The licensor grants you a patent license for the software that
+covers patent claims the licensor can license, or becomes able
+to license, that you would infringe by using the software.
+
+## Noncommercial Purposes
+
+Any noncommercial purpose is a permitted purpose.
+
+## Personal Uses
+
+Personal use for research, experiment, and testing for
+the benefit of public knowledge, personal study, private
+entertainment, hobby projects, amateur pursuits, or religious
+observance, without any anticipated commercial application,
+is use for a permitted purpose.
+
+## Noncommercial Organizations
+
+Use by any charitable organization, educational institution,
+public research organization, public safety or health
+organization, environmental protection organization,
+or government institution is use for a permitted purpose
+regardless of the source of funding or obligations resulting
+from the funding.
+
+## Fair Use
+
+You may have "fair use" rights for the software under the
+law.  These terms do not limit them.
+
+## No Other Rights
+
+These terms do not allow you to sublicense or transfer any of
+your licenses to anyone else, or prevent the licensor from
+granting licenses to anyone else.  These terms do not imply
+any other licenses.
+
+## Patent Defense
+
+If you make any written claim that the software infringes or
+contributes to infringement of any patent, your patent license
+for the software granted under these terms ends immediately. If
+your company makes such a claim, your patent license ends
+immediately for work on behalf of your company.
+
+## Violations
+
+The first time you are notified in writing that you have
+violated any of these terms, or done anything with the software
+not covered by your licenses, your licenses can nonetheless
+continue if you come into full compliance with these terms,
+and take practical steps to correct past violations, within
+32 days of receiving notice.  Otherwise, all your licenses
+end immediately.
+
+## No Liability
+
+***As far as the law allows, the software comes as is, without
+any warranty or condition, and the licensor will not be liable
+to you for any damages arising out of these terms or the use
+or nature of the software, under any kind of legal claim.***
+
+## Definitions
+
+The **licensor** is the individual or entity offering these
+terms, and the **software** is the software the licensor makes
+available under these terms.
+
+**You** refers to the individual or entity agreeing to these
+terms.
+
+**Your company** is any legal entity, sole proprietorship,
+or other kind of organization that you work for, plus all
+organizations that have control over, are under the control of,
+or are under common control with that organization.  **Control**
+means ownership of substantially all the assets of an entity,
+or the power to direct its management and policies by vote,
+contract, or otherwise.  Control can be direct or indirect.
+
+**Your licenses** are all the licenses granted to you for the
+software under these terms.
+
+**Use** means anything you do with the software requiring one
+of your licenses.
+
+---
+
+以下内容**不属于上方许可证正文**，仅为使用说明。
+The notes below are **not part of the license text above**.
+
+## 商用授权 / Commercial licensing
+
+上方许可证只覆盖**非商业用途**。以下情形属于商业用途，需要另行取得授权：在公司内部用于
+生产/交付工作、用它承接付费项目、把它或其衍生品作为产品或服务的一部分提供给他人。
+
+Commercial use — including internal production use at a company, using it to deliver paid
+client work, or shipping it (or a derivative) as part of a product or service — requires a
+separate license from the copyright holder.
+
+取得授权请开 issue 说明用途：<https://github.com/OttoPrua/cardex/issues>
+To request one, open an issue describing the intended use.
+
+个人自用、学习研究、业余项目，以及慈善/教育/公共研究机构的使用，直接用即可，无需联系。
+Personal use, study and research, hobby projects, and use by charitable, educational, or
+public research organizations need no permission.
+
+## 许可变更历史 / License history
+
+本项目在 2026-08-03 之前发布的版本（GitHub 上截至提交 `b1ed92b` 的全部代码）以 **MIT 许可证**
+发布。那部分授权不可撤销：已按 MIT 取得该版本代码的人，对**该版本**继续享有 MIT 的全部权利。
+本次变更只对其后的版本生效。
+
+Versions published before 2026-08-03 (all code up to and including commit `b1ed92b` on
+GitHub) were released under the **MIT License**. That grant is irrevocable for those
+versions — anyone who obtained the code under MIT keeps full MIT rights to **those**
+versions. This change applies only to subsequent versions.

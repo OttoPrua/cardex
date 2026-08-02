@@ -1,5 +1,40 @@
 # cardex changelog
 
+## 2026-08-03 · Board: scroll position survives refresh, orphan grouping, a third「工时进度」scale
+
+- **Auto-refresh no longer resets scroll**: mount replaces the whole DOM, so the 30-second
+  refresh zeroed both the horizontal rail and per-column vertical scroll — watching one
+  project's progress lasted 30 seconds at most. Now captured before mount and restored after,
+  keyed by **stable identity** (project columns by `data-pid`, kanban columns by a new
+  `data-status`) rather than DOM order: projects get added/removed/reordered and status columns
+  get filtered away between refreshes, so index-based restore would hand A's position to B.
+  Capture sits immediately before mount (so it includes scrolling done during the request);
+  restore runs twice (sync + rAF, because scrollTop is clamped before column heights settle);
+  navigation doesn't restore (switching pages should start at the top).
+- **Orphan cards spawning their own project (production ledger 12 projects → 10)**: the root
+  cause was one project splitting by name — a hand-typed `-project trading` (lowercase) collided
+  in slug with the heuristic-derived `Trading`, so both got hash suffixes and appeared side by
+  side; the 7 retro cards under `~/.cardex` did the same (`.cardex` vs `cardex`). Names that
+  slugify identically are now folded into one project, with the display name chosen by authority
+  (alias-declared > pinned on a card > most cards > lexicographic). `Trading-docs` correctly
+  stays separate.
+- **New lineage grouping layer** (explicit > alias > pattern > heuristic > **lineage** > inbox):
+  derived cards follow `review_of` / `emitted_by` up to the parent's project. Review-offload
+  mirrors and cross-check scratchpads are one-card-per-directory with no grouping evidence — but
+  a review card belongs to whatever it reviews. Placed after the heuristic so it is pure rescue,
+  never overriding an existing verdict; bounded by depth limit and cycle detection. Terminal
+  cards already grouped like active ones; a test now pins that fact.
+- **A third scale「工时进度」**: progress weighted by each card's **workload** (turns as proxy),
+  plus a projected completion time. Measured spread across types is 28× (sequence median 57 vs
+  progress-pull 2), so "7 of 10 done" badly overstates progress when the rest are big cards.
+  Not-yet-run cards are predicted from the historical median per (type × single/multi-step)
+  — median, not mean, because turns are heavy-tailed right-skewed. Completion time converts via
+  the measured wall-clock-minutes-per-unit-of-work (absorbing parallelism/cooldown/redline).
+  Below 12 measured samples the scale falls back to card counts; with no derivable rate it
+  reports the percentage and no time. The turns-reporting gap for codex/engine cards (24% of
+  done cards) is disclosed both under the bar and in the basis. Kind buckets carry their own
+  weighted numerator/denominator on this scale too.
+
 ## 2026-08-02 · Dual board progress scales (existing cards / estimated remaining)
 
 - **Global scale switch**: a「实发进度 / 预估进度」segmented control in the page header, beside

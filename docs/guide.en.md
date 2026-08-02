@@ -168,14 +168,38 @@ remaining" ghost segment at the tail, and the percentage carries a `~` suffix). 
   clairvoyance) — use the planned anchor there. Legacy system-spawned cards predate the
   `emitted_by` stamp, which underestimates k (bias direction: conservative; disclosed in basis).
 
-**Kind buckets switch with the scale**: the estimated remainder is distributed across the
-design/impl/fix/review buckets by **historical spawn composition** (if 60% of past spawned cards
-were fixes, the fix bucket gets 60% of the remainder; largest-remainder rounding, **Σ bucket
-remainders ≡ project remainder** so buckets always reconcile with the total bar); buckets that
-get no remainder fall back to the filed-scale denominator. Phase bars stay on the filed scale
-(phases are execution slices with no spawn composition to lean on). The control lives beside the
-status filter chips on both the overview and project pages — both are "how to read the board"
-view switches, and splitting them across two places would suggest the scale is a per-page
+**A third scale:「工时进度」(work-weighted progress + projected finish)**: card-count scales
+treat every card as one unit, but across this ledger's 1622 done cards the median turns run
+**sequence 57 / design-review 34 / coordinate 8 / progress-pull 2 — a 28× spread**, and
+multi-step cards (112) are 2.7× single-step ones (41). "7 of 10 done = 70%" badly overstates
+progress when the remaining three are all big sequence cards. The work scale weights each card
+by workload and adds a projected completion time:
+
+- **Weight uses turns (round count) as a workload proxy**, not duration — cards carry no
+  execution-duration field, and `updated_at−created_at` is mostly queue waiting (same argument
+  as the ETA section above). Done cards use measured turns; not-yet-run cards are predicted from
+  the historical **median** per (type × single/multi-step) — median rather than mean because
+  turns are heavy-tailed right-skewed, and a mean would let a few outliers inflate every prediction;
+- **Completion time** converts via the measured "wall-clock minutes per unit of work" from the
+  same sample window, which absorbs parallelism, cooldowns, and redline windows. When the sample
+  spans zero time (no derivable rate), it reports the percentage and **no time at all**;
+- **Known gap**: codex / remote / engine cards don't report turns (24% of done cards measured at
+  turns=0); those are filled from the type median, direction of bias unknown — coverage and the
+  gap are printed under the bar and in the basis;
+- Below 12 measured samples the whole scale is marked unavailable and falls back to the filed
+  scale with the reason stated outright.
+
+**Kind buckets switch with the scale**: on the projected scale, the remainder is distributed
+across the design/impl/fix/review buckets by **historical spawn composition** (if 60% of past
+spawned cards were fixes, the fix bucket gets 60%; largest-remainder rounding, **Σ bucket
+remainders ≡ project remainder** so buckets always reconcile with the total bar); on the work
+scale each bucket carries its own weighted numerator/denominator (existing cards only — the
+projected remainder is borne by the total bar, since distributing it in both places would make
+the two scales' bucket denominators tell different stories). Buckets with no share fall back to
+the filed denominator. Phase bars always stay on the filed scale (phases are execution slices
+with neither spawn composition nor an independent workload baseline). The control lives beside
+the status filter chips on both the overview and project pages — both are "how to read the
+board" view switches, and splitting them across two places would suggest the scale is a per-page
 setting. The preference persists in localStorage.
 
 **Project override `~/.cardex/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Fields allowed inside a project block: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules` / `planned_total_cards`; the file also has a top-level `project_aliases` grouping table (see below).

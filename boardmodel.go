@@ -192,6 +192,9 @@ type Project struct {
 	// Estimate 是「含预估余量」的第二进度口径（boardestimate.go）：把预估还会派生的卡数
 	// 并入分母。与 ProgressPercent 并列——前端全局切换用哪个口径画轴线，两套数字都带 basis。
 	Estimate *ProjectEstimate `json:"estimate,omitempty"`
+	// Weighted 是第三口径「工时进度」（boardweight.go）：按每张卡的工作量（turns 代理）
+	// 加权算完成占比，并给出预估完成时刻。Available=false 时前端回落卡数口径并显示 basis。
+	Weighted *ProjectWeighted `json:"weighted,omitempty"`
 	// KindRuleError 是 board.json kind_rules 里被跳过的规则的披露串（无问题时 omitempty 消失）。
 	// 坏规则逐条跳过而非整块拒，但被跳过的必须说出来——静默失效即造读数。
 	KindRuleError string `json:"kind_rule_error,omitempty"`
@@ -1193,6 +1196,10 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 	}
 	p.Estimate = buildProjectEstimate(ts, planned)
 	annotateKindEstimates(p.Kinds, ts, kindOf, p.Estimate.EstimatedRemaining)
+	// 工时口径：按工作量加权 + 预估完成时刻（含预估余量卡，故建立在 Estimate 之上）；
+	// 分桶同步补工时分子分母，三种口径下分桶都有自己的数字。
+	p.Weighted = buildProjectWeighted(ts, p.Estimate, now)
+	annotateKindWeights(p.Kinds, ts, kindOf)
 
 	// 模型分布（覆盖项目全部卡：这是「这个项目在用什么档位的模型」的完整画像）
 	mc := map[string]int{}

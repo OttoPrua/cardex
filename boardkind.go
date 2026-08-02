@@ -180,6 +180,10 @@ type KindProgress struct {
 	// 0 = 本桶没分到余量（或整体处于卡口径），前端据此回落现有卡分母。
 	EstimatedTotal     int `json:"estimated_total,omitempty"`
 	EstimatedRemaining int `json:"estimated_remaining,omitempty"`
+	// WeightedDone / WeightedTotal 是「工时口径」下本桶的分子分母（单位同 ProjectWeighted.Unit）。
+	// 只计已存在的卡，不摊预估余量（见 annotateKindWeights）。0 = 工时口径不可用，前端回落卡数。
+	WeightedDone  float64 `json:"weighted_done,omitempty"`
+	WeightedTotal float64 `json:"weighted_total,omitempty"`
 }
 
 // buildKindProgress 把一批卡按性质分桶。

@@ -260,20 +260,30 @@ const KIND_SCOPE = {
 function kindProgress(stats, pct, kinds, opts) {
   const o = opts || {};
   const wrap = h('div', { class: 'prog-group' });
-  // 全局口径开关：含预估口径把预估余量并入分母（estimate 由后端带 basis 给出）。
-  // 分桶行同步切换——项目级余量按历史派生构成分摊进桶（后端 annotateKindEstimates，
-  // Σ 桶余量 ≡ 项目余量），没分到余量的桶回落现有卡分母。
-  const est = progressScale === 'est' ? o.estimate : null;
-  const useEst = est && isNum(est.estimated_total) && est.estimated_total > 0;
   const done = stats.done || 0;
   const denCards = (stats.total || 0) - (stats.canceled || 0);
-  if (useEst) {
-    const pctEst = est.estimated_total > 0 ? Math.round((done / est.estimated_total) * 1000) / 10 : 0;
+
+  // 三种口径走同一条渲染路径：每一行先算出 {分子, 分母, 幽灵段, 标签后缀, 悬停}，再统一画。
+  // 后端在任一口径不可用时（样本不足/无实测数据）都给 available=false + basis，此处回落
+  // 实发口径并把回落原因摆在明面上——静默换口径会让人拿着另一套读数做决定。
+  const est = progressScale === 'est' ? o.estimate : null;
+  const useEst = !!(est && isNum(est.estimated_total) && est.estimated_total > 0);
+  const wt = progressScale === 'work' ? o.weighted : null;
+  const useWork = !!(wt && wt.available && wt.total_weight > 0);
+  const fallbackNote = wt && !wt.available ? wt.basis : null;
+
+  // 总条
+  if (useWork) {
+    wrap.append(h('div', { class: 'prog-row is-total' },
+      h('span', { class: 'prog-key', title: `工时口径。${wt.basis}`, text: '工时进度' }),
+      h('span', { class: 'prog-n', title: wt.basis, text: `${fmtNum(wt.done_weight)}/${fmtNum(wt.total_weight)}` }),
+      weightBar(wt.percent)));
+  } else if (useEst) {
+    const pctEst = Math.round((done / est.estimated_total) * 1000) / 10;
     wrap.append(h('div', { class: 'prog-row is-total' },
       h('span', { class: 'prog-key', title: `含预估余量口径。${est.basis}`, text: '总进度~' }),
       h('span', {
-        class: 'prog-n',
-        title: est.basis,
+        class: 'prog-n', title: est.basis,
         text: est.estimated_remaining > 0 ? `${done}/~${est.estimated_total}` : `${done}/${est.estimated_total}`,
       }),
       progressBar(stats, pctEst, est)));
@@ -284,11 +294,38 @@ function kindProgress(stats, pct, kinds, opts) {
       progressBar(stats, pct)));
   }
 
+  // 工时口径的完成时刻。这是本口径的主要交付物之一，独占一行而不是塞进悬停。
+  if (useWork) {
+    wrap.append(h('p', { class: 'prog-note', title: wt.basis, text:
+      (wt.finish_at
+        ? `预计完成 ${fmtTime(wt.finish_at) || wt.finish_at}（还需 ${fmtDur(wt.remain_minutes) || '—'}）`
+        : '预计完成：数据不足——样本内没有足够的完成工作量可推算换算率，故只给占比不给时间')
+      + (wt.measured_ratio < 1
+        ? `　·　实测覆盖 ${Math.round(wt.measured_ratio * 100)}%，其余按同类中位补估`
+        : '') }));
+  }
+  if (fallbackNote) {
+    wrap.append(h('p', { class: 'prog-note', title: fallbackNote, text: '⚠ 已回落实发口径：' + fallbackNote }));
+  }
+
   if (!kinds || !kinds.length) return wrap;
   for (const k of kinds) {
     const den = (k.stats.total || 0) - (k.stats.canceled || 0);
     const kDone = k.stats.done || 0;
-    // 预估口径下分到余量的桶换预估分母；没分到的桶（estimated_total=0）回落现有卡口径。
+    // 工时口径：本桶有加权分母就用（只计已存在的卡，余量不摊进桶，见后端 annotateKindWeights）。
+    if (useWork && isNum(k.weighted_total) && k.weighted_total > 0) {
+      const kPct = Math.round((k.weighted_done / k.weighted_total) * 1000) / 10;
+      wrap.append(h('div', { class: 'prog-row' },
+        h('span', {
+          class: 'prog-key',
+          title: `${KIND_SCOPE[k.key] || k.label}｜工时口径：本桶 ${fmtNum(k.weighted_done)}/${fmtNum(k.weighted_total)} ${wt.unit}（只计已存在的卡，预估余量由总条承担）`,
+          text: k.label + '⏱',
+        }),
+        h('span', { class: 'prog-n', text: `${fmtNum(k.weighted_done)}/${fmtNum(k.weighted_total)}` }),
+        weightBar(kPct)));
+      continue;
+    }
+    // 预估口径：分到余量的桶换预估分母；没分到的桶回落现有卡口径。
     if (useEst && isNum(k.estimated_total) && k.estimated_total > 0) {
       const kEst = { estimated_total: k.estimated_total, estimated_remaining: k.estimated_remaining || 0, source: est.source };
       const kPct = Math.round((kDone / k.estimated_total) * 1000) / 10;
@@ -313,6 +350,21 @@ function kindProgress(stats, pct, kinds, opts) {
     ? h('p', { class: 'prog-note', title: KIND_BASIS, text: '口径同总条；分类依据见悬停说明 ⓘ' })
     : h('p', { class: 'prog-note', text: KIND_BASIS }));
   return wrap;
+}
+
+/**
+ * 工时口径的进度条：单段填充。
+ *
+ * 与 progressBar 的分段条**刻意不同形**：那条按状态分段（每段是"多少张卡处于该状态"），
+ * 而工时口径的分子分母是工作量，没有"某状态占多少工作量"的可靠拆分（未跑的卡只有预测值，
+ * 按状态铺出来会让预测值长得像实测）。画成一条单色填充，是在如实说"这里只有一个比例"。
+ */
+function weightBar(pct) {
+  const p = isNum(pct) ? Math.max(0, Math.min(100, pct)) : 0;
+  return h('div', { class: 'prog-wrap' },
+    h('div', { class: 'prog', role: 'img', 'aria-label': `工作量完成 ${p}%` },
+      h('span', { class: 'prog-seg is-weight', style: `width:${p}%` })),
+    h('span', { class: 'prog-pct', title: '工作量完成占比（turns 作代理），分母含预估余量', text: `${p}%` }));
 }
 
 function statusLegend(stats) {
@@ -533,6 +585,9 @@ function progressScaleSeg() {
     ['cards', '实发进度', '分母＝已经派出去的卡（现存非取消卡）。这是"手上这些活干完了多少"。'],
     ['est', '预估进度', '分母＝预估最终总卡数：把复审/修复/emit 还会派生出来的卡提前算进来。'
       + '来源与口径（计划锚点或派生耦合系数）见各进度条的悬停说明；数据不足时自动回落实发口径并标注。'],
+    ['work', '工时进度', '不按卡数计，按每张卡的**工作量**（turns 回合数作代理）加权，并给出预估完成时刻。'
+      + '实测本账本类型间工作量差 28 倍（sequence 中位 57 turns vs progress-pull 2），'
+      + '"完成 7/10 张"在剩下都是大卡时会严重高估。样本不足或缺实测的项目自动回落实发口径并标注。'],
   ];
   // 复用仓内既有的分段控件惯例 .seg（总列/阶段泳道同款，选中态由 aria-pressed 驱动）：
   // 本仓只该有一种"互斥一组"的视觉语言，自创第二套会让人以为它是另一类控件。
@@ -1316,7 +1371,7 @@ function projectCard(p) {
           { mono: true, title: p.dirs.join('\n') })
         : null,
       relTime(p.last_activity) ? metaChip(`活动 ${relTime(p.last_activity)}`) : null),
-    kindProgress(p.stats, p.progress_percent, p.kinds, { compact: true, estimate: p.estimate }),
+    kindProgress(p.stats, p.progress_percent, p.kinds, { compact: true, estimate: p.estimate, weighted: p.weighted }),
     p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     statusLegend(p.stats),
@@ -1458,7 +1513,7 @@ async function viewProject(id) {
     p.archive_revived
       ? callout('warning', 'ⓘ', p.archive_revived_reason || '归档后检测到新卡，已自动切回活跃')
       : null,
-    kindProgress(p.stats, p.progress_percent, p.kinds, { estimate: p.estimate }),
+    kindProgress(p.stats, p.progress_percent, p.kinds, { estimate: p.estimate, weighted: p.weighted }),
     p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     etaLine(p.eta),

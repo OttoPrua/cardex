@@ -19,7 +19,8 @@
 | `type_defaults.<类型>` | 见内置表 | 类型默认执行参数。**条目内没写的字段沿用内置同类型的值**：JSON 只按键合并，只写 `{"design-review": {"model": "opus"}}` 会把整条替换成"只有 model"，`allowed_tools` 变空——复审卡的只读工具集就此静默消失。想彻底不下发工具白名单请写 `skip_permissions: true`，不要把 `allowed_tools` 留空（留空与"没写"在 JSON 里不可区分）。整个类型条目缺失则不烘焙任何参数（那是"该类型没配"这另一种意图） |
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `thinking_tokens` | 0 | >0 时给 claude 调用设 MAX_THINKING_TOKENS（设计活加大思考预算） |
-| `stakes_policy` | low=不复审 / normal=跟随 / high=强制复审+抬 high | 卡级投入产出分档查表（`add -stakes`），**入队即钉到卡面**、运行期不回查；见[进阶指南 · 投入产出分档](guide.md#卡级投入产出分档-stakes--复核深度查表) |
+| `max_fix_rounds` | 3 | "实现→对抗审核→自动修复"闭环的**全局**轮次上限，超过挂 held 升级卡交人裁；被 `stakes_policy.<档>.max_fix_rounds` 按档覆盖 |
+| `stakes_policy` | low=不复审 / normal=跟随 / high=强制复审+抬 high+轮限 4 | 卡级投入产出分档查表（`add -stakes`），档内字段 `review` / `default_effort` / `max_fix_rounds`（`0`=跟随全局）。**入队即钉到卡面**、运行期不回查；见[进阶指南 · 投入产出分档](guide.md#卡级投入产出分档-stakes--复核深度查表) |
 | `retro_every_n_done` | 0（关） | 每 N 张卡进 done 终态自动入队一张 haiku 复盘卡（只读统计、proposal-only）；建议 10，见[进阶指南 · 自动复盘卡](guide.md#自动复盘卡retro_every_n_done) |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见[进阶指南 · 额度红线](guide.md#5-小时额度红线保底额度) |
 | `oauth_usage` / `oauth_usage_*` | false | 订阅端点直读（第三用量源），端点未文档化——异常按数据不足处理 |

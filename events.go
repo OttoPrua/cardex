@@ -557,6 +557,54 @@ func hasCanceledEvent(root, taskID string) bool {
 	return false
 }
 
+// ---- 终态事件的成本遥测（retro-77 建议二，2026-08-02 监控 session 终裁采纳）----
+
+// 终态事件 detail 里成本遥测的键名。cost_total/turns_total 沿用正常 done 路径既有的键
+// （runner.go 完成分支），让复盘按同一组键取数，不必按事件类型分支。
+const (
+	evDetailCostTotal         = "cost_total"
+	evDetailTurnsTotal        = "turns_total"
+	evDetailCostUnavailable   = "cost_unavailable"
+	evDetailCostUnavailReason = "cost_unavailable_reason"
+)
+
+// costUnavailNoUsage 是唯一的"无数据"原因：本卡账面 turns/cost 皆为 0，即从未产生可归集用量
+// （取消发生在任何一步产出结果之前、或执行器根本没跑起来）。
+const costUnavailNoUsage = "no_usage_recorded"
+
+// withCostTelemetry 给终态/提前退出事件的 detail 补上成本遥测，返回同一张 map（nil 时新建）。
+//
+// 【要解决什么】retro-77 样本：10 张卡有 9 张的事件账本查不到 cost_usd/turns——正常完成路径写了
+// （done 事件带 cost_total/turns_total），但 cancel、超轮限升级、分类器直判 failed/held 这些
+// **提前退出**路径只写 reason 就收工。于是复盘算成本时这些卡一律按"无此维度"跳过，而跳过与
+// "确实花了 0 块"在账面上长得一模一样：复盘报出的总额系统性偏低，且偏低多少无从得知。
+//
+// 【为什么无数据也要显式落一个标记，而不是省掉字段】省掉字段 = 复盘只能猜。有 cost_unavailable
+// 这条明路后，"这张卡没花钱"与"这张卡花没花钱我们不知道"在账面上是两件不同的事，复盘的 gaps 段
+// 才有东西可如实分列（templates/retro.md）。静默缺字段是本功能定义的最坏失败模式——它让不完整的
+// 统计看起来完整，与事件账本"缺口显式披露、绝不靠反推伪造完整历史"的第一性纪律直接冲突。
+//
+// 【口径】取 Task.CostUSD/TurnsUsed，即**该卡累计至今**的用量（跨限额中断续跑仍累加在卡面上），
+// 不是本次派发单步的用量。终态事件问的是"这张卡一共花了多少"，累计值才是那个答案。
+func withCostTelemetry(detail map[string]any, t *Task) map[string]any {
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	if t == nil {
+		detail[evDetailCostUnavailable] = true
+		detail[evDetailCostUnavailReason] = costUnavailNoUsage
+		return detail
+	}
+	if t.TurnsUsed > 0 || t.CostUSD > 0 {
+		detail[evDetailCostTotal] = t.CostUSD
+		detail[evDetailTurnsTotal] = t.TurnsUsed
+		return detail
+	}
+	detail[evDetailCostUnavailable] = true
+	detail[evDetailCostUnavailReason] = costUnavailNoUsage
+	return detail
+}
+
 // emitTaskEvent 是 recordEvent 的便捷封装：状态机侧点用它记录事件，写入失败只打警告不阻断。
 // 【为什么失败不阻断】事件账本是审计凭证层，绝不能反向让 saveTask 失败卡死主流程；出错走
 // stderr 提示由 launchd 日志收拢——事件缺口在活动流里由 seq 检测自动可见。

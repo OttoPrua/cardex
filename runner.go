@@ -919,9 +919,10 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		// 事件账本自洽:盘上 canceled 但账本无 canceled 事件时(cli:cancel 后 emit 失败/崩溃),
 		// 入口守卫必须补一条,防止"取消事件永久缺失且无 seq 缺口可见"的最险恶回归.
 		if !hasCanceledEvent(root, t.ID) {
-			emitTaskEvent(root, t.ID, evCanceled, "runner:entry", statusCanceled, t.Step, map[string]any{
-				"reason": "backfill", "source": "entry_guard",
-			})
+			emitTaskEvent(root, t.ID, evCanceled, "runner:entry", statusCanceled, t.Step,
+				withCostTelemetry(map[string]any{
+					"reason": "backfill", "source": "entry_guard",
+				}, t))
 		}
 		_ = archiveTask(root, t)
 		return nil
@@ -998,7 +999,8 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			t.Status = statusDone
 			t.touch()
 			// 无 prompt 可跑的空转 done(如 retry 后 Step 已越界的兜底路径):也是"终态"必须留事件。
-			emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, map[string]any{"reason": "no_more_prompts"})
+			emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step,
+				withCostTelemetry(map[string]any{"reason": "no_more_prompts"}, t))
 			noteTaskDoneLogged(root, cfg, t, lg) // 复盘计数器:两条 done 出口都要记,漏一条 N 就永远偏小
 			return saveTask(root, t)
 		}
@@ -1173,18 +1175,20 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				t.Status = statusHeld
 				t.LastError = annotatedError(cls, msg)
 				logBlock(lg, "CLASS_HELD", fmt.Sprintf("[%s] 不烧 attempts 直接挂 held(升级人工): %s", cls, msg))
-				emitTaskEvent(root, t.ID, evHeld, "runner:classifier", statusHeld, t.Step, map[string]any{
-					"err": msg, "failure_class": string(cls), "reason": policy.Reason,
-				})
+				emitTaskEvent(root, t.ID, evHeld, "runner:classifier", statusHeld, t.Step,
+					withCostTelemetry(map[string]any{
+						"err": msg, "failure_class": string(cls), "reason": policy.Reason,
+					}, t))
 			case statusFailed:
 				// 输入超长：同样 prompt 再送必然再超长，直接 failed 不烧 attempts；人工按 retry 时
 				// 可裁剪 prompt 或换更大窗口的模型。
 				t.Status = statusFailed
 				t.LastError = annotatedError(cls, msg)
 				logBlock(lg, "CLASS_FAILED", fmt.Sprintf("[%s] 不可重试类直接 failed: %s", cls, msg))
-				emitTaskEvent(root, t.ID, evFailed, "runner:classifier", statusFailed, t.Step, map[string]any{
-					"err": msg, "failure_class": string(cls), "reason": policy.Reason,
-				})
+				emitTaskEvent(root, t.ID, evFailed, "runner:classifier", statusFailed, t.Step,
+					withCostTelemetry(map[string]any{
+						"err": msg, "failure_class": string(cls), "reason": policy.Reason,
+					}, t))
 			default:
 				// 现行 retry_backoff：超时/执行器崩溃/未知类。回归基线纪律——未知类的 LastError 与
 				// 事件字段结构与旧版逐字节一致（annotatedError 对 unknown 返回原 msg，不加前缀）；
@@ -1208,7 +1212,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 						detail["softened_from_terminal"] = true
 						detail["reason"] = "softened_transcript_derived"
 					}
-					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, detail)
+					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, withCostTelemetry(detail, t))
 				} else {
 					t.Status = statusQueued
 					backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
@@ -1276,16 +1280,15 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 				"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
 			})
 			if t.Status == statusDone {
-				emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, map[string]any{
-					"turns_total": t.TurnsUsed, "cost_total": t.CostUSD,
-				})
+				emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, withCostTelemetry(nil, t))
 				// 复盘计数器：只数真 done。上面交叉 C 契约违规改判 failed 的分支不该计入
 				// "产能"，否则复盘窗口里混进从未交付的卡。
 				noteTaskDoneLogged(root, cfg, t, lg)
 			} else {
-				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, map[string]any{
-					"err": t.LastError, "reason": "cross_merge_contract_violation",
-				})
+				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step,
+					withCostTelemetry(map[string]any{
+						"err": t.LastError, "reason": "cross_merge_contract_violation",
+					}, t))
 			}
 			if err := saveTask(root, t); err != nil {
 				return err
@@ -1339,7 +1342,9 @@ func finalizeCanceled(root string, t *Task, lg *os.File) error {
 			// 用 reason=backfill 让审计能与正规 runner_cancel/cli:cancel 分辨.
 			detail = map[string]any{"reason": "backfill", "source": "runner_finalize"}
 		}
-		emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, detail)
+		// 取消是 retro-77 点名的遥测缺口首位：卡被杀时已烧掉的 turns/cost 必须随终态事件落盘，
+		// 否则这部分开销在复盘里彻底消失（卡文件虽有累计值，但复盘按事件账本算账）。
+		emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, withCostTelemetry(detail, t))
 	}
 	if err := archiveTask(root, t); err != nil && !os.IsNotExist(err) {
 		return err
@@ -1518,9 +1523,10 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 				// 前面在 runTask 完成路径已 emit evDone(runner.go:815-817);此处终局又改判 failed 却不 emit,
 				// 事件账本终局为 done、盘上为 failed——活动流按事件流会展示"已完成"的假历史。
 				// 补一条 evFailed(actor=runner:postComplete)让终局改判有对应迁移事件,禁反推伪造。
-				emitTaskEvent(root, t.ID, evFailed, "runner:postComplete", statusFailed, t.Step, map[string]any{
-					"reason": "progress_persist_failed", "err": err.Error(), "role": t.XRole,
-				})
+				emitTaskEvent(root, t.ID, evFailed, "runner:postComplete", statusFailed, t.Step,
+					withCostTelemetry(map[string]any{
+						"reason": "progress_persist_failed", "err": err.Error(), "role": t.XRole,
+					}, t))
 			}
 		} else {
 			logBlock(lg, "PROGRESS", "进度报告已写入: "+progressPath(root, key))
@@ -1572,6 +1578,7 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 			// 不继承的话，一张钉了 -project 的实现卡派出的审核卡会掉进「未分类」。
 			rv.Project = t.Project
 			rv.FixRound = t.FixRound
+			rv.MaxFixRounds = t.MaxFixRounds // 轮限随审核卡继承（卡面自洽；判据仍取被审卡）
 			rv.RemoteHost = reviewHost
 			// 远程审核（分流或远程实现卡回退）的模型选取：非空烘焙值恒优先，空才继承实现卡模型。
 			// newTask 已从 type_defaults.review.model 烘焙 rv.Model；仅当它为空（typeDefaults 未配审核模型）
@@ -1869,10 +1876,10 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		return
 	}
 	round := t.FixRound + 1
-	maxRounds := cfg.MaxFixRounds
-	if maxRounds <= 0 {
-		maxRounds = 3
-	}
+	// 轮限取**被审卡卡面钉死的值**（add 时按 stakes 查表固化，经修复链继承），不回查 config：
+	// 见 stakes.go:taskMaxFixRounds【为什么以卡面为准】。审核卡 t 本身也继承了同一值，用 orig
+	// 是因为它才是修复链的谱系承载者（审核卡是链上的旁支）。
+	maxRounds := taskMaxFixRounds(orig, cfg)
 	base := baseFixTitle(orig.Title)
 	findings := ""
 	for i, p := range v.P0 {
@@ -1906,6 +1913,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		esc.RemoteHost = orig.RemoteHost
 		esc.Project = orig.Project // 显式归属随派生卡继承（升级卡属于原卡的项目）
 		esc.FixRound = round
+		esc.MaxFixRounds = orig.MaxFixRounds // 轮限随谱系留档：人裁后 release 续跑不该换上限
 		if saveTask(root, esc) == nil {
 			// 父审核卡 closeout：超轮限 held 卡是审核链的显式终点，父卡账本必须留指针。
 			emitTaskEvent(root, t.ID, evCloseout, "runner:escalation", statusDone, t.Step, map[string]any{
@@ -1915,9 +1923,15 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 			emitTaskEvent(root, esc.ID, evQueued, "runner:escalation", statusQueued, 0, map[string]any{
 				"parent": t.ID, "review_of": t.ReviewOf, "round": round,
 			})
-			emitTaskEvent(root, esc.ID, evHeld, "runner:escalation", statusHeld, 0, map[string]any{
-				"reason": "over_max_fix_rounds", "max_rounds": maxRounds,
-			})
+			// 超轮限升级卡的 held 是这条修复链的显式终点。遥测按**升级卡自身**的用量落（新卡从未
+			// 执行 → cost_unavailable），并另记被审链累计开销 chain_cost_total/chain_turns_total：
+			// 复盘要回答的是"这条链撞墙前烧了多少"，而不是"这张刚出生的壳卡花了多少"。两组键分开，
+			// 谁也不冒充谁——按卡求和时只取 cost_total，链账另算。
+			emitTaskEvent(root, esc.ID, evHeld, "runner:escalation", statusHeld, 0,
+				withCostTelemetry(map[string]any{
+					"reason": "over_max_fix_rounds", "max_rounds": maxRounds,
+					"chain_cost_total": orig.CostUSD, "chain_turns_total": orig.TurnsUsed,
+				}, esc))
 			logBlock(lg, "FIXLOOP", fmt.Sprintf("超轮限（R%d>上限%d），已挂 held 升级卡 %s 交人工裁定", round, maxRounds, esc.ID))
 		}
 		return
@@ -1941,6 +1955,10 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	nt.ReviewAfter = true
 	nt.FixRound = round
 	nt.Project = orig.Project // 显式归属随修复链继承
+	// 轮限随修复链继承：下一轮的 handleReviewVerdict 读的是**下一张卡**的卡面，不继承就会在
+	// R2 静默掉回全局值——一张 -stakes high 的卡只有第一轮享受 4 轮上限，后面又按 3 轮截断。
+	nt.MaxFixRounds = orig.MaxFixRounds
+	nt.Stakes = orig.Stakes // 审计留档随链传递（非运行期判据，见 stakes.go 文件头）
 	nt.Model = orig.Model
 	nt.SkipPermissions = orig.SkipPermissions
 	nt.PermissionMode = orig.PermissionMode
@@ -2136,9 +2154,10 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		_ = os.Remove(crossPeerPath(root, t.XKey)) // 断裂时清理侧车,不留甲结论长期残驻
 		// 断裂前先记 failed 事件：postComplete 后 runTask 会 saveTask 但不再进 failed 分支，
 		// 若不在此处记事件，"交叉链断裂"这条关键状态迁移会在事件账本里彻底缺席。
-		emitTaskEvent(root, t.ID, evFailed, "runner:cross", statusFailed, t.Step, map[string]any{
-			"reason": "cross_chain_break", "role": t.XRole, "detail": reason,
-		})
+		emitTaskEvent(root, t.ID, evFailed, "runner:cross", statusFailed, t.Step,
+			withCostTelemetry(map[string]any{
+				"reason": "cross_chain_break", "role": t.XRole, "detail": reason,
+			}, t))
 		logBlock(lg, "CROSS", "链中断（母卡置 failed 留痕）: "+reason)
 	}
 	// 乙引擎用**冻结**规格（入队时钉死），不从当前 config 重解析——防身份漂移。
@@ -2275,9 +2294,10 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 			t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, nextRole)
 			_ = os.Remove(crossPeerPath(root, t.XKey))
 			// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
-			emitTaskEvent(root, t.ID, evFailed, "runner:reconcile", statusFailed, t.Step, map[string]any{
-				"reason": "cross_chain_orphan", "role": t.XRole, "missing_next": nextRole,
-			})
+			emitTaskEvent(root, t.ID, evFailed, "runner:reconcile", statusFailed, t.Step,
+				withCostTelemetry(map[string]any{
+					"reason": "cross_chain_orphan", "role": t.XRole, "missing_next": nextRole,
+				}, t))
 			return saveTask(root, t)
 		})
 		if tombErr != nil {
@@ -2331,10 +2351,11 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 			}
 			if shouldEmit {
 				// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
-				emitTaskEvent(root, t.ID, evHeld, "runner:reconcile-tombstone", statusHeld, t.Step, map[string]any{
-					"reason": "reconcile_cross_tombstone_exhausted", "kind": reconcileCrossKind(),
-					"role": t.XRole, "missing_next": nextRole,
-				})
+				emitTaskEvent(root, t.ID, evHeld, "runner:reconcile-tombstone", statusHeld, t.Step,
+					withCostTelemetry(map[string]any{
+						"reason": "reconcile_cross_tombstone_exhausted", "kind": reconcileCrossKind(),
+						"role": t.XRole, "missing_next": nextRole,
+					}, t))
 			}
 			if err := saveTask(root, t); err != nil {
 				fmt.Fprintf(os.Stderr, "警告: reconcile 挂 held 落盘失败 %s: %v\n", t.ID, err)

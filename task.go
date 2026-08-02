@@ -77,8 +77,13 @@ type Task struct {
 	// ReviewOf: 本卡是审核卡时指向被审卡 ID；修复闭环靠它取被审卡的 prompt/参数做继承。
 	ReviewOf string `json:"review_of,omitempty"`
 	// FixRound: "实现→对抗审核→修复"循环轮次。实现卡 0，第 n 轮自动修复卡为 n；审核卡继承被审卡轮次。
-	// 达到 config.max_fix_rounds 后不再自动派修复，改挂 held 升级卡交人工/设计权威裁定。
+	// 达到 MaxFixRounds 后不再自动派修复，改挂 held 升级卡交人工/设计权威裁定。
 	FixRound int `json:"fix_round,omitempty"`
+	// MaxFixRounds: 本卡修复链的轮次上限，**add 时按 stakes 查表钉死的绝对轮数**
+	// （config.stakes_policy.<档>.max_fix_rounds，缺省回落全局 config.max_fix_rounds）。
+	// 与 ReviewAfter/Effort 同属"入队即钉"字段：运行期只读卡面，不回查 config——否则改配置会让
+	// 在队修复链静默换上限而卡面无差别。经修复链/审核卡/升级卡继承。0 = 存量卡，回落全局值。
+	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 	// Closeout: 收口回写指令（opt-in）。非空时，本卡的对抗复审 verdict=pass 后，自动入队一张
 	// 廉价（haiku）收口卡跑此 prompt——把"done"回写权威账本的动作绑定到 pass 事件而非实现卡自评，
 	// 根治"实现卡提前自标 done / 老实等审却 pass 后没人翻"的双真相源漂移。经修复链继承。

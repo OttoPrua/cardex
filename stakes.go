@@ -33,17 +33,47 @@ const (
 
 var validStakes = map[string]bool{stakesLow: true, stakesNormal: true, stakesHigh: true}
 
+// defaultMaxFixRounds 是全局兜底的修复轮次上限（config.max_fix_rounds 为 0 时取它）。
+const defaultMaxFixRounds = 3
+
 // defaultStakesPolicy 是内置查表。委托人指定的三档语义：
 //
 //	low    → 不配复审（改错别字/加注释一类，复审收益低于成本）
 //	normal → 跟随 -review-after 显式指定（保持既有默认行为，不改变任何存量派卡习惯）
-//	high   → 强制配复审 + 思考档地板抬到 high
+//	high   → 强制配复审 + 思考档地板抬到 high + 修复轮限放到 4
+//
+// 【为什么只有 high 抬轮限】retro-77（2026-08-02，监控 session 终裁采纳）样本：10 张高 effort
+// 规格对齐类卡有 9 张撞在全局上限 3 上进人裁壳，事后均判"壳清、工作在新链继续"——对这类卡而言
+// 上限 3 不是护栏而是噪声源，它没拦住任何打转，只是把同一件事换条链重跑。低/普通档保持跟随
+// 全局（0 = 不覆盖）：低价值卡在实现层打转三轮就该停，多给一轮只是多烧一轮额度。
 func defaultStakesPolicy() map[string]StakesRule {
 	return map[string]StakesRule{
 		stakesLow:    {Review: stakesReviewOff},
 		stakesNormal: {Review: stakesReviewFollow},
-		stakesHigh:   {Review: stakesReviewOn, DefaultEffort: "high"},
+		stakesHigh:   {Review: stakesReviewOn, DefaultEffort: "high", MaxFixRounds: 4},
 	}
+}
+
+// globalMaxFixRounds 取全局兜底轮限（config 未配则 defaultMaxFixRounds）。
+func globalMaxFixRounds(cfg *Config) int {
+	if cfg != nil && cfg.MaxFixRounds > 0 {
+		return cfg.MaxFixRounds
+	}
+	return defaultMaxFixRounds
+}
+
+// taskMaxFixRounds 取一张卡实际适用的轮限：**优先卡面钉死的值**，为 0 才回落全局。
+//
+// 【为什么以卡面为准】与 ReviewAfter/Effort 同一条"入队即钉"纪律（见文件头）：轮限在 add 时按
+// stakes 查表定死，运行期不再回查 config——否则改一次 stakes_policy 或 max_fix_rounds，队列里
+// 所有在跑/在等的修复链会静默换上限，而"这张卡还能修几轮"在卡面上看不出任何差别。
+// 回落全局这一支服务两类卡：本改动之前入队的存量卡，以及不经 add 创建的派生卡（其轮限由
+// handleReviewVerdict 沿修复链继承，见 runner.go）。
+func taskMaxFixRounds(t *Task, cfg *Config) int {
+	if t != nil && t.MaxFixRounds > 0 {
+		return t.MaxFixRounds
+	}
+	return globalMaxFixRounds(cfg)
 }
 
 // stakesRule 取该档位的规则：**缺档回落整条内置默认，档内留空的字段逐个回落内置同档位的值**。
@@ -62,7 +92,9 @@ func defaultStakesPolicy() map[string]StakesRule {
 // 靶：TestStakesRuleFieldLevelFallback / TestLoadConfigPartialHighTierKeepsForcedReview。
 //
 // 【已知表达力缺口】`default_effort` 同理留空 = 继承，因此"高档位但不要思考地板"在 high 档无法表达
-// （没有代表"无地板"的合法档位字面量）；需要时只能显式写一个更低的档位。登记在案，未做语法扩展。
+// （没有代表"无地板"的合法档位字面量）；需要时只能显式写一个更低的档位。`max_fix_rounds` 同理：
+// 0 = 继承，所以"high 档跟随全局轮限"不能靠留空表达，只能把全局那个数显式写进 high 档。
+// 两处登记在案，未做语法扩展。
 func stakesRule(cfg *Config, stakes string) StakesRule {
 	base, ok := defaultStakesPolicy()[stakes]
 	if !ok {
@@ -80,6 +112,9 @@ func stakesRule(cfg *Config, stakes string) StakesRule {
 	}
 	if r.DefaultEffort == "" {
 		r.DefaultEffort = base.DefaultEffort
+	}
+	if r.MaxFixRounds == 0 {
+		r.MaxFixRounds = base.MaxFixRounds
 	}
 	return r
 }
@@ -142,6 +177,19 @@ func applyStakes(t *Task, cfg *Config, stakes string, explicitEffort bool) error
 		if !explicitEffort && effortRank(t.Effort) < effortRank(r.DefaultEffort) {
 			t.Effort = r.DefaultEffort
 		}
+	}
+
+	// 修复轮限固化到卡面：**钉的是解析后的绝对轮数**，不是"0=跟随全局"这种延后判定的哨兵值。
+	// 否则一张 -stakes low 的卡入队时 max_fix_rounds 留 0，跑到第 3 轮时人改了全局 max_fix_rounds，
+	// 它的上限就静默变了——这正是入队即钉要防的漂移。钉绝对值后，卡面上直接看得见"还能修几轮"。
+	if r.MaxFixRounds < 0 {
+		return fmt.Errorf("config.stakes_policy.%s.max_fix_rounds=%d 非法（须 >0；0/不写 = 跟随全局 max_fix_rounds）",
+			stakes, r.MaxFixRounds)
+	}
+	if r.MaxFixRounds > 0 {
+		t.MaxFixRounds = r.MaxFixRounds
+	} else {
+		t.MaxFixRounds = globalMaxFixRounds(cfg)
 	}
 	return nil
 }

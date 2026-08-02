@@ -382,12 +382,21 @@ The table lives in `config.json`, with defaults for all three tiers:
 "stakes_policy": {
   "low":    {"review": "off"},                            // never attach a review
   "normal": {"review": "follow"},                          // follow the explicit -review-after (default tier)
-  "high":   {"review": "on", "default_effort": "high"}     // force a review + thinking-tier floor
+  "high":   {"review": "on", "default_effort": "high",     // force a review + thinking-tier floor
+             "max_fix_rounds": 4}                          // one extra fix round (the global default is 3)
 }
 ```
 
 - `review` takes `on` / `off` / `follow` (`follow` = don't interfere; keep whatever `-review-after` said);
 - `default_effort` is a **floor, not an override**: it only applies when `-effort` was not given explicitly, and it only raises — a card whose type default is already `max` is never pulled down to `high`;
+- `max_fix_rounds` overrides the global key of the same name for that tier (the round cap on the
+  implement → adversarial-review → auto-fix loop; the global default is 3). The built-in table raises it to
+  **4** for `high` only; `low` and `normal` carry `0`, meaning "follow the global value".
+  **Why only the top tier**: in the `retro-77` sample, 9 of 10 high-effort spec-alignment cards hit the cap of 3
+  and were escalated into a human-adjudication shell — and every one of those shells was later judged empty,
+  with the work simply continuing on a fresh chain. At that tier the cap was not a guardrail but a noise source:
+  it stopped no spinning, it merely made the same work restart on another chain, burning one dispatch and one
+  round of human triage for nothing. Low-value cards should still stop after three rounds, so they are unchanged;
 - an explicit `-effort` always wins over the floor (`-stakes high -effort low` really is `low`): the command line has the final say, otherwise the command line stops being trustworthy;
 - you may specify only some tiers — the rest keep the built-in defaults (keys are merged, the table is not replaced wholesale);
 - **fields you omit inside a tier also fall back to the built-in value for that tier** — JSON merges at key
@@ -397,10 +406,19 @@ The table lives in `config.json`, with defaults for all three tiers:
   `-stakes high` card**, with no error anywhere. So omitted means inherited, and expressing "don't interfere"
   requires writing `"review": "follow"` explicitly;
 - known gap: `default_effort` inherits on omission the same way, so "high tier but no thinking floor" cannot be
-  expressed at the `high` tier (there is no literal meaning "no floor"); write a lower tier explicitly instead;
-- a malformed table value (`review: "yes"`, `default_effort: "ultra"`) **errors out at `add` time** instead of silently falling back to a default — a misspelled guardrail that silently does nothing is far more expensive than an error.
+  expressed at the `high` tier (there is no literal meaning "no floor"); write a lower tier explicitly instead.
+  `max_fix_rounds` has the same shape — `0` means inherit, so "the `high` tier should follow the global cap"
+  is likewise inexpressible; write the global number into the tier explicitly;
+- a malformed table value (`review: "yes"`, `default_effort: "ultra"`, `max_fix_rounds: -1`) **errors out at `add` time** instead of silently falling back to a default — a misspelled guardrail that silently does nothing is far more expensive than an error.
 
-**Frozen at enqueue (drift protection)**: the lookup runs **exactly once, at `add`**, and the result is baked onto the card (the `review_after` / `effort` fields). Nothing is re-read from `config.json` at run time. Otherwise a single edit to `stakes_policy` would silently change the review depth of every queued and running card, with nothing visible on the card itself. The `stakes` field on the card is an audit record only, never a runtime predicate (same discipline as cross-verification freezing engine identity at enqueue).
+**Frozen at enqueue (drift protection)**: the lookup runs **exactly once, at `add`**, and the result is baked onto the card (the `review_after` / `effort` / `max_fix_rounds` fields). Nothing is re-read from `config.json` at run time. Otherwise a single edit to `stakes_policy` would silently change the review depth of every queued and running card, with nothing visible on the card itself. The `stakes` field on the card is an audit record only, never a runtime predicate (same discipline as cross-verification freezing engine identity at enqueue).
+
+The round cap is frozen as a **resolved absolute number**, not as the `0` "follow the global" sentinel: otherwise
+a card enqueued with `0` would silently change caps the moment someone edited the global `max_fix_rounds` while
+it was on round 3. With the absolute value pinned, `cardex show` tells you directly how many fix rounds the card
+has left. The field is inherited along the fix chain, by review cards, and by over-round escalation cards —
+without that, a `-stakes high` card would enjoy the widened cap on its first round only and be silently clipped
+back to the global value from round two onward.
 
 ### Review-seat quality floor (review cards are never downgraded or rerouted)
 
@@ -425,9 +443,9 @@ Every N cards that reach the `done` terminal state, a `progress-pull` + `haiku` 
 
 1. Failure-class distribution (reasons on `failed`/`retry` events plus each card's `last_error`)
 2. Fix-round distribution (`fix_round`)
-3. Per-card cost and model distribution (`cost_usd` grouped by `model` / `runner`)
+3. Per-card cost and model distribution (`cost_usd` grouped by `model` / `runner`; cards carrying a `cost_unavailable` marker are counted separately and itemised under `gaps` — never folded into the total as zero)
 4. Review verdict distribution (`design-review` and `x_role=C` outcomes)
-5. Round-limit and divert events (cards escalated past `max_fix_rounds`, `limit_paused` counts, `runner=codex` diverted cards)
+5. Round-limit and divert events (cards escalated past their round cap, `limit_paused` counts, `runner=codex` diverted cards)
 6. **At most 3** actionable recommendations (e.g. "file this card class with `-stakes low`", "template X lacks Y, causing repeated rework")
 
 The report lands in `progress/retro-<watermark>.json`; read it with `cardex progress -show retro-<watermark>`.
@@ -435,3 +453,14 @@ The report lands in `progress/retro-<watermark>.json`; read it with `cardex prog
 **Proposal-only (standing rule D11)**: the retrospective card is **read-only analysis** — it does not touch `config.json`, templates, or any card. Recommendations are consumed by a human or a monitoring session. Letting automation edit automation's own parameters turns a wrong recommendation directly into a wrong production config.
 
 **Idempotent (a crash never double-enqueues)**: the counter lives in `<root>/retro_counter.json` (single writer = this binary; in-process mutex plus the tick single-instance lock). It records two numbers: `done_total` (cumulative terminal cards) and `triggered_at` (**the watermark already triggered**). The watermark is advanced and persisted *before* the retro card is enqueued — so a crash in between costs you **one missing** retro card and can never produce a duplicate. That direction is deliberate: a duplicate retro burns quota, pushes a duplicate report into `progress/`, and pollutes the next retro's own statistics; one missing retro is far cheaper (same discipline as the tombstone mechanism's "better one missed injection than a duplicate one"). While the switch is off (0) the counter **still counts**, so the moment you turn it on there is already a historical baseline — you don't restart from zero. A retrospective card's own completion is not counted.
+
+### Cost telemetry on terminal events (how the retro does its accounting)
+
+The retro tallies cost from the **event ledger**, so every terminal event (`done` / `failed` / `canceled`, and `held`) has to answer "what did this card cost":
+
+- the card has accumulated usage → the event `detail` carries `cost_total` / `turns_total` (the card's **cumulative** usage, which keeps accruing across limit-pause resumes);
+- the card has no usage at all → it carries `cost_unavailable: true` plus `cost_unavailable_reason`. **Silently omitting the fields is not allowed.**
+
+**Why an explicit marker rather than a missing field**: drop the fields and the retro can only guess — "this card cost nothing" and "we don't know whether this card cost anything" become indistinguishable on paper, so the reported total is systematically low by an unknowable amount. In the `retro-77` sample, 9 of 10 cards had no cost recorded: the normal completion path wrote it, but the **early-exit** paths — cancel, over-round escalation, classifier-driven failed/held — wrote only a `reason` and called it done. A silently missing field makes an incomplete tally look complete, which collides head-on with the event ledger's founding discipline: disclose gaps explicitly, never reconstruct a fake complete history by inference.
+
+One card may emit `held` and later `failed`, each carrying the cumulative figure as of that moment: when accounting, **count only the last terminal event per card** — summing every event double-counts. The `held` event of an over-round escalation card additionally carries `chain_cost_total` / `chain_turns_total`, the cost the reviewed chain burned before hitting the wall; the escalation card itself is a newborn shell (its `cost_unavailable` is a truthful zero, not a ledger defect). The two key groups are kept separate so neither can impersonate the other.

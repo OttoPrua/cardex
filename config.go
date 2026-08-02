@@ -97,6 +97,7 @@ type Config struct {
 	ThinkingTokens int `json:"thinking_tokens,omitempty"`
 	// MaxFixRounds: "实现→对抗审核→自动修复"闭环的轮次上限，超过后不再自动派修复卡，
 	// 改挂 held 升级卡交人工/设计权威裁定（防同一叶卡在实现层无限打转）。0 用默认 3。
+	// 这是**全局兜底值**：stakes_policy.<档>.max_fix_rounds 非 0 时按档覆盖它（add 时钉到卡面）。
 	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 
 	// ---- 远程执行器（SSH → 远端 codex，让远端主机进编排）----
@@ -128,6 +129,7 @@ type Config struct {
 	// loadConfig 从 defaultConfig 起手）；**档内留空的字段也逐个回落内置同档位的值**——JSON 的合并
 	// 粒度只到键，只写 `{"high":{"default_effort":"xhigh"}}` 会把 review 打成空串，若按 follow 处理
 	// 就等于静默解除 high 档的强制复审。补齐由 stakesRule 完成，要 follow 必须显式写 "follow"。
+	// 【档内字段】review / default_effort / max_fix_rounds，三者同受上述字段级回落纪律。
 	StakesPolicy map[string]StakesRule `json:"stakes_policy,omitempty"`
 
 	// RetroEveryNDone: 每累计 N 张卡进入 done 终态，自动入队一张 haiku 复盘卡
@@ -162,6 +164,13 @@ type StakesRule struct {
 	// 只抬不降——已经是更高档（如类型默认给了 max）的卡不会被这张表拉低。
 	// 不写 = 继承内置表同档位的地板。
 	DefaultEffort string `json:"default_effort,omitempty"`
+	// MaxFixRounds 是该档位的"实现→对抗审核→自动修复"轮次上限，覆盖全局 config.max_fix_rounds。
+	// 0/不写 = 继承内置表同档位的值；内置表里 low/normal 为 0（跟随全局），high 为 4。
+	//
+	// 【为什么高档要多给一轮】retro-77（2026-08-02）样本：10 张高 effort 规格对齐类卡有 9 张撞在
+	// 全局上限 3 上进人裁壳，事后复核均判"壳清、工作在新链继续"——上限对这类卡偏紧，人裁壳只是
+	// 把同一件事换条链重跑，白烧一次派卡与一次人工翻看。低档位不动：低价值卡打转三轮就该停。
+	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 }
 
 // CrossEngine 描述交叉验证链中一个引擎的执行位置（模型来源可切换的落点）。

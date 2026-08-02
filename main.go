@@ -353,6 +353,7 @@ func cmdAdd(args []string) error {
 	emitTaskEvent(root, t.ID, evQueued, "cli:add", statusQueued, t.Step, map[string]any{
 		"type": t.Type, "priority": t.Priority, "prompts": len(t.Prompts),
 		"stakes": t.Stakes, "review_after": t.ReviewAfter, "effort": t.Effort,
+		"max_fix_rounds": t.MaxFixRounds,
 	})
 	if *hold {
 		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step, map[string]any{"reason": "add -hold"})
@@ -1485,9 +1486,10 @@ func cmdSetStatus(args []string, action string) error {
 			return err
 		}
 		// cancel 事件先落再决定是否归档:即便随后 archive 失败,事件已记留痕。
-		emitTaskEvent(root, t.ID, evCanceled, "cli:cancel", statusCanceled, t.Step, map[string]any{
-			"was_running": wasRunning,
-		})
+		// 成本遥测随终态落盘(retro-77 建议二):人工取消是账面开销最容易凭空蒸发的一条路——
+		// 卡上累计的 turns/cost 若不写进终态事件,复盘按事件账本算账时这笔开销就查不到了。
+		emitTaskEvent(root, t.ID, evCanceled, "cli:cancel", statusCanceled, t.Step,
+			withCostTelemetry(map[string]any{"was_running": wasRunning}, t))
 		if wasRunning {
 			// 进程还活着，先别归档：drain 每个重扫周期对账任务文件，见 canceled 即
 			// 击杀其执行进程组、释放槽位与目录互斥，然后归档（调度进程不在场时由

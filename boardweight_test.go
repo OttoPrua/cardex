@@ -117,6 +117,46 @@ func TestWeightedProgressDiffersFromCardCount(t *testing.T) {
 	if w.Percent >= cardPct {
 		t.Errorf("剩余全是大卡时工时口径必须低于卡数口径: 工时 %v%% vs 卡数 %v%%", w.Percent, cardPct)
 	}
+	// 状态拆分（供进度条分段着色）：各段之和 ≡ Stats.Total ≡ 不含余量的总权重。
+	if w.Stats.Done != 264 || w.Stats.Queued != 240 || w.Stats.Total != 504 {
+		t.Fatalf("状态拆分: %+v", w.Stats)
+	}
+	sum := w.Stats.Queued + w.Stats.Running + w.Stats.LimitPaused + w.Stats.Held +
+		w.Stats.Failed + w.Stats.Done
+	if sum != w.Stats.Total {
+		t.Errorf("各状态段之和必须等于 Stats.Total（否则条画不满/画溢出）: %v vs %v", sum, w.Stats.Total)
+	}
+}
+
+// 取消卡不进任何状态段，也不进 Total——与卡数口径"分母排除已取消"一致。
+func TestWeightStatsExcludesCanceled(t *testing.T) {
+	var s WeightStats
+	s.add(statusDone, 10)
+	s.add(statusCanceled, 999)
+	s.add(statusQueued, 5)
+	if s.Canceled != 0 || s.Total != 15 {
+		t.Fatalf("取消卡不得计入: %+v", s)
+	}
+}
+
+// 预估余量单列 SpawnWeight（画条尾幽灵段），不混进任何状态段——混进去就会被读成真实卡的活。
+func TestWeightedSpawnWeightSeparateFromStats(t *testing.T) {
+	now := time.Now()
+	var ts []*Task
+	for i := 0; i < 12; i++ {
+		ts = append(ts, wcard(statusDone, typeSequence, 50, now.Add(-time.Duration(i+1)*time.Hour), 1))
+	}
+	ts = append(ts, &Task{ID: "p1", Type: typeSequence, Status: statusQueued, Prompts: []string{"p"}})
+	w := buildProjectWeighted(ts, &ProjectEstimate{EstimatedRemaining: 2}, now)
+	if w.SpawnWeight != 100 { // 2 × 在途均值 50
+		t.Fatalf("SpawnWeight 应为 100, got %v", w.SpawnWeight)
+	}
+	if w.Stats.Total != 650 { // 12×50 + 1×50，不含余量
+		t.Fatalf("Stats.Total 只算已存在的卡: %v", w.Stats.Total)
+	}
+	if w.TotalWeight != w.Stats.Total+w.SpawnWeight {
+		t.Errorf("总权重应 = 已存在 + 余量: %v vs %v+%v", w.TotalWeight, w.Stats.Total, w.SpawnWeight)
+	}
 }
 
 // 预估余量按在途卡的平均权重折进总分母（余量卡与在途卡同源）。
@@ -222,5 +262,10 @@ func TestAnnotateKindWeights(t *testing.T) {
 	// 修复桶：done 30（实测）+ pending 40（sequence 中位）= 70；取消卡不计
 	if kinds[1].WeightedTotal != 70 || kinds[1].WeightedDone != 30 {
 		t.Errorf("修复桶应为 30/70（取消卡不进分母）: %+v", kinds[1])
+	}
+	// 分桶也要带状态拆分（工时口径下分桶条同样按状态分段着色）。
+	ws := kinds[1].WeightStats
+	if ws == nil || ws.Done != 30 || ws.Queued != 40 || ws.Total != 70 {
+		t.Errorf("修复桶状态拆分: %+v", ws)
 	}
 }

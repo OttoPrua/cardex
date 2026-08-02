@@ -184,6 +184,8 @@ type KindProgress struct {
 	// 只计已存在的卡，不摊预估余量（见 annotateKindWeights）。0 = 工时口径不可用，前端回落卡数。
 	WeightedDone  float64 `json:"weighted_done,omitempty"`
 	WeightedTotal float64 `json:"weighted_total,omitempty"`
+	// WeightStats 是本桶按状态拆的工作量，供工时口径下的分桶条同样按状态分段着色。
+	WeightStats *WeightStats `json:"weight_stats,omitempty"`
 }
 
 // buildKindProgress 把一批卡按性质分桶。

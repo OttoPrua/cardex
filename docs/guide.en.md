@@ -187,7 +187,13 @@ by workload and adds a projected completion time:
   turns=0); those are filled from the type median, direction of bias unknown — coverage and the
   gap are printed under the bar and in the basis;
 - Below 12 measured samples the whole scale is marked unavailable and falls back to the filed
-  scale with the reason stated outright.
+  scale with the reason stated outright;
+- The bar uses the **same status segmentation and status colors** as the other two scales (each
+  segment is "how much work sits in this status", with the same hatched projected-remainder
+  segment at the tail). The segments for not-yet-run cards are median-predicted estimates — that
+  is disclosed by the coverage figure and basis under the bar rather than by dimming the
+  segments: segmentation says "what state this work is in", not "how trustworthy this number
+  is", and cramming both into one visual channel makes neither readable.
 
 **Kind buckets switch with the scale**: on the projected scale, the remainder is distributed
 across the design/impl/fix/review buckets by **historical spawn composition** (if 60% of past

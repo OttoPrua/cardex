@@ -33,7 +33,11 @@
   Below 12 measured samples the scale falls back to card counts; with no derivable rate it
   reports the percentage and no time. The turns-reporting gap for codex/engine cards (24% of
   done cards) is disclosed both under the bar and in the basis. Kind buckets carry their own
-  weighted numerator/denominator on this scale too.
+  weighted numerator/denominator on this scale too. The bar uses the same status segmentation
+  and colors as the other two scales (each segment = how much work sits in that status, same
+  hatched remainder at the tail); segments for not-yet-run cards are predictions, disclosed via
+  the coverage figure and basis rather than by dimming — segmentation conveys state, not
+  confidence, and merging both into one channel makes neither readable.
 
 ## 2026-08-02 · Dual board progress scales (existing cards / estimated remaining)
 

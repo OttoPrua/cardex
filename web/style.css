@@ -504,10 +504,7 @@ button { font: inherit; color: inherit; }
 .prog-seg { height: 100%; }
 .prog-seg:first-child { border-radius: 4px 0 0 4px; }
 .prog-seg:last-child  { border-radius: 0 4px 4px 0; }
-/* 工时口径的单段填充：用中性强调色，与按状态分段的彩条区分开——那条讲"卡分布在哪些状态"，
-   这条只讲一个比例（工作量没有可靠的按状态拆分，铺成彩段会让预测值长得像实测）。 */
-.prog-seg.is-weight { background: color-mix(in oklab, var(--s1) 62%, var(--surface)); }
-/* 预估余量幽灵段（含预估口径）：斜纹镂空——一眼区别于任何实卡状态色，避免被读成真实卡。 */
+/* 预估余量幽灵段（含预估/工时口径）：斜纹镂空——一眼区别于任何实卡状态色，避免被读成真实卡。 */
 .prog-seg.is-est-remaining {
   background: repeating-linear-gradient(45deg, transparent, transparent 3px,
     var(--line) 3px, var(--line) 6px);

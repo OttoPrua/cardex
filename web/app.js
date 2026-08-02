@@ -277,7 +277,7 @@ function kindProgress(stats, pct, kinds, opts) {
     wrap.append(h('div', { class: 'prog-row is-total' },
       h('span', { class: 'prog-key', title: `工时口径。${wt.basis}`, text: '工时进度' }),
       h('span', { class: 'prog-n', title: wt.basis, text: `${fmtNum(wt.done_weight)}/${fmtNum(wt.total_weight)}` }),
-      weightBar(wt.percent)));
+      weightBar(wt.stats, wt.percent, wt.spawn_weight, wt.unit)));
   } else if (useEst) {
     const pctEst = Math.round((done / est.estimated_total) * 1000) / 10;
     wrap.append(h('div', { class: 'prog-row is-total' },
@@ -322,7 +322,7 @@ function kindProgress(stats, pct, kinds, opts) {
           text: k.label + '⏱',
         }),
         h('span', { class: 'prog-n', text: `${fmtNum(k.weighted_done)}/${fmtNum(k.weighted_total)}` }),
-        weightBar(kPct)));
+        weightBar(k.weight_stats, kPct, 0, wt.unit)));
       continue;
     }
     // 预估口径：分到余量的桶换预估分母；没分到的桶回落现有卡口径。
@@ -353,18 +353,53 @@ function kindProgress(stats, pct, kinds, opts) {
 }
 
 /**
- * 工时口径的进度条：单段填充。
+ * 工时口径的进度条：与 progressBar 同一套状态分段与状态色，只是每段的量是**工作量**而不是
+ * 卡数。三种口径长得一致，读的时候不用切换视觉语言。
  *
- * 与 progressBar 的分段条**刻意不同形**：那条按状态分段（每段是"多少张卡处于该状态"），
- * 而工时口径的分子分母是工作量，没有"某状态占多少工作量"的可靠拆分（未跑的卡只有预测值，
- * 按状态铺出来会让预测值长得像实测）。画成一条单色填充，是在如实说"这里只有一个比例"。
+ * 【诚实边界】未跑的卡（排队/运行中/挂起/限额暂停）的工作量是按同类中位**预测**的，不是实测；
+ * 段的长度因此是估计值。这一点由条下的实测覆盖率与 basis 披露，不靠把段涂淡来暗示——
+ * 分段的语义是"这部分活处于什么状态"，不是"这段数据多可靠"，两件事混在一个视觉通道里
+ * 只会让两者都读不准。
+ *
+ * spawn 是预估余量折算的工作量，画在条尾的斜纹幽灵段（与预估口径同一形状语言）。
  */
-function weightBar(pct) {
+function weightBar(ws, pct, spawn, unit) {
   const p = isNum(pct) ? Math.max(0, Math.min(100, pct)) : 0;
+  const s = ws || {};
+  const ghost = isNum(spawn) && spawn > 0 ? spawn : 0;
+  const den = (s.total || 0) + ghost;
+  const u = unit || 'turns';
+  const segs = [];
+  const label = [];
+  if (den > 0) {
+    for (const k of STATUS_ORDER) {
+      const v = s[k] || 0;
+      if (!v) continue;
+      segs.push(h('span', {
+        class: 'prog-seg',
+        style: `width:${(v / den) * 100}%;background:var(--k-${k})`,
+        title: `${STATUS_ZH[k]} ${fmtNum(v)} ${u}`,
+      }));
+      label.push(`${STATUS_ZH[k]} ${fmtNum(v)}`);
+    }
+    if (ghost) {
+      segs.push(h('span', {
+        class: 'prog-seg is-est-remaining',
+        style: `width:${(ghost / den) * 100}%`,
+        title: `预估余量 ~${fmtNum(ghost)} ${u}（按在途卡平均工作量折算）`,
+      }));
+    }
+  }
   return h('div', { class: 'prog-wrap' },
-    h('div', { class: 'prog', role: 'img', 'aria-label': `工作量完成 ${p}%` },
-      h('span', { class: 'prog-seg is-weight', style: `width:${p}%` })),
-    h('span', { class: 'prog-pct', title: '工作量完成占比（turns 作代理），分母含预估余量', text: `${p}%` }));
+    h('div', {
+      class: 'prog', role: 'img',
+      'aria-label': `工作量共 ${fmtNum(den)} ${u}：${label.join('，')}${ghost ? `，预估余量 ${fmtNum(ghost)}` : ''}`,
+    }, segs),
+    h('span', {
+      class: 'prog-pct',
+      title: `工作量完成占比（${u} 作代理）${ghost ? '，分母含预估余量' : ''}`,
+      text: `${p}%`,
+    }));
 }
 
 function statusLegend(stats) {

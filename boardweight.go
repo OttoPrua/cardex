@@ -29,6 +29,55 @@ import (
 	"time"
 )
 
+// WeightStats 是各状态的工作量分布，键与 boardStats 完全一致——前端因此能复用同一套状态色
+// 与状态次序，三种口径的进度条长得一样，只是分子分母的单位不同（卡数 ↔ 工作量）。
+//
+// 【Canceled 恒 0】取消卡不计工作量（与卡数口径"分母排除已取消"一致）。保留这个键位是为了
+// 让前端能无脑复用 STATUS_ORDER 遍历，而不是给工时条另写一套跳过逻辑。
+//
+// 【诚实边界】未跑的卡（queued/running/held/limit_paused）的权重是**按同类中位预测的**，
+// 不是实测。段的长度因此是估计值——这一点由条下的实测覆盖率与 basis 一并披露；把它们涂成
+// 与 done 段同样的实色是刻意的：分段的语义是"这部分活处于什么状态"，不是"这段数据多可靠"。
+type WeightStats struct {
+	Queued      float64 `json:"queued"`
+	Running     float64 `json:"running"`
+	LimitPaused float64 `json:"limit_paused"`
+	Held        float64 `json:"held"`
+	Failed      float64 `json:"failed"`
+	Done        float64 `json:"done"`
+	Canceled    float64 `json:"canceled"`
+	Total       float64 `json:"total"`
+}
+
+func (s *WeightStats) add(status string, w float64) {
+	if status == statusCanceled {
+		return // 不计入任何字段，含 Total
+	}
+	s.Total += w
+	switch status {
+	case statusQueued:
+		s.Queued += w
+	case statusRunning:
+		s.Running += w
+	case statusLimitPaused:
+		s.LimitPaused += w
+	case statusHeld:
+		s.Held += w
+	case statusFailed:
+		s.Failed += w
+	case statusDone:
+		s.Done += w
+	}
+}
+
+// round 把各字段收成整数（turns 是回合数，小数位只会让悬停里的数字看着像精密测量）。
+func (s *WeightStats) round() {
+	for _, p := range []*float64{&s.Queued, &s.Running, &s.LimitPaused, &s.Held,
+		&s.Failed, &s.Done, &s.Canceled, &s.Total} {
+		*p = math.Round(*p)
+	}
+}
+
 // ProjectWeighted 是项目的工时口径读数。Available=false 时前端必须回落卡数口径并显示 Basis。
 type ProjectWeighted struct {
 	Available bool `json:"available"`
@@ -38,6 +87,10 @@ type ProjectWeighted struct {
 	DoneWeight  float64 `json:"done_weight"`
 	TotalWeight float64 `json:"total_weight"`
 	Unit        string  `json:"unit"`
+	// Stats 是**已存在的卡**按状态拆的工作量（不含预估余量），供进度条分段着色。
+	Stats WeightStats `json:"stats"`
+	// SpawnWeight 是预估余量折算的工作量（TotalWeight − Stats.Total），画在条尾的幽灵段。
+	SpawnWeight float64 `json:"spawn_weight"`
 	// MeasuredRatio 是 done 卡里**有实测 turns** 的比例（0..1）。低于 1 说明有卡是补的估计值。
 	MeasuredRatio float64 `json:"measured_ratio"`
 	// FinishAt / RemainMinutes 是按实测换算率推的完成时刻；换算率不可得时为 nil
@@ -128,23 +181,21 @@ func buildProjectWeighted(ts []*Task, est *ProjectEstimate, now time.Time) *Proj
 				"无法建立同类工作量基准，已回落卡数口径。", tbl.measured, weightMinSamples)}
 	}
 
-	doneW, totalW, pendingW := 0.0, 0.0, 0.0
+	var stats WeightStats
+	pendingW := 0.0
 	pendingN := 0
 	for _, t := range ts {
 		if t.Status == statusCanceled {
 			continue // 与 progressPercent 同口径：取消卡不进分母
 		}
 		w := tbl.weightOf(t)
-		totalW += w
-		if t.Status == statusDone {
-			doneW += w
-			continue
-		}
+		stats.add(t.Status, w)
 		if !t.terminal() {
 			pendingW += w
 			pendingN++
 		}
 	}
+	doneW, totalW := stats.Done, stats.Total
 	// 预估余量卡：按在途卡的平均权重折算（无在途卡时用全局中位）。
 	spawnW := 0.0
 	if est != nil && est.EstimatedRemaining > 0 {
@@ -160,11 +211,14 @@ func buildProjectWeighted(ts []*Task, est *ProjectEstimate, now time.Time) *Proj
 			Basis: "工时口径不可用：本项目总工作量为 0（没有可计权的卡）。"}
 	}
 
+	stats.round()
 	out := &ProjectWeighted{
 		Available: true, Unit: "turns",
 		Percent:       round1(doneW / totalW * 100),
 		DoneWeight:    math.Round(doneW),
 		TotalWeight:   math.Round(totalW),
+		Stats:         stats,
+		SpawnWeight:   math.Round(spawnW),
 		MeasuredRatio: round2(float64(tbl.measured) / math.Max(1, float64(tbl.total))),
 	}
 
@@ -201,27 +255,26 @@ func annotateKindWeights(kinds []KindProgress, ts []*Task, kindOf map[string]kin
 	if !tbl.ok() {
 		return
 	}
-	type acc struct{ done, total float64 }
-	byKind := map[string]*acc{}
+	byKind := map[string]*WeightStats{}
 	for _, t := range ts {
 		if t.Status == statusCanceled {
 			continue
 		}
 		k := kindOf[t.ID].Kind
 		if byKind[k] == nil {
-			byKind[k] = &acc{}
+			byKind[k] = &WeightStats{}
 		}
-		w := tbl.weightOf(t)
-		byKind[k].total += w
-		if t.Status == statusDone {
-			byKind[k].done += w
-		}
+		byKind[k].add(t.Status, tbl.weightOf(t))
 	}
 	for i := range kinds {
-		if a := byKind[kinds[i].Key]; a != nil && a.total > 0 {
-			kinds[i].WeightedDone = math.Round(a.done)
-			kinds[i].WeightedTotal = math.Round(a.total)
+		s := byKind[kinds[i].Key]
+		if s == nil || s.Total <= 0 {
+			continue
 		}
+		s.round()
+		kinds[i].WeightedDone = s.Done
+		kinds[i].WeightedTotal = s.Total
+		kinds[i].WeightStats = s // 供分桶条同样按状态分段着色
 	}
 }
 

@@ -506,32 +506,45 @@ const el = {
   refresh: document.getElementById('btn-refresh'),
   auto: document.getElementById('auto-refresh'),
   live: document.getElementById('live'),
-  scale: document.getElementById('btn-scale'),
 };
 
-/* ---- 进度口径全局开关（现有卡 / 含预估余量）----
- * 「现有卡」：进度分母 = 现存非取消卡（原口径，默认）。
- * 「含预估」：分母 = 预估最终总卡数（后端 estimate 字段：计划锚点或派生耦合模型，
+/* ---- 进度口径全局开关（实发进度 / 预估进度）----
+ * 「实发进度」：分母 = 已经真派出去的卡（现存非取消卡，原口径，默认）。
+ * 「预估进度」：分母 = 预估最终总卡数（后端 estimate 字段：计划锚点或派生耦合模型，
  *   basis 随条悬停披露）。项目总条与 kind 分桶同步切换（余量按历史派生构成分摊进桶）；
- *   阶段条保持现有卡口径（阶段是执行切片，预估分摊到阶段没有历史构成可依）。 */
+ *   阶段条保持实发口径（阶段是执行切片，预估分摊到阶段没有历史构成可依）。
+ * 开关渲染在状态芯片同一排（progressScaleSeg），与筛选芯片并列——两者都是"看板怎么读"
+ * 的视图开关，散在两处会让人以为口径是某个页面的局部设置。 */
 const PROGRESS_SCALE_KEY = 'cardex.board.progressScale';
 let progressScale = 'cards';
 try { if (localStorage.getItem(PROGRESS_SCALE_KEY) === 'est') progressScale = 'est'; } catch { /* 私隐模式等，保默认 */ }
-function syncScaleButton() {
-  if (!el.scale) return;
-  el.scale.textContent = progressScale === 'est' ? '~' : '卡';
-  el.scale.classList.toggle('is-est', progressScale === 'est');
-  el.scale.setAttribute('aria-label',
-    progressScale === 'est' ? '进度口径：含预估余量（点击切回现有卡）' : '进度口径：现有卡（点击切到含预估余量）');
+
+function setProgressScale(v) {
+  if (v === progressScale) return;
+  progressScale = v;
+  try { localStorage.setItem(PROGRESS_SCALE_KEY, v); } catch { /* 存不进就只影响本次会话 */ }
+  el.live.textContent = v === 'est' ? '进度口径已切到预估进度' : '进度口径已切回实发进度';
+  load({ silent: true });
 }
-if (el.scale) {
-  syncScaleButton();
-  el.scale.addEventListener('click', () => {
-    progressScale = progressScale === 'est' ? 'cards' : 'est';
-    try { localStorage.setItem(PROGRESS_SCALE_KEY, progressScale); } catch { /* 存不进就只影响本次会话 */ }
-    syncScaleButton();
-    navigate(); // 重渲染当前视图，两个口径的数据都在响应里，无需重新拉取之外的请求
-  });
+
+/** 进度口径分段控件。与状态芯片同排（两者都是视图开关），总览与项目页共用。 */
+function progressScaleSeg() {
+  const opts = [
+    ['cards', '实发进度', '分母＝已经派出去的卡（现存非取消卡）。这是"手上这些活干完了多少"。'],
+    ['est', '预估进度', '分母＝预估最终总卡数：把复审/修复/emit 还会派生出来的卡提前算进来。'
+      + '来源与口径（计划锚点或派生耦合系数）见各进度条的悬停说明；数据不足时自动回落实发口径并标注。'],
+  ];
+  const wrap = h('div', { class: 'scale-seg', role: 'group', 'aria-label': '进度口径' });
+  for (const [val, label, tip] of opts) {
+    const on = progressScale === val;
+    wrap.append(h('button', {
+      class: `seg-btn${on ? ' is-on' : ''}`, type: 'button',
+      'aria-pressed': String(on), title: tip,
+      onclick: () => setProgressScale(val),
+      text: label,
+    }));
+  }
+  return wrap;
 }
 
 // 自动刷新 30 秒；页面隐藏时不轮询——看板常年开在后台标签页，
@@ -1089,6 +1102,7 @@ async function viewOverview() {
         },
         text: state.ui.allCollapsed ? '全部展开' : '全部收起',
       }),
+      progressScaleSeg(),
       statusFilterChips(totals))));
   appendMaybe(frag, filterNote());
   appendMaybe(frag, orderNote(live));
@@ -1382,6 +1396,7 @@ async function viewProject(id) {
       descBlock(p.desc, p.desc_source)),
     h('div', { class: 'head-right' },
       archiveBtn(p),
+      progressScaleSeg(),
       statusFilterChips(p.stats))));
   appendMaybe(frag, filterNote());
 

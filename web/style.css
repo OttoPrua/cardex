@@ -510,9 +510,30 @@ button { font: inherit; color: inherit; }
     var(--line) 3px, var(--line) 6px);
   opacity: .75;
 }
-/* 进度口径切换钮：est 态高亮提醒——预估口径下的百分比不是实卡账，别忘了自己切过去了。 */
-.scale-toggle { font-weight: 700; }
-.scale-toggle.is-est { color: var(--accent, #7aa2ff); border-color: currentColor; }
+/* 进度口径分段控件（实发进度 / 预估进度）。与状态芯片同排，故沿用芯片的尺寸语言，
+   但用"连体分段"的形状与它们区分：芯片是各自独立的开关，这两个是互斥的一组。 */
+.scale-seg {
+  display: inline-flex; align-items: center;
+  border: 1px solid var(--border); border-radius: 999px;
+  background: var(--surface); overflow: hidden;
+}
+.scale-seg .seg-btn {
+  padding: 4px 11px; border: 0; background: transparent;
+  font: inherit; font-size: 12px; white-space: nowrap;
+  color: var(--ink-2); cursor: pointer;
+  transition: background .12s, color .12s;
+}
+.scale-seg .seg-btn:hover { background: var(--surface-2); color: var(--ink); }
+.scale-seg .seg-btn:focus-visible { outline: 2px solid var(--s1); outline-offset: -2px; }
+/* 选中态与导航/归档钮同源（--s1 底色 + 加粗）：看板里"这一项当前生效"只有一种视觉语言，
+   自创第二种会让人以为它是另一类控件。不能只靠色相——"当前是哪个口径"读错的代价是把预估
+   百分比当实卡账去做决定，故同时加粗。 */
+.scale-seg .seg-btn.is-on {
+  background: color-mix(in oklab, var(--s1) 13%, transparent);
+  color: color-mix(in oklab, var(--s1) 78%, var(--ink));
+  font-weight: 640;
+}
+.scale-seg .seg-btn.is-on:hover { background: color-mix(in oklab, var(--s1) 18%, transparent); }
 .prog-seg:only-child  { border-radius: 4px; }
 .prog-pct {
   font-size: 12px; font-weight: 640; color: var(--ink-2);

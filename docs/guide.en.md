@@ -140,12 +140,13 @@ One inviolable rule: **filtering never changes any reading**. The chip counts, t
 
 **Quota is shown as remaining**: the headline reading in both the top quota strip and the burndown page is **remaining quota** (`BurnSource.remaining_percent`, computed server-side and clamped to [0,100]); the burndown curve descends and hitting zero means exhausted. The source data (CodexBar) reports used %, so `used_percent` is preserved verbatim in the response and shown alongside in tooltips / subtitles / the sample table — whenever both appear on screen, which one you're looking at is always labelled. The decision you make on this screen ("can I dispatch another batch?") is a direct function of what's left; "how much has burned" requires a subtraction first.
 
-**Two progress scales (topbar「卡/~」toggle, added 2026-08-02)**: project total progress
-defaults to counting **existing cards** in the denominator (9 of 12 done → 75%), but cardex's
-work model keeps spawning cards (review_after reviews, fix rounds, emit output), so the existing
-scale routinely overstates completion. Toggling to the **estimated-remaining** scale swaps the
-denominator to the estimated final card count (the bar gains a hatched "estimated remaining"
-ghost segment at the tail, and the percentage carries a `~` suffix). Two estimate sources:
+**Two progress scales (a「实发进度 / 预估进度」segmented control in the page header, sitting in
+the same row as the status filter chips; added 2026-08-02, revised twice the same day)**: the
+default **filed scale**（实发进度）counts cards actually dispatched (9 of 12 done → 75%), but
+cardex's work model keeps spawning cards (review_after reviews, fix rounds, emit output), so
+the filed scale routinely overstates completion. Switching to the **projected scale**（预估进度）
+swaps the denominator to the estimated final card count (the bar gains a hatched "estimated
+remaining" ghost segment at the tail, and the percentage carries a `~` suffix). Two sources:
 - **Planned anchor first**: `projects.<id>.planned_total_cards` in `board.json` (the phase-plan
   total). Update it when a plan milestone lands or changes — that's the calibration hook; when
   existing cards exceed the plan, the denominator uses existing and the basis says the plan is stale.
@@ -171,9 +172,11 @@ ghost segment at the tail, and the percentage carries a `~` suffix). Two estimat
 design/impl/fix/review buckets by **historical spawn composition** (if 60% of past spawned cards
 were fixes, the fix bucket gets 60% of the remainder; largest-remainder rounding, **Σ bucket
 remainders ≡ project remainder** so buckets always reconcile with the total bar); buckets that
-get no remainder fall back to the existing-card denominator. Phase bars stay on the
-existing-card scale (phases are execution slices with no spawn composition to lean on). The
-preference persists in localStorage.
+get no remainder fall back to the filed-scale denominator. Phase bars stay on the filed scale
+(phases are execution slices with no spawn composition to lean on). The control lives beside the
+status filter chips on both the overview and project pages — both are "how to read the board"
+view switches, and splitting them across two places would suggest the scale is a per-page
+setting. The preference persists in localStorage.
 
 **Project override `~/.cardex/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Fields allowed inside a project block: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules` / `planned_total_cards`; the file also has a top-level `project_aliases` grouping table (see below).
 

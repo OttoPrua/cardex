@@ -2,12 +2,12 @@
 
 ## 2026-08-02 · Dual board progress scales (existing cards / estimated remaining)
 
-- **Global scale toggle**: a topbar「卡/~」button switches between two progress scales
-  (preference persisted in localStorage) — "existing cards" keeps the original denominator;
-  "estimated remaining" folds the estimated future spawn into it, with a hatched ghost segment
-  at the bar's tail and a `~` suffix on the percentage. Only the project total bar switches;
-  kind buckets and phase bars stay on the existing-card scale (estimates stop at project
-  granularity — splitting finer would dress a rough estimate up as precise bookkeeping).
+- **Global scale switch**: a「实发进度 / 预估进度」segmented control in the page header, beside
+  the status filter chips on both the overview and project pages (preference persisted in
+  localStorage) — the filed scale keeps the original denominator; the projected scale folds the
+  estimated future spawn into it, with a hatched ghost segment at the bar's tail and a `~`
+  suffix on the percentage. The selected state reuses the existing nav/archive-button visual
+  language (`--s1` tint + weight) rather than inventing a second "currently active" idiom.
 - **Two estimate sources, basis always attached**: `projects.<id>.planned_total_cards` in
   board.json wins when declared (update it when phase plans land/change — that's the calibration
   hook; when existing cards exceed it, the denominator uses existing and the basis flags the

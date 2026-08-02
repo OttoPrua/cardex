@@ -202,7 +202,7 @@ function progressBar(stats, pct, estimate) {
       segs.push(h('span', {
         class: 'prog-seg is-est-remaining',
         style: `width:${(estimate.estimated_remaining / den) * 100}%`,
-        title: `预估余量 ~${estimate.estimated_remaining} 张（${estimate.source === 'planned' ? '计划锚点' : '历史膨胀率'}，口径见进度行悬停）`,
+        title: `预估余量 ~${estimate.estimated_remaining} 张（${estimate.source === 'planned' ? '计划锚点' : '派生耦合'}，口径见进度行悬停）`,
       }));
     }
   }
@@ -260,8 +260,9 @@ const KIND_SCOPE = {
 function kindProgress(stats, pct, kinds, opts) {
   const o = opts || {};
   const wrap = h('div', { class: 'prog-group' });
-  // 全局口径开关只切**项目总条**：含预估口径把预估余量并入分母（estimate 由后端带 basis 给出）。
-  // kind 分桶与阶段条保持现有卡口径——预估只做到项目粒度，往下拆是把粗估伪装成细账。
+  // 全局口径开关：含预估口径把预估余量并入分母（estimate 由后端带 basis 给出）。
+  // 分桶行同步切换——项目级余量按历史派生构成分摊进桶（后端 annotateKindEstimates，
+  // Σ 桶余量 ≡ 项目余量），没分到余量的桶回落现有卡分母。
   const est = progressScale === 'est' ? o.estimate : null;
   const useEst = est && isNum(est.estimated_total) && est.estimated_total > 0;
   const done = stats.done || 0;
@@ -286,9 +287,24 @@ function kindProgress(stats, pct, kinds, opts) {
   if (!kinds || !kinds.length) return wrap;
   for (const k of kinds) {
     const den = (k.stats.total || 0) - (k.stats.canceled || 0);
+    const kDone = k.stats.done || 0;
+    // 预估口径下分到余量的桶换预估分母；没分到的桶（estimated_total=0）回落现有卡口径。
+    if (useEst && isNum(k.estimated_total) && k.estimated_total > 0) {
+      const kEst = { estimated_total: k.estimated_total, estimated_remaining: k.estimated_remaining || 0, source: est.source };
+      const kPct = Math.round((kDone / k.estimated_total) * 1000) / 10;
+      wrap.append(h('div', { class: 'prog-row' },
+        h('span', {
+          class: 'prog-key',
+          title: `${KIND_SCOPE[k.key] || k.label}｜含预估余量：本桶按历史派生构成分得 ~${k.estimated_remaining} 张（项目级口径见总进度悬停）`,
+          text: k.label + '~',
+        }),
+        h('span', { class: 'prog-n', text: `${kDone}/~${k.estimated_total}` }),
+        progressBar(k.stats, kPct, kEst)));
+      continue;
+    }
     wrap.append(h('div', { class: 'prog-row' },
       h('span', { class: 'prog-key', title: KIND_SCOPE[k.key] || k.label, text: k.label }),
-      h('span', { class: 'prog-n', text: `${k.stats.done || 0}/${den}` }),
+      h('span', { class: 'prog-n', text: `${kDone}/${den}` }),
       progressBar(k.stats, k.progress_percent)));
   }
   // 总览一屏并排十来个项目，整段口径说明逐列重复会把任务清单挤出视口；
@@ -495,9 +511,9 @@ const el = {
 
 /* ---- 进度口径全局开关（现有卡 / 含预估余量）----
  * 「现有卡」：进度分母 = 现存非取消卡（原口径，默认）。
- * 「含预估」：分母 = 预估最终总卡数（后端 estimate 字段：计划锚点或历史膨胀率，
- *   basis 随条悬停披露）。只切项目级总条；kind 分桶与阶段条保持现有卡口径——
- *   预估只做到项目粒度，往下拆是把粗估伪装成细账。 */
+ * 「含预估」：分母 = 预估最终总卡数（后端 estimate 字段：计划锚点或派生耦合模型，
+ *   basis 随条悬停披露）。项目总条与 kind 分桶同步切换（余量按历史派生构成分摊进桶）；
+ *   阶段条保持现有卡口径（阶段是执行切片，预估分摊到阶段没有历史构成可依）。 */
 const PROGRESS_SCALE_KEY = 'cardex.board.progressScale';
 let progressScale = 'cards';
 try { if (localStorage.getItem(PROGRESS_SCALE_KEY) === 'est') progressScale = 'est'; } catch { /* 私隐模式等，保默认 */ }

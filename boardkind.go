@@ -174,6 +174,12 @@ type KindProgress struct {
 	ProgressPercent float64    `json:"progress_percent"`
 	// ProgressPercent 与项目总条同口径（done/(total-canceled)），故两者可直接对读：
 	// 总条 88% 而落地条 41% 就是"这个项目的乐观观感来自哪里"的直接答案。
+
+	// EstimatedTotal / EstimatedRemaining 是「含预估余量」口径下本桶的分母与余量：
+	// 项目级余量按历史派生构成分摊进桶（annotateKindEstimates），Σ 桶余量 ≡ 项目余量。
+	// 0 = 本桶没分到余量（或整体处于卡口径），前端据此回落现有卡分母。
+	EstimatedTotal     int `json:"estimated_total,omitempty"`
+	EstimatedRemaining int `json:"estimated_remaining,omitempty"`
 }
 
 // buildKindProgress 把一批卡按性质分桶。

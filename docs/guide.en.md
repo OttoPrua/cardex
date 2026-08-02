@@ -149,16 +149,31 @@ ghost segment at the tail, and the percentage carries a `~` suffix). Two estimat
 - **Planned anchor first**: `projects.<id>.planned_total_cards` in `board.json` (the phase-plan
   total). Update it when a plan milestone lands or changes — that's the calibration hook; when
   existing cards exceed the plan, the denominator uses existing and the basis says the plan is stale.
-- **Historical spawn factor as fallback**: with no anchor, remaining ≈ unfinished root cards ×
-  (project's all-history cards-per-root factor − 1); roots = cards that aren't reviews, fix
-  rounds, or cross-chain derived legs. Recomputed live on every snapshot (self-calibrating, no
-  timers needed); the factor includes in-flight chains so it errs conservative, and it only
-  estimates derivatives of existing work — never future projects. Insufficient samples (<5 roots
-  or <3 derived) fall back to existing-card counts with explicit disclosure — estimates always
-  carry a basis, never an unexplained percentage. The toggle only switches the **project total
-  bar**; kind buckets and phase bars stay on the existing-card scale (estimates stop at project
-  granularity — splitting them finer would dress a rough estimate up as precise bookkeeping).
-  The preference persists in localStorage.
+- **Spawn-coupling model as fallback** (upgraded same-day): with no anchor, the estimate asks a
+  measurable historical question — **how many new cards does each completion spawn on average**
+  (k = system-spawned cards / completions; system-spawned = review cards, fix rounds,
+  cross-chain legs, and emit output / closeout / escalation cards carrying the `emitted_by`
+  lineage stamp). Clearing the current A in-flight cards then spawns A·k/(1−k) more in total
+  (geometric series — **the whole derivation cascade is front-loaded into the estimate at
+  once**). That yields the trend property this revision was about: completing a non-spawning
+  card shrinks the estimated total; completing a spawning card leaves it roughly flat because
+  its offspring were already priced in — every update trends toward completion instead of the
+  denominator drifting away. k≥0.85 marks an expansion phase (an emit wave in progress): the
+  estimate clamps to 0.85 and the basis explicitly calls it a **lower bound**. Recomputed live
+  on every snapshot (self-calibrating, zero quota, no timers); insufficient samples
+  (<5 completions or <3 spawned) fall back to existing-card counts with explicit disclosure —
+  estimates always carry a basis, never an unexplained percentage. Honest limit: a young project
+  that has never emitted will still see its estimate jump on the first wave (no history, no
+  clairvoyance) — use the planned anchor there. Legacy system-spawned cards predate the
+  `emitted_by` stamp, which underestimates k (bias direction: conservative; disclosed in basis).
+
+**Kind buckets switch with the scale**: the estimated remainder is distributed across the
+design/impl/fix/review buckets by **historical spawn composition** (if 60% of past spawned cards
+were fixes, the fix bucket gets 60% of the remainder; largest-remainder rounding, **Σ bucket
+remainders ≡ project remainder** so buckets always reconcile with the total bar); buckets that
+get no remainder fall back to the existing-card denominator. Phase bars stay on the
+existing-card scale (phases are execution slices with no spawn composition to lean on). The
+preference persists in localStorage.
 
 **Project override `~/.cardex/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Fields allowed inside a project block: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules` / `planned_total_cards`; the file also has a top-level `project_aliases` grouping table (see below).
 

@@ -1959,7 +1959,8 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 			if orig, err := findTaskAnywhere(root, t.ReviewOf); err == nil && strings.TrimSpace(orig.Closeout) != "" {
 				co := newTask(root, cfg, typeSequence, "收口: "+baseFixTitle(orig.Title), orig.Dir, []string{orig.Closeout}, orig.Priority)
 				co.Model = "haiku"
-				co.Project = orig.Project // 显式归属随派生卡继承（收口卡属于被收口卡的项目）
+				co.Project = orig.Project   // 显式归属随派生卡继承（收口卡属于被收口卡的项目）
+				co.EmittedBy = t.ID         // 谱系标：系统派生卡，进度预估的派生耦合系数依赖（boardestimate.go）
 				co.SkipPermissions = orig.SkipPermissions
 				co.RemoteHost = orig.RemoteHost
 				if saveTask(root, co) == nil {
@@ -2026,6 +2027,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		}
 		esc := newTask(root, cfg, typeSequence, fmt.Sprintf("[超轮限R%d·需人裁] %s", round, base), escDir, []string{prompt}, t.Priority)
 		esc.Status = statusHeld
+		esc.EmittedBy = t.ID // 谱系标：系统派生卡（升级壳），进度预估的派生耦合系数依赖（boardestimate.go）
 		// 远端链的升级卡必须继承执行主机：dir 是远端路径（如 D:/...），缺 remote_host
 		// 会在 release 后被派到本机、cd 直接失败（实测远端 R4 卡两张踩中）。
 		esc.RemoteHost = orig.RemoteHost
@@ -2587,6 +2589,9 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		// 显式归属随 emit 继承：协调/装配产出的子卡属于同一个项目，
 		// 哪怕它们各自跑在不同的子目录/车道里（那正是启发式会散架的地方）。
 		nt.Project = parent.Project
+		// 谱系标：emit 产出是"系统繁殖"的主力人口，卡面必须留父指针（此前只在事件 detail），
+		// 进度预估的派生耦合系数靠它区分系统派生与人工立项（boardestimate.go）。
+		nt.EmittedBy = parent.ID
 		nt.ReviewAfter = s.ReviewAfter
 		// 协调链：产出的 coordinate 任务同样具备 emit 能力（自愈式续排——每批收尾排下一批）。
 		// 递归有界：每次 emit ≤10 张、每张协调都消耗额度且受红线节流，模板负责终止条款。

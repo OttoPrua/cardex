@@ -11,12 +11,23 @@
 - **Two estimate sources, basis always attached**: `projects.<id>.planned_total_cards` in
   board.json wins when declared (update it when phase plans land/change — that's the calibration
   hook; when existing cards exceed it, the denominator uses existing and the basis flags the
-  plan as stale); otherwise a historical spawn factor (project's all-history cards-per-root ×
-  unfinished roots; roots = non-review, non-fix-round, non-cross-derived) recomputed live on
-  every snapshot (self-calibrating, zero quota, no timers). Insufficient samples (<5 roots or
-  <3 derived) and settled projects fall back to existing-card counts with explicit disclosure —
-  estimates never ship without a stated basis. The formula is self-bounding (remaining ≤
-  existing − roots), so outlier factors cannot blow up the axis.
+  plan as stale); otherwise a mechanical estimate recomputed live on every snapshot
+  (self-calibrating, zero quota, no timers). Insufficient samples and settled projects fall back
+  to existing-card counts with explicit disclosure — estimates never ship without a stated basis.
+- **Revision round (same day, per the "stop the remainder from creeping up" ask)**: the
+  mechanical estimator switched from roots×factor to a **spawn-coupling geometric model** —
+  k = system-spawned cards / completions; clearing the A in-flight cards spawns A·k/(1−k) more
+  (the geometric series front-loads the whole derivation cascade at once). The trend property is
+  pinned by test: completing a non-spawning card must shrink the estimated total, completing a
+  spawning one must not raise it (TestEstimateConvergesTowardCompletion); k≥0.85 marks an
+  expansion phase, clamped to 0.85 and disclosed as a lower bound. Lineage backfill ships with
+  it: emit output / closeout / escalation cards now carry `emitted_by` on the card (previously
+  the parent pointer lived only in event detail, so assembly output was mistaken for manual
+  filings and k was underestimated; legacy cards lacking the stamp are disclosed as a
+  conservative bias). **Kind buckets now switch with the scale**: the estimated remainder is
+  distributed across buckets by historical spawn composition (largest-remainder rounding,
+  Σ bucket remainders ≡ project remainder); buckets with no share fall back to the card scale;
+  phase bars stay on the card scale.
 
 ## 2026-08-02 · Multi-subscription engine profiles (Kimi / GLM / MiniMax / MiMo / OpenCode Go / Ollama Cloud)
 

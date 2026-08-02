@@ -1161,12 +1161,14 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 	p.ActiveTotal = p.Stats.activeTotal()
 	p.ProgressPercent = progressPercent(&p.Stats)
 	p.Kinds = buildKindProgress(ts, kindOf)
-	// 预估口径：计划锚点来自 board.json（人工校准点），无锚点走历史膨胀率（每快照自校准）。
+	// 预估口径：计划锚点来自 board.json（人工校准点），无锚点走派生耦合模型（每快照自校准）；
+	// 余量按历史派生构成分摊进分桶，分桶在预估口径下才有自己的分母。
 	planned := 0
 	if o, ok := ov.Projects[id]; ok {
 		planned = o.PlannedTotalCards
 	}
 	p.Estimate = buildProjectEstimate(ts, planned)
+	annotateKindEstimates(p.Kinds, ts, kindOf, p.Estimate.EstimatedRemaining)
 
 	// 模型分布（覆盖项目全部卡：这是「这个项目在用什么档位的模型」的完整画像）
 	mc := map[string]int{}

@@ -76,6 +76,12 @@ type Task struct {
 	Stakes string `json:"stakes,omitempty"`
 	// ReviewOf: 本卡是审核卡时指向被审卡 ID；修复闭环靠它取被审卡的 prompt/参数做继承。
 	ReviewOf string `json:"review_of,omitempty"`
+	// EmittedBy: 本卡由哪张卡派生入队（emit 产出/收口卡/超轮限升级卡的谱系标；修复卡与
+	// 自动审核卡的谱系已由 FixRound/ReviewOf 承担，不重复打）。看板进度预估的派生耦合系数
+	// 靠它把"系统繁殖的卡"与"人工立项"分开（boardestimate.go）——此前 emit 的父指针只落在
+	// 事件 detail 里，卡面无谱系，预估会把装配产出误当外生立项而低估派生系数。
+	// 2026-08-02 起新卡生效；存量系统派生卡缺标（已知偏差，estimator basis 里披露）。
+	EmittedBy string `json:"emitted_by,omitempty"`
 	// FixRound: "实现→对抗审核→修复"循环轮次。实现卡 0，第 n 轮自动修复卡为 n；审核卡继承被审卡轮次。
 	// 达到 MaxFixRounds 后不再自动派修复，改挂 held 升级卡交人工/设计权威裁定。
 	FixRound int `json:"fix_round,omitempty"`

@@ -760,3 +760,163 @@ func TestInitialAliasTableClassifiesRealInventory(t *testing.T) {
 		t.Fatalf("容器别名不得吞掉其下的项目，TShare → %q", got)
 	}
 }
+
+// ---- 谱系层（lineage）与项目名折叠：2026-08-03 修委托人报的"孤卡自成一个项目" ----
+
+// 派生卡跑在一次性目录上（复审分流的远端镜像、交叉腿的 scratchpad）时，目录天然没有归组
+// 证据，此前一律落进收件箱。谱系层沿 review_of / emitted_by 上溯：一张审核卡审的是谁，
+// 就属于谁的项目——这比猜目录强得多。
+func TestLineageRescuesDerivedCardsFromInbox(t *testing.T) {
+	var ts []*Task
+	for i := 0; i < 3; i++ { // 够格的启发式项目 Alpha
+		ts = append(ts, pcard("/work/Alpha", "a"+string(rune('0'+i))))
+	}
+	impl := ts[0]
+	impl.ID = "t-impl"
+	// 审核卡：跑在一次性镜像目录上，只有 review_of 指回实现卡。
+	rv := &Task{ID: "t-review", Title: "审核: a0", Dir: "D:/mirrors/one-shot-1",
+		Status: statusDone, ReviewOf: "t-impl"}
+	// emit 产出：跑在另一个一次性目录，只有 emitted_by。
+	em := &Task{ID: "t-emit", Title: "子卡", Dir: "D:/mirrors/one-shot-2",
+		Status: statusQueued, EmittedBy: "t-impl"}
+	ts = append(ts, rv, em)
+
+	res := newProjectResolver(ts, nil)
+	for _, c := range []*Task{rv, em} {
+		name, src := resolveOne(t, res, c)
+		if name != "Alpha" || src != projSourceLineage {
+			t.Errorf("%s: got (%q,%q), want (Alpha,lineage)", c.ID, name, src)
+		}
+	}
+}
+
+// 谱系是**兜底**层：卡自身目录已有结论时不得被父卡的归属顶掉（那是关于这张卡的直接证据）。
+func TestLineageDoesNotOverrideOwnEvidence(t *testing.T) {
+	var ts []*Task
+	for i := 0; i < 3; i++ {
+		ts = append(ts, pcard("/work/Alpha", "a"+string(rune('0'+i))))
+		ts = append(ts, pcard("/work/Beta", "b"+string(rune('0'+i))))
+	}
+	ts[0].ID = "t-alpha-impl"
+	// 审核卡跑在 Beta 的目录里、父卡属于 Alpha：自身目录证据优先。
+	rv := &Task{ID: "t-rv", Title: "审核: a0", Dir: "/work/Beta", Status: statusDone, ReviewOf: "t-alpha-impl"}
+	ts = append(ts, rv)
+	res := newProjectResolver(ts, nil)
+	if name, src := resolveOne(t, res, rv); name != "Beta" || src != projSourceHeuristic {
+		t.Fatalf("自身目录证据应优先于谱系: got (%q,%q)", name, src)
+	}
+}
+
+// 多跳谱系（实现→审核→修复→审核）与断链/成环：都必须停得下来且不误判。
+func TestLineageMultiHopAndBrokenChain(t *testing.T) {
+	var ts []*Task
+	for i := 0; i < 3; i++ {
+		ts = append(ts, pcard("/work/Alpha", "a"+string(rune('0'+i))))
+	}
+	ts[0].ID = "t-impl"
+	r1 := &Task{ID: "t-r1", Title: "审核", Dir: "D:/m/1", Status: statusDone, ReviewOf: "t-impl"}
+	f1 := &Task{ID: "t-f1", Title: "修复R1", Dir: "D:/m/2", Status: statusDone, EmittedBy: "t-r1"}
+	r2 := &Task{ID: "t-r2", Title: "审核R1", Dir: "D:/m/3", Status: statusQueued, ReviewOf: "t-f1"}
+	// 断链：父卡已被 clean 清掉。
+	orphan := &Task{ID: "t-orphan", Title: "审核", Dir: "D:/m/4", Status: statusDone, ReviewOf: "t-gone"}
+	// 成环：账本是可手工编辑的文件，环不能把快照重建吊死。
+	c1 := &Task{ID: "t-c1", Title: "环A", Dir: "D:/m/5", Status: statusDone, ReviewOf: "t-c2"}
+	c2 := &Task{ID: "t-c2", Title: "环B", Dir: "D:/m/6", Status: statusDone, ReviewOf: "t-c1"}
+	ts = append(ts, r1, f1, r2, orphan, c1, c2)
+
+	res := newProjectResolver(ts, nil)
+	for _, c := range []*Task{r1, f1, r2} {
+		if name, src := resolveOne(t, res, c); name != "Alpha" || src != projSourceLineage {
+			t.Errorf("%s 多跳上溯: got (%q,%q), want (Alpha,lineage)", c.ID, name, src)
+		}
+	}
+	for _, c := range []*Task{orphan, c1, c2} {
+		if name, src := resolveOne(t, res, c); name != unclassifiedProject || src != projSourceUnclassified {
+			t.Errorf("%s 断链/成环应如实回落收件箱: got (%q,%q)", c.ID, name, src)
+		}
+	}
+}
+
+// 项目名折叠：slug 相同的名字合并成一个项目，显示名按权威度挑
+// （别名声明 > 卡上显式钉 > 卡数多 > 字典序）。实测账本里 trading/Trading 与
+// .cardex/cardex 就是这样各带哈希后缀裂成两格的。
+func TestCanonicalProjectNamesFoldsSlugCollisions(t *testing.T) {
+	cases := []struct {
+		name    string
+		names   []string
+		count   map[string]int
+		aliases []boardProjectAlias
+		tasks   []*Task
+		want    map[string]string // 输入名 → 归一后的名（未列出的表示不折叠）
+	}{
+		{
+			name:  "大小写差异按卡数挑显示名",
+			names: []string{"Trading", "trading"},
+			count: map[string]int{"Trading": 147, "trading": 1},
+			want:  map[string]string{"trading": "Trading"},
+		},
+		{
+			name:  "前导点：.cardex 并入 cardex",
+			names: []string{".cardex", "cardex"},
+			count: map[string]int{".cardex": 7, "cardex": 139},
+			want:  map[string]string{".cardex": "cardex"},
+		},
+		{
+			name:    "别名表声明的名字胜过卡数更多的派生名",
+			names:   []string{"Trading", "trading"},
+			count:   map[string]int{"Trading": 147, "trading": 1},
+			aliases: []boardProjectAlias{{Match: "/x", Project: "trading"}},
+			want:    map[string]string{"Trading": "trading"},
+		},
+		{
+			name:  "卡上显式钉的名字胜过纯派生名",
+			names: []string{"Alpha", "alpha"},
+			count: map[string]int{"Alpha": 9, "alpha": 2},
+			tasks: []*Task{{ID: "t1", Project: "alpha"}},
+			want:  map[string]string{"Alpha": "alpha"},
+		},
+		{
+			name:  "slug 不同不折叠（Trading-docs 是独立项目）",
+			names: []string{"Trading", "Trading-docs"},
+			count: map[string]int{"Trading": 147, "Trading-docs": 64},
+			want:  map[string]string{},
+		},
+		{
+			name:  "收件箱不参与折叠",
+			names: []string{unclassifiedProject, "未分类X"},
+			count: map[string]int{unclassifiedProject: 6, "未分类X": 1},
+			want:  map[string]string{},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := canonicalProjectNames(c.names, c.count, c.aliases, c.tasks)
+			if len(got) != len(c.want) {
+				t.Fatalf("折叠条数不符: got %v, want %v", got, c.want)
+			}
+			for k, v := range c.want {
+				if got[k] != v {
+					t.Errorf("%q → %q, want %q", k, got[k], v)
+				}
+			}
+		})
+	}
+}
+
+// 终态卡（已完成/已取消）与活跃卡同等参与归组——委托人点名"已取消、已完成也需要归并"。
+// 这条钉住的是"终态不被排除"这个事实本身：若哪天有人给归组链加个 !t.terminal() 过滤，
+// 一个做完的项目会整个从看板消失。
+func TestTerminalCardsGroupLikeActiveOnes(t *testing.T) {
+	var ts []*Task
+	for i, st := range []string{statusDone, statusCanceled, statusDone} {
+		c := pcard("/work/Gamma", "g"+string(rune('0'+i)))
+		c.Status = st
+		ts = append(ts, c)
+	}
+	res := newProjectResolver(ts, nil)
+	for _, c := range ts {
+		if name, src := resolveOne(t, res, c); name != "Gamma" || src != projSourceHeuristic {
+			t.Errorf("%s(%s): got (%q,%q), want (Gamma,heuristic)", c.ID, c.Status, name, src)
+		}
+	}
+}

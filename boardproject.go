@@ -57,10 +57,13 @@ const minSoloProjectCards = 3
 // 归组证据来源。给测试与诊断用：优先级链一旦被改错，断言的是**来源**而不只是结果名，
 // 否则"别名恰好和启发式给出同一个名字"会让优先级回归测试假绿。
 const (
-	projSourceExplicit     = "explicit"
-	projSourceAlias        = "alias"
-	projSourcePattern      = "pattern"
-	projSourceHeuristic    = "heuristic"
+	projSourceExplicit  = "explicit"
+	projSourceAlias     = "alias"
+	projSourcePattern   = "pattern"
+	projSourceHeuristic = "heuristic"
+	// projSourceLineage：派生谱系（review_of / emitted_by 上溯到父卡的归属）。
+	// 排在启发式之后、收件箱之前——只救原本要落进收件箱的派生卡，见 resolveLineage。
+	projSourceLineage      = "lineage"
 	projSourceUnclassified = "unclassified"
 )
 
@@ -191,16 +194,84 @@ type projectResolver struct {
 	//     提供任何独立证据。
 	// 只用于 matchPattern 的链首等值判定，见那里的说明。
 	authoritative map[string]bool
+	// byID 供 lineage 层沿谱系上溯父卡（见 resolveLineage）。
+	byID map[string]*Task
+	// lineageMemo 缓存谱系层的判定结果（同一条链上多张卡会重复上溯同一批父卡）。
+	// 值为 "" 表示"上溯过、没结论"，与未算过（键不存在）区分开。
+	lineageMemo map[string]string
+}
+
+// canonicalProjectNames 把「slug 相同的一组项目名」折叠成一个显示名。
+//
+// 【治什么】实测账本里同一个项目裂成两格：一张卡手打 `-project trading`（小写），启发式对
+// 同一批目录派生出 `Trading`——两个名字 slug 都是 "trading"，撞 id 后**双方各带一个哈希
+// 后缀**（trading-9af2ec54 / trading-756e2198），于是总览上并排出现两个 Trading，其中一个
+// 只有 1 张卡。`~/.cardex` 的复盘卡同理：dirBase 派生出 `.cardex`，与 `cardex` 撞 slug。
+// 用户看到的就是"孤卡自成一个项目"。哈希后缀本是 id 唯一性的兜底，不该被用来把明显同一个
+// 项目钉成两个。
+//
+// 【为什么按 slug 折叠而不只按大小写】slug 归一（大小写、点、空格、连字符）恰好是"人眼看来
+// 是同一个名字"的边界：`trading`/`Trading`、`.cardex`/`cardex`、`Foo Bar`/`foo-bar`。真要分开
+// 两个 slug 相同的项目，出口与本功能一贯的一致——`project_aliases` 登记或 `-project` 钉一次。
+//
+// 【显示名怎么挑】按权威度：别名表声明过的 > 卡上显式钉过的 > 卡数多的 > 字典序靠前的。
+// 前两条是"人明说的名字"，最后一条只为让结果与 map 遍历顺序无关。
+func canonicalProjectNames(names []string, cardCount map[string]int,
+	aliases []boardProjectAlias, tasks []*Task) map[string]string {
+
+	declared := map[string]int{} // 名字 → 权威度（2=别名表，1=卡上显式钉）
+	for _, a := range aliases {
+		if n := strings.TrimSpace(a.Project); n != "" {
+			declared[n] = 2
+		}
+	}
+	for _, t := range tasks {
+		if n := strings.TrimSpace(t.Project); n != "" && declared[n] < 1 {
+			declared[n] = 1
+		}
+	}
+	bySlug := map[string][]string{}
+	for _, n := range names {
+		if n == unclassifiedProject {
+			continue // 兜底桶 id 固定，不参与折叠
+		}
+		s := projectSlug(n)
+		bySlug[s] = append(bySlug[s], n)
+	}
+	out := map[string]string{}
+	for _, group := range bySlug {
+		if len(group) < 2 {
+			continue
+		}
+		sort.Slice(group, func(i, j int) bool {
+			if declared[group[i]] != declared[group[j]] {
+				return declared[group[i]] > declared[group[j]]
+			}
+			if cardCount[group[i]] != cardCount[group[j]] {
+				return cardCount[group[i]] > cardCount[group[j]]
+			}
+			return group[i] < group[j]
+		})
+		for _, n := range group[1:] {
+			out[n] = group[0]
+		}
+	}
+	return out
 }
 
 func newProjectResolver(tasks []*Task, rawAliases []boardProjectAlias) *projectResolver {
 	aliases, aliasErr := parseProjectAliases(rawAliases)
 	r := &projectResolver{
-		aliases:  aliases,
-		aliasErr: aliasErr,
-		rep:      groupDirs(tasks),
-		compName: map[string]string{},
-		compOK:   map[string]bool{},
+		aliases:     aliases,
+		aliasErr:    aliasErr,
+		rep:         groupDirs(tasks),
+		compName:    map[string]string{},
+		compOK:      map[string]bool{},
+		byID:        make(map[string]*Task, len(tasks)),
+		lineageMemo: map[string]string{},
+	}
+	for _, t := range tasks {
+		r.byID[t.ID] = t // 谱系层按父卡 ID 上溯（review_of / emitted_by）
 	}
 
 	dirCount := map[string]int{}
@@ -322,13 +393,75 @@ func knownNames(tasks []*Task, aliases []boardProjectAlias,
 // resolve 判定一张卡归哪个项目，并返回判定来源（见 projSource* 常量）。
 // 顺序即优先级，任何一层命中立即返回——这是本功能的核心契约，改动请连带改测试。
 func (r *projectResolver) resolve(t *Task) (string, string) {
+	if name, src := r.resolveExcludingLineage(t); src != projSourceUnclassified {
+		return name, src
+	}
+	// 前四层都无结论：沿派生谱系上溯，把审核/修复/emit 产出接回它父卡的项目（见 resolveLineage）。
+	if n := r.resolveLineage(t, 0); n != "" {
+		return n, projSourceLineage
+	}
+	return unclassifiedProject, projSourceUnclassified
+}
+
+// lineageMaxDepth 是谱系上溯的深度上限。修复链最长受 max_fix_rounds（默认 3、high 档 4）约束，
+// 每轮两跳（实现→审核→修复），再加 emit 链几层——8 层足够覆盖真实谱系，同时挡住数据异常
+// （父指针成环/指向自身）把快照重建吊死。
+const lineageMaxDepth = 8
+
+// resolveLineage 沿派生谱系上溯，返回父卡的项目归属；无谱系或上溯不到结论返回 ""。
+//
+// 【为什么需要这一层】派生卡常跑在**一次性目录**上：复审分流的远端镜像 D:/Project/mirrors/…、
+// 交叉验证腿的 scratchpad、任务级工作树。这些目录天然没有归组证据（一卡一目录），于是审核卡
+// 落进「未分类」——但一张审核卡的项目归属根本不需要猜：它审的是谁，就属于谁的项目。
+// 谱系是**比目录更强的证据**，只是此前完全没被用上。
+//
+// 【为什么排在启发式之后而不是之前】卡自身的目录若已有扎实证据（跨机镜像互证、够格分量），
+// 那是关于**这张卡**的直接证据，比"我父亲属于哪"更具体。本层只做兜底救援：把原本要落进
+// 收件箱的派生卡接回它本来的项目，不改动任何已经判出结论的卡（纯增益，无回归面）。
+//
+// 【环与深度】父指针来自卡面字段（review_of/emitted_by），理论上不该成环，但账本是可以被
+// 手工编辑的文件——seen 集合 + 深度上限保证任何数据形态下都能停下来。
+func (r *projectResolver) resolveLineage(t *Task, depth int) string {
+	if t == nil || depth > lineageMaxDepth {
+		return ""
+	}
+	if n, ok := r.lineageMemo[t.ID]; ok {
+		return n
+	}
+	// 先占位防环：同一条链上再次回到本卡时直接拿到 ""，不会无限递归。
+	r.lineageMemo[t.ID] = ""
+
+	parentID := t.ReviewOf
+	if parentID == "" {
+		parentID = t.EmittedBy
+	}
+	if parentID == "" {
+		return ""
+	}
+	parent := r.byID[parentID]
+	if parent == nil {
+		return "" // 父卡已被 clean 清掉：谱系断了，如实回落收件箱
+	}
+	// 父卡自身也可能是派生卡（修复链：实现→审核→修复→审核…），故递归。
+	name, src := r.resolveExcludingLineage(parent)
+	if src == projSourceUnclassified {
+		name = r.resolveLineage(parent, depth+1)
+	}
+	r.lineageMemo[t.ID] = name
+	return name
+}
+
+// resolveExcludingLineage 跑前四层（显式 > 别名 > 模式 > 启发式），不进谱系层。
+// 两个调用方：resolve 的主链，以及 resolveLineage 判断父卡自身是否已有结论
+// （分开写是为了让"谱系层不能再触发谱系层"这条防递归约束在类型层面显而易见）。
+func (r *projectResolver) resolveExcludingLineage(t *Task) (string, string) {
 	if p := strings.TrimSpace(t.Project); p != "" {
 		return p, projSourceExplicit
 	}
 	d := normDir(t.Dir)
 	if d == "" {
-		// 无目录卡（历史上单列一个 "(无目录)" 项目）：它按定义没有任何归组证据，
-		// 正是收件箱要收的东西，不该在总览里另占一格。
+		// 无目录卡（历史上单列一个 "(无目录)" 项目）：它按定义没有任何目录证据，
+		// 正是收件箱要收的东西，不该在总览里另占一格（但仍可被谱系层救回）。
 		return unclassifiedProject, projSourceUnclassified
 	}
 	for _, a := range r.aliases {

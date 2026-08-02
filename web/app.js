@@ -534,12 +534,12 @@ function progressScaleSeg() {
     ['est', '预估进度', '分母＝预估最终总卡数：把复审/修复/emit 还会派生出来的卡提前算进来。'
       + '来源与口径（计划锚点或派生耦合系数）见各进度条的悬停说明；数据不足时自动回落实发口径并标注。'],
   ];
-  const wrap = h('div', { class: 'scale-seg', role: 'group', 'aria-label': '进度口径' });
+  // 复用仓内既有的分段控件惯例 .seg（总列/阶段泳道同款，选中态由 aria-pressed 驱动）：
+  // 本仓只该有一种"互斥一组"的视觉语言，自创第二套会让人以为它是另一类控件。
+  const wrap = h('div', { class: 'seg seg-sm', role: 'group', 'aria-label': '进度口径' });
   for (const [val, label, tip] of opts) {
-    const on = progressScale === val;
     wrap.append(h('button', {
-      class: `seg-btn${on ? ' is-on' : ''}`, type: 'button',
-      'aria-pressed': String(on), title: tip,
+      type: 'button', 'aria-pressed': String(progressScale === val), title: tip,
       onclick: () => setProgressScale(val),
       text: label,
     }));
@@ -830,15 +830,67 @@ function renderError(err, retry) {
     h('button', { class: 'btn-ghost', onclick: retry, text: '重试' }));
 }
 
-function mount(node) {
+function mount(node, scroll) {
   el.app.replaceChildren(node);
   el.app.dataset.ready = '1';
   syncRailHeight();
+  restoreScroll(scroll);
   // 再补一帧：字体/图标加载完、顶栏额度条换行与否定下来之后，轨道顶端还会挪一次。
   // 只测一次的话会把"布局还没落定"时的位置当成最终值，列高卡在 min-height 上，
-  // 外层滚动条就回来了。
-  requestAnimationFrame(syncRailHeight);
+  // 外层滚动条就回来了。滚动位置同样再放一次——列高定下来之前 scrollTop 会被夹到
+  // 当时的可滚区间（列还矮着，一个大的 scrollTop 会被截短），只设一次等于没设。
+  requestAnimationFrame(() => { syncRailHeight(); restoreScroll(scroll); });
   restoreGripFocus();
+}
+
+/**
+ * 滚动位置的捕获与恢复。
+ *
+ * 【为什么必须做】mount 是 replaceChildren 全量换 DOM，所有滚动位置随之归零；而自动刷新
+ * 每 30 秒跑一次。于是"横滚到第 7 个项目、把某列往下翻了两屏在看"这件事，最多只能维持
+ * 30 秒——刷新是**同一视图的数据更新**，不是导航，把人正在看的地方从眼前抽走是纯粹的损失。
+ *
+ * 【为什么按身份键而不是 DOM 顺序】两次刷新之间项目可能增删、换序、被归档，状态列可能因
+ * 筛选整列消失。按下标恢复会把 A 项目的位置塞给 B 项目——那比不恢复更糟（人会以为自己看错了）。
+ * 故每个容器用稳定键定位：项目列用 data-pid，kanban 列用 data-status。找不到的键直接跳过。
+ *
+ * 【导航时不恢复】navigate() 会把 #app 换成 boot 占位并清掉 dataset.ready，此刻 captureScroll
+ * 扫不到任何容器、window 位置也不带走——切页/切项目本就该从头看起，这条由调用点的 ready 判断兜住。
+ */
+function captureScroll() {
+  if (el.app.dataset.ready !== '1') return null; // boot 占位态：没有可保留的位置
+  const boxes = {};
+  for (const [key, node] of scrollBoxes()) {
+    if (node.scrollLeft || node.scrollTop) boxes[key] = [node.scrollLeft, node.scrollTop];
+  }
+  return { win: window.scrollY, boxes };
+}
+
+function restoreScroll(snap) {
+  if (!snap) return;
+  for (const [key, node] of scrollBoxes()) {
+    const v = snap.boxes[key];
+    if (!v) continue;
+    if (v[0]) node.scrollLeft = v[0];
+    if (v[1]) node.scrollTop = v[1];
+  }
+  if (snap.win) window.scrollTo(0, snap.win);
+}
+
+/** 带稳定身份的滚动容器：[键, 元素]。键必须跨刷新稳定，见 captureScroll 的注释。 */
+function* scrollBoxes() {
+  const rail = el.app.querySelector('.project-rail');
+  if (rail) yield ['rail', rail];
+  for (const proj of el.app.querySelectorAll('.proj[data-pid]')) {
+    const phases = proj.querySelector('.phases');
+    if (phases) yield [`col:${proj.dataset.pid}`, phases];
+  }
+  const kanban = el.app.querySelector('.kanban');
+  if (kanban) yield ['kanban', kanban];
+  for (const col of el.app.querySelectorAll('.kcol[data-status]')) {
+    const body = col.querySelector('.kcol-body');
+    if (body) yield [`kcol:${col.dataset.status}`, body];
+  }
 }
 
 /** 键盘移动项目后把焦点还给同一个手柄（见 dragGrip 里 pendingGripFocus 的注释）。 */
@@ -891,7 +943,9 @@ async function load(opts) {
     else if (route.view === 'project') node = await viewProject(route.id);
     else node = await viewBurn();
     if (state.route !== route) return;   // 路由在 await 期间被切走了，丢弃这次结果
-    mount(node);
+    // 紧贴 mount 之前抓：此刻旧 DOM 还在（位置读得到），且已包含用户在请求这几百毫秒里
+    // 又滚过的距离。抓在请求**之前**会恢复一个过期位置，等于把人从当下拽回旧处。
+    mount(node, captureScroll());
     state.lastLoaded = Date.now();
     tickFreshness();
     if (!silent) el.live.textContent = '看板数据已更新';
@@ -1473,7 +1527,8 @@ function kanbanColumn(c) {
       }));
     }
   }
-  return h('section', { class: 'kcol' },
+  // data-status 是列的稳定身份键：刷新后按它把列内滚动位置放回原处（scrollBoxes）。
+  return h('section', { class: 'kcol', 'data-status': c.key },
     h('header', { class: 'kcol-head' },
       statusDot(c.key),
       h('span', { class: 'kcol-label', text: c.label }),

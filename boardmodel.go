@@ -913,9 +913,11 @@ type boardOverrideKindRule struct {
 }
 
 // 【R3·P1-2】overrideErrKind 分类:app.js 需按这个把顶端横幅的文案区分开 ——
-//   "type" 场景 name/desc/phases 覆盖仍生效(Unmarshal skip 掉出错字段继续填充其它),
-//       写"全部失效"是失实披露(fail-honest 卡的披露自身失实,自身破线)。
-//   "syntax" 场景整块 override 蒸发,前端应写"全部失效,回落自动推导"。
+//
+//	"type" 场景 name/desc/phases 覆盖仍生效(Unmarshal skip 掉出错字段继续填充其它),
+//	    写"全部失效"是失实披露(fail-honest 卡的披露自身失实,自身破线)。
+//	"syntax" 场景整块 override 蒸发,前端应写"全部失效,回落自动推导"。
+//
 // 常量导出到包级,前端与测试可 grep 到具体字符串保防误改。
 const (
 	overrideErrKindSyntax = "syntax"
@@ -1020,10 +1022,32 @@ func buildSnapshot(root string, now time.Time) (*boardSnapshot, error) {
 			names = append(names, name)
 		}
 	}
+	// 名字折叠：slug 相同的一组名字（trading/Trading、.cardex/cardex）合并成一个项目，
+	// 否则双方各带哈希后缀并排出现，看着就是"同一个项目裂成两格"。见 canonicalProjectNames。
+	// 先跑一遍 resolve 收集名字与卡数——resolve 无副作用，第二遍取的是同一批结论。
+	rawNames := map[string]int{}
+	for _, t := range tasks {
+		n, _ := res.resolve(t)
+		rawNames[n]++
+	}
+	nameList := make([]string, 0, len(rawNames))
+	for n := range rawNames {
+		nameList = append(nameList, n)
+	}
+	sort.Strings(nameList) // 折叠内部按权威度排序，入参先定序保证结果与 map 遍历无关
+	canon := canonicalProjectNames(nameList, rawNames, ov.ProjectAliases, tasks)
+	canonical := func(n string) string {
+		if c, ok := canon[n]; ok {
+			return c
+		}
+		return n
+	}
+
 	// 兜底桶恒存在：0 张卡时也要出现在总览里（空收件箱本身就是信息）。
 	touchProject(unclassifiedProject)
 	for _, t := range tasks {
 		name, _ := res.resolve(t)
+		name = canonical(name)
 		touchProject(name)
 		projTaskList[name] = append(projTaskList[name], t)
 		if d := normDir(t.Dir); d != "" {

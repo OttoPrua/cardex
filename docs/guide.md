@@ -159,7 +159,20 @@ cardex board -ttl 30       # 任务快照缓存秒数（默认 10）
 
 **额度显示口径 = 剩余**：顶部额度条与燃尽页的主读数一律是**剩余额度**（`BurnSource.remaining_percent`，后端算并钳在 [0,100]），燃尽曲线也是往下走、触底即耗尽。源数据（CodexBar）给的是已用 %，`used_percent` 原样保留在响应里、并在悬停/副标题/样本表里同时展示——两个口径同屏时永远标明是哪一个。用户在这一屏做的决定（还能不能再派一批卡）是"还剩多少"的直接函数，"已经烧了多少"要先在脑子里做一次减法。
 
-**项目覆盖块 `~/.cardex/board.json`**：项目/阶段自动推导的介绍难免干瘪，可人工写一份更准的；文件缺失就全部走自动推导。项目块内允许字段：`name` / `desc` / `phases.<name>` / `goal` / `kind_rules`；文件顶层还有一张 `project_aliases` 归组规则表（见下节）。
+**进度双口径（顶栏「卡/~」切换，委托人 2026-08-02 追加）**：项目总进度默认按**现有卡**计
+分母（12 卡完成 9 → 75%），但 cardex 的工作模式会持续派生新卡（review_after 复审、修复轮、
+emit 产出），现有口径常高估完成度。顶栏切换到**含预估余量**口径后，分母换成预估最终总卡数
+（进度条尾部补一段斜纹「预估余量」幽灵段，百分比带 `~` 后缀），预估来源两级：
+- **计划锚点优先**：`board.json` 的 `projects.<id>.planned_total_cards`（阶段性计划总卡量）。
+  计划达成/调整时人工更新它——这就是预估口径的校准 hook；被现存量超出时按现存计并提示更新。
+- **历史膨胀率替补**：无锚点时按本项目全史「卡数/根卡数」系数 × 未完结根卡数推算余量
+  （根卡 = 非复审/非修复轮/非交叉派生腿）。每次快照按最新历史**即时重算（自校准）**，
+  不需要定时任务；系数含在途链故偏保守，且只估现有工作的衍生量、不预测新立项。
+  样本不足（根卡 <5 或衍生卡 <3）时显式回落现存卡数并说明——预估必须带 basis，绝不给
+  来历不明的百分比。口径只切**项目总条**；kind 分桶与阶段条保持现有卡口径（预估只做到
+  项目粒度，往下拆是把粗估伪装成细账）。切换偏好存 localStorage。
+
+**项目覆盖块 `~/.cardex/board.json`**：项目/阶段自动推导的介绍难免干瘪，可人工写一份更准的；文件缺失就全部走自动推导。项目块内允许字段：`name` / `desc` / `phases.<name>` / `goal` / `kind_rules` / `planned_total_cards`；文件顶层还有一张 `project_aliases` 归组规则表（见下节）。
 
 **`goal` 字段（CG-8「落地进度」）**：项目"离目标多远"的机械化视图，与卡片进度**并列**呈现（不替换）。V1 只做合成，不做历史/趋势。
 
@@ -388,6 +401,97 @@ cardex board -ttl 30       # 任务快照缓存秒数（默认 10）
 **降级专用模型与档位对等规则（`codex_fallback_model`）**：`codex_fallback` 生效时若 claude 卡被改道 codex，优先用 `codex_fallback_model`，而非全局 `codex_model`。档位对等映射：**opus 档降级首选同档的 terra（o3），不降设计档的 sol（GPT-5）**——设计档不去干实现档的活。空值回退 `codex_model`；此键仅对降级径（任务 `runner_pref≠codex` 且非远端）生效，codex 主跑卡与远端 codex 不受影响。
 
 **钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
+
+## 多订阅引擎（engine profiles：Kimi / GLM / MiniMax / MiMo / OpenCode Go / Ollama Cloud）
+
+Claude 之外的编码订阅计划基本都提供 **Anthropic 兼容端点**——接入方式同构：还是跑同一个
+`claude` CLI，只是按任务注入 `ANTHROPIC_BASE_URL` + 认证变量 + 模型映射。cardex 把这层差异
+收敛成**引擎档案**（`config.engines`）：每个订阅一段配置、独立冷却、独立限额解析、账本打标；
+不配则一切行为与旧版完全一致。端点/模型 ID 均取自各家官方文档（核实日期 2026-08-02），
+模型代次更新快，**以你订阅页当前提供为准**，预设只是起手值。
+
+三步接入（以 Kimi 为例）：
+
+```bash
+cardex engines add kimi        # 并入内置预设（不含密钥）；可用预设见 cardex engines
+export KIMI_API_KEY=sk-...     # 密钥走环境变量引用（config 可安心备份）；launchd 场景见下
+cardex doctor                  # 核认证可解析（值不回显）
+```
+
+用法两种，可并存：
+
+```bash
+# ① 钉定主跑：这张卡花 Kimi 的额度（-model 可用档位别名 sonnet/opus，或供应商原生 ID 如 k3）
+cardex add -runner kimi -model sonnet -dir ~/proj "重构上传模块"
+
+# ② 纳入降级链：claude 冷却/红线期自动改道，顺序自定义
+#    config.json: "fallback_order": ["codex", "kimi", "glm-cn"]
+```
+
+内置预设与统一能力分级（评测源：Artificial Analysis 智能指数 2026 快照 **2026-08-02**，
+锚点 = Claude 各档同快照分数：Fable 5 = 59.9 / Opus 4.8 = 55.7 / Sonnet 5 = 53.4；
+编码向以 SWE-bench Verified（Vals AI，2026-07）交叉核对。**分级是统一标准线下的档位，
+不是各家自报的高中低**；无同快照分数的模型标"未评"，不编造）：
+
+| 预设 | 订阅计划 | 端点 | 默认映射模型（AA 分数） | 统一档位 |
+|---|---|---|---|---|
+| `kimi` | Kimi 会员（Kimi Code），5h 窗约 300–1200 次请求 | api.kimi.com/coding | k3（57.1，SWE-bench 93.4% vs Fable 5 的 95.0%）/ kimi-for-coding | **opus 档**（距旗舰带 0.9 分，编码实测接近旗舰） |
+| `glm-cn` / `glm-global` | GLM Coding Plan（5h 窗按 prompt 计数） | open.bigmodel.cn / api.z.ai | glm-5.2（51.1，1M 上下文）/ glm-4.5-air | **sonnet 档** |
+| `minimax-cn` / `minimax-global` | MiniMax Coding Plan | api.minimaxi.com / api.minimax.io | MiniMax-M3（44.4，1M 上下文） | haiku 档 |
+| `mimo` | 小米 MiMo Token Plan（预付费按量） | api.xiaomimimo.com | mimo-v2.5-pro（42.2）/ mimo-v2-flash | haiku 档 |
+| `opencode-go` | OpenCode Go（$12/5h、$30/周、$60/月美元等值，17 模型一把钥匙） | opencode.ai/zen/go/v1 | kimi-k3 / glm-5.2 / deepseek-v4-flash | 随映射模型（默认 opus 档） |
+| `ollama` | Ollama Cloud 云订阅（Free/Pro/Max） | ollama.com | glm-4.7:cloud（33.7）等 `:cloud` 目录 | 随映射模型 |
+
+参考分数（同快照）：Kimi K2.6 = 44.2、DeepSeek V4 Pro = 44.3、Qwen3.7 Max = 46.0、
+GLM-5 = 39.5、GLM-4.7 = 33.7、MiniMax M2.7 = 38.1。据此的**推荐降级链**（按档位从高到低，
+只把你真的订阅了的加进去）：`["codex", "kimi", "opencode-go", "glm-cn", "minimax-cn", "mimo", "ollama"]`。
+
+**行为语义**（与 codex 备用执行器的差异是理解重点）：
+
+- **会话可续**：引擎跑的就是 claude CLI，钉定卡有 SessionID、多步 `--resume`、限额续跑全可用
+  （codex 无会话）。改道（非钉定）运行**不回写会话**——否则冷却结束后卡回到 claude 会
+  `--resume` 引擎会话，跨引擎身份漂移，与交叉链"入队即钉引擎"同一禁区；
+- **冷却分账**：每个引擎独立 `cooldown-<名>.json`。Kimi 撞限额绝不挂 claude 队列，反之亦然；
+  claude 的全局 `cooldown.json` 语义不变。限额无重置时间戳时按档案级回退等待（月度/计费周期
+  措辞自动抬到 ≥6 小时）；
+- **账各归各**：引擎调用不占 claude 的 5 小时红线预算（红线三通道只管 claude 订阅）；
+  各家**没有公开用量端点**，看板/quota 只披露"冷却状态 + 本地账窗口计数（下限口径）"，
+  不做燃尽估算——数据不足显式披露，绝不编造；
+- **质量地板全量沿用**：`no_fallback_models` 钉定模型、交叉卡、复审位（design-review /
+  交叉裁决 C 卡）在降级链上对**每一个引擎**同等不降级；钉定引擎的卡在该引擎冷却/缺配置时
+  跳过等待，绝不 fail-open 回 claude；
+- **凭据三选一**：`auth_env`（环境变量名引用，推荐）> `auth_file`（0600 文件，launchd 不想改
+  plist 时用）> `auth_value`（明文，仅限无真实密钥的场景）。`cardex cmd <id>` 打印的手动接管
+  命令只给引用形态（`$KIMI_API_KEY` / `$(cat 文件)`），永不解析明文；doctor 只报"可解析/缺失"。
+
+手动接管一张引擎卡时 `cardex cmd <id>` 会打出完整 env 前缀命令，例如：
+`ANTHROPIC_BASE_URL=https://api.kimi.com/coding/ ANTHROPIC_API_KEY=$KIMI_API_KEY claude --model kimi-for-coding`。
+
+### 自定义分级（`model_tiers`：无更强模型的机队按牌面定档）
+
+上面的统一分级是**绝对标准线**（锚点是 Claude 各档）。但如果你的机队里没有更强的订阅——
+比如只有 GLM + MiniMax——按标准线你的最强模型永远只是"中档"，而实际使用中它就是你的
+最强档。`model_tiers` 让你按手里的牌面自定义档位，**自定义恒优先于标准线**：
+
+```jsonc
+// GLM-only 机队示例：glm-5.2 顶最强档，minimax-m3 顶中档
+"model_tiers": {
+  "glm-5.2":    "fable",     // 键=模型 ID（全小写；前缀匹配，"glm-4.7" 盖住 "glm-4.7:cloud"）
+  "minimax-m3": "sonnet",    // 值=档位关键字 fable/opus/sonnet/haiku（写错载入即拒）
+  "glm-4.5-air": "haiku"
+},
+// 配合引擎档案的槽位映射，把最强模型填进 fable 槽——设计/复审类卡（默认 claude-fable-5）
+// 钉定该引擎时就落在你的最强模型上，且不再产生"档位回落"披露噪声：
+"engines": {
+  "glm-cn": { "models": { "fable": "glm-5.2", "opus": "glm-5.2", "sonnet": "glm-5.2", "haiku": "glm-4.5-air" }, ... }
+}
+```
+
+生效面：看板/`cardex list` 的模型档位标签、`cardex engines`/`cardex quota`/看板额度条的
+引擎档位（未显式写 `tier` 时从最高档映射模型自动推导）、消耗页的主力模型档位。
+**派发路由不吃档位**——真正决定"哪张卡跑哪个模型"的是引擎档案里的 `models` 槽位映射与
+`fallback_order`，`model_tiers` 只管把展示与推导对齐到你的机队现实；统一标准线表仍在
+（未列条目回落它），两套口径孰是孰非不需要争：你列的条目就是你的口径。
 
 ## 卡级投入产出分档（`-stakes` → 复核深度查表）
 

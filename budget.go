@@ -18,12 +18,16 @@ import (
 // 边界附近略保守，但不需要探测窗口起点。
 const windowHours = 5
 
-// usageRec 是一次 claude 调用的额度消耗记录（本地账本 usage.json）。
+// usageRec 是一次 claude CLI 调用的额度消耗记录（本地账本 usage.json）。
 type usageRec struct {
 	At       int64   `json:"at"`
 	TaskID   string  `json:"task"`
 	Model    string  `json:"model"`
 	Weighted float64 `json:"wtok"`
+	// Engine 非空时这条记录是订阅引擎（config.engines）的调用：走该订阅自己的额度，
+	// **不占 claude 的 5 小时红线预算**（queueWindowSpent 跳过），只作看板披露式计数。
+	// 旧记录无此字段 = claude（omitempty 双向兼容）。
+	Engine string `json:"engine,omitempty"`
 }
 
 func modelWeight(cfg *Config, model string) float64 {
@@ -62,12 +66,18 @@ func loadUsage(root string) []usageRec {
 var usageMu sync.Mutex
 
 // appendUsage 记账并顺手把窗口外的旧记录剪掉（多留 1 小时算燃烧速率用）。
+// 引擎执行（t.Runner=引擎名，runTaskVia 在 invoke 前已写好标签）打 Engine 标——引擎的
+// wtok 是"该订阅的本地计数"而非 claude 额度，红线判定在 queueWindowSpent 侧按标过滤。
 func appendUsage(root string, cfg *Config, t *Task, u *usageInfo) {
 	usageMu.Lock()
 	defer usageMu.Unlock()
 	w := weightedTokens(cfg, t.Model, u)
 	if w <= 0 {
 		return
+	}
+	engine := ""
+	if _, ok := cfg.Engines[t.Runner]; ok {
+		engine = t.Runner // Runner 由 runTaskVia 按 via 写入，成员资格判定不误吃 codex/remote 标签
 	}
 	now := time.Now()
 	keep := now.Add(-(windowHours + 1) * time.Hour).Unix()
@@ -77,19 +87,21 @@ func appendUsage(root string, cfg *Config, t *Task, u *usageInfo) {
 			recs = append(recs, r)
 		}
 	}
-	recs = append(recs, usageRec{At: now.Unix(), TaskID: t.ID, Model: t.Model, Weighted: w})
+	recs = append(recs, usageRec{At: now.Unix(), TaskID: t.ID, Model: t.Model, Weighted: w, Engine: engine})
 	if data, err := json.Marshal(recs); err == nil {
 		_ = atomicWrite(usagePath(root), append(data, '\n'))
 	}
 }
 
 // queueWindowSpent 返回滑动窗口内队列消耗的加权 token 与各模型分布。
+// **只统计 claude 记录**（Engine 空）：红线三通道管的是 claude 订阅的保底额度，引擎调用
+// 走各自订阅的账，混进来会让红线早触发、白白把 claude 队列拦停。
 func queueWindowSpent(root string, now time.Time) (float64, map[string]float64) {
 	since := now.Add(-windowHours * time.Hour).Unix()
 	total := 0.0
 	byModel := map[string]float64{}
 	for _, r := range loadUsage(root) {
-		if r.At < since {
+		if r.At < since || r.Engine != "" {
 			continue
 		}
 		total += r.Weighted
@@ -100,6 +112,21 @@ func queueWindowSpent(root string, now time.Time) (float64, map[string]float64) 
 		byModel[m] += r.Weighted
 	}
 	return total, byModel
+}
+
+// engineWindowSpent 返回滑动窗口内各引擎的本地账计数（看板披露式接入用）。
+// 这是"cardex 自己派发的调用"的下限计数，不是订阅端的权威用量——各家无公开用量端点，
+// 按项目纪律显式披露口径，绝不冒充燃尽数据。
+func engineWindowSpent(root string, now time.Time) map[string]float64 {
+	since := now.Add(-windowHours * time.Hour).Unix()
+	byEngine := map[string]float64{}
+	for _, r := range loadUsage(root) {
+		if r.At < since || r.Engine == "" {
+			continue
+		}
+		byEngine[r.Engine] += r.Weighted
+	}
+	return byEngine
 }
 
 // ---- 外部全局用量源（CodexBar usage-history.jsonl 格式）----

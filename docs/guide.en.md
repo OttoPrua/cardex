@@ -140,7 +140,27 @@ One inviolable rule: **filtering never changes any reading**. The chip counts, t
 
 **Quota is shown as remaining**: the headline reading in both the top quota strip and the burndown page is **remaining quota** (`BurnSource.remaining_percent`, computed server-side and clamped to [0,100]); the burndown curve descends and hitting zero means exhausted. The source data (CodexBar) reports used %, so `used_percent` is preserved verbatim in the response and shown alongside in tooltips / subtitles / the sample table — whenever both appear on screen, which one you're looking at is always labelled. The decision you make on this screen ("can I dispatch another batch?") is a direct function of what's left; "how much has burned" requires a subtraction first.
 
-**Project override `~/.cardex/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Fields allowed inside a project block: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules`; the file also has a top-level `project_aliases` grouping table (see below).
+**Two progress scales (topbar「卡/~」toggle, added 2026-08-02)**: project total progress
+defaults to counting **existing cards** in the denominator (9 of 12 done → 75%), but cardex's
+work model keeps spawning cards (review_after reviews, fix rounds, emit output), so the existing
+scale routinely overstates completion. Toggling to the **estimated-remaining** scale swaps the
+denominator to the estimated final card count (the bar gains a hatched "estimated remaining"
+ghost segment at the tail, and the percentage carries a `~` suffix). Two estimate sources:
+- **Planned anchor first**: `projects.<id>.planned_total_cards` in `board.json` (the phase-plan
+  total). Update it when a plan milestone lands or changes — that's the calibration hook; when
+  existing cards exceed the plan, the denominator uses existing and the basis says the plan is stale.
+- **Historical spawn factor as fallback**: with no anchor, remaining ≈ unfinished root cards ×
+  (project's all-history cards-per-root factor − 1); roots = cards that aren't reviews, fix
+  rounds, or cross-chain derived legs. Recomputed live on every snapshot (self-calibrating, no
+  timers needed); the factor includes in-flight chains so it errs conservative, and it only
+  estimates derivatives of existing work — never future projects. Insufficient samples (<5 roots
+  or <3 derived) fall back to existing-card counts with explicit disclosure — estimates always
+  carry a basis, never an unexplained percentage. The toggle only switches the **project total
+  bar**; kind buckets and phase bars stay on the existing-card scale (estimates stop at project
+  granularity — splitting them finer would dress a rough estimate up as precise bookkeeping).
+  The preference persists in localStorage.
+
+**Project override `~/.cardex/board.json`**: auto-derived project/phase blurbs are often dry — write a better one by hand if you like; missing file simply falls back to full derivation. Fields allowed inside a project block: `name` / `desc` / `phases.<name>` / `goal` / `kind_rules` / `planned_total_cards`; the file also has a top-level `project_aliases` grouping table (see below).
 
 **`goal` field (CG-8 "landed progress")**: a mechanized "how far from the project goal" view, displayed **alongside** the card-based `progress_percent` (never replacing it). V1 does synthesis only — no history/trend.
 
@@ -365,6 +385,111 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 **Downgrade-specific model and tier-parity rule (`codex_fallback_model`)**: when `codex_fallback` is active and a claude card is rerouted to codex, `codex_fallback_model` takes priority over the global `codex_model`. Tier-parity mapping: **opus-tier cards downgrade to the same-tier terra (o3), not the design-tier sol (GPT-5)** — design-tier doesn't go fill implementation-tier roles. Empty falls back to `codex_model`; this key only applies to the downgrade path (task `runner_pref≠codex` and not remote) — codex-primary cards and remote codex are unaffected.
 
 **Pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
+
+## Multi-subscription engines (engine profiles: Kimi / GLM / MiniMax / MiMo / OpenCode Go / Ollama Cloud)
+
+Most coding subscriptions besides Claude expose an **Anthropic-compatible endpoint**, so the
+integration is structurally identical: run the same `claude` CLI, inject `ANTHROPIC_BASE_URL` +
+an auth variable + model mappings per task. cardex collapses that difference into **engine
+profiles** (`config.engines`): one config block per subscription, independent cooldowns,
+independent limit parsing, ledger tagging; with no profiles configured, behavior is byte-for-byte
+identical to before. Endpoints/model IDs come from each vendor's official docs (verified
+2026-08-02); model generations churn fast — **your subscription page is the source of truth**,
+presets are just starting values.
+
+Three steps (Kimi as the example):
+
+```bash
+cardex engines add kimi        # merge the built-in preset (no secrets); see `cardex engines` for the list
+export KIMI_API_KEY=sk-...     # keys are referenced via env var names (config stays backup-safe)
+cardex doctor                  # verifies the key resolves (value never echoed)
+```
+
+Two usage modes, freely combined:
+
+```bash
+# ① Pin as primary: this card spends Kimi quota (-model takes tier aliases sonnet/opus, or native IDs like k3)
+cardex add -runner kimi -model sonnet -dir ~/proj "refactor the upload module"
+
+# ② Join the fallback chain for claude cooldown/redline gaps, order is yours:
+#    config.json: "fallback_order": ["codex", "kimi", "glm-cn"]
+```
+
+Built-in presets and the unified capability tiers (rating source: Artificial Analysis
+Intelligence Index, 2026 snapshot **2026-08-02**, anchored to Claude's own scores on the same
+snapshot: Fable 5 = 59.9 / Opus 4.8 = 55.7 / Sonnet 5 = 53.4; cross-checked against SWE-bench
+Verified (Vals AI, 2026-07). **Tiers are positions on one standard line, not each vendor's own
+high/mid/low**; models without a same-snapshot score are marked unrated, never guessed):
+
+| Preset | Plan | Endpoint | Default mapped models (AA score) | Unified tier |
+|---|---|---|---|---|
+| `kimi` | Kimi membership (Kimi Code), ~300–1200 requests per 5h window | api.kimi.com/coding | k3 (57.1; SWE-bench 93.4% vs Fable 5's 95.0%) / kimi-for-coding | **opus tier** (0.9 pts shy of the flagship band; near-flagship on coding evals) |
+| `glm-cn` / `glm-global` | GLM Coding Plan (prompt-counted 5h windows) | open.bigmodel.cn / api.z.ai | glm-5.2 (51.1, 1M context) / glm-4.5-air | **sonnet tier** |
+| `minimax-cn` / `minimax-global` | MiniMax Coding Plan | api.minimaxi.com / api.minimax.io | MiniMax-M3 (44.4, 1M context) | haiku tier |
+| `mimo` | Xiaomi MiMo Token Plan (prepaid metered) | api.xiaomimimo.com | mimo-v2.5-pro (42.2) / mimo-v2-flash | haiku tier |
+| `opencode-go` | OpenCode Go ($12/5h, $30/wk, $60/mo dollar-equivalent; 17 models, one key) | opencode.ai/zen/go/v1 | kimi-k3 / glm-5.2 / deepseek-v4-flash | follows mapped model (opus tier by default) |
+| `ollama` | Ollama Cloud subscription (Free/Pro/Max) | ollama.com | glm-4.7:cloud (33.7) etc. from the `:cloud` catalog | follows mapped model |
+
+Reference scores on the same snapshot: Kimi K2.6 = 44.2, DeepSeek V4 Pro = 44.3, Qwen3.7 Max =
+46.0, GLM-5 = 39.5, GLM-4.7 = 33.7, MiniMax M2.7 = 38.1. The resulting **recommended fallback
+chain** (tier-descending; only add plans you actually subscribe to):
+`["codex", "kimi", "opencode-go", "glm-cn", "minimax-cn", "mimo", "ollama"]`.
+
+**Behavioral semantics** (the differences vs. the codex backup executor are the point):
+
+- **Sessions work**: engines run the actual claude CLI — pinned cards get SessionIDs, multi-step
+  `--resume`, and limit-resume, all functional (codex has no sessions). Diverted (non-pinned)
+  runs **never write back a session** — otherwise the card would later `--resume` an engine
+  session on claude after the cooldown ends: cross-engine identity drift, same forbidden zone as
+  the cross-chain "engine pinned at enqueue" rule;
+- **Cooldowns are per-engine**: each engine gets its own `cooldown-<name>.json`. Kimi hitting its
+  limit never stalls the claude queue and vice versa; claude's global `cooldown.json` semantics
+  are unchanged. When no reset timestamp can be parsed, the profile-level fallback wait applies
+  (monthly/billing-cycle phrasings auto-raise it to ≥6h);
+- **Separate books**: engine calls never count against claude's 5-hour redline budget (the three
+  redline channels only govern the claude subscription). Vendors expose **no public usage
+  endpoints**, so the board/quota views disclose only "cooldown state + local-ledger window
+  count (lower-bound)" — no burn-down estimates: insufficient data is disclosed, never invented;
+- **Quality floors apply to the whole chain**: `no_fallback_models` pins, cross-check cards, and
+  review slots (design-review / cross-verdict C cards) are never downgraded to **any** engine;
+  engine-pinned cards wait (never fail open to claude) when their engine is cooling or unconfigured;
+- **Credentials, three ways**: `auth_env` (env var name reference, recommended) > `auth_file`
+  (0600 file, for launchd setups) > `auth_value` (plaintext, dummy-value scenarios only).
+  `cardex cmd <id>` prints manual-takeover commands with reference forms only (`$KIMI_API_KEY` /
+  `$(cat file)`), never resolved plaintext; doctor reports resolvability only, never values.
+
+Taking over an engine card manually, `cardex cmd <id>` prints the full env-prefixed command, e.g.
+`ANTHROPIC_BASE_URL=https://api.kimi.com/coding/ ANTHROPIC_API_KEY=$KIMI_API_KEY claude --model kimi-for-coding`.
+
+### Custom tiering (`model_tiers`: fleets without stronger models rank by the cards they hold)
+
+The unified tiers above are an **absolute standard line** (anchored to Claude's own tiers). But
+if your fleet has no stronger subscription — say GLM + MiniMax only — the standard line pins
+your best model at "mid tier" forever, while operationally it *is* your top tier. `model_tiers`
+lets you tier by the hand you actually hold; **custom entries always beat the standard line**:
+
+```jsonc
+// GLM-only fleet: glm-5.2 takes the top tier, minimax-m3 the mid tier
+"model_tiers": {
+  "glm-5.2":    "fable",     // key = model ID (lowercase; prefix match, "glm-4.7" covers "glm-4.7:cloud")
+  "minimax-m3": "sonnet",    // value = tier keyword fable/opus/sonnet/haiku (bad values rejected at load)
+  "glm-4.5-air": "haiku"
+},
+// Pair it with the engine profile's slot map — put your best model in the fable slot so
+// design/review cards (default claude-fable-5) land on it when pinned to this engine,
+// with no "tier fell back" disclosure noise:
+"engines": {
+  "glm-cn": { "models": { "fable": "glm-5.2", "opus": "glm-5.2", "sonnet": "glm-5.2", "haiku": "glm-4.5-air" }, ... }
+}
+```
+
+Where it applies: model tier labels on the board / `cardex list`, engine tiers in
+`cardex engines` / `cardex quota` / the board quota strip (derived from the highest mapped model
+when `tier` isn't set explicitly), and the spend page's top-model tier. **Dispatch routing never
+consumes tiers** — what actually decides which card runs which model is the engine profile's
+`models` slot map plus `fallback_order`; `model_tiers` only aligns display and derivation with
+your fleet's reality. The standard-line table stays (unlisted models fall back to it), and the
+two scales never need to fight: entries you list are your call.
 
 ## Per-card stakes tiering (`-stakes` → review-depth lookup table)
 

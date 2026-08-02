@@ -180,27 +180,42 @@ function metaChip(text, opts) {
 }
 
 /** 分段进度条：展示状态构成，而不是只给一个百分比。 */
-function progressBar(stats, pct) {
+function progressBar(stats, pct, estimate) {
   const total = stats.total || 0;
+  // 预估口径（estimate 非空且启用时由调用方传入）：分段宽度按预估最终总量算，
+  // 已取消卡不进条（预估分母本就排除它），尾部补一段「预估余量」幽灵段。
+  const useEst = estimate && isNum(estimate.estimated_total) && estimate.estimated_total > 0;
+  const den = useEst ? estimate.estimated_total : total;
   const segs = [];
-  if (total > 0) {
+  if (den > 0) {
     for (const k of STATUS_ORDER) {
+      if (useEst && k === 'canceled') continue;
       const n = stats[k] || 0;
       if (!n) continue;
       segs.push(h('span', {
         class: 'prog-seg',
-        style: `width:${(n / total) * 100}%;background:var(--k-${k})`,
+        style: `width:${(n / den) * 100}%;background:var(--k-${k})`,
         title: `${STATUS_ZH[k]} ${n}`,
+      }));
+    }
+    if (useEst && estimate.estimated_remaining > 0) {
+      segs.push(h('span', {
+        class: 'prog-seg is-est-remaining',
+        style: `width:${(estimate.estimated_remaining / den) * 100}%`,
+        title: `预估余量 ~${estimate.estimated_remaining} 张（${estimate.source === 'planned' ? '计划锚点' : '历史膨胀率'}，口径见进度行悬停）`,
       }));
     }
   }
   const label = STATUS_ORDER.filter((k) => stats[k]).map((k) => `${STATUS_ZH[k]} ${stats[k]}`).join('，');
+  const aria = useEst
+    ? `预估共 ~${den} 张卡（现存 ${total}，预估余量 ${estimate.estimated_remaining}）：${label}`
+    : `共 ${total} 张卡：${label}`;
   return h('div', { class: 'prog-wrap' },
-    h('div', { class: 'prog', role: 'img', 'aria-label': `共 ${total} 张卡：${label}` }, segs),
+    h('div', { class: 'prog', role: 'img', 'aria-label': aria }, segs),
     h('span', {
       class: 'prog-pct',
-      title: '完成占比，分母已排除已取消卡',
-      text: `${isNum(pct) ? pct : 0}%`,
+      title: useEst ? '完成占比（含预估余量口径），分母=预估最终总卡数' : '完成占比，分母已排除已取消卡',
+      text: `${isNum(pct) ? pct : 0}%${useEst ? '~' : ''}`,
     }));
 }
 
@@ -245,10 +260,28 @@ const KIND_SCOPE = {
 function kindProgress(stats, pct, kinds, opts) {
   const o = opts || {};
   const wrap = h('div', { class: 'prog-group' });
-  wrap.append(h('div', { class: 'prog-row is-total' },
-    h('span', { class: 'prog-key', title: '全部卡的完成占比，分母已排除已取消卡', text: '总进度' }),
-    h('span', { class: 'prog-n', text: `${stats.done || 0}/${(stats.total || 0) - (stats.canceled || 0)}` }),
-    progressBar(stats, pct)));
+  // 全局口径开关只切**项目总条**：含预估口径把预估余量并入分母（estimate 由后端带 basis 给出）。
+  // kind 分桶与阶段条保持现有卡口径——预估只做到项目粒度，往下拆是把粗估伪装成细账。
+  const est = progressScale === 'est' ? o.estimate : null;
+  const useEst = est && isNum(est.estimated_total) && est.estimated_total > 0;
+  const done = stats.done || 0;
+  const denCards = (stats.total || 0) - (stats.canceled || 0);
+  if (useEst) {
+    const pctEst = est.estimated_total > 0 ? Math.round((done / est.estimated_total) * 1000) / 10 : 0;
+    wrap.append(h('div', { class: 'prog-row is-total' },
+      h('span', { class: 'prog-key', title: `含预估余量口径。${est.basis}`, text: '总进度~' }),
+      h('span', {
+        class: 'prog-n',
+        title: est.basis,
+        text: est.estimated_remaining > 0 ? `${done}/~${est.estimated_total}` : `${done}/${est.estimated_total}`,
+      }),
+      progressBar(stats, pctEst, est)));
+  } else {
+    wrap.append(h('div', { class: 'prog-row is-total' },
+      h('span', { class: 'prog-key', title: '全部卡的完成占比，分母已排除已取消卡', text: '总进度' }),
+      h('span', { class: 'prog-n', text: `${done}/${denCards}` }),
+      progressBar(stats, pct)));
+  }
 
   if (!kinds || !kinds.length) return wrap;
   for (const k of kinds) {
@@ -457,7 +490,33 @@ const el = {
   refresh: document.getElementById('btn-refresh'),
   auto: document.getElementById('auto-refresh'),
   live: document.getElementById('live'),
+  scale: document.getElementById('btn-scale'),
 };
+
+/* ---- 进度口径全局开关（现有卡 / 含预估余量）----
+ * 「现有卡」：进度分母 = 现存非取消卡（原口径，默认）。
+ * 「含预估」：分母 = 预估最终总卡数（后端 estimate 字段：计划锚点或历史膨胀率，
+ *   basis 随条悬停披露）。只切项目级总条；kind 分桶与阶段条保持现有卡口径——
+ *   预估只做到项目粒度，往下拆是把粗估伪装成细账。 */
+const PROGRESS_SCALE_KEY = 'cardex.board.progressScale';
+let progressScale = 'cards';
+try { if (localStorage.getItem(PROGRESS_SCALE_KEY) === 'est') progressScale = 'est'; } catch { /* 私隐模式等，保默认 */ }
+function syncScaleButton() {
+  if (!el.scale) return;
+  el.scale.textContent = progressScale === 'est' ? '~' : '卡';
+  el.scale.classList.toggle('is-est', progressScale === 'est');
+  el.scale.setAttribute('aria-label',
+    progressScale === 'est' ? '进度口径：含预估余量（点击切回现有卡）' : '进度口径：现有卡（点击切到含预估余量）');
+}
+if (el.scale) {
+  syncScaleButton();
+  el.scale.addEventListener('click', () => {
+    progressScale = progressScale === 'est' ? 'cards' : 'est';
+    try { localStorage.setItem(PROGRESS_SCALE_KEY, progressScale); } catch { /* 存不进就只影响本次会话 */ }
+    syncScaleButton();
+    navigate(); // 重渲染当前视图，两个口径的数据都在响应里，无需重新拉取之外的请求
+  });
+}
 
 // 自动刷新 30 秒；页面隐藏时不轮询——看板常年开在后台标签页，
 // 没人看的时候每 30 秒重扫近 2000 个 JSON 是纯粹的浪费。
@@ -733,6 +792,8 @@ function syncNav(view) {
 }
 
 function renderError(err, retry) {
+  // 完整堆栈进 console：横幅只有 message，排查渲染层 null 崩溃时没有堆栈等于蒙眼修。
+  console.error('看板渲染失败:', err);
   return h('div', { class: 'err' },
     h('h2', { text: '加载失败' }),
     h('p', {}, '无法取得看板数据：', h('code', { text: String((err && err.message) || err) })),
@@ -896,6 +957,34 @@ function renderQuota(quota) {
         h('span', { class: 'qp-fill', style: `width:${rem}%;background:${remainColor(rem)}` })),
       h('span', { class: 'qp-val', text: `剩 ${Math.round(rem)}%${src.stale ? ' ⚠' : ''}` })));
   }
+  // 订阅引擎披露行（engines 档案）：只有冷却状态 + 本地账窗口计数两个事实——各家没有公开
+  // 用量端点，本地账是"cardex 自己派发的调用"的下限计数，不冒充燃尽百分比（口径写进 title）。
+  for (const eng of quota.engines || []) {
+    const cooling = isNum(eng.cooling_until) && eng.cooling_until > Date.now() / 1000;
+    const tier = eng.tier ? `（${eng.tier} 档）` : '';
+    const state = cooling ? `冷却→${fmtClock(eng.cooling_until)}` :
+      (eng.window_weighted > 0 ? `5h窗 ${fmtNum(eng.window_weighted)} wtok` : '就绪');
+    el.quota.append(h('span', {
+      class: `quota-pill${cooling ? ' is-stale' : ''}`,
+      title: `订阅引擎 ${eng.name}${tier}｜` + (cooling
+        ? `限额冷却中，${fmtClock(eng.cooling_until)} 自动恢复`
+        : `滑动 5h 窗口本地账 ${fmtNum(eng.window_weighted)} 加权 token——仅统计 cardex 派发的调用（下限口径），订阅端无公开用量接口，不做燃尽估算`),
+    },
+      h('span', { class: 'qp-name', text: eng.name }),
+      h('span', { class: 'qp-val', text: state })));
+  }
+}
+
+// fmtClock/fmtNum：引擎披露行的最小格式化（epoch 秒 → HH:MM；计数 → 千分位缩写）。
+function fmtClock(epochSec) {
+  const d = new Date(epochSec * 1000);
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+function fmtNum(n) {
+  if (!isNum(n)) return '0';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(Math.round(n));
 }
 
 /* ============================ 视图：总览 ============================ */
@@ -1136,14 +1225,14 @@ function projectCard(p) {
       p.archive_revived
         ? metaChip('已自动恢复活跃', { title: p.archive_revived_reason || '归档后检测到新卡' })
         : null,
-      p.models.slice(0, 3).map((m) => tierBadge(m.model, m.tier)),
-      p.models.length > 3 ? metaChip(`+${p.models.length - 3} 个模型`) : null,
+      (p.models || []).slice(0, 3).map((m) => tierBadge(m.model, m.tier)), // 0 卡项目 models 为 null，别炸整页
+      (p.models || []).length > 3 ? metaChip(`+${p.models.length - 3} 个模型`) : null,
       p.dirs.length
         ? metaChip(p.dirs.length > 1 ? `${p.dirs.length} 个目录` : p.dirs[0],
           { mono: true, title: p.dirs.join('\n') })
         : null,
       relTime(p.last_activity) ? metaChip(`活动 ${relTime(p.last_activity)}`) : null),
-    kindProgress(p.stats, p.progress_percent, p.kinds, { compact: true }),
+    kindProgress(p.stats, p.progress_percent, p.kinds, { compact: true, estimate: p.estimate }),
     p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     statusLegend(p.stats),
@@ -1284,7 +1373,7 @@ async function viewProject(id) {
     p.archive_revived
       ? callout('warning', 'ⓘ', p.archive_revived_reason || '归档后检测到新卡，已自动切回活跃')
       : null,
-    kindProgress(p.stats, p.progress_percent, p.kinds),
+    kindProgress(p.stats, p.progress_percent, p.kinds, { estimate: p.estimate }),
     p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     etaLine(p.eta),

@@ -74,6 +74,8 @@ func main() {
 		err = cmdInstallLaunchd(os.Args[2:])
 	case "uninstall-launchd":
 		err = uninstallLaunchd()
+	case "engines":
+		err = cmdEngines(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "version", "-v", "--version":
@@ -147,7 +149,11 @@ func printUsage() {
                                    # 对账，不符即回滚）。不代建 symlink、不代卸 launchd
   install-launchd [-interval 300]  # 安装 macOS 定时器，开机自动调度
   uninstall-launchd
-  doctor                           # 自检环境
+  doctor                           # 自检环境（含各订阅引擎认证可解析性，值不回显）
+  engines   [add <预设名>]          # 多订阅引擎档案：列已配引擎与内置预设
+                                   # （kimi / glm-cn / glm-global / minimax-cn / minimax-global /
+                                   #   mimo / opencode-go / ollama），add 后配好密钥即可
+                                   #   -runner <引擎名> 钉定主跑，或加入 fallback_order 参与降级链
 `)
 }
 
@@ -234,7 +240,10 @@ func cmdAdd(args []string) error {
 		return err
 	}
 	if *runner != "" && *runner != "codex" {
-		return fmt.Errorf("未知 runner %q（可选: codex）", *runner)
+		if _, ok := cfg.Engines[*runner]; !ok {
+			return fmt.Errorf("未知 runner %q（可选: codex%s；引擎预设用 cardex engines add <名> 并入）",
+				*runner, engineNamesHint(cfg))
+		}
 	}
 	if !validTypes[*typ] {
 		return fmt.Errorf("未知类型 %q（可选: %s, %s, %s, %s, %s）",
@@ -321,6 +330,12 @@ func cmdAdd(args []string) error {
 		if *model != "" {
 			return fmt.Errorf("-runner codex 的模型请用 -codex-model 指定（-model 是 claude 专用旗标，对 codex 无效）")
 		}
+	} else if *runner != "" {
+		// 订阅引擎钉定（config.engines 的键，上面已校验存在）。与 codex 钉定的两点差异：
+		//   - 不要求 codexEligible：引擎跑的是 claude CLI，有会话、多步/续跑全可用；
+		//   - -model 有效：档位别名（haiku/sonnet/opus/fable）经档案映射，其余字符串按
+		//     供应商原生模型 ID 直通（如 -model k3 / -model glm-5.2）。
+		t.PreferRunner = *runner
 	}
 	t.CodexModel = strings.TrimSpace(*codexModel)
 	if *host != "" {
@@ -1138,15 +1153,39 @@ func cmdCmd(args []string) error {
 		step = len(t.Prompts) - 1
 	}
 	parts := []string{"claude"}
-	if t.Model != "" {
-		parts = append(parts, "--model", t.Model)
+	cmdModel := t.Model
+	envPrefix := ""
+	// 引擎钉定卡：手动接管命令带 env 前缀（base_url + 认证 + extra_env），密钥只给**引用形态**
+	// （$VAR / $(cat 文件)），绝不解析明文——cmd 输出常被复制进聊天/工单，明文即泄露。
+	if engineVia(t.PreferRunner) {
+		if p, ok := cfg.Engines[t.PreferRunner]; ok {
+			cmdModel, _ = resolveEngineModel(p, t.Model)
+			pairs := []string{
+				"ANTHROPIC_BASE_URL=" + shellQuote(strings.TrimSpace(p.BaseURL)),
+				engineAuthVar(p) + "=" + engineAuthRef(p),
+			}
+			extraKeys := make([]string, 0, len(p.ExtraEnv))
+			for k := range p.ExtraEnv {
+				extraKeys = append(extraKeys, k)
+			}
+			sort.Strings(extraKeys)
+			for _, k := range extraKeys {
+				pairs = append(pairs, k+"="+shellQuote(p.ExtraEnv[k]))
+			}
+			envPrefix = strings.Join(pairs, " ") + " "
+		} else {
+			fmt.Printf("# 警告: 该卡钉定引擎 %q 但 config.engines 已无此档案，按本机 claude 打印。\n", t.PreferRunner)
+		}
+	}
+	if cmdModel != "" {
+		parts = append(parts, "--model", cmdModel)
 	}
 	if t.SessionID != "" {
 		parts = append(parts, "--resume", t.SessionID)
 	}
 	fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
 		t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
-	fmt.Printf("cd %s && %s\n", shellQuote(t.Dir), strings.Join(parts, " "))
+	fmt.Printf("cd %s && %s%s\n", shellQuote(t.Dir), envPrefix, strings.Join(parts, " "))
 	if t.MidStep && t.SessionID != "" {
 		fmt.Printf("\n# 该会话在步骤中途被打断，进入后先发续跑提示：\n%s\n", cfg.ResumePrompt)
 	} else {
@@ -1289,6 +1328,23 @@ func cmdQuota(args []string) error {
 		fmt.Println("⛔ 红线生效中：" + reason)
 	} else {
 		fmt.Println("✓ 未触线，队列正常派发")
+	}
+	// 订阅引擎披露段：冷却状态 + 本地账窗口计数。口径明示——各家无公开用量端点，
+	// 本地账只是 cardex 自己派发调用的下限计数，不做燃尽估算（红线三通道也不管引擎）。
+	if len(cfg.Engines) > 0 {
+		fmt.Printf("\n订阅引擎（%d 小时窗口本地账计数，下限口径，不参与红线判定）：\n", windowHours)
+		byEngine := engineWindowSpent(root, now)
+		for _, name := range sortedEngineNames(cfg.Engines) {
+			state := "就绪"
+			if cd := loadEngineCooldown(root, name); cd.active(now) {
+				state = fmt.Sprintf("⏳ 限额冷却中，%s 恢复（%s）", fmtClock(cd.UntilEpoch), fmtIn(cd.UntilEpoch, now))
+			}
+			tier := engineDisplayTier(cfg, cfg.Engines[name])
+			if tier == "" {
+				tier = "-"
+			}
+			fmt.Printf("  %-16s %-7s %-10.0f %s\n", name, tier+"档", byEngine[name], state)
+		}
 	}
 	return nil
 }
@@ -1638,6 +1694,18 @@ func cmdDoctor(args []string) error {
 	if cd := loadCooldown(root); cd.active(now) {
 		fmt.Printf("  - 限额冷却中，%s 恢复\n", fmtClock(cd.UntilEpoch))
 	}
+	// 引擎档案自检：认证只报"能否解析"，**永不回显密钥值**。
+	if cfg != nil {
+		for _, name := range sortedEngineNames(cfg.Engines) {
+			p := cfg.Engines[name]
+			_, aerr := resolveEngineAuth(p)
+			check("引擎 "+name+" 认证（"+engineAuthDesc(p)+"，值不回显）", aerr,
+				"按 docs/guide.md「多订阅引擎」配置 auth_env/auth_file 后重试")
+			if cd := loadEngineCooldown(root, name); cd.active(now) {
+				fmt.Printf("  - 引擎 %s 限额冷却中，%s 恢复\n", name, fmtClock(cd.UntilEpoch))
+			}
+		}
+	}
 	if tasks, err := loadTasks(root); err == nil {
 		counts := map[string]int{}
 		for _, t := range tasks {
@@ -1650,6 +1718,162 @@ func cmdDoctor(args []string) error {
 		return fmt.Errorf("存在需要处理的问题")
 	}
 	return nil
+}
+
+// ---- engines（多订阅引擎档案）----
+
+// cmdEngines 列出/并入订阅引擎档案。
+//
+//	cardex engines               # 已配引擎（认证/冷却状态）+ 可用内置预设
+//	cardex engines add <预设名>  # 把内置预设并入 config.json 的 engines（不含密钥）
+func cmdEngines(args []string) error {
+	fs := flag.NewFlagSet("engines", flag.ExitOnError)
+	rootFlag := fs.String("root", "", "数据目录")
+	_ = fs.Parse(args)
+	root := resolveRoot(*rootFlag)
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	rest := fs.Args()
+	if len(rest) > 0 && rest[0] == "add" {
+		if len(rest) != 2 {
+			return fmt.Errorf("用法: cardex engines add <预设名>（可用: %s）", strings.Join(presetNames(), ", "))
+		}
+		return enginesAddPreset(root, cfg, rest[1])
+	}
+	if len(rest) > 0 {
+		return fmt.Errorf("未知子命令 %q（可用: cardex engines / cardex engines add <预设名>）", rest[0])
+	}
+
+	now := time.Now()
+	if len(cfg.Engines) == 0 {
+		fmt.Println("尚未配置任何订阅引擎。")
+	} else {
+		fmt.Println("已配置引擎（config.engines）:")
+		w := tabwriter.NewWriter(os.Stdout, 2, 4, 2, ' ', 0)
+		fmt.Fprintln(w, "  名称\t档位\t端点\t认证\t状态")
+		for _, name := range sortedEngineNames(cfg.Engines) {
+			p := cfg.Engines[name]
+			status := "就绪"
+			if _, aerr := resolveEngineAuth(p); aerr != nil {
+				status = "认证未就绪（doctor 查详情）"
+			}
+			if cd := loadEngineCooldown(root, name); cd.active(now) {
+				status = "限额冷却中，" + fmtClock(cd.UntilEpoch) + " 恢复"
+			}
+			tier := engineDisplayTier(cfg, p)
+			if tier == "" {
+				tier = "-"
+			}
+			fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n", name, tier, p.BaseURL, engineAuthDesc(p), status)
+		}
+		w.Flush()
+	}
+	var avail []string
+	for _, name := range presetNames() {
+		if _, exists := cfg.Engines[name]; !exists {
+			avail = append(avail, name)
+		}
+	}
+	if len(avail) > 0 {
+		fmt.Printf("\n可并入的内置预设（cardex engines add <名>）: %s\n", strings.Join(avail, ", "))
+	}
+	if len(cfg.FallbackOrder) > 0 {
+		fmt.Printf("当前降级链 fallback_order: %s\n", strings.Join(cfg.FallbackOrder, " → "))
+	}
+	fmt.Println("统一能力分级表与推荐降级顺序见 docs/guide.md「多订阅引擎」章节。")
+	return nil
+}
+
+// enginesAddPreset 把内置预设**外科式**并入 config.json：读原始 JSON 为 map、只动 engines.<名>
+// 一个键、写回。不走 saveConfig(cfg)——那会把 defaultConfig 合并后的全量键实体化进用户的稀疏
+// config，之后升级默认值就再也覆盖不到这些键（与 typeDefaultsFor 的合并粒度纪律同源）。
+func enginesAddPreset(root string, cfg *Config, name string) error {
+	preset, ok := enginePresets()[name]
+	if !ok {
+		return fmt.Errorf("没有预设 %q（可用: %s；自定义引擎直接编辑 config.json 的 engines 键，字段见 docs/config.md）",
+			name, strings.Join(presetNames(), ", "))
+	}
+	if _, exists := cfg.Engines[name]; exists {
+		return fmt.Errorf("engines.%s 已存在于 config.json，不覆盖（要重置请先删除该条目再 add）", name)
+	}
+	raw, err := os.ReadFile(configPath(root))
+	if err != nil {
+		return err
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("解析 %s 失败: %w", configPath(root), err)
+	}
+	engines, _ := m["engines"].(map[string]any)
+	if engines == nil {
+		engines = map[string]any{}
+	}
+	pb, err := json.Marshal(preset)
+	if err != nil {
+		return err
+	}
+	var pv any
+	if err := json.Unmarshal(pb, &pv); err != nil {
+		return err
+	}
+	engines[name] = pv
+	m["engines"] = engines
+	data, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := atomicWrite(configPath(root), append(data, '\n')); err != nil {
+		return err
+	}
+	fmt.Printf("已并入预设 engines.%s（端点/模型为 2026-08-02 核实的官方起手值，以订阅页当前提供为准可改）。\n", name)
+	fmt.Println("下一步:")
+	if preset.AuthEnv != "" {
+		fmt.Printf("  1. export %s=<你的 API key>（写进 shell 配置；launchd 场景改用 auth_file，见 docs/guide.md）\n", preset.AuthEnv)
+	}
+	fmt.Printf("  2. cardex doctor                    # 核认证可解析（值不回显）\n")
+	fmt.Printf("  3. cardex add -runner %s ...        # 钉定主跑；或把 %q 加进 config.fallback_order 参与降级链\n", name, name)
+	return nil
+}
+
+func presetNames() []string {
+	var names []string
+	for name := range enginePresets() {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedEngineNames(m map[string]EngineProfile) []string {
+	var names []string
+	for name := range m {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// engineNamesHint 拼 -runner 报错里的已配引擎清单（空则不占位）。
+func engineNamesHint(cfg *Config) string {
+	if cfg == nil || len(cfg.Engines) == 0 {
+		return ""
+	}
+	return " / " + strings.Join(sortedEngineNames(cfg.Engines), " / ")
+}
+
+// engineAuthDesc 描述认证来源（不含值）：doctor / engines 列表用。
+func engineAuthDesc(p EngineProfile) string {
+	switch {
+	case p.AuthEnv != "":
+		return "auth_env " + p.AuthEnv
+	case p.AuthFile != "":
+		return "auth_file " + p.AuthFile
+	case p.AuthValue != "":
+		return "auth_value（明文，建议改 auth_env）"
+	}
+	return "未配置"
 }
 
 // ---- helpers ----

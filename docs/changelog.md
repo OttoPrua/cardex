@@ -2,6 +2,52 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-02 · 看板进度双口径（现有卡 / 含预估余量）
+
+- **全局口径切换**：顶栏「卡/~」按钮在两个进度口径间切换（偏好存 localStorage）——
+  「现有卡」维持原分母；「含预估余量」把预估还会派生的卡数并入分母，进度条尾部补斜纹
+  「预估余量」幽灵段，百分比带 `~` 后缀。只切项目总条，kind 分桶与阶段条保持原口径
+  （预估只做到项目粒度，往下拆是把粗估伪装成细账）。
+- **预估两级来源，basis 必带**：`board.json` 的 `projects.<id>.planned_total_cards`
+  计划锚点优先（阶段计划达成/调整时人工更新即校准 hook；被现存量超出时按现存计并提示
+  过期）；无锚点走历史膨胀率（本项目全史 卡数/根卡数 系数 × 未完结根卡，根卡=非复审/
+  非修复轮/非交叉派生腿），每次快照即时重算（自校准、零额度、无定时任务）。样本不足
+  （根卡<5 或衍生卡<3）与无在途卡的项目显式回落现存口径并说明——估算永远带口径披露，
+  绝不给来历不明的百分比。公式自有界（余量 ≤ 现存−根卡），离群系数撑不爆预估轴。
+
+## 2026-08-02 · 多订阅引擎档案（Kimi / GLM / MiniMax / MiMo / OpenCode Go / Ollama Cloud）
+
+- **引擎档案（`config.engines`）**：任何 Anthropic 兼容端点的订阅计划都以"claude CLI +
+  按任务注入环境变量"的方式接入——档案含 base_url、凭据引用（auth_env / auth_file 两种都支持，
+  auth_value 仅限哑值场景）、档位模型映射、extra_env、档案级限额回退。内置 8 个预设
+  （kimi、glm-cn/glm-global、minimax-cn/minimax-global、mimo、opencode-go、ollama），
+  `cardex engines add <名>` 外科式并入 config（不实体化其他默认键、不含密钥）；端点/模型 ID
+  取自各家官方文档（核实 2026-08-02）。设计规格见 docs/2026-08-02-engine-profiles-design.md。
+- **派发**：`-runner <引擎名>` 钉定主跑（有会话、多步可用；引擎冷却/缺配置时等待，绝不
+  fail-open 回 claude）；`fallback_order` 自定义 claude 空窗期的改道顺序（默认 `["codex"]`，
+  行为与旧版一致）。质量地板全量沿用：`no_fallback_models`/交叉卡/复审位对链上每一项同等生效；
+  改道运行不回写会话（防跨引擎 `--resume` 身份漂移）。
+- **冷却与账本分账**：每引擎独立 `cooldown-<名>.json`——Kimi 撞限额不挂 claude 队列，反之
+  亦然；限额判据在 claude 形状的收敛扫描面上追加通用配额措辞（Kimi 官方 429/403 限额文案
+  已被 limitRe 覆盖，403 计费周期先于失败分类命中限额分支，不会误判 permission→held）；
+  月度/计费周期措辞自动把回退等待抬到 ≥6h。`usage.json` 记录加 `engine` 标：引擎调用不占
+  claude 的 5 小时红线预算。
+- **统一能力分级**：以 Artificial Analysis 智能指数 2026 快照（2026-08-02）为评测源、
+  Claude 各档同快照分数为锚点（SWE-bench Verified 交叉核对），把各家模型放入统一档位
+  （K3→opus 档、GLM-5.2→sonnet 档、MiniMax-M3/MiMo 等→haiku 档），看板 modelTier 同表；
+  推荐降级链按档位排序，用户自由指定哪些订阅入链。
+- **披露式接入**：看板额度条与 `cardex quota` 新增引擎行——只披露冷却状态 + 本地账窗口计数
+  （下限口径），各家无公开用量端点，不做燃尽估算；boardspend 把引擎卡归 Unpriced（claude CLI
+  的 cost 数字按 Anthropic 价目算，与订阅真实成本口径不可比）。`cardex cmd` 打印引擎卡的
+  手动接管命令带 env 前缀，密钥只给引用形态（`$VAR` / `$(cat 文件)`），永不解析明文；doctor
+  逐引擎核认证可解析性（值不回显）。
+- **自定义分级（`model_tiers`，同日追加）**：模型 ID → 档位关键字（fable/opus/sonnet/haiku）
+  的自定义表，**优先于内置统一标准线**——无更强模型的机队按牌面定档（GLM-only 机队可把
+  glm-5.2 定为自己的 fable 档），配合引擎档案的 models 槽位映射即可让设计/复审类卡落在手里
+  最强的模型上。精确匹配优先、前缀匹配盖住 `:cloud` 这类变体；键强制全小写、坏值载入即拒；
+  只影响档位展示与引擎档位推导（`cardex engines`/`quota`/看板额度条未显式写 tier 时自动
+  推导），派发路由不吃档位。
+
 ## 2026-07-31 · 项目更名 ClaudeGo → cardex
 
 - **改名裁决**：产品由 ClaudeGo 更名为 cardex（裁决 BD-44）。命令名 `claudego` → `cardex`；

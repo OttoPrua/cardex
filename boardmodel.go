@@ -189,6 +189,9 @@ type Project struct {
 	// 分桶只是把"总条为什么这么高"摊开——审核卡与修复卡完成率天然高、占比又大，
 	// 单看总条会把"落地才走了四成"读成"整体快完了"。
 	Kinds []KindProgress `json:"kinds"`
+	// Estimate 是「含预估余量」的第二进度口径（boardestimate.go）：把预估还会派生的卡数
+	// 并入分母。与 ProgressPercent 并列——前端全局切换用哪个口径画轴线，两套数字都带 basis。
+	Estimate *ProjectEstimate `json:"estimate,omitempty"`
 	// KindRuleError 是 board.json kind_rules 里被跳过的规则的披露串（无问题时 omitempty 消失）。
 	// 坏规则逐条跳过而非整块拒，但被跳过的必须说出来——静默失效即造读数。
 	KindRuleError string `json:"kind_rule_error,omitempty"`
@@ -653,29 +656,69 @@ func phaseForTask(t *Task, byID map[string]*Task, depth int) string {
 
 // ---- 模型等级 ----
 
-// modelTier 把模型名映射成人话等级。GPT 侧按对等档位对齐 claude 侧
-// （sol≈fable 设计档 / terra≈opus 实现档 / luna≈sonnet）。
-func modelTier(model string) string {
+// tierDisplay 档位关键字（fable/opus/sonnet/haiku，与 engines.models 的键同一取值域）→ 看板人话。
+var tierDisplay = map[string]string{"fable": "旗舰", "opus": "高", "sonnet": "中", "haiku": "轻"}
+
+// modelTierKeyword 判定模型的档位关键字，两级：
+//  1. **用户自定义分级表 config.model_tiers**（精确匹配优先，其次最长前缀——"glm-4.7" 能盖住
+//     "glm-4.7:cloud" 这类变体后缀）。这是给"机队里没有更强模型"的用户的一等出口：手里最强的
+//     模型就是自己的最强档，按牌面定档而不是被绝对标准线钉死在中低档。
+//  2. 内置统一标准线（评测源：Artificial Analysis 智能指数 2026 快照 2026-08-02，锚点=Claude
+//     各档同快照分数；SWE-bench Verified 交叉核对；表与出处见 docs/guide.md）：GPT 侧
+//     sol≈fable / terra≈opus / luna≈sonnet；订阅引擎侧 k3(57.1)≈opus 档；glm-5.2(51.1)≈sonnet
+//     档；minimax-m3(44.4)/kimi-k2.x(44.2)/deepseek(44.3)/qwen(46.0)/mimo(42.2)/glm-5(39.5)/
+//     glm-4.x(≤33.7) 轻量档。匹配顺序即优先级：更具体的代次串（glm-5.2）先于其前缀族（glm-）。
+//
+// 判不出返回 ""（调用方决定显示"未知"还是留空）。
+func modelTierKeyword(cfg *Config, model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
-	switch {
-	case m == "":
-		return "未知"
-	case strings.Contains(m, "fable"), strings.Contains(m, "sol"):
-		return "旗舰"
-	case strings.Contains(m, "opus"), strings.Contains(m, "terra"):
-		return "高"
-	case strings.Contains(m, "sonnet"), strings.Contains(m, "luna"):
-		return "中"
-	case strings.Contains(m, "haiku"):
-		return "轻"
-	default:
-		return "未知"
+	if m == "" {
+		return ""
 	}
+	if cfg != nil && len(cfg.ModelTiers) > 0 {
+		if t, ok := cfg.ModelTiers[m]; ok {
+			return t
+		}
+		best := ""
+		for k := range cfg.ModelTiers {
+			if strings.HasPrefix(m, k) && len(k) > len(best) {
+				best = k
+			}
+		}
+		if best != "" {
+			return cfg.ModelTiers[best]
+		}
+	}
+	switch {
+	case strings.Contains(m, "fable"), strings.Contains(m, "sol"):
+		return "fable"
+	case strings.Contains(m, "opus"), strings.Contains(m, "terra"), strings.Contains(m, "k3"):
+		return "opus"
+	case strings.Contains(m, "sonnet"), strings.Contains(m, "luna"), strings.Contains(m, "glm-5.2"),
+		strings.Contains(m, "kimi-for-coding"):
+		return "sonnet"
+	case strings.Contains(m, "haiku"), strings.Contains(m, "glm-"), strings.Contains(m, "minimax"),
+		strings.Contains(m, "kimi-k2"), strings.Contains(m, "mimo"), strings.Contains(m, "deepseek"),
+		strings.Contains(m, "qwen"):
+		return "haiku"
+	}
+	return ""
+}
+
+// modelTier 把模型名映射成人话等级（看板展示层）。自定义分级表优先于内置标准线，见
+// modelTierKeyword。
+func modelTier(cfg *Config, model string) string {
+	if kw := modelTierKeyword(cfg, model); kw != "" {
+		return tierDisplay[kw]
+	}
+	return "未知"
 }
 
 // effectiveModel 还原一张卡**实际生效**的模型与来源。
-// 三条路径：codex 系走 resolveCodexModel（含交叉冻结/卡级钉定/降级专用/全局回落），
-// claude 系用卡上的 Model，卡上为空则回填 type_defaults。
+// 四条路径：codex 系走 resolveCodexModel（含交叉冻结/卡级钉定/降级专用/全局回落），
+// 引擎系走 resolveEngineModel（档位映射后的供应商模型——卡面 Model 是 sonnet 这类别名时，
+// 真跑的是映射结果，看板必须显示真跑的那个），claude 系用卡上的 Model，
+// 卡上为空则回填 type_defaults。
 func effectiveModel(cfg *Config, t *Task) (model, source string) {
 	codexSide := t.Runner == "codex" || t.PreferRunner == "codex" ||
 		(strings.HasPrefix(t.Runner, "remote:") && t.Model == "") ||
@@ -683,6 +726,13 @@ func effectiveModel(cfg *Config, t *Task) (model, source string) {
 	if codexSide {
 		if m := resolveCodexModel(cfg, t); m != "" {
 			return m, "codex_model"
+		}
+	}
+	if name := taskEngineName(cfg, t); name != "" {
+		if p, ok := engineProfile(cfg, name); ok {
+			if m, _ := resolveEngineModel(p, t.Model); m != "" {
+				return m, "engine:" + name
+			}
 		}
 	}
 	if t.Model != "" {
@@ -779,7 +829,7 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 		Step:          t.Step,
 		StepsTotal:    len(t.Prompts),
 		Model:         model,
-		ModelTier:     modelTier(model),
+		ModelTier:     modelTier(cfg, model),
 		ModelSource:   source,
 		Runner:        t.Runner,
 		Effort:        t.Effort,
@@ -849,6 +899,10 @@ type boardOverrideProject struct {
 	// KindRules 是人工分类规则（见 boardkind.go）。标题关键词启发式再怎么调都会判错几张卡，
 	// 给一个精确出口比继续往 kindDesignHints 里堆词更诚实——堆词会让别的项目跟着遭殃。
 	KindRules []boardOverrideKindRule `json:"kind_rules,omitempty"`
+	// PlannedTotalCards 是「含预估余量」进度口径的人工计划锚点（boardestimate.go）：
+	// 阶段性计划的总卡量，声明后恒压过机械膨胀率估算；计划达成/调整时人工更新——
+	// 这就是预估口径的校准 hook。0/不写 = 无锚点，走历史膨胀率自动估算。
+	PlannedTotalCards int `json:"planned_total_cards,omitempty"`
 }
 
 // boardOverrideKindRule 是单条人工分类规则：match 命中标题子串（大小写不敏感）或任务 ID 全串，
@@ -1107,6 +1161,12 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 	p.ActiveTotal = p.Stats.activeTotal()
 	p.ProgressPercent = progressPercent(&p.Stats)
 	p.Kinds = buildKindProgress(ts, kindOf)
+	// 预估口径：计划锚点来自 board.json（人工校准点），无锚点走历史膨胀率（每快照自校准）。
+	planned := 0
+	if o, ok := ov.Projects[id]; ok {
+		planned = o.PlannedTotalCards
+	}
+	p.Estimate = buildProjectEstimate(ts, planned)
 
 	// 模型分布（覆盖项目全部卡：这是「这个项目在用什么档位的模型」的完整画像）
 	mc := map[string]int{}
@@ -1118,7 +1178,7 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 		mc[m]++
 	}
 	for m, c := range mc {
-		p.Models = append(p.Models, BoardModelStat{Model: m, Tier: modelTier(m), Count: c})
+		p.Models = append(p.Models, BoardModelStat{Model: m, Tier: modelTier(cfg, m), Count: c})
 	}
 	sort.Slice(p.Models, func(i, j int) bool {
 		if p.Models[i].Count != p.Models[j].Count {

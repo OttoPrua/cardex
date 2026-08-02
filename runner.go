@@ -83,12 +83,35 @@ var (
 )
 
 func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
+	return invokeClaudeCLI(ctx, cfg, t, prompt, t.Model, nil)
+}
+
+// invokeEngine 用引擎档案（config.engines）执行一步：同一个 claude CLI，模型经档案映射、
+// 环境经 buildEngineEnv 整体注入（base_url/认证/档位映射）。会话/输出/超时语义与本机
+// claude 完全同构——差异只有环境与模型来源。认证解析失败直接返回错误（不发子进程）；
+// 错误串带 "invalid api key" 锚词，让 failure_class 归 auth 类挂 held 等人工补配置，
+// 而不是烧 attempts 空转。
+func invokeEngine(ctx context.Context, cfg *Config, name string, p EngineProfile, t *Task, prompt string) (*claudeResult, string, string, error) {
+	model, note := resolveEngineModel(p, t.Model)
+	env, err := buildEngineEnv(cfg, p)
+	if err != nil {
+		return nil, "", note, fmt.Errorf("invalid api key: 引擎 %s 认证未就绪——%v", name, err)
+	}
+	res, combined, runErr := invokeClaudeCLI(ctx, cfg, t, prompt, model, env)
+	return res, combined, note, runErr
+}
+
+// invokeClaudeCLI 是本机 claude / 引擎档案两条路径共用的命令体。
+// model 由调用方定（默认路径 = t.Model，引擎路径 = 档案映射结果）；
+// env == nil 表示默认路径——**env 组装保持旧行为一字不动**（仅 ThinkingTokens>0 时设，
+// 否则全量继承父环境）；引擎路径传 buildEngineEnv 的完整环境。
+func invokeClaudeCLI(ctx context.Context, cfg *Config, t *Task, prompt, model string, env []string) (*claudeResult, string, error) {
 	args := []string{"-p", "--output-format", "json"}
 	if t.SessionID != "" {
 		args = append(args, "--resume", t.SessionID)
 	}
-	if t.Model != "" {
-		args = append(args, "--model", t.Model)
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	if t.Effort != "" {
 		args = append(args, "--effort", t.Effort)
@@ -107,7 +130,9 @@ func invokeClaude(ctx context.Context, cfg *Config, t *Task, prompt string) (*cl
 	cmd := exec.CommandContext(ctx, cfg.ClaudeBin, args...)
 	setupProcGroup(cmd)
 	cmd.Dir = t.Dir
-	if cfg.ThinkingTokens > 0 {
+	if env != nil {
+		cmd.Env = env
+	} else if cfg.ThinkingTokens > 0 {
 		cmd.Env = append(os.Environ(), fmt.Sprintf("MAX_THINKING_TOKENS=%d", cfg.ThinkingTokens))
 	}
 	cmd.Stdin = strings.NewReader(prompt)
@@ -907,11 +932,27 @@ func clampEpoch(v int64, now time.Time) int64 {
 	return v
 }
 
-// runTask 在一次派发内循环执行任务的各个步骤，直到完成、失败、撞上限额或被取消。
-// 同一任务的多个步骤通过 --resume 复用同一会话，保持上下文连续。
-// useCodex 为 true 时用备用执行器 codex exec（限单步任务，冷却/红线期间由 tick 决定）。
-// ctx 由 tick 持有：任务被 cancel 后 tick 对账发现即取消 ctx，整组击杀执行进程。
+// runTask 是 runTaskVia 的兼容壳：既有调用点/测试用 (useCodex bool) 二态签名，引擎档案
+// 引入后真实路由是 via 三态（""=claude / "codex" / 引擎名），新调用点请直接用 runTaskVia。
 func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bool) error {
+	via := ""
+	if useCodex {
+		via = "codex"
+	}
+	return runTaskVia(ctx, root, cfg, t, via)
+}
+
+// runTaskVia 在一次派发内循环执行任务的各个步骤，直到完成、失败、撞上限额或被取消。
+// 同一任务的多个步骤通过 --resume 复用同一会话，保持上下文连续。
+// via 是执行路由：""=本机 claude；"codex"=备用执行器 codex exec（限单步任务）；
+// 其余=引擎档案名（config.engines 的键，claude CLI + env 注入，会话语义与本机 claude 同构）。
+// ctx 由 tick 持有：任务被 cancel 后 tick 对账发现即取消 ctx，整组击杀执行进程。
+func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via string) error {
+	useCodex := via == "codex"
+	engineName := ""
+	if engineVia(via) {
+		engineName = via
+	}
 	// 守门：pickNext 之后、开跑之前任务可能刚被 cancel（非运行态 cancel 直接归档移走文件），
 	// 别把已取消的任务写回 tasks/ 复活成 running。
 	if diskCanceled(root, t.ID) {
@@ -947,6 +988,8 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		t.Runner = "remote:" + t.RemoteHost
 	case useCodex:
 		t.Runner = "codex"
+	case engineName != "":
+		t.Runner = engineName // 引擎名即执行器标签（看板/账本/审计三处同源）
 	default:
 		t.Runner = "" // 清除历史执行器标签（如降级失败后的重试回到 claude）
 	}
@@ -955,7 +998,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 		return err
 	}
 	// 派发事件:tick 已把卡从 queued/limit_paused 拉进 running。actor=runner,detail 记录执行器身份
-	// (远端/codex/claude)与当前步序号——恢复限额后续跑与首次派发在这条事件上会有 step/mid_step 差异。
+	// (远端/codex/引擎/claude)与当前步序号——恢复限额后续跑与首次派发在这条事件上会有 step/mid_step 差异。
 	emitTaskEvent(root, t.ID, evDispatched, "runner", statusRunning, t.Step, map[string]any{
 		"runner": t.Runner, "mid_step": t.MidStep, "use_codex": useCodex,
 	})
@@ -1005,9 +1048,14 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			return saveTask(root, t)
 		}
 
+		runnerTag := ""
+		if useCodex {
+			runnerTag = "  runner=codex"
+		} else if engineName != "" {
+			runnerTag = "  runner=" + engineName
+		}
 		logSection(lg, fmt.Sprintf("步骤 %d/%d%s  session=%s%s", t.Step+1, len(t.Prompts),
-			map[bool]string{true: "（限额中断后续跑）", false: ""}[resuming], orDash(t.SessionID),
-			map[bool]string{true: "  runner=codex", false: ""}[useCodex]))
+			map[bool]string{true: "（限额中断后续跑）", false: ""}[resuming], orDash(t.SessionID), runnerTag))
 		logBlock(lg, "PROMPT", prompt)
 
 		var res *claudeResult
@@ -1027,6 +1075,31 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			case useCodex:
 				// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
 				res, combined, runErr = invokeCodex(ctx, root, cfg, t, prompt)
+			case engineName != "":
+				// 引擎档案：claude CLI + env 注入，走该订阅自己的额度。会话可续（与 claude 同构），
+				// 账本记录打 engine 标（不占 claude 红线预算），限额只写 cooldown-<name>.json。
+				prof, ok := engineProfile(cfg, engineName)
+				if !ok {
+					// tick 派发时档案还在、执行时被人删了 config 条目：按执行器缺失处理，走退避。
+					res, combined, runErr = nil, "", fmt.Errorf("引擎 %s 的档案已不在 config.engines（派发后被删？）", engineName)
+					return nil
+				}
+				var note string
+				res, combined, note, runErr = invokeEngine(ctx, cfg, engineName, prof, t, prompt)
+				if note != "" {
+					// 档位回落/透传必须可见：静默降档是"复审照跑只是审得更浅"同类的静默事故。
+					logBlock(lg, "ENGINE", fmt.Sprintf("引擎 %s 模型解析: %s", engineName, note))
+				}
+				// 会话只在**钉定主跑**（runner_pref=本引擎）时回写：改道卡后续可能回到 claude
+				// （冷却结束的 retry/限额恢复），带着引擎会话就成了跨引擎 --resume——引擎身份
+				// 漂移，与交叉链"入队即钉引擎"同一禁区。改道卡本就是 codexEligible 形状
+				// （单步/fresh 无会话依赖），不回写零损失。
+				if t.PreferRunner == engineName && res != nil && res.SessionID != "" {
+					t.SessionID = res.SessionID
+				}
+				if res != nil {
+					appendUsage(root, cfg, t, res.Usage)
+				}
 			default:
 				res, combined, runErr = invokeClaude(ctx, cfg, t, prompt)
 				if res != nil && res.SessionID != "" {
@@ -1080,12 +1153,41 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			return finalizeCanceled(root, t, lg)
 		}
 
+		// 1c) 引擎限额：只写该引擎自己的 cooldown-<name>.json，**绝不写 claude 全局冷却**
+		// （Kimi 撞限额挂住 claude 队列＝把独立额度池焊死在一根保险丝上，本分支存在的全部意义
+		// 就是拆开它）。会话语义与 claude 分支同构：有会话→MidStep 续跑提示；fresh→重发本步。
+		// 判据走 isLimitHitEngine（claude 形状的收敛扫描面 + engineQuotaRe 追加措辞）；回退等待
+		// 用档案级 limit_fallback_min，月度/计费周期措辞自动抬到 ≥6h（engineResetEpoch）。
+		if engineName != "" && !remote && limitHitForRunner(via, remote, t, res, combined) {
+			prof, _ := engineProfile(cfg, engineName)
+			scan := engineLimitScanText(res, combined)
+			until := engineResetEpoch(combined+"\n"+resultText(res), scan, cfg, prof, now)
+			setEngineCooldown(root, engineName, until, firstLine(strings.TrimSpace(scan)))
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = t.SessionID != ""
+			if t.FreshSteps {
+				// 状态在文件里：恢复时重发本步 prompt 开新会话即可，不需要续跑提示。
+				t.SessionID = ""
+				t.MidStep = false
+			}
+			t.LastError = "引擎 " + engineName + " 用量限额: " + firstLine(strings.TrimSpace(scan))
+			t.touch()
+			logBlock(lg, "LIMIT", fmt.Sprintf("引擎 %s 命中用量限额，%s 后恢复（%s）\n%s",
+				engineName, fmtIn(until, now), fmtClock(until), firstLine(strings.TrimSpace(scan))))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+				"engine": engineName, "resume_at": until, "mid_step": t.MidStep,
+			})
+			return saveTask(root, t)
+		}
+
 		// 1) 限额：记录恢复时间，全局冷却，等 tick 到点自动续跑
 		// 【CG-R1 修复】用 isLimitHitClaude 收敛扫描面到 stderr 尾段 + res.Result(非 transcript),
 		// 挡"自审本仓 transcript 含 usage limit 字面量 + 超时→误挂 limit_paused/写全局冷却"回归。
 		// 【CG-R1 R3 P2-3】三处 call site 全走 limitHitForEngine 单口路由, 让 (useCodex, remote)
 		// 到 wrapper 的映射被 TestLimitHitForEngineRoutesByFlags 钉住; 错改条件顺序会立即测试红。
-		if !useCodex && !remote && limitHitForEngine(useCodex, remote, t, res, combined) {
+		// 引擎路由（engineName != ""）已被上方 1c 分支独占承接，此处仅本机 claude。
+		if engineName == "" && !useCodex && !remote && limitHitForEngine(useCodex, remote, t, res, combined) {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			setCooldown(root, until, firstLine(combined))
 			t.Status = statusLimitPaused
@@ -1240,9 +1342,14 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 			return saveTask(root, t)
 		}
 
-		// 3) 成功：推进步骤（codex/远端成功不代表 claude 限额解除，冷却只由 claude 路径清除）
+		// 3) 成功：推进步骤（codex/远端/引擎成功不代表 claude 限额解除，全局冷却只由 claude 路径
+		// 清除；引擎成功清的是自己的 cooldown-<name>.json——账各归各）。
 		if !useCodex && !remote {
-			clearCooldown(root)
+			if engineName != "" {
+				clearEngineCooldown(root, engineName)
+			} else {
+				clearCooldown(root)
+			}
 		}
 		t.Attempts = 0
 		t.NotBeforeEpoch = 0

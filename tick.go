@@ -105,8 +105,11 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 
 		// 有空槽时尽量填满并行槽位。每个候选独立决定执行器：
 		//  - runner_pref=codex 的任务钉在 codex 上（不管 claude 忙闲，用独立 GPT 额度）；
+		//  - runner_pref=<引擎名> 的任务钉在该订阅引擎上（同理独立额度；引擎自己冷却时等待，
+		//    绝不 fail-open 回 claude）；
 		//  - claude 正常时其余任务走 claude；
-		//  - claude 被冷却/红线拦住时，开启 fallback 的话把 codexEligible 的任务切给 codex。
+		//  - claude 被冷却/红线拦住时，按 fallback_order 逐个找第一个可用出路
+		//    （codex 沿用五道闸，引擎各查自己的 cooldown-<名>.json；默认链只有 codex）。
 		if len(activeIDs) < maxPar {
 			tasks, err := loadTasks(root)
 			if err != nil {
@@ -115,7 +118,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				}
 			} else {
 				reconcileCrossChains(root, tasks, activeIDs) // 崩溃对账：单腿孤儿交叉卡置 failed
-				viaCodex := map[string]bool{}
+				viaRunner := map[string]string{}             // 任务ID → ""(claude) / "codex" / 引擎名
 				var cands []*Task
 				for _, t := range tasks {
 					if t.Status == statusCanceled {
@@ -136,22 +139,33 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							continue
 						}
 					case t.PreferRunner == "codex" && cfg.CodexBin != "" && codexEligible(t):
-						viaCodex[t.ID] = true
+						viaRunner[t.ID] = "codex"
 					case t.PreferRunner == "codex":
 						// codex 钉定但上面条件没满足（codex_bin 缺失/不 eligible）：绝不 fail-open 到 claude。
 						// 引擎身份是交叉验证的交付物——甲乙跑成同引擎=验证形同虚设。跳过本轮，等 codex 可用。
 						continue
+					case engineVia(t.PreferRunner):
+						// 引擎钉定：档案在且该引擎不在冷却才派。缺档案/冷却中一律跳过等待——与 codex
+						// 钉定同一纪律，绝不 fail-open 回 claude（额度归属是用户显式划的边界）。
+						// 钉定径不要求 codexEligible：引擎跑 claude CLI，有会话、多步可用。
+						if !pinnedEngineReady(root, cfg, t.PreferRunner, now) {
+							continue
+						}
+						viaRunner[t.ID] = t.PreferRunner
 					case blockReason == "":
 						// claude 可用，正常走
-					case codexDivertOK(cfg, t):
-						viaCodex[t.ID] = true
 					default:
-						continue // claude 被拦且没有 codex 出路
+						// claude 被拦：按 fallback_order 找出路，找不到就等窗口。
+						via := pickDivertRunner(root, cfg, t, now)
+						if via == "" {
+							continue
+						}
+						viaRunner[t.ID] = via
 					}
 					cands = append(cands, t)
 				}
 				if next := pickNext(cfg, cands, now); next != nil {
-					useCodex := viaCodex[next.ID]
+					via := viaRunner[next.ID]
 					activeIDs[next.ID] = true
 					if !readOnly(next) {
 						activeDirs[next.Dir] = true
@@ -162,18 +176,18 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 					launched++
 					if !quiet {
 						runner := ""
-						if useCodex {
-							runner = "，runner=codex"
+						if via != "" {
+							runner = "，runner=" + via
 						}
 						fmt.Printf("▶ 运行 %s [%s] %s（第 %d/%d 步，并行 %d/%d%s）\n",
 							next.ID, next.Type, next.Title, next.Step+1, len(next.Prompts), len(activeIDs), maxPar, runner)
 					}
-					go func(t *Task, viaCodex bool) {
-						if err := runTask(runCtx, root, cfg, t, viaCodex); err != nil && !quiet {
+					go func(t *Task, via string) {
+						if err := runTaskVia(runCtx, root, cfg, t, via); err != nil && !quiet {
 							fmt.Printf("✖ %s 执行出错: %v\n", t.ID, err)
 						}
 						ch <- doneMsg{t}
-					}(next, useCodex)
+					}(next, via)
 					continue // 尝试继续填下一个槽位
 				}
 			}

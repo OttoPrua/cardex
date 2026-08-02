@@ -1,5 +1,66 @@
 # cardex changelog
 
+## 2026-08-02 · Dual board progress scales (existing cards / estimated remaining)
+
+- **Global scale toggle**: a topbar「卡/~」button switches between two progress scales
+  (preference persisted in localStorage) — "existing cards" keeps the original denominator;
+  "estimated remaining" folds the estimated future spawn into it, with a hatched ghost segment
+  at the bar's tail and a `~` suffix on the percentage. Only the project total bar switches;
+  kind buckets and phase bars stay on the existing-card scale (estimates stop at project
+  granularity — splitting finer would dress a rough estimate up as precise bookkeeping).
+- **Two estimate sources, basis always attached**: `projects.<id>.planned_total_cards` in
+  board.json wins when declared (update it when phase plans land/change — that's the calibration
+  hook; when existing cards exceed it, the denominator uses existing and the basis flags the
+  plan as stale); otherwise a historical spawn factor (project's all-history cards-per-root ×
+  unfinished roots; roots = non-review, non-fix-round, non-cross-derived) recomputed live on
+  every snapshot (self-calibrating, zero quota, no timers). Insufficient samples (<5 roots or
+  <3 derived) and settled projects fall back to existing-card counts with explicit disclosure —
+  estimates never ship without a stated basis. The formula is self-bounding (remaining ≤
+  existing − roots), so outlier factors cannot blow up the axis.
+
+## 2026-08-02 · Multi-subscription engine profiles (Kimi / GLM / MiniMax / MiMo / OpenCode Go / Ollama Cloud)
+
+- **Engine profiles (`config.engines`)**: any subscription with an Anthropic-compatible endpoint
+  plugs in as "claude CLI + per-task env injection" — a profile carries base_url, credential
+  references (both auth_env and auth_file supported; auth_value for dummy-key scenarios only),
+  tier→model mappings, extra_env, and a profile-level limit fallback. Eight built-in presets
+  (kimi, glm-cn/glm-global, minimax-cn/minimax-global, mimo, opencode-go, ollama);
+  `cardex engines add <name>` merges surgically into config.json (no other defaults materialized,
+  no secrets). Endpoints/model IDs from official vendor docs (verified 2026-08-02); design spec
+  in docs/2026-08-02-engine-profiles-design.md.
+- **Dispatch**: `-runner <engine>` pins a card to that subscription (sessions and multi-step
+  work; when the engine is cooling/unconfigured the card waits — never fails open to claude).
+  `fallback_order` customizes the divert order during claude gaps (default `["codex"]`, i.e.
+  unchanged behavior). Quality floors carry over wholesale: `no_fallback_models`, cross-check
+  cards, and review slots are never downgraded to any chain entry; diverted runs never adopt
+  sessions (prevents cross-engine `--resume` identity drift).
+- **Per-engine cooldowns and books**: each engine gets `cooldown-<name>.json` — Kimi hitting its
+  limit never stalls the claude queue, and vice versa. Limit detection reuses the claude-shaped
+  narrowed scan plus generic quota phrasings (Kimi's official 429/403 limit texts already match
+  limitRe; the 403 billing-cycle message hits the limit branch before failure classification, so
+  it can't be misfiled as permission→held). Monthly/billing-cycle phrasings raise the fallback
+  wait to ≥6h. `usage.json` records gain an `engine` tag: engine calls never count against
+  claude's 5-hour redline budget.
+- **One capability scale**: Artificial Analysis Intelligence Index (2026 snapshot, 2026-08-02)
+  as the rating source, anchored to Claude's own same-snapshot scores and cross-checked against
+  SWE-bench Verified — K3→opus tier, GLM-5.2→sonnet tier, MiniMax-M3/MiMo→haiku tier; the board's
+  modelTier uses the same table, and the recommended fallback chain is tier-ordered with the user
+  choosing which subscriptions join.
+- **Disclosure-style surfacing**: the board quota strip and `cardex quota` gain engine rows —
+  cooldown state + local-ledger window counts (lower-bound) only; vendors expose no public usage
+  endpoints, so no burn-down estimates are fabricated. boardspend files engine cards under
+  Unpriced (claude CLI costs are Anthropic-rate figures, incomparable to real subscription cost).
+  `cardex cmd` prints env-prefixed takeover commands with reference-form credentials only
+  (`$VAR` / `$(cat file)`); doctor verifies key resolvability without echoing values.
+- **Custom tiering (`model_tiers`, added same day)**: a user table of model ID → tier keyword
+  (fable/opus/sonnet/haiku) that **overrides the built-in standard line** — fleets without
+  stronger models rank by the cards they hold (a GLM-only fleet can declare glm-5.2 its fable
+  tier), and paired with the engine profile's slot map, design/review cards land on the best
+  model available. Exact match beats prefix match (prefixes cover `:cloud`-style variants);
+  keys must be lowercase and bad values are rejected at load; affects tier display and engine
+  tier derivation only (`cardex engines`/`quota`/board strip auto-derive when `tier` is unset) —
+  dispatch routing never consumes tiers.
+
 [中文](changelog.md) | **English** · back to [README](../README.en.md)
 
 ## 2026-07-31 · Project renamed ClaudeGo → cardex

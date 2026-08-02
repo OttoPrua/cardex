@@ -125,6 +125,37 @@ type QuotaSummary struct {
 	ClaudeWeekly   *BurnSource `json:"claude_weekly"`
 	CodexPrimary   *BurnSource `json:"codex_primary"`
 	CodexSecondary *BurnSource `json:"codex_secondary"`
+	// Engines 是订阅引擎的**披露式**额度行：冷却状态 + 本地账本窗口计数。
+	// 与上面四槽的燃尽百分比**不是同一口径**——各家没有公开用量端点，本地账只是
+	// "cardex 自己派发的调用"的下限计数，绝不冒充订阅端权威用量（数据不足显式披露原则）。
+	Engines []EngineQuota `json:"engines,omitempty"`
+}
+
+// EngineQuota 是一个订阅引擎在额度条上的披露行。
+type EngineQuota struct {
+	Name string `json:"name"`
+	Tier string `json:"tier,omitempty"`
+	// CoolingUntil 非零 = 该引擎撞限额冷却中（cooldown-<name>.json），到点自动恢复。
+	CoolingUntil int64 `json:"cooling_until,omitempty"`
+	// WindowWeighted 是滑动 5h 窗口内本地账本的加权 token 计数（下限口径，见上）。
+	WindowWeighted float64 `json:"window_weighted"`
+}
+
+// engineQuotaRows 组装披露行；无引擎配置时返回 nil（额度条不多占地）。
+func engineQuotaRows(root string, cfg *Config, now time.Time) []EngineQuota {
+	if cfg == nil || len(cfg.Engines) == 0 {
+		return nil
+	}
+	byEngine := engineWindowSpent(root, now)
+	var rows []EngineQuota
+	for _, name := range sortedEngineNames(cfg.Engines) {
+		row := EngineQuota{Name: name, Tier: engineDisplayTier(cfg, cfg.Engines[name]), WindowWeighted: byEngine[name]}
+		if cd := loadEngineCooldown(root, name); cd.active(now) {
+			row.CoolingUntil = cd.UntilEpoch
+		}
+		rows = append(rows, row)
+	}
+	return rows
 }
 
 type BurnResp struct {

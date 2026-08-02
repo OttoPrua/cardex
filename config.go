@@ -100,6 +100,23 @@ type Config struct {
 	// 这是**全局兜底值**：stakes_policy.<档>.max_fix_rounds 非 0 时按档覆盖它（add 时钉到卡面）。
 	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 
+	// ---- 多订阅引擎档案（Kimi Code / GLM Coding Plan / MiniMax / MiMo / OpenCode Go / Ollama Cloud…）----
+	// Engines 键 = 引擎名（进 Runner 标签与 cooldown-<名>.json，限小写字母数字连字符；
+	// claude/codex/remote 是保留字）。执行复用 claude CLI + 按档案注入环境变量（base_url/
+	// 认证/模型映射），每个引擎独立冷却、账本打 engine 标、不占 claude 红线预算。
+	// 内置预设用 `cardex engines add <预设名>` 并入；设计规格见 docs/2026-08-02-engine-profiles-design.md。
+	Engines map[string]EngineProfile `json:"engines,omitempty"`
+	// FallbackOrder 是 claude 被冷却/红线拦住时的改道顺序（"codex" 与 engines 的键混排，
+	// 逐个找第一个可用出路）。默认 ["codex"]——不配引擎则行为与旧版完全一致。
+	// 质量地板（no_fallback_models/交叉卡/复审位）对链上每一项同等生效，见 tick.go。
+	FallbackOrder []string `json:"fallback_order,omitempty"`
+	// ModelTiers 自定义分级表：模型 ID（小写；精确或前缀匹配，"glm-4.7" 盖住 "glm-4.7:cloud"）
+	// → 档位关键字（fable/opus/sonnet/haiku）。优先于内置统一标准线——给"机队里没有更强模型"
+	// 的用户按牌面定档：手里最强的模型就是自己的 fable 档，看板/引擎档位展示随之。
+	// 只影响档位**展示与推导**；派发路由不吃档位（模型槽位由 engines.<名>.models 显式填）。
+	// 值写错载入即拒（fail fast），键必须全小写。见 docs/guide.md「自定义分级」。
+	ModelTiers map[string]string `json:"model_tiers,omitempty"`
+
 	// ---- 远程执行器（SSH → 远端 codex，让远端主机进编排）----
 	// SSHBin 默认 "ssh"（测试可指向 mock-ssh）。RemoteHosts 键 = Task.RemoteHost（ssh 别名）。
 	// 远端 codex 走自己的 GPT 额度：不记 claude 账本、不写全局冷却、不受 claude 冷却/红线阻塞。
@@ -420,6 +437,7 @@ func defaultConfig(claudeBin string) *Config {
 			"default": 1, "opus": 5, "sonnet": 1, "haiku": 0.2, "claude-fable-5": 10, "fable": 10,
 		},
 		NoFallbackModels: []string{"claude-fable-5", "fable"},
+		FallbackOrder:    []string{"codex"},
 		StakesPolicy:     defaultStakesPolicy(),
 		RetroEveryNDone:  0,
 		// 交叉验证默认引擎对：设计档模型撞限时，用两个不同引擎独立作答再交叉查漏顶替。
@@ -579,6 +597,11 @@ func loadConfig(root string) (*Config, error) {
 	cfg := defaultConfig("claude")
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("解析 %s 失败: %w", configPath(root), err)
+	}
+	// 引擎档案的配置面错误在读入时就炸：等到派发/执行时才发现，卡已经在队里静默跳过
+	// 或把额度花错账号（auth_var 注错的表现是 claude CLI 静默用本机订阅跑）。
+	if err := validateEngines(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
 	}
 	return cfg, nil
 }

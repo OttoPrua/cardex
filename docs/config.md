@@ -29,6 +29,9 @@
 | `codex_fallback_model` | "" | claude 卡降级到 codex 时用此模型（档位对等：opus→terra，不降 sol）；空回退 `codex_model` |
 | `codex_reasoning` | "" | 全局 codex 推理档（minimal/low/medium/high/xhigh/max/ultra）→ `-c model_reasoning_effort=…`；任务级 effort 可覆盖 |
 | `codex_review_sandbox` | "worktree-write" | codex 只读分析卡(design-review/crosscheck 等)的沙箱策略。默认 `worktree-write`:**本机** codex 建一次性隔离副本 + `--sandbox workspace-write`,复审可跑测试/写夹具做动态验证,副本落 `<root>/tmp/codex-review-work/`,卡结束即删,原仓永不受写污染(CG-R3)。**远端** codex 只对 `t.Dir` 位于 `remote_mirror_root` 之下的镜像卡放宽；默认用 `workspace-write`，若该主机显式配置 `sandbox: "danger-full-access"`（Windows OS sandbox runner 不可用），严格镜像子孙继承该值。交叉/协调/回退等真实业务仓仍维持 `--sandbox read-only` 硬保证。改 `readonly` 全线回落旧行为。**取值写错时按最小权限回落 `readonly`(fail-closed)并在日志披露一次**；键留空/不写才用默认 `worktree-write`。sequence 卡不受此配置影响。 |
+| `engines` | {}（空） | 多订阅引擎档案：键=引擎名（小写字母数字连字符；claude/codex/remote 保留），值含 base_url、认证三选一（auth_env 环境变量名引用 / auth_file 文件 / auth_value 明文）、auth_var（注入变量名，仅 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY）、models 档位映射（fable/opus/sonnet/haiku → 供应商模型 ID）、default_model、extra_env、limit_fallback_min（0 继承全局）、tier 展示档位。内置预设用 `cardex engines add <名>` 并入；见[进阶指南 · 多订阅引擎](guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud) |
+| `fallback_order` | ["codex"] | claude 冷却/红线时的改道顺序（"codex" 与 engines 键混排，逐个找第一个可用出路）；质量地板（`no_fallback_models`/交叉卡/复审位）对链上每一项同等生效 |
+| `model_tiers` | {}（空） | 自定义分级表：模型 ID（全小写，精确或前缀匹配）→ 档位关键字（fable/opus/sonnet/haiku），优先于内置统一标准线。给无更强模型的机队按牌面定档；只影响档位展示与引擎档位推导，派发路由不吃档位。坏值载入即拒。见[进阶指南 · 自定义分级](guide.md#自定义分级model_tiers无更强模型的机队按牌面定档) |
 | `cross_profiles` | {opus-codex} | 交叉验证引擎对（`cardex cross`），见[进阶指南 · 交叉验证](guide.md#交叉验证fable-顶替双引擎独立作答--对抗式交叉查漏) |
 | `default_cross_profile` | "opus-codex" | `cross` 未指定 `-profile` 时用的引擎对 |
 | `default_review_host` | "" | 全局默认审核主机（`remote_hosts` 的键）；三键齐备时本地实现卡自动分流，见[进阶指南 · 审核分流](guide.md#审核分流把只读审核负载摊到第二台机器) |
@@ -45,6 +48,7 @@
 | `projects.<项目id>.name` / `.desc` / `.phases.<阶段名>` | 项目块 | 人工文案覆盖自动推导的项目/阶段介绍 |
 | `projects.<项目id>.goal` | 项目块 | 目标锚定的「落地进度」（与卡片进度并列，不替换），见[进阶指南](guide.md#项目覆盖块-cardexboardjson) |
 | `projects.<项目id>.kind_rules` | 项目块 | 人工分类规则（标题子串或任务 ID 全串 → kind）；坏规则逐条跳过并挂 `kind_rule_error` |
+| `projects.<项目id>.planned_total_cards` | 项目块 | 「含预估余量」进度口径的人工计划锚点（阶段性计划总卡量），声明后恒压过历史膨胀率自动估算；计划达成/调整时人工更新即校准。0/不写 = 走自动估算 |
 | `project_aliases` | **顶层** | 有序的「目录 → 项目」归组规则表 `[{"match":"<精确目录或 glob>","title":"<标题子串，可选>","project":"<项目名>"}]`。首条命中即用；归组优先级 **显式(`add -project`) > 别名 > 内建模式 > 目录启发式 > 「未分类」**。改这张表不动任何任务卡，下次快照重建全量追溯生效——这是整理存量野项目的手段。坏规则逐条跳过并挂 `project_alias_error`。详见[进阶指南 · 项目归属](guide.md#项目归属显式--别名--模式--启发式--未分类) |
 
 `match` 不含通配符时是**精确匹配该目录**（防止给容器目录写一条规则就吞掉它下面所有项目）；要覆盖子树写 `X/*`（glob 匹配该目录或其任一祖先，故覆盖任意深度）。大小写不敏感。

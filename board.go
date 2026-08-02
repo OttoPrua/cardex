@@ -287,13 +287,16 @@ func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 	// 顶部额度条只用 burn.Sources（与窗口无关），取最便宜的 24h 那格即可——
 	// 传别的窗口会让总览页顺带触发 30 天的 transcript 全扫。
 	burn := s.burn.get(s.root, snap.Cfg, now, "24h")
+	quota := quotaSummary(burn.Sources)
+	// 订阅引擎披露行：冷却状态 + 本地账窗口计数（下限口径，非订阅端权威用量）。
+	quota.Engines = engineQuotaRows(s.root, snap.Cfg, now)
 	resp := OverviewResp{
 		GeneratedAt:            now.Format(time.RFC3339),
 		Root:                   snap.Root,
 		Totals:                 snap.Totals,
 		MaxParallel:            snap.Cfg.MaxParallel,
 		Projects:               projects,
-		Quota:                  quotaSummary(burn.Sources),
+		Quota:                  quota,
 		BoardOverrideError:     snap.BoardOverrideError,
 		BoardOverrideErrorKind: snap.BoardOverrideErrorKind,
 		ProjectAliasError:      snap.ProjectAliasError,

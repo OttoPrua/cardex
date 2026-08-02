@@ -504,6 +504,15 @@ button { font: inherit; color: inherit; }
 .prog-seg { height: 100%; }
 .prog-seg:first-child { border-radius: 4px 0 0 4px; }
 .prog-seg:last-child  { border-radius: 0 4px 4px 0; }
+/* 预估余量幽灵段（含预估口径）：斜纹镂空——一眼区别于任何实卡状态色，避免被读成真实卡。 */
+.prog-seg.is-est-remaining {
+  background: repeating-linear-gradient(45deg, transparent, transparent 3px,
+    var(--line) 3px, var(--line) 6px);
+  opacity: .75;
+}
+/* 进度口径切换钮：est 态高亮提醒——预估口径下的百分比不是实卡账，别忘了自己切过去了。 */
+.scale-toggle { font-weight: 700; }
+.scale-toggle.is-est { color: var(--accent, #7aa2ff); border-color: currentColor; }
 .prog-seg:only-child  { border-radius: 4px; }
 .prog-pct {
   font-size: 12px; font-weight: 640; color: var(--ink-2);

@@ -171,7 +171,10 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 		// 会被读成这条线没在动。
 		ps.Tasks++
 
-		if t.CostUSD <= 0 {
+		// 订阅引擎卡一律归 Unpriced：claude CLI 报的 total_cost_usd 是按 Anthropic 价目
+		// 对供应商模型算的（未知模型多为 0，偶有别名误计价），与真实订阅成本口径不可比——
+		// 混进 Priced 会污染"平均每卡花费"。与文件头 codex 卡 cost=0 的披露纪律同源。
+		if t.CostUSD <= 0 || taskEngineName(cfg, t) != "" {
 			out.Unpriced++
 			continue
 		}
@@ -185,7 +188,7 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 		}
 		m := byModel[model]
 		if m == nil {
-			m = &ModelSpend{Model: model, Tier: modelTier(model)}
+			m = &ModelSpend{Model: model, Tier: modelTier(cfg, model)}
 			byModel[model] = m
 		}
 		m.Tasks++
@@ -213,7 +216,7 @@ func buildTaskSpend(cfg *Config, snap *boardSnapshot, key string, now time.Time)
 			}
 		}
 		if best != "" {
-			ps.TopModel, ps.TopModelTier, ps.TopModelCost = best, modelTier(best), round2(bestCost)
+			ps.TopModel, ps.TopModelTier, ps.TopModelCost = best, modelTier(cfg, best), round2(bestCost)
 		}
 		out.ByProject = append(out.ByProject, *ps)
 	}

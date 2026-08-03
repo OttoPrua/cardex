@@ -1,5 +1,50 @@
 # cardex changelog
 
+## 2026-08-03 · Gemini CLI fallback executor (second heterogeneous executor)
+
+- **Execution** (gemini.go): headless `gemini -o json` (prompt over stdin); sessions are
+  cardex-generated UUIDs via `--session-id`/`--resume` — pinned cards (`-runner gemini`)
+  support multi-step and limit-resume, closing codex's single-step gap. Non-sequence cards
+  are forced to `--approval-mode plan` (read-only hard guard — gemini has no OS sandbox);
+  sequence cards use `gemini_approval_mode` (default yolo).
+- **Lane cooldown** (reuses engine infra, `cooldown-gemini.json`): Google quotas are
+  account-level daily request counts (official quota-and-pricing, verified 2026-08-03:
+  OAuth free tier 1,000/day, AI Pro 1,500, AI Ultra 2,000, free API key 250/day Flash-only),
+  so daily exhaustion suspends the lane, not just the card. **Auth/eligibility errors also
+  suspend the lane for 6h** (reason prefixed `auth:`, incl. the observed
+  `IneligibleTierError: UNSUPPORTED_CLIENT` — the personal free OAuth tier is rejected by
+  gemini-cli 0.42+; Google is migrating individuals to Antigravity); the queue self-heals
+  once credentials are fixed. Per-minute throttling stays on retry backoff, never the lane.
+  Detection wording is grounded in the CLI's own error-classification source
+  (googleQuotaErrors.ts).
+- **Dispatch**: pinned cards never fail open; `fallback_order` whitelists `"gemini"`; the
+  divert gate mirrors codex's five checks plus the lane-cooldown check; `engineVia`
+  excludes gemini (reserved name — engine profiles cannot claim it).
+- **Model mapping**: tier-slot map `gemini_models` (defaults fable/opus→pro, sonnet→flash,
+  haiku→flash-lite — official stable aliases, so Google model rotations need no config
+  change; pro for high tiers is an explicit call based on the coding cross-signal,
+  SWE-bench 80.6%). Resolution never returns empty (empty = auto routing with silent model
+  swaps, rejected); every fallback is disclosed in the task log. Unified standard-line
+  tiers (AA II v4.1 snapshot 2026-08-03, anchors cross-checked against the 2026-08-02
+  table): flash line 50 = sonnet band, pro line 46 = top edge of the haiku band,
+  flash-lite 36 / 2.5-pro 26.
+- **Cross-check fifth engine kind** (`"kind": "gemini"`): identity frozen into
+  `XFrozenEngine.GeminiModel` / task `XGeminiModel`; a profile that sets `model` or
+  `effort` is rejected at load (gemini CLI has no reasoning-effort knob — swallowing it
+  would fake a max-effort verdict).
+- **Ledger/board**: usage.json records tagged `engine:"gemini"` (never counted against the
+  claude redline); modelTierKeyword/effectiveModel gained gemini branches (bare aliases
+  match exactly — no false hits on other vendors' `*-pro`/`*-flash`); boardspend/boardweight
+  disclosure wording now covers gemini.
+- **Two pre-existing codex gaps fixed in passing**: `cardex cmd` used to print a wrong
+  claude command for codex-pinned cards (now prints a `codex exec` form); `cardex doctor`
+  never checked `codex_bin` (now checked alongside gemini_bin; the gemini side also reports
+  the three auth paths and lane-cooldown state). Also fixed a wiring bug found during the
+  work: gemini/engine successes could wrongly clear claude's global cooldown.
+- Design spec: docs/2026-08-03-gemini-executor-design.md; 14 new pinning tests (slot-map
+  priority, forced plan mode, three-way limit classification, lane-vs-claude cooldown
+  isolation, six divert gates, argv/stdin contract, cross freeze, tiers).
+
 ## 2026-08-03 · License change: MIT → PolyForm Noncommercial 1.0.0
 
 Personal use, study and research, hobby projects, and charitable/educational/public-research

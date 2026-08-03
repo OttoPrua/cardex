@@ -255,7 +255,7 @@ func spendBasis(s *TaskSpend) string {
 		b.WriteString(strconv.Itoa(s.Tasks))
 		b.WriteString(" 张卡中有 ")
 		b.WriteString(strconv.Itoa(s.Unpriced))
-		b.WriteString(" 张没有花费数据（codex / 远端 codex 不回报花费，未跑或已取消的卡同样为空），")
+		b.WriteString(" 张没有花费数据（codex / 远端 codex / gemini 不回报美元花费，未跑或已取消的卡同样为空），")
 		b.WriteString("它们烧的是另一套额度，**未计入**上面的合计。")
 	}
 	b.WriteString(" 时间按卡的 updated_at（跑完那一刻）归档；")

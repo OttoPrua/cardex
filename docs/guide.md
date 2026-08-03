@@ -435,6 +435,68 @@ progress-pull 2——相差 28 倍**，多步卡（112）又是单步卡（41）
 
 **钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
 
+## Gemini CLI 备用执行器（第二异构执行器）
+
+Google 的 `gemini` CLI 是与 codex 并列的**第二个异构执行器**（独立 CLI、独立输出协议、独立
+Google 订阅额度；接入方式以官方文档为准，核实 2026-08-03，设计规格
+docs/2026-08-03-gemini-executor-design.md）：
+
+```jsonc
+"gemini_bin": "/opt/homebrew/bin/gemini",
+"gemini_model": "pro",                    // 卡无模型时的默认；官方稳定别名 pro/flash/flash-lite
+"gemini_models": {                        // 档位槽映射（缺省即此表）：claude 卡改道时按 t.Model 档位查
+  "fable": "pro", "opus": "pro", "sonnet": "flash", "haiku": "flash-lite"
+},
+"fallback_order": ["codex", "gemini"]     // gemini 进降级链：codex 不可用再轮到 gemini
+```
+
+与 codex 的三点差异（都是拿引擎档案的既有基建补 codex 的短板）：
+
+- **有会话**：`--session-id <uuid>`（cardex 生成，不解析输出）/`--resume` 续跑——钉定卡
+  （`-runner gemini`）多步可用、限额中断续跑可用，不受 codexEligible 单步形状限制
+  （改道径仍限单步形状，与全链同规）；
+- **有车道冷却**：`cooldown-gemini.json`。Google 配额是**账号级每日请求数**（OAuth 免费档
+  1000/天、Google AI Pro 1500、AI Ultra 2000、API key 免费档 250/天仅 Flash——官方
+  quota-and-pricing，核实 2026-08-03），一张卡撞到当日耗尽 = 整条车道耗尽，挂车道而不是
+  像 codex 只挂本卡；**认证/资格错误同样挂车道 6 小时**（reason 前缀 `auth:`）——重试不能
+  修好凭据，挂车道让队列自愈，修好后到点自恢复；每分钟限流（PerMinute/裸 429）不挂车道，
+  走普通退避重试；
+- **记账**：`usage.json` 打 `engine:"gemini"` 标——不占 claude 红线预算；CLI 报 token 不报
+  美元，花费口径归 Unpriced 披露（与 codex 同）。
+
+**模型映射用官方稳定别名**（`pro`/`flash`/`flash-lite`，官方 models.ts 常量）：Google 轮换
+代次不用改配置。当前解析（核实 2026-08-03）：pro→gemini-3.1-pro-preview 线、flash→
+gemini-3.5-flash 线。高档槽取 pro 是按**编码交叉信号**（SWE-bench V：pro 80.6% > 3.6-flash
+77.5% > 3.5-flash 68.6%，Vals 子集）的显式取舍；统一标准线（AA II v4.1）上 flash=50 反超
+pro=46——展示档位按标准线披露（pro 显示轻量档上沿），要按牌面抬档用 `model_tiers` 覆写。
+`auto` 别名被否决：撞配额会静默换模型，违反「档位漂移必须可见」。
+
+**审批模式即安全边界**：gemini 无 codex 那样的 OS 沙箱。非 sequence 卡（复审/协调/装配/
+交叉/进度回收）**恒强制 `--approval-mode plan`（只读）**，不吃配置；sequence 卡用
+`gemini_approval_mode`（空=yolo——与 claude 卡 acceptEdits 姿态同级，信任边界是任务内容
+本身）。因此 gemini 不需要 codex 的复审副本机制——plan 只读天然保护原仓。
+
+**认证三条路径**（`cardex doctor` 报「已配置/缺失」，值不回显）：`gemini_auth_env` 指名的
+环境变量（注入为 GEMINI_API_KEY，密钥不进 config）> 环境 `GEMINI_API_KEY` > OAuth 缓存
+凭据（`~/.gemini/oauth_creds.json`）。**注意（2026-08-03 实测）**：OAuth 个人免费档已被
+gemini-cli 0.42+ 拒绝（`IneligibleTierError: UNSUPPORTED_CLIENT`，Google 要求个人免费档
+迁移 Antigravity）——可用路径是 Google AI Pro/Ultra 订阅的 OAuth，或 AI Studio API key
+（免费档 250 次/天仅 Flash）。认证没修好也可以安全地把 gemini 留在 fallback_order：
+首次改道撞认证错误即挂车道，之后 6 小时内不再空撞。
+
+交叉验证第五种引擎 kind（`"kind": "gemini"`）：要求 `gemini_bin` 与 `gemini_model` 都显式
+配置（身份可冻结）；profile 里写 `model` 或 `effort` 载入即拒——模型由 `gemini_model` 决定，
+而 gemini CLI **没有思考等级参数**，静默吞 effort 会让人以为乙引擎跑在 max。示例：
+
+```jsonc
+"cross_profiles": {
+  "opus5-gemini": {
+    "a": { "kind": "claude", "model": "claude-opus-5", "effort": "max", "label": "opus5·max" },
+    "b": { "kind": "gemini", "label": "gemini·pro" }
+  }
+}
+```
+
 ## 多订阅引擎（engine profiles：Kimi / GLM / MiniMax / MiMo / OpenCode Go / Ollama Cloud）
 
 Claude 之外的编码订阅计划基本都提供 **Anthropic 兼容端点**——接入方式同构：还是跑同一个
@@ -476,8 +538,18 @@ cardex add -runner kimi -model sonnet -dir ~/proj "重构上传模块"
 | `ollama` | Ollama Cloud 云订阅（Free/Pro/Max） | ollama.com | glm-4.7:cloud（33.7）等 `:cloud` 目录 | 随映射模型 |
 
 参考分数（同快照）：Kimi K2.6 = 44.2、DeepSeek V4 Pro = 44.3、Qwen3.7 Max = 46.0、
-GLM-5 = 39.5、GLM-4.7 = 33.7、MiniMax M2.7 = 38.1。据此的**推荐降级链**（按档位从高到低，
-只把你真的订阅了的加进去）：`["codex", "kimi", "opencode-go", "glm-cn", "minimax-cn", "mimo", "ollama"]`。
+GLM-5 = 39.5、GLM-4.7 = 33.7、MiniMax M2.7 = 38.1。**Gemini 执行器**（AA II v4.1 快照
+2026-08-03，锚点与上表同量表核对无漂移）：gemini-3.5/3.6-flash = 50（sonnet 档，与 GLM-5.2
+同带）、gemini-3.1-pro-preview = 46（haiku 档上沿，SWE-bench V 80.6% 编码交叉信号偏 sonnet）、
+gemini-3.5-flash-lite = 36 / gemini-2.5-pro = 26（haiku 档）。
+
+据此的**推荐降级链**（按档位从高到低，只把你真的订阅了的加进去）：
+`["codex", "kimi", "opencode-go", "glm-cn", "gemini", "minimax-cn", "mimo", "ollama"]`。
+**编程类质价比口径**（2026-08-03 委托人指示；AA II v4.1 + 单任务成本 + SWE-bench 交叉）：
+链上跑的本就是编程执行形状的卡（复审位/交叉卡/no_fallback 模型恒不进链——质量地板天然
+把"仅编程类"圈出来），编码向把 gemini 排在 glm 前：gemini flash 的编码交叉信号已知
+（SWE-bench 77.5%）而 glm-5.2 未评，AA 主档仅差 1 分（51 vs 50）；订阅额度都按请求计，
+边际成本同为零。通用（非编程）链仍按 AA 主档排序（glm 在前）。
 
 **行为语义**（与 codex 备用执行器的差异是理解重点）：
 

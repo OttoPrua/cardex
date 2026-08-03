@@ -434,6 +434,81 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 
 **Pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
 
+## Gemini CLI fallback executor (second heterogeneous executor)
+
+Google's `gemini` CLI is a **second heterogeneous executor** alongside codex (its own CLI, its
+own output protocol, its own Google subscription quota; integration follows the official docs,
+verified 2026-08-03; design spec docs/2026-08-03-gemini-executor-design.md):
+
+```jsonc
+"gemini_bin": "/opt/homebrew/bin/gemini",
+"gemini_model": "pro",                    // default when a card has no model; official stable aliases pro/flash/flash-lite
+"gemini_models": {                        // tier slot mapping (unset defaults to this table): looked up by t.Model tier when a claude card diverts
+  "fable": "pro", "opus": "pro", "sonnet": "flash", "haiku": "flash-lite"
+},
+"fallback_order": ["codex", "gemini"]     // gemini joins the fallback chain: once codex is unavailable, gemini is next
+```
+
+Three differences from codex (all borrowed from the engine-profile infrastructure to cover codex's gaps):
+
+- **Has sessions**: `--session-id <uuid>` (cardex-generated, never parsed from output) / `--resume`
+  to continue — pinned cards (`-runner gemini`) support multi-step and limit-interrupt resume,
+  unconstrained by the codexEligible single-step-shape restriction (the divert path is still
+  limited to single-step shapes, same rule as the rest of the chain);
+- **Has a lane cooldown**: `cooldown-gemini.json`. Google's quota is an **account-level daily
+  request count** (OAuth free tier 1000/day, Google AI Pro 1500, AI Ultra 2000, API-key free tier
+  250/day Flash-only — official quota-and-pricing, verified 2026-08-03), so one card hitting the
+  daily cap means the **whole lane** is exhausted — cooling down the lane rather than just that
+  card the way codex does; **auth/eligibility errors likewise cool down the lane for 6 hours**
+  (reason prefixed `auth:`) — a retry can't fix broken credentials, so parking the lane lets the
+  queue self-heal and auto-resume once credentials are fixed; per-minute rate limiting
+  (PerMinute / bare 429) does not cool down the lane and just gets ordinary backoff-and-retry;
+- **Ledger**: `usage.json` entries are tagged `engine:"gemini"` — they don't count against the
+  claude redline budget; the CLI reports tokens, not dollars, so spend is disclosed under
+  Unpriced (same as codex).
+
+**Model mapping uses the official stable aliases** (`pro`/`flash`/`flash-lite`, official
+`models.ts` constants): Google's generation rotations never require a config change. Current
+resolution (verified 2026-08-03): pro → the gemini-3.1-pro-preview line, flash → the
+gemini-3.5-flash line. The top tier slot takes pro as a deliberate call based on the **coding
+cross-signal** (SWE-bench V: pro 80.6% > 3.6-flash 77.5% > 3.5-flash 68.6%, Vals subset); on the
+standard line (AA II v4.1), flash=50 actually beats pro=46 — the displayed tier discloses that
+standard-line reading (pro shows at the top of the lightweight tier), and to rank by the raw
+scoreboard instead, override with `model_tiers`. The `auto` alias was rejected: hitting quota
+would silently swap models, violating "tier drift must be visible".
+
+**Approval mode is the safety boundary**: gemini has no OS-level sandbox the way codex does.
+Non-`sequence` cards (review / coordinate / assembly / cross / progress-pull) **always force
+`--approval-mode plan` (read-only)**, ignoring config; `sequence` cards use
+`gemini_approval_mode` (empty = yolo — the same trust posture as a claude card's acceptEdits,
+where the trust boundary is the task content itself). Gemini therefore doesn't need codex's
+review-copy machinery — plan mode's read-only nature protects the source repo by construction.
+
+**Authentication, three paths** (`cardex doctor` reports "configured/missing", values never
+echoed): the env var named by `gemini_auth_env` (injected as `GEMINI_API_KEY`, the secret itself
+never enters config) > the `GEMINI_API_KEY` environment variable > cached OAuth credentials
+(`~/.gemini/oauth_creds.json`). **Note (verified 2026-08-03)**: the OAuth personal free tier is
+now rejected by gemini-cli 0.42+ (`IneligibleTierError: UNSUPPORTED_CLIENT` — Google requires the
+personal free tier to migrate to Antigravity); the working paths are OAuth under a Google AI
+Pro/Ultra subscription, or an AI Studio API key (free tier 250 requests/day, Flash only). It's
+safe to leave gemini in `fallback_order` even with auth unresolved: the first divert that hits an
+auth error parks the lane, with no further wasted attempts for the next 6 hours.
+
+Cross-verification gets a fifth engine kind (`"kind": "gemini"`): it requires both `gemini_bin`
+and `gemini_model` to be explicitly configured (so identity can be frozen); writing `model` or
+`effort` inside the profile is rejected at load — the model is decided by `gemini_model`, and the
+gemini CLI **has no thinking-effort parameter**, so silently swallowing `effort` would leave the
+impression that engine 乙 was running at max. Example:
+
+```jsonc
+"cross_profiles": {
+  "opus5-gemini": {
+    "a": { "kind": "claude", "model": "claude-opus-5", "effort": "max", "label": "opus5·max" },
+    "b": { "kind": "gemini", "label": "gemini·pro" }
+  }
+}
+```
+
 ## Multi-subscription engines (engine profiles: Kimi / GLM / MiniMax / MiMo / OpenCode Go / Ollama Cloud)
 
 Most coding subscriptions besides Claude expose an **Anthropic-compatible endpoint**, so the
@@ -479,9 +554,21 @@ high/mid/low**; models without a same-snapshot score are marked unrated, never g
 | `ollama` | Ollama Cloud subscription (Free/Pro/Max) | ollama.com | glm-4.7:cloud (33.7) etc. from the `:cloud` catalog | follows mapped model |
 
 Reference scores on the same snapshot: Kimi K2.6 = 44.2, DeepSeek V4 Pro = 44.3, Qwen3.7 Max =
-46.0, GLM-5 = 39.5, GLM-4.7 = 33.7, MiniMax M2.7 = 38.1. The resulting **recommended fallback
-chain** (tier-descending; only add plans you actually subscribe to):
-`["codex", "kimi", "opencode-go", "glm-cn", "minimax-cn", "mimo", "ollama"]`.
+46.0, GLM-5 = 39.5, GLM-4.7 = 33.7, MiniMax M2.7 = 38.1. **Gemini executor** (AA II v4.1 snapshot
+2026-08-03, anchor cross-checked against the same scale as the table above, no drift):
+gemini-3.5/3.6-flash = 50 (sonnet tier, same band as GLM-5.2), gemini-3.1-pro-preview = 46 (top of
+haiku tier; SWE-bench V 80.6% coding cross-signal leans sonnet), gemini-3.5-flash-lite = 36 /
+gemini-2.5-pro = 26 (haiku tier).
+
+The resulting **recommended fallback chain** (tier-descending; only add plans you actually
+subscribe to): `["codex", "kimi", "opencode-go", "glm-cn", "gemini", "minimax-cn", "mimo", "ollama"]`.
+**Coding cost-effectiveness rule** (2026-08-03 instruction; AA II v4.1 + per-task cost +
+SWE-bench cross-check): the chain only ever runs coding-execution-shaped cards (review seats /
+cross cards / `no_fallback` models never enter the chain — the quality floor naturally scopes it
+to "coding only"), so for coding it ranks gemini ahead of glm: gemini flash's coding cross-signal
+is known (SWE-bench 77.5%) while glm-5.2 is unrated, and the AA main-tier gap is only 1 point
+(51 vs 50); both subscriptions bill per request, so marginal cost is zero either way. The general
+(non-coding) chain still ranks by AA main tier (glm first).
 
 **Behavioral semantics** (the differences vs. the codex backup executor are the point):
 

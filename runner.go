@@ -949,6 +949,7 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 // ctx 由 tick 持有：任务被 cancel 后 tick 对账发现即取消 ctx，整组击杀执行进程。
 func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via string) error {
 	useCodex := via == "codex"
+	useGemini := geminiVia(via)
 	engineName := ""
 	if engineVia(via) {
 		engineName = via
@@ -988,6 +989,8 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		t.Runner = "remote:" + t.RemoteHost
 	case useCodex:
 		t.Runner = "codex"
+	case useGemini:
+		t.Runner = "gemini"
 	case engineName != "":
 		t.Runner = engineName // 引擎名即执行器标签（看板/账本/审计三处同源）
 	default:
@@ -1051,6 +1054,8 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		runnerTag := ""
 		if useCodex {
 			runnerTag = "  runner=codex"
+		} else if useGemini {
+			runnerTag = "  runner=gemini"
 		} else if engineName != "" {
 			runnerTag = "  runner=" + engineName
 		}
@@ -1075,6 +1080,21 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			case useCodex:
 				// codex 走自己的额度：不记 claude 账本；其限额/错误按普通错误退避，不写全局冷却。
 				res, combined, runErr = invokeCodex(ctx, root, cfg, t, prompt)
+			case useGemini:
+				// gemini 走 Google 订阅额度：账本打 engine:"gemini" 标（不占 claude 红线），
+				// 限额/认证错误只写 cooldown-gemini.json 车道冷却。会话与引擎同规：只在钉定
+				// 主跑回写（改道卡回 claude 后带 gemini 会话 = 跨引擎 --resume，禁区）。
+				var note string
+				res, combined, note, runErr = invokeGemini(ctx, root, cfg, t, prompt)
+				if note != "" {
+					logBlock(lg, "GEMINI", "模型解析: "+note)
+				}
+				if t.PreferRunner == "gemini" && res != nil && res.SessionID != "" {
+					t.SessionID = res.SessionID
+				}
+				if res != nil {
+					appendUsage(root, cfg, t, res.Usage)
+				}
 			case engineName != "":
 				// 引擎档案：claude CLI + env 注入，走该订阅自己的额度。会话可续（与 claude 同构），
 				// 账本记录打 engine 标（不占 claude 红线预算），限额只写 cooldown-<name>.json。
@@ -1153,6 +1173,38 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			return finalizeCanceled(root, t, lg)
 		}
 
+		// 1d) gemini 车道挂起（当日配额耗尽 / 认证资格错误）：只写 cooldown-gemini.json，
+		// **绝不写 claude 全局冷却**。Google 配额是账号级每日请求数——挂车道（而非像 codex
+		// 只挂本卡）防止队里 N 张 gemini 卡各撞一次白烧派发轮。认证错误（IneligibleTierError/
+		// API key 无效）同走此分支：重试无益，挂车道 6h 让队列自愈，修好认证冷却到点即恢复。
+		// 会话语义与引擎分支同构：有会话→MidStep 续跑；fresh→重发本步。
+		if useGemini && !remote && limitHitForRunner(via, remote, t, res, combined) {
+			scan := geminiLimitScanText(res, combined)
+			kind := geminiSuspendKind(res, combined)
+			until := geminiResetEpoch(combined+"\n"+resultText(res), scan, cfg, now)
+			reason := geminiSuspendReason(res, combined, kind)
+			cdReason := reason
+			if kind == "auth" {
+				cdReason = "auth: " + reason
+			}
+			setEngineCooldown(root, "gemini", until, cdReason)
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = t.SessionID != ""
+			if t.FreshSteps {
+				t.SessionID = ""
+				t.MidStep = false
+			}
+			t.LastError = "gemini 车道挂起(" + kind + "): " + reason
+			t.touch()
+			logBlock(lg, "LIMIT", fmt.Sprintf("gemini 车道挂起（%s），%s 后恢复（%s）\n%s",
+				kind, fmtIn(until, now), fmtClock(until), reason))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+				"engine": "gemini", "kind": kind, "resume_at": until, "mid_step": t.MidStep,
+			})
+			return saveTask(root, t)
+		}
+
 		// 1c) 引擎限额：只写该引擎自己的 cooldown-<name>.json，**绝不写 claude 全局冷却**
 		// （Kimi 撞限额挂住 claude 队列＝把独立额度池焊死在一根保险丝上，本分支存在的全部意义
 		// 就是拆开它）。会话语义与 claude 分支同构：有会话→MidStep 续跑提示；fresh→重发本步。
@@ -1186,8 +1238,8 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		// 挡"自审本仓 transcript 含 usage limit 字面量 + 超时→误挂 limit_paused/写全局冷却"回归。
 		// 【CG-R1 R3 P2-3】三处 call site 全走 limitHitForEngine 单口路由, 让 (useCodex, remote)
 		// 到 wrapper 的映射被 TestLimitHitForEngineRoutesByFlags 钉住; 错改条件顺序会立即测试红。
-		// 引擎路由（engineName != ""）已被上方 1c 分支独占承接，此处仅本机 claude。
-		if engineName == "" && !useCodex && !remote && limitHitForEngine(useCodex, remote, t, res, combined) {
+		// 引擎路由（engineName != ""）已被上方 1c 分支独占承接，gemini 被 1d 承接，此处仅本机 claude。
+		if engineName == "" && !useCodex && !useGemini && !remote && limitHitForEngine(useCodex, remote, t, res, combined) {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			setCooldown(root, until, firstLine(combined))
 			t.Status = statusLimitPaused
@@ -1342,12 +1394,15 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			return saveTask(root, t)
 		}
 
-		// 3) 成功：推进步骤（codex/远端/引擎成功不代表 claude 限额解除，全局冷却只由 claude 路径
-		// 清除；引擎成功清的是自己的 cooldown-<name>.json——账各归各）。
+		// 3) 成功：推进步骤（codex/gemini/远端/引擎成功不代表 claude 限额解除，全局冷却只由
+		// claude 路径清除；引擎/gemini 成功清的是自己的 cooldown-<name>.json——账各归各）。
 		if !useCodex && !remote {
-			if engineName != "" {
+			switch {
+			case useGemini:
+				clearEngineCooldown(root, "gemini")
+			case engineName != "":
 				clearEngineCooldown(root, engineName)
-			} else {
+			default:
 				clearCooldown(root)
 			}
 		}
@@ -1754,8 +1809,10 @@ type emitTask struct {
 	FreshSteps  bool   `json:"fresh_steps"`
 	Runner      string `json:"runner"`
 	// CodexModel 卡级钉定 codex 模型（runner=codex 时随卡生效，档位对等制下协调器可按档发 terra/luna）。
-	CodexModel string   `json:"codex_model"`
-	Prompts    []string `json:"prompts"`
+	CodexModel string `json:"codex_model"`
+	// GeminiModel 卡级钉定 gemini 模型（runner=gemini 时随卡生效；推荐官方别名 pro/flash/flash-lite）。
+	GeminiModel string   `json:"gemini_model"`
+	Prompts     []string `json:"prompts"`
 	// 模型常见的字段名漂移，做别名容错：steps=[...] / prompt="..." / 标题写成 role 或 id。
 	Steps  []string `json:"steps"`
 	Prompt string   `json:"prompt"`
@@ -1959,8 +2016,8 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 			if orig, err := findTaskAnywhere(root, t.ReviewOf); err == nil && strings.TrimSpace(orig.Closeout) != "" {
 				co := newTask(root, cfg, typeSequence, "收口: "+baseFixTitle(orig.Title), orig.Dir, []string{orig.Closeout}, orig.Priority)
 				co.Model = "haiku"
-				co.Project = orig.Project   // 显式归属随派生卡继承（收口卡属于被收口卡的项目）
-				co.EmittedBy = t.ID         // 谱系标：系统派生卡，进度预估的派生耦合系数依赖（boardestimate.go）
+				co.Project = orig.Project // 显式归属随派生卡继承（收口卡属于被收口卡的项目）
+				co.EmittedBy = t.ID       // 谱系标：系统派生卡，进度预估的派生耦合系数依赖（boardestimate.go）
 				co.SkipPermissions = orig.SkipPermissions
 				co.RemoteHost = orig.RemoteHost
 				if saveTask(root, co) == nil {
@@ -2156,6 +2213,8 @@ func crossEngineIdentity(eng CrossEngine, cfg *Config) string {
 		return "claude|" + eng.Model
 	case "codex":
 		return "codex|" + cfg.CodexModel
+	case "gemini":
+		return "gemini|" + cfg.GeminiModel
 	case "remote-claude":
 		return "remote-claude|" + eng.Host + "|" + eng.Model
 	case "remote-codex":
@@ -2179,6 +2238,8 @@ func freezeCrossEngine(eng CrossEngine, cfg *Config) (*XFrozenEngine, error) {
 		if f.Effort == "" {
 			f.Effort = cfg.CodexReasoning
 		}
+	case "gemini":
+		f.GeminiModel = cfg.GeminiModel // gemini 无思考等级参数，Effort 恒空（applyCrossEngine 已拒非空）
 	case "remote-codex":
 		f.CodexModel = cfg.CodexModel
 		if f.Effort == "" {
@@ -2194,6 +2255,7 @@ func freezeCrossEngine(eng CrossEngine, cfg *Config) (*XFrozenEngine, error) {
 func applyFrozenEngine(t *Task, f *XFrozenEngine) {
 	t.Model, t.Effort, t.PreferRunner, t.RemoteHost = f.Model, f.Effort, f.PreferRunner, f.RemoteHost
 	t.XCodexModel = f.CodexModel
+	t.XGeminiModel = f.GeminiModel
 }
 
 func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
@@ -2227,6 +2289,24 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 		}
 		t.PreferRunner = "codex"
 		t.Effort = eng.Effort
+	case "gemini":
+		// 本机 gemini：钉 runner=gemini，用独立 Google 订阅额度。模型来自全局 gemini_model
+		//（身份必须显式，不吃内置 pro 回落——冻结的身份串要能对上实际执行）。
+		if cfg.GeminiBin == "" {
+			return fmt.Errorf("gemini 引擎需 config.gemini_bin")
+		}
+		if cfg.GeminiModel == "" {
+			return fmt.Errorf("gemini 交叉引擎需 config.gemini_model 显式指定（如官方别名 pro），否则身份不可冻结")
+		}
+		if eng.Model != "" {
+			return fmt.Errorf("gemini 交叉引擎的 model 由 config.gemini_model 决定，请从 profile 删掉 model 字段（此处写它会被忽略）")
+		}
+		// gemini CLI 没有思考等级参数（无 --effort / reasoning 等价物）：写了必须炸而不是静默吞——
+		// 使用者以为乙引擎跑在 max，实际参数根本没传出去，验证深度被静默降级。
+		if eng.Effort != "" {
+			return fmt.Errorf("gemini 交叉引擎不支持 effort（gemini CLI 无思考等级参数），请从 profile 删掉 effort 字段")
+		}
+		t.PreferRunner = "gemini"
 	case "remote-claude":
 		// SSH 远端 claude：Model 必填，否则 remoteUsesClaude 判 false 会被路由到远端 codex。
 		rh, ok := cfg.RemoteHosts[eng.Host]
@@ -2257,9 +2337,10 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 		t.RemoteHost = eng.Host
 		t.Effort = eng.Effort
 	default:
-		return fmt.Errorf("未知交叉引擎 kind %q（可选 claude/codex/remote-claude/remote-codex）", eng.Kind)
+		return fmt.Errorf("未知交叉引擎 kind %q（可选 claude/codex/gemini/remote-claude/remote-codex）", eng.Kind)
 	}
 	// codex/远端引擎要求 codexEligible（单步无会话）——交叉卡都是单步，正常满足；防御性兜底。
+	// gemini 不在此列：有会话（--session-id/--resume），无此形状约束。
 	if (t.PreferRunner == "codex" || t.RemoteHost != "") && !codexEligible(t) {
 		return fmt.Errorf("codex/远端引擎要求单步无会话")
 	}
@@ -2540,6 +2621,8 @@ func crossEngineLabel(eng CrossEngine) string {
 		return orDash(eng.Model) + "·" + orDash(eng.Effort)
 	case "codex":
 		return "codex"
+	case "gemini":
+		return "gemini"
 	case "remote-claude", "remote-codex":
 		return eng.Kind + "@" + eng.Host
 	}
@@ -2610,6 +2693,11 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 			if nt.PreferRunner == "codex" {
 				nt.CodexModel = s.CodexModel
 			}
+		}
+		// 协调同样可钉 gemini（独立 Google 订阅额度）。无 eligible 形状门：gemini 有会话，多步可用。
+		if s.Runner == "gemini" {
+			nt.PreferRunner = "gemini"
+			nt.GeminiModel = s.GeminiModel
 		}
 		if s.Model != "" {
 			nt.Model = s.Model

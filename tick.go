@@ -144,6 +144,14 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						// codex 钉定但上面条件没满足（codex_bin 缺失/不 eligible）：绝不 fail-open 到 claude。
 						// 引擎身份是交叉验证的交付物——甲乙跑成同引擎=验证形同虚设。跳过本轮，等 codex 可用。
 						continue
+					case t.PreferRunner == "gemini":
+						// gemini 钉定：gemini_bin 已配且车道不在冷却（cooldown-gemini.json）才派；
+						// 否则跳过本轮等车道恢复，绝不 fail-open 回 claude——与 codex/引擎钉定同一纪律。
+						// 不要求 codexEligible：gemini 有会话（--session-id/--resume），多步可用。
+						if !pinnedGeminiReady(root, cfg, now) {
+							continue
+						}
+						viaRunner[t.ID] = "gemini"
 					case engineVia(t.PreferRunner):
 						// 引擎钉定：档案在且该引擎不在冷却才派。缺档案/冷却中一律跳过等待——与 codex
 						// 钉定同一纪律，绝不 fail-open 回 claude（额度归属是用户显式划的边界）。

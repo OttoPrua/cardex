@@ -39,6 +39,9 @@
    - 只有上述高风险任务，或明确修改多个现役消费方共享契约的中风险任务，才设 `review_after: true`；其他任务必须为 false；
    - 填充类任务（独立视角审计、文档整理、低耦合支线）可加 "runner":"codex"——走独立的 GPT-5.5 额度，
      不占 claude 限额、claude 冷却期间也照跑；须配 "fresh_steps": true 或单步。
+   - 也可加 "runner":"gemini"（独立 Google 订阅额度，按每日请求数计）：多步可用（有会话），
+     "gemini_model" 可选 pro/flash/flash-lite（默认按档位映射）；注意非 sequence 类型在 gemini
+     上只读运行（plan 模式），写盘类任务须为 sequence 类型。
 3. 先用一小节人话说明分工方案，逐个任务给出：做什么、为什么这样分、建议模型、以及手动接管命令（形如 `cd <dir> && claude --model <模型>` 然后粘贴该任务第一步的 prompt）。这段说明会保留在任务日志里供人查阅。
 4. 本任务只做分工，不修改任何代码。如果项目还没有状态/任务清单文件，把"创建它"作为第一个任务（haiku 即可）。
 

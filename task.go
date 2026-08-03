@@ -51,6 +51,10 @@ type Task struct {
 	// 空 = 按径回落（降级径先看 config.codex_fallback_model，再全局 codex_model；主跑径直接全局）。
 	// 交叉链卡的 XCodexModel（入队冻结的引擎身份）恒优先于本字段。
 	CodexModel string `json:"codex_model,omitempty"`
+	// GeminiModel 钉定本卡经 gemini 执行时的具体模型（-gemini-model，推荐官方别名 pro/flash/
+	// flash-lite）。主跑（runner_pref=gemini）与降级改道两径都生效；空 = 按 t.Model 档位查
+	// config.gemini_models 槽映射（见 resolveGeminiModel 优先序）。XGeminiModel 恒优先。
+	GeminiModel string `json:"gemini_model,omitempty"`
 	// RemoteHost 非空时任务在该远程主机执行（SSH → 远端 codex），键入 Config.RemoteHosts。
 	// 让远端机器进编排（跨机 dev）；要求 remoteEligible（单步/fresh、无 claude 会话）。
 	RemoteHost string `json:"remote_host,omitempty"`
@@ -124,6 +128,9 @@ type Task struct {
 	// XCodexModel 是本卡冻结的 codex 模型（codex/远端 codex 引擎）。invokeCodex/invokeRemoteCodex 优先用它，
 	// 空才回落全局 codex_model——否则入队后改/清 codex_model 会静默换模型或掉 -m 跑默认模型。
 	XCodexModel string `json:"x_codex_model,omitempty"`
+	// XGeminiModel 是本卡冻结的 gemini 模型（kind=gemini 交叉引擎）。resolveGeminiModel 恒最高
+	// 优先——否则入队后改/清 gemini_model 会静默换模型（与 XCodexModel 同一防漂移纪律）。
+	XGeminiModel string `json:"x_gemini_model,omitempty"`
 	// 注：甲的结论**不**放在任何交叉卡的字段里，也不写进 A 的日志（RESULT 被抹）——最小化 B 的执行器
 	// 从盘上被动读到 A 的表面。A 完成后其结论落进 <root>/crosscheck/<XKey>.a 隔离侧车，仅由编排进程在派 C 时
 	// 读取注入 C 的 prompt、用完即删。B 卡不含 A 卡 ID、不含 A 结论。**诚实边界**：B 持有 XKey，而侧车路径

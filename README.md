@@ -110,6 +110,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 - **[Web 看板](docs/guide.md#web-看板board-命令)**——项目横排 kanban + **剩余**额度燃尽曲线 + 按「设计/落地/修复/审核」拆分的进度 + 目标锚定的「落地进度」+ 进度双口径（现有卡 / 含预估余量，计划锚点或历史膨胀率，口径全披露），数据不足一律显式披露，绝不编造估算；对队列数据只读（唯一写入是看板自己的项目折叠状态）。
 - **[5 小时额度红线](docs/guide.md#5-小时额度红线保底额度)**——给突发/交互任务留余量：本地账本 + CodexBar 用量源 + 订阅端点三通道，分歧时取最保守值；支持分时段红线。
 - **[Codex 备用执行器](docs/guide.md#codex-备用执行器限额空窗不断档)**——claude 冷却期把单步编排卡切给 codex；设计档模型钉定不降级，交叉验证的引擎独立性不被偷换。
+- **[Gemini CLI 备用执行器](docs/guide.md#gemini-cli-备用执行器第二异构执行器)**——第二异构执行器：`-runner gemini` 钉定（有会话、多步可用）、降级链改道、交叉验证第五种引擎；账号级每日配额挂车道冷却，认证故障自愈；模型映射用官方稳定别名（pro/flash/flash-lite），统一标准线定档。
 - **[多订阅引擎](docs/guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud)**——Kimi Code / GLM Coding Plan / MiniMax / 小米 MiMo / OpenCode Go / Ollama Cloud 订阅经引擎档案接入：复用 claude CLI + 环境注入，独立冷却、独立记账、统一能力分级（评测源锚定 Claude 各档），降级顺序自定义。
 - **[存量角色会话的接管](docs/guide.md#存量角色会话的接管此前手动维护的-审核装配执行-session)**——手工养的审核/装配/执行 session 按角色收编进队列。
 
@@ -134,8 +135,10 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见[进阶指南](docs/guide.md#codex-备用执行器限额空窗不断档) |
 | `codex_fallback_model` | "" | claude 卡降级到 codex 时用此模型（档位对等：opus→terra，不降 sol）；空回退 `codex_model` |
+| `gemini_bin` / `gemini_model` | 空 / ""（内置 pro） | Gemini CLI 第二异构执行器（钉定/降级链/交叉验证），见[进阶指南](docs/guide.md#gemini-cli-备用执行器第二异构执行器) |
+| `gemini_models` | fable/opus→pro，sonnet→flash，haiku→flash-lite | 档位槽映射（官方稳定别名）；非 sequence 卡恒 `--approval-mode plan` 只读 |
 | `engines` | {}（空） | 多订阅引擎档案（Kimi/GLM/MiniMax/MiMo/OpenCode Go/Ollama Cloud），`cardex engines add <名>` 并入预设，见[进阶指南](docs/guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud) |
-| `fallback_order` | ["codex"] | claude 冷却/红线时的改道顺序（codex 与引擎名混排，质量地板对全链生效） |
+| `fallback_order` | ["codex"] | claude 冷却/红线时的改道顺序（codex/gemini 与引擎名混排，质量地板对全链生效） |
 | `model_tiers` | {}（空） | 自定义分级表（模型→档位，优先于内置标准线）：无更强模型的机队按牌面定档 |
 | `default_review_host` / `remote_mirror_root` / `default_review_sync` | "" | 审核分流三件套：三键齐备时本地实现卡的自动审核默认分流到远端 |
 | `remote_hosts.<name>.codex_only` | false | 主机级额度硬边界：为 true 时该远端只运行 Codex，自动审核也不会调用 Claude |

@@ -226,8 +226,9 @@ func cmdAdd(args []string) error {
 	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
 	stakes := fs.String("stakes", "", "投入产出档位（low|normal|high，缺省 normal）：按 config.stakes_policy 查表决定是否配对抗复审/抬思考档，入队即固化到卡面")
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
-	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）")
+	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）；gemini = 走 Google 订阅额度（有会话，多步可用）")
 	codexModel := fs.String("codex-model", "", "钉定经 codex 执行时的模型（如 gpt-5.6-terra）：配 -runner codex 主跑生效；不配 runner 时作为本卡 codex_fallback 降级模型")
+	geminiModel := fs.String("gemini-model", "", "钉定经 gemini 执行时的模型（推荐官方别名 pro/flash/flash-lite）：主跑与降级改道两径生效；空按档位槽映射")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
 	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
@@ -239,9 +240,9 @@ func cmdAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *runner != "" && *runner != "codex" {
+	if *runner != "" && *runner != "codex" && *runner != "gemini" {
 		if _, ok := cfg.Engines[*runner]; !ok {
-			return fmt.Errorf("未知 runner %q（可选: codex%s；引擎预设用 cardex engines add <名> 并入）",
+			return fmt.Errorf("未知 runner %q（可选: codex, gemini%s；引擎预设用 cardex engines add <名> 并入）",
 				*runner, engineNamesHint(cfg))
 		}
 	}
@@ -330,6 +331,14 @@ func cmdAdd(args []string) error {
 		if *model != "" {
 			return fmt.Errorf("-runner codex 的模型请用 -codex-model 指定（-model 是 claude 专用旗标，对 codex 无效）")
 		}
+	} else if *runner == "gemini" {
+		// gemini 钉定：有会话（--session-id/--resume），不要求 codexEligible，多步可用。
+		// -model 有效且有意义：档位别名（fable/opus/sonnet/haiku）经 gemini_models 槽映射
+		// 解析成 pro/flash/flash-lite；要钉具体 gemini 模型用 -gemini-model。
+		t.PreferRunner = "gemini"
+		if cfg.GeminiBin == "" {
+			return fmt.Errorf("config.json 未配置 gemini_bin，无法钉定 gemini 执行器")
+		}
 	} else if *runner != "" {
 		// 订阅引擎钉定（config.engines 的键，上面已校验存在）。与 codex 钉定的两点差异：
 		//   - 不要求 codexEligible：引擎跑的是 claude CLI，有会话、多步/续跑全可用；
@@ -338,6 +347,7 @@ func cmdAdd(args []string) error {
 		t.PreferRunner = *runner
 	}
 	t.CodexModel = strings.TrimSpace(*codexModel)
+	t.GeminiModel = strings.TrimSpace(*geminiModel)
 	if *host != "" {
 		t.RemoteHost = *host
 		if !codexEligible(t) {
@@ -1155,6 +1165,42 @@ func cmdCmd(args []string) error {
 	parts := []string{"claude"}
 	cmdModel := t.Model
 	envPrefix := ""
+	// 异构执行器钉定卡打各自 CLI 的接管命令（此前 codex 卡会打出一条错误的 claude 命令——
+	// 本轮加 gemini 时顺带修复）。
+	switch {
+	case t.PreferRunner == "codex":
+		parts = []string{"codex", "exec", "-C", shellQuote(t.Dir), "--sandbox", "workspace-write"}
+		if m := resolveCodexModel(cfg, t); m != "" {
+			parts = append(parts, "-m", m)
+		}
+		if r := t.Effort; r != "" {
+			parts = append(parts, "-c", "model_reasoning_effort="+r)
+		} else if cfg.CodexReasoning != "" {
+			parts = append(parts, "-c", "model_reasoning_effort="+cfg.CodexReasoning)
+		}
+		fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
+			t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
+		fmt.Printf("%s\n", strings.Join(parts, " "))
+		fmt.Printf("\n# codex exec 从 stdin 读 prompt，进入后粘贴当前步骤的 prompt：\n%s\n", injectLiveContext(root, t.ID, t.Prompts[step]))
+		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
+		return nil
+	case t.PreferRunner == "gemini":
+		model, _ := resolveGeminiModel(cfg, t)
+		parts = []string{"gemini", "-m", model, "--approval-mode", geminiApprovalModeFor(cfg, t)}
+		if t.SessionID != "" {
+			parts = append(parts, "--resume", t.SessionID)
+		}
+		fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
+			t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
+		fmt.Printf("cd %s && %s\n", shellQuote(t.Dir), strings.Join(parts, " "))
+		if t.MidStep && t.SessionID != "" {
+			fmt.Printf("\n# 该会话在步骤中途被打断，进入后先发续跑提示：\n%s\n", cfg.ResumePrompt)
+		} else {
+			fmt.Printf("\n# 进入后粘贴当前步骤的 prompt：\n%s\n", injectLiveContext(root, t.ID, t.Prompts[step]))
+		}
+		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
+		return nil
+	}
 	// 引擎钉定卡：手动接管命令带 env 前缀（base_url + 认证 + extra_env），密钥只给**引用形态**
 	// （$VAR / $(cat 文件)），绝不解析明文——cmd 输出常被复制进聊天/工单，明文即泄露。
 	if engineVia(t.PreferRunner) {
@@ -1676,6 +1722,42 @@ func cmdDoctor(args []string) error {
 			_, err = exec.LookPath(cfg.ClaudeBin)
 		}
 		check("claude 可执行文件 ("+cfg.ClaudeBin+")", err, "确认 claude CLI 已安装，或修改 config.json 的 claude_bin")
+	}
+	// codex/gemini 备用执行器自检（配了才查；此前 codex_bin 从不检查是已知缺口，随 gemini 补齐）。
+	if cfg != nil && cfg.CodexBin != "" {
+		_, err = os.Stat(cfg.CodexBin)
+		if err != nil {
+			_, err = exec.LookPath(cfg.CodexBin)
+		}
+		check("codex 可执行文件 ("+cfg.CodexBin+")", err, "确认 codex CLI 已安装，或修改 config.json 的 codex_bin")
+	}
+	if cfg != nil && cfg.GeminiBin != "" {
+		_, err = os.Stat(cfg.GeminiBin)
+		if err != nil {
+			_, err = exec.LookPath(cfg.GeminiBin)
+		}
+		check("gemini 可执行文件 ("+cfg.GeminiBin+")", err, "确认 gemini CLI 已安装，或修改 config.json 的 gemini_bin")
+		// 认证信号只报「已配置/缺失」，值不回显。三条独立路径任一即可：
+		// gemini_auth_env 指名的变量 > 环境 GEMINI_API_KEY > OAuth 缓存凭据。
+		switch {
+		case cfg.GeminiAuthEnv != "" && strings.TrimSpace(os.Getenv(cfg.GeminiAuthEnv)) != "":
+			fmt.Printf("  ✔ gemini 认证（gemini_auth_env=%s，值不回显）\n", cfg.GeminiAuthEnv)
+		case strings.TrimSpace(os.Getenv("GEMINI_API_KEY")) != "":
+			fmt.Println("  ✔ gemini 认证（环境 GEMINI_API_KEY，值不回显）")
+		default:
+			home, _ := os.UserHomeDir()
+			if _, oerr := os.Stat(filepath.Join(home, ".gemini", "oauth_creds.json")); oerr == nil {
+				fmt.Println("  - gemini 认证：仅 OAuth 缓存凭据。注意：个人免费档已被 gemini-cli 0.42+ 拒绝" +
+					"（IneligibleTierError，Google 要求迁移 Antigravity）——需 Google AI Pro/Ultra 订阅 OAuth，" +
+					"或改用 GEMINI_API_KEY（AI Studio；免费档 250 次/天仅 Flash）")
+			} else {
+				check("gemini 认证", fmt.Errorf("未发现 GEMINI_API_KEY / gemini_auth_env / OAuth 凭据"),
+					"export GEMINI_API_KEY=<key>（或 config.gemini_auth_env 指名变量），或先交互跑一次 gemini 完成 OAuth 登录")
+			}
+		}
+		if cd := loadEngineCooldown(root, "gemini"); cd.active(time.Now()) {
+			fmt.Printf("  - gemini 车道冷却中（%s），%s 恢复\n", cd.Reason, fmtClock(cd.UntilEpoch))
+		}
 	}
 	_, err = os.Stat(tasksDir(root))
 	check("任务目录", err, "运行 cardex init")

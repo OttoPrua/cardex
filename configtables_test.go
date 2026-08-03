@@ -31,6 +31,7 @@ func TestConfigMapTablesRegistered(t *testing.T) {
 		"model_weights":  "不命中: 值是标量无档内字段; 键缺失有 default 与硬兜底(TestModelWeightSurvivesTruncatedTable)",
 		"engines":        "不命中: 内置表不预置任何引擎条目, 无内置值可被截断(TestDefaultConfigShipsNoBuiltinEngines); 档内缺字段全落保守默认或载入即拒(TestValidateEnginesRejectsBadConfigs/TestEngineProfileZeroFieldsFailClosed)",
 		"model_tiers":    "不命中: 值是标量档位关键字无档内字段; 内置表不预置条目, 缺键回落内置标准线, 坏值载入即拒(TestModelTiersCustomOverride/TestModelTiersValidation)",
+		"gemini_models":  "不命中: 值是标量模型串无档内字段; 非空即整表生效(空表才用内置槽默认), 缺槽向下档回落并披露, 终兜底 gemini_model/内置 pro 永不落空(TestResolveGeminiModelSlotFallback); 坏键载入即拒(TestValidateGeminiRejectsBadConfigs)",
 	}
 
 	found := map[string]bool{}

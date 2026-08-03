@@ -283,7 +283,7 @@ func (w *weightTable) gapNote() string {
 	if w.total == 0 || w.measured >= w.total {
 		return ""
 	}
-	return fmt.Sprintf("已知缺口：%d/%d 张完成卡不回报 turns（codex/远端/引擎执行器），"+
+	return fmt.Sprintf("已知缺口：%d/%d 张完成卡不回报 turns（codex/gemini/远端/引擎执行器），"+
 		"这些卡按同类中位补估计值，偏差方向未知。", w.total-w.measured, w.total)
 }
 

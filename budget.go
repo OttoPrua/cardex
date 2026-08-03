@@ -79,6 +79,9 @@ func appendUsage(root string, cfg *Config, t *Task, u *usageInfo) {
 	if _, ok := cfg.Engines[t.Runner]; ok {
 		engine = t.Runner // Runner 由 runTaskVia 按 via 写入，成员资格判定不误吃 codex/remote 标签
 	}
+	if t.Runner == "gemini" {
+		engine = "gemini" // gemini 执行器同引擎待遇：走 Google 订阅额度，不占 claude 红线预算
+	}
 	now := time.Now()
 	keep := now.Add(-(windowHours + 1) * time.Hour).Unix()
 	var recs []usageRec

@@ -2,6 +2,39 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-03 · Gemini CLI 备用执行器（第二异构执行器）
+
+- **执行面**（gemini.go）：`gemini -o json` headless 接入（prompt 走 stdin），会话由 cardex
+  生成 UUID 经 `--session-id`/`--resume` 管理——钉定卡（`-runner gemini`）多步/限额续跑可用，
+  这是对 codex 单步限制的补齐；非 sequence 卡恒强制 `--approval-mode plan`（只读硬护栏，
+  gemini 无 OS 沙箱），sequence 卡按 `gemini_approval_mode`（默认 yolo）。
+- **车道冷却**（复用引擎冷却基建 `cooldown-gemini.json`）：Google 配额是账号级每日请求数
+  （官方 quota-and-pricing 核实 2026-08-03：OAuth 免费档 1000/天、AI Pro 1500、AI Ultra
+  2000、API key 免费档 250/天仅 Flash），当日耗尽挂车道而非单卡；**认证/资格错误同挂车道
+  6 小时**（reason 前缀 `auth:`，含实测的 `IneligibleTierError: UNSUPPORTED_CLIENT`——
+  OAuth 个人免费档已被 0.42+ 客户端拒绝、Google 要求迁移 Antigravity），修好认证到点自愈；
+  每分钟限流留给退避重试，不挂车道。判据依据 = CLI 官方源码错误分类（googleQuotaErrors.ts）。
+- **派发面**：钉定绝不 fail-open；`fallback_order` 白名单新增 `"gemini"`，改道五道闸与
+  codex 全量同规 + 车道冷却检查；`engineVia` 排除 gemini（保留字，引擎档案不得占用此名）。
+- **模型映射**：档位槽映射 `gemini_models`（缺省 fable/opus→pro、sonnet→flash、haiku→
+  flash-lite，官方稳定别名——Google 轮换代次不用改配置；高档取 pro 是编码交叉信号
+  SWE-bench 80.6% 的显式取舍）；解析永不落空（空=auto 静默换模型，已否决）；回落/兜底
+  全部披露 note 落任务日志。统一标准线定档（AA II v4.1 快照 2026-08-03，锚点与 2026-08-02
+  表同量表核对）：flash 线 50=sonnet 档、pro 线 46=haiku 档上沿、flash-lite 36/2.5-pro 26。
+- **交叉验证第五种 kind**（`"kind": "gemini"`）：身份冻结进 `XFrozenEngine.GeminiModel`/
+  卡面 `XGeminiModel`；profile 写 `model`/`effort` 载入即拒（gemini CLI 无思考等级参数，
+  静默吞会假装跑在 max）。
+- **账本/看板**：usage.json 打 `engine:"gemini"` 标（不占 claude 红线）；modelTierKeyword/
+  effectiveModel 补 gemini 分支（裸别名精确匹配，不误吃他家 `*-pro`/`*-flash`）；boardspend/
+  boardweight 缺口披露文案并入 gemini。
+- **顺带修复两个 codex 既有缺口**：`cardex cmd` 此前对 codex 钉定卡打出错误的 claude 命令
+  （现打 `codex exec` 形态）；`cardex doctor` 此前从不检查 `codex_bin`（现与 gemini_bin
+  一并检查，gemini 侧另报认证信号三路径与车道冷却状态）。
+- **成功路径修正**：gemini/引擎成功只清自己的车道冷却——修掉「gemini 成功会误清 claude
+  全局冷却」的接线错误（账各归各）。
+- 设计规格 docs/2026-08-03-gemini-executor-design.md；14 个新测试钉桩（槽映射优先序/审批
+  模式强制/限额三分类/车道冷却不写 claude 全局/改道六闸/argv-stdin 契约/交叉冻结/档位）。
+
 ## 2026-08-03 · 许可证变更：MIT → PolyForm Noncommercial 1.0.0
 
 个人自用 / 学习研究 / 业余项目 / 慈善教育公共研究机构：直接用，无需联系。

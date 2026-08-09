@@ -20,6 +20,9 @@ package main
 //     样本缺 resetsAt 是常态（限额重置后写入的 0% 样本就没有），此时不许编一个重置时刻，
 //     消费方必须按可空处理——注意这四个字段的 null 与 verdict / stale 无关，
 //     一条完全新鲜、有速率、verdict="充裕" 的源同样可能没有 resets_at。
+//   - burn_rate_pct_per_hour 是本周期全部样本的平均趋势，不是“此刻瞬时速度”。另给
+//     recent_* 一组近期综合趋势：它仍来自同一账号的全局额度读数，天然混合 Cardex 与
+//     Codex/Claude 客户端等消费，无法也不会伪装成可归因的 Cardex 单独速率。
 
 import (
 	"bufio"
@@ -44,9 +47,9 @@ type BurnPoint struct {
 
 // BurnSource 是一个「账号 × 窗口」的额度视图。
 //
-// 五个指针字段（ResetsAt / MinutesToReset / BurnRatePctPerH / ExhaustAt）都可能是 null，
+// 预测与重置相关的指针字段都可能是 null，
 // 这是刻意的，见文件头诚实性要点。两类原因要分清：
-//   - BurnRatePctPerH / ExhaustAt 为 null = 这批样本算不出可信的估算；
+//   - BurnRatePctPerH / ExhaustAt 或 Recent* 为 null = 这批样本算不出对应口径的可信估算；
 //   - ResetsAt / MinutesToReset 为 null = 源数据里就没有重置时刻（不是估算失败）。
 //     后者与 verdict、stale **都不相关**，别拿 verdict 当护栏。
 type BurnSource struct {
@@ -71,10 +74,19 @@ type BurnSource struct {
 	MinutesToReset   *float64    `json:"minutes_to_reset"`
 	Stale            bool        `json:"stale"`
 	Series           []BurnPoint `json:"series"`
-	BurnRatePctPerH  *float64    `json:"burn_rate_pct_per_hour"`
-	ExhaustAt        *string     `json:"exhaust_at"`
-	ExhaustBefore    bool        `json:"exhaust_before_reset"`
-	Verdict          string      `json:"verdict"`
+	// BurnRatePctPerH / ExhaustAt 是当前额度周期内全部样本的普通最小二乘趋势。
+	// 保留旧字段名以兼容既有消费方，但 UI 必须称它为“本周期均速”，不能再叫“当前速度”。
+	BurnRatePctPerH *float64 `json:"burn_rate_pct_per_hour"`
+	ExhaustAt       *string  `json:"exhaust_at"`
+	ExhaustBefore   bool     `json:"exhaust_before_reset"`
+	// Recent* 是同一全局额度序列尾部的近期趋势。窗口按额度周期自适应到 1–6 小时，
+	// RecentSpanMinutes 披露实际参与拟合的跨度；偶遇低频采样时可多取边界外一个点，
+	// 因而这里必须报实际跨度，不能只报名义窗口。
+	RecentBurnRatePctPerH *float64 `json:"recent_burn_rate_pct_per_hour"`
+	RecentSpanMinutes     *float64 `json:"recent_span_minutes"`
+	RecentExhaustAt       *string  `json:"recent_exhaust_at"`
+	RecentExhaustBefore   bool     `json:"recent_exhaust_before_reset"`
+	Verdict               string   `json:"verdict"`
 }
 
 type TokenSeriesPoint struct {
@@ -248,6 +260,13 @@ const (
 	// burnResetDropPct 是「用量回落多少算跨过一次重置」的阈值。
 	// 同一周期内用量单调不减，明显回落只可能是重置。
 	burnResetDropPct = 0.5
+
+	// 近期综合线取当前周期尾部约 1/24 的时间，并钳在 1–6 小时：5h 窗口至少覆盖
+	// CodexBar 常见的小时级采样，周窗口至多回看一个活跃工作段，既吸收近期真实加速，
+	// 又不让整周前半段的空闲把“现在还能撑多久”稀释掉。
+	burnRecentMinLookbackMin = 60
+	burnRecentMaxLookbackMin = 6 * 60
+	burnRecentWindowDivisor  = 24
 )
 
 type rawSample struct {
@@ -331,22 +350,33 @@ func buildBurnSource(id, provider, acctKey, acctLabel, window, windowLabel strin
 		now.Sub(latest.at) > time.Duration(windowMinutes)*time.Minute
 	unusable := resetPassed || staleBeyondWindow
 
-	// 燃烧速率：当前周期内最小二乘拟合（%/小时）。
+	// 本周期均速：当前周期内全部样本的最小二乘拟合（%/小时）。
 	// 少于 2 个点、或跨度太短 → 没有可言的速率，保持 null。
 	if !unusable && len(period) >= 2 {
-		spanMin := period[len(period)-1].at.Sub(period[0].at).Minutes()
-		if spanMin >= burnMinSpanMin {
-			if rate, ok := leastSquaresSlopePerHour(period); ok {
-				if rate < 0 {
-					// 同一周期内用量不可能变少。负斜率是「样本仍跨了周期」的证据
-					// （currentPeriod 的边界检测没兜住的残余情形），不是一个能报出去的速率。
-					unusable = true
-				} else {
-					r := round1(rate)
-					src.BurnRatePctPerH = &r
-					src.ExhaustAt, src.ExhaustBefore = projectExhaust(latest, rate, src.ResetsAt, now)
-				}
+		if rate, _, ok := fittedBurnRate(period); ok {
+			if rate < 0 {
+				// 同一周期内用量不可能变少。负斜率是「样本仍跨了周期」的证据
+				// （currentPeriod 的边界检测没兜住的残余情形），不是一个能报出去的速率。
+				unusable = true
+			} else {
+				r := round1(rate)
+				src.BurnRatePctPerH = &r
+				src.ExhaustAt, src.ExhaustBefore = projectExhaust(latest, rate, src.ResetsAt, now)
 			}
+		}
+	}
+
+	// 近期综合速率：仍只看当前周期，但把拟合范围收窄到序列尾部。额度源给的是
+	// 账号全局百分比，所以这条线自动包含 Cardex 与客户端/其他会话的总消耗；源数据
+	// 没有调用归属，不能进一步拆成两条可审计的 Cardex / 非 Cardex 百分比曲线。
+	if !unusable {
+		recent := recentBurnPeriod(period, windowMinutes)
+		if rate, spanMin, ok := fittedBurnRate(recent); ok && rate >= 0 {
+			r := round1(rate)
+			span := round1(spanMin)
+			src.RecentBurnRatePctPerH = &r
+			src.RecentSpanMinutes = &span
+			src.RecentExhaustAt, src.RecentExhaustBefore = projectExhaust(latest, rate, src.ResetsAt, now)
 		}
 	}
 
@@ -409,7 +439,47 @@ func sameResetBoundary(a, b time.Time) bool {
 	return d <= burnResetTolerance
 }
 
-// projectExhaust 按当前速率外推「打到 100% 的时刻」。三道闸，缺一不可：
+// recentBurnPeriod 取“近期综合线”的尾部样本。名义回看窗按额度周期自适应到 1–6 小时。
+// 如果采样刚好落在边界外、窗内只剩 1 点，可向前多取 1 点，但最多放宽到名义窗的 2 倍；
+// RecentSpanMinutes 会把真实跨度报给前端，避免把 65 分钟说成“近 1 小时”。
+func recentBurnPeriod(period []rawSample, windowMinutes int) []rawSample {
+	if len(period) < 2 {
+		return nil
+	}
+	lookbackMin := windowMinutes / burnRecentWindowDivisor
+	if lookbackMin < burnRecentMinLookbackMin {
+		lookbackMin = burnRecentMinLookbackMin
+	}
+	if lookbackMin > burnRecentMaxLookbackMin {
+		lookbackMin = burnRecentMaxLookbackMin
+	}
+	latest := period[len(period)-1]
+	lookback := time.Duration(lookbackMin) * time.Minute
+	cut := latest.at.Add(-lookback)
+	start := sort.Search(len(period), func(i int) bool { return !period[i].at.Before(cut) })
+	if len(period)-start < 2 && start > 0 && latest.at.Sub(period[start-1].at) <= 2*lookback {
+		start--
+	}
+	if len(period)-start < 2 {
+		return nil
+	}
+	return period[start:]
+}
+
+// fittedBurnRate 统一两条预测线的“至少 2 点 + 至少 5 分钟跨度”门槛。
+func fittedBurnRate(pts []rawSample) (rate, spanMin float64, ok bool) {
+	if len(pts) < 2 {
+		return 0, 0, false
+	}
+	spanMin = pts[len(pts)-1].at.Sub(pts[0].at).Minutes()
+	if spanMin < burnMinSpanMin {
+		return 0, spanMin, false
+	}
+	rate, ok = leastSquaresSlopePerHour(pts)
+	return rate, spanMin, ok
+}
+
+// projectExhaust 按传入的可信拟合速率外推「打到 100% 的时刻」。三道闸，缺一不可：
 //
 //  1. 速率下限 burnMinRatePctPerH：平坦序列的浮点残差也是正数，
 //     只判 rate>0 会外推出公元 2318 年，而展示用的 round1(rate) 同时显示成 0——
@@ -473,15 +543,23 @@ func burnVerdict(s *BurnSource, unusable bool) string {
 	if s.UsedPercent >= 100 {
 		return "已耗尽"
 	}
-	if s.BurnRatePctPerH == nil {
+	if s.BurnRatePctPerH == nil && s.RecentBurnRatePctPerH == nil {
 		return "数据不足"
 	}
-	if s.ExhaustBefore {
+	if s.ExhaustBefore || s.RecentExhaustBefore {
 		return "将在重置前烧完"
 	}
-	// 按当前速率推到重置时刻的预计用量，超过 80% 算偏紧。
+	// 用两条有效趋势里更快的一条推到重置时刻。近期加速可以收紧预警，短时放缓却
+	// 不该覆盖本周期平均风险；这是只读看板的保守提示，不会改变调度红线。
+	rate := 0.0
+	if s.BurnRatePctPerH != nil {
+		rate = *s.BurnRatePctPerH
+	}
+	if s.RecentBurnRatePctPerH != nil && *s.RecentBurnRatePctPerH > rate {
+		rate = *s.RecentBurnRatePctPerH
+	}
 	if s.MinutesToReset != nil {
-		projected := s.UsedPercent + (*s.BurnRatePctPerH)*(*s.MinutesToReset/60)
+		projected := s.UsedPercent + rate*(*s.MinutesToReset/60)
 		if projected >= 80 {
 			return "偏紧"
 		}

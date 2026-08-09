@@ -1,5 +1,19 @@
 # cardex changelog
 
+## 2026-08-10 · Burndown forecasts split period average from recent combined consumption
+
+- Corrected the label: existing `burn_rate_pct_per_hour` is a full-current-period OLS average,
+  not an instantaneous “current speed”. That is why a recently accelerated measured tail is not
+  tangent to the old projection.
+- Added a recent combined line: an adaptive 1–6 h tail fit over the same account-wide quota series,
+  with rate, actual span, and projected zero time in the API. The chart shows it beside the period
+  average, and the headline reports the earlier valid pre-reset exhaustion time. When a weekly reset
+  is much later, the axis focuses on exhaustion and labels the reset as off-chart instead of crushing
+  every line against the left edge.
+- Made attribution limits explicit: the account percentage already mixes Cardex and Codex/Claude
+  clients. Cardex's dollar/token lower-bound ledgers use different units and are never subtracted to
+  fabricate a client-consumption percentage.
+
 ## 2026-08-03 · License change: MIT → PolyForm Noncommercial 1.0.0
 
 Personal use, study and research, hobby projects, and charitable/educational/public-research

@@ -382,6 +382,17 @@ The time dimension uses each card's **`updated_at` (the moment it finished)**, n
 
 **"Insufficient data" semantics**: a single sample point has no computable rate; a sample older than the window it describes (e.g. a 5 h window with a 14-hour-old sample); or a reset time that has already passed — all three cases produce `verdict="insufficient data"`, and `burn_rate` / `exhaust_at` remain null. Only points within the current window period (sharing the same `resetsAt` boundary as the latest sample, with a 90 s tolerance) participate in rate fitting; no values are fabricated.
 
+**Why the measured tail and the old projection have different slopes**: `burn_rate_pct_per_hour` is not the instantaneous speed of the last segment. It is an ordinary least-squares trend over **all samples in the current quota period**. When an idle first half is followed by a burst of parallel work, the measured tail becomes steep while the period-wide average remains diluted; projecting that average from the latest point therefore cannot be tangent to the tail. This is not a Cardex line being compared with a separate client line.
+
+Each account window now exposes two explicitly named forecasts:
+
+- **Current-period average projection** (`burn_rate_pct_per_hour` / `exhaust_at`) keeps the full-period fit as a stable, backwards-compatible baseline;
+- **Recent combined-consumption projection** (`recent_burn_rate_pct_per_hour` / `recent_exhaust_at`) fits the tail of the same series over an adaptive 1–6 h lookback. `recent_span_minutes` discloses the actual fitted span, and the result reacts faster to a recent acceleration. If either valid forecast reaches zero before reset, the board warns and the top summary shows the earlier time.
+
+When exhaustion is forecast well before a distant weekly reset, the x-axis focuses on the two zero-time projections instead of compressing all observed and forecast data into the far-left edge merely to draw a reset several days away. The legend still reports the exact reset as off-chart. If no forecast exhausts before reset, the reset remains on the axis.
+
+“Combined” means the **account-wide quota reading**. CodexBar / the usage feed already mixes Cardex, Codex or Claude clients, and every other session using that account; the source contains no call attribution, so it cannot honestly be split into a Cardex percentage line and a client percentage line. `task_spend` / `queue_spend` remain useful Cardex-only lower-bound ledgers, but their units are API-equivalent dollars / weighted tokens and cannot be subtracted from a global percentage to fabricate an external-consumption curve. Both forecasts are trend references, not provider availability guarantees; if the quota resets first, the source is not predicted to become unavailable in that period.
+
 ## 5-hour quota redline (reserve headroom)
 
 To leave headroom for bursty/interactive work: when the redline is active the queue stops dispatching (multi-step tasks also yield between steps), and `-force` crosses it. Three channels, inspectable anytime with `cardex quota`:

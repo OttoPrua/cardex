@@ -391,6 +391,8 @@ Each account window now exposes two explicitly named forecasts:
 
 When exhaustion is forecast well before a distant weekly reset, the x-axis focuses on the two zero-time projections instead of compressing all observed and forecast data into the far-left edge merely to draw a reset several days away. The legend still reports the exact reset as off-chart. If no forecast exhausts before reset, the reset remains on the axis.
 
+Every credible projection now labels its estimated zero time directly at the intersection with the 0% time axis. Nearby labels use separate rows; forecasts within one minute collapse to a single “average / combined” marker. The verdict detail is also split into one row each for current-period average, recent combined consumption, and window reset instead of packing rate, zero time, and reset into one sentence.
+
 “Combined” means the **account-wide quota reading**. CodexBar / the usage feed already mixes Cardex, Codex or Claude clients, and every other session using that account; the source contains no call attribution, so it cannot honestly be split into a Cardex percentage line and a client percentage line. `task_spend` / `queue_spend` remain useful Cardex-only lower-bound ledgers, but their units are API-equivalent dollars / weighted tokens and cannot be subtracted from a global percentage to fabricate an external-consumption curve. Both forecasts are trend references, not provider availability guarantees; if the quota resets first, the source is not predicted to become unavailable in that period.
 
 ## 5-hour quota redline (reserve headroom)

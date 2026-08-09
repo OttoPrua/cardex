@@ -1846,28 +1846,32 @@ function burnCard(src) {
         text: rem === null ? '剩余未知' : `剩余 ${Math.round(rem)}%`,
       })));
 
-  // 结论横幅。每个可空字段都有自己的措辞，不含糊带过。
+  // 结论横幅。一个预测口径占一行，重置另占一行；比把所有信息用间隔号挤成一段更易扫读。
+  // 每个可空字段仍有自己的措辞，不含糊带过。
   const detail = [];
-  detail.push(isNum(src.burn_rate_pct_per_hour)
-    ? `本周期均速 ${src.burn_rate_pct_per_hour}%/小时`
-    : '本周期均速未知');
-  if (src.exhaust_at) detail.push(`均速预计 ${fmtTime(src.exhaust_at)} 归零`);
-  else if (src.verdict !== '已耗尽') detail.push('本周期均速无可信归零时刻');
+  let periodDetail = isNum(src.burn_rate_pct_per_hour)
+    ? `本周期均速：${src.burn_rate_pct_per_hour}%/小时`
+    : '本周期均速：未知';
+  if (src.exhaust_at) periodDetail += `；预计 ${fmtTime(src.exhaust_at)} 归零`;
+  else if (src.verdict !== '已耗尽') periodDetail += '；无可信归零时刻';
+  detail.push(periodDetail);
   if (isNum(src.recent_burn_rate_pct_per_hour)) {
     const span = isNum(src.recent_span_minutes) ? `近 ${fmtDur(src.recent_span_minutes)}` : '近期';
-    detail.push(`综合消耗 ${src.recent_burn_rate_pct_per_hour}%/小时（${span}，含 Cardex 与客户端）`);
-    if (src.recent_exhaust_at) detail.push(`综合预计 ${fmtTime(src.recent_exhaust_at)} 归零`);
-    else if (src.verdict !== '已耗尽') detail.push('综合消耗无可信归零时刻');
+    let recentDetail = `近期综合：${src.recent_burn_rate_pct_per_hour}%/小时（${span}，含 Cardex 与客户端）`;
+    if (src.recent_exhaust_at) recentDetail += `；预计 ${fmtTime(src.recent_exhaust_at)} 归零`;
+    else if (src.verdict !== '已耗尽') recentDetail += '；无可信归零时刻';
+    detail.push(recentDetail);
   }
   // resets_at 为 null 与 verdict 无关：新鲜且有结论的源也可能没有重置时刻。
-  if (isNum(src.minutes_to_reset)) detail.push(`${fmtDur(src.minutes_to_reset)}后重置`);
-  else if (src.resets_at) detail.push(`重置于 ${fmtTime(src.resets_at)}`);
-  else detail.push('源数据未提供重置时刻');
+  if (isNum(src.minutes_to_reset)) detail.push(`窗口重置：${fmtDur(src.minutes_to_reset)}后`);
+  else if (src.resets_at) detail.push(`窗口重置：${fmtTime(src.resets_at)}`);
+  else detail.push('窗口重置：源数据未提供时刻');
 
   const card = h('section', { class: 'card chart-card' }, head,
     h('div', { class: `verdict callout-${verdictKind(src.verdict)}` },
       h('span', { class: 'verdict-label', text: src.verdict }),
-      h('span', { class: 'verdict-detail', text: detail.join('・') })));
+      h('span', { class: 'verdict-detail' },
+        detail.map((text) => h('span', { class: 'verdict-detail-line', text })))));
 
   if (src.series.length < 2) {
     card.append(h('div', {
@@ -1898,7 +1902,6 @@ function burnCard(src) {
  * 三道闸）且 verdict 不是「数据不足」时才画；两者重合时只画一条并明确说明。
  */
 function burnChart(src) {
-  const W = 560, H = 170, PAD = { t: 12, r: 16, b: 26, l: 34 };
   const pts = src.series
     .map((p) => ({ t: parseTime(p.t), v: remainPct(p), used: p.used_percent }))
     .filter((p) => p.t && isNum(p.v));
@@ -1909,6 +1912,22 @@ function burnChart(src) {
   const recentExhaust = drawProjection && src.recent_exhaust_at ? parseTime(src.recent_exhaust_at) : null;
   const recentDistinct = recentExhaust && (!exhaust
     || Math.abs(recentExhaust.getTime() - exhaust.getTime()) > 60 * 1000);
+  // 时间直接贴在外推线与 0% 轴的交点下方。两个端点即使只差几分钟，也分行放置，
+  // 避免文字互相覆盖；若两种预测在 1 分钟内重合，则只标一个“均速/综合”时间。
+  const projectionLabels = [];
+  if (exhaust) projectionLabels.push({
+    at: exhaust, label: recentExhaust && !recentDistinct ? '均速/综合' : '均速',
+    color: 'var(--s7)',
+  });
+  if (recentDistinct) projectionLabels.push({
+    at: recentExhaust, label: '综合', color: 'var(--st-critical)',
+  });
+  projectionLabels.sort((a, b) => a.at.getTime() - b.at.getTime());
+
+  const W = 560;
+  const PAD = { t: 12, r: 16, b: 26 + projectionLabels.length * 12, l: 34 };
+  // 保持绘图区底边固定，只把新增的交点时间标签放进加高后的横轴留白中。
+  const H = 144 + PAD.b;
   const reset = parseTime(src.resets_at);
   const tMin = pts[0].t.getTime();
   let tMax = pts[pts.length - 1].t.getTime();
@@ -1927,10 +1946,13 @@ function burnChart(src) {
   const y = (v) => PAD.t + (1 - Math.min(100, Math.max(0, v)) / 100) * (H - PAD.t - PAD.b);
 
   const remNow = remainPct(src);
+  const projectionAria = projectionLabels.map((item) =>
+    `${item.label}预计 ${fmtTime(item.at.toISOString())} 耗尽`).join('，');
   const g = sv('svg', {
     viewBox: `0 0 ${W} ${H}`, role: 'img',
     'aria-label': `${src.account_label} ${src.window_label} 剩余额度曲线，当前剩余 `
-      + `${remNow === null ? '未知' : Math.round(remNow) + '%'}，线触底即额度耗尽`,
+      + `${remNow === null ? '未知' : Math.round(remNow) + '%'}，线触底即额度耗尽`
+      + (projectionAria ? `；${projectionAria}` : ''),
   });
 
   for (const v of [0, 25, 50, 75, 100]) {
@@ -1990,21 +2012,41 @@ function burnChart(src) {
       style: 'font-size:9px;fill:var(--ink-mute)',
     }, '重置'));
   }
+
+  // 交点时间是预测最重要的精确读数：直接标在 0% 时间轴上，不再要求读者去图例或横幅反查。
+  for (const item of projectionLabels) {
+    const row = projectionLabels.indexOf(item);
+    const px = x(item.at.getTime());
+    const nearLeft = px < PAD.l + 62;
+    const nearRight = px > W - PAD.r - 62;
+    const tx = nearLeft ? PAD.l + 2 : nearRight ? W - PAD.r - 2 : px;
+    const anchor = nearLeft ? 'start' : nearRight ? 'end' : 'middle';
+    const label = `${item.label} ${fmtTime(item.at.toISOString())}`;
+    g.append(sv('text', {
+      class: 'forecast-time-label', x: tx, y: y(0) + 13 + row * 12,
+      'text-anchor': anchor, style: `fill:${item.color}`,
+    }, label, sv('title', {}, `${label} 预计剩余额度归零`)));
+  }
   g.append(sv('text', { x: PAD.l, y: H - 7, style: 'font-size:9px;fill:var(--ink-mute)' },
     fmtTime(pts[0].t.toISOString()) || ''));
-  g.append(sv('text', {
-    x: W - PAD.r, y: H - 7, 'text-anchor': 'end', style: 'font-size:9px;fill:var(--ink-mute)',
-  }, fmtTime(new Date(tMax).toISOString()) || ''));
+  const projectionLabelsTMax = projectionLabels.some((item) =>
+    Math.abs(item.at.getTime() - tMax) <= 60 * 1000);
+  // 右端恰好就是归零交点时，直接标签已经给出时刻；不在同一位置再重复印一个裸时间。
+  if (!projectionLabelsTMax) {
+    g.append(sv('text', {
+      x: W - PAD.r, y: H - 7, 'text-anchor': 'end', style: 'font-size:9px;fill:var(--ink-mute)',
+    }, fmtTime(new Date(tMax).toISOString()) || ''));
+  }
 
   const legend = h('div', { class: 'chart-legend' },
     h('span', { class: 'cl-item' },
       h('span', { class: 'cl-line', style: 'border-top-color:var(--s1)' }), '实测剩余额度'),
     exhaust ? h('span', { class: 'cl-item' },
       h('span', { class: 'cl-line', style: 'border-top-color:var(--s7);border-top-style:dashed' }),
-      '本周期均速外推') : null,
+      `本周期均速外推・${fmtTime(src.exhaust_at)} 归零`) : null,
     recentDistinct ? h('span', { class: 'cl-item' },
       h('span', { class: 'cl-line', style: 'border-top-color:var(--st-critical);border-top-style:dashed' }),
-      '近期综合消耗外推（含 Cardex 与客户端）') : null,
+      `近期综合消耗外推・${fmtTime(src.recent_exhaust_at)} 归零（含 Cardex 与客户端）`) : null,
     recentExhaust && !recentDistinct ? h('span', {
       class: 'cl-item', text: '近期综合预测与本周期均速重合',
     }) : null,

@@ -13,6 +13,9 @@
 - Made attribution limits explicit: the account percentage already mixes Cardex and Codex/Claude
   clients. Cardex's dollar/token lower-bound ledgers use different units and are never subtracted to
   fabricate a client-consumption percentage.
+- Projection endpoints now label the estimated zero time directly where they meet the 0% time axis;
+  nearby forecasts are staggered and near-identical ones are merged. Verdict details such as
+  “will exhaust before reset” are split into average, recent-combined, and reset rows.
 
 ## 2026-08-03 · License change: MIT → PolyForm Noncommercial 1.0.0
 

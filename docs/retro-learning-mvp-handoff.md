@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 13:40 +08:00
+Last updated: 2026-08-13 13:45 +08:00
 
 ## Ownership and safety envelope
 
@@ -9,7 +9,7 @@ Last updated: 2026-08-13 13:40 +08:00
 - Worktree: `/Users/ottoprua/Projects/cardex-retro-mvp`
 - Branch: `codex/retro-learning-mvp`
 - Base commit: `29f3e9694d9501bff2d0c038dea6b39fb15cb92a`
-- Tested implementation commits: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`) and `effcb24` (`feat(retro): validate evidence-bound reports`). Later commit(s) are handoff/documentation-only unless this line is explicitly revised.
+- Tested implementation commits: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`), `effcb24` (`feat(retro): validate evidence-bound reports`), and `b50b73b` (`fix(doctor): detect launchd signing drift`).
 - The main worktree `/Users/ottoprua/Projects/cardex` was already dirty before this packet (27 tracked and 8 untracked paths observed). Do not copy, clean, stage, or commit those bytes.
 - The user authorized the exact production install and one Board restart on 2026-08-13. That cutover is complete. Do not change `/Users/ottoprua/.cardex/config.json` or perform another restart without a new reason; preserve the `0.0.0.0:8788` LAN/Tailscale binding.
 - The user subsequently authorized direct modification of already-evidenced problems. Apply that only to reproducible, recurring/core-path, narrow, reversible defects with a focused RED and no authority expansion; keep policy/routing/promotion changes evidence-gated.
@@ -96,15 +96,19 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 13:37 +08:00 — Added a focused RED showing doctor had no parser for `OS_REASON_CODESIGNING` or `needs LWCR update`; the test failed to compile on the missing behavior as intended.
 - 2026-08-13 13:40 +08:00 — Minimal GREEN added: on macOS, doctor now verifies the loaded `com.cardex.tick` job and rejects the two known signing-policy drift markers. An idle periodic timer with last exit 0 remains healthy. A freshly built candidate correctly passed the live launchd check; doctor still exited 1 for the unrelated, pre-existing Gemini-auth gap.
 - 2026-08-13 13:40 +08:00 — Added the durable lessons/checklist document and updated both README quick starts to require launchd re-registration after binary replacement. Full regression, commit, and production replacement remain pending at this log point.
+- 2026-08-13 13:42 +08:00 — Full regression passed: `go test ./... -count=1` → `ok cardex 53.963s`; `go vet ./...`, macOS build/signature verification, Windows amd64 test-binary cross-compile, and `git diff --check` all exited 0. Committed exact candidate `b50b73bc3b8813ac24cc1a8b0ce01910b0e926df`.
+- 2026-08-13 13:44 +08:00 — Backed up the prior retrospective-MVP production binary, installed `b50b73b` through a verified new inode, re-registered `com.cardex.tick`, and restarted only `com.cardex.board`. Installed SHA-256 is `9e296b0a80fb6b0a985c5c56b98c05581d9c1a2eb2bb63b21171bbae4dbbb8dd`.
+- 2026-08-13 13:45 +08:00 — Production verification passed: Board PID `87702`, bind `*:8788`, health `0.10.0`; fresh tick RunAtLoad exit 0 with no signing/LWCR marker; doctor reports launchd can execute the current binary. Doctor's overall exit remains 1 solely because the pre-existing Gemini authentication check is not ready; no credential/config change was made. Production retro facts remained hash/cohort stable and the natural counter remained `702/697`.
 
 ## Production activation and rollback evidence
 
 - Installed binary: `/opt/homebrew/bin/cardex`
-- Installed candidate commit: `70ebe2041222cf114401d820701a2a07a6240c69`
-- Installed SHA-256: `545bd5730e51f9641a785465c280cdf4248ba5783ec98709c373a979a7378c71`
+- Installed candidate commit: `b50b73bc3b8813ac24cc1a8b0ce01910b0e926df`
+- Installed SHA-256: `9e296b0a80fb6b0a985c5c56b98c05581d9c1a2eb2bb63b21171bbae4dbbb8dd`
 - Recoverable backup: `/Users/ottoprua/.cardex/backups/cardex-0.10.0-pre-retro-mvp-20260813T131933+0800`
 - Backup SHA-256: `e803020640fb94118d69000b4bd2673bb0bfba75b7282ce1c7a7453e9a819a4e`
-- Board service: `com.cardex.board`, PID `74082`, bind `0.0.0.0:8788`, health version `0.10.0`
+- Immediate pre-doctor-fix backup: `/Users/ottoprua/.cardex/backups/cardex-0.10.0-pre-doctor-b50b73b-20260813T134349+0800`, SHA-256 `545bd5730e51f9641a785465c280cdf4248ba5783ec98709c373a979a7378c71`
+- Board service: `com.cardex.board`, PID `87702`, bind `0.0.0.0:8788`, health version `0.10.0`
 - Scheduler service: `com.cardex.tick`, re-registered against the installed inode, 300-second interval, fresh RunAtLoad exit code 0
 - Scheduler plist backup: `/Users/ottoprua/.cardex/backups/com.cardex.tick.plist-pre-retro-mvp-20260813T132522+0800`, SHA-256 `3f2995f557dc7418399f6bf84e084906ee815273c3819d66ae5bcaeb0f1541b2` (identical to the regenerated plist)
 - Continuity monitor: Codex heartbeat `cardex-mvp`, `ACTIVE`, hourly, attached to the current thread

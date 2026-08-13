@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 23:29 +08:00
+Last updated: 2026-08-14 00:29 +08:00
 
 ## Ownership and safety envelope
 
@@ -112,6 +112,7 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 22:27 +08:00 — Heartbeat read-only check: counter remains `705/697` and `last_retro_task=t0812-1747-df1a`; no v2 retrospective has triggered. Three real review attempts appeared after 21:27: `t0813-2224-1977` (OpenCode K3) and `t0813-2225-c784` (Kimi CLI K3) each dispatched, retried on exit status 1, then held/canceled without usage; successor `t0813-2226-123d` followed the same dispatch/retry path and remains held. Cardex is now 31 done / 53 held with no queued or running cards. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two completed business cards away; no mutation or implementation action taken.
 - 2026-08-13 22:36 +08:00 — Published `codex/retro-learning-mvp` to `origin` and opened Draft PR [#4](https://github.com/OttoPrua/cardex/pull/4) against `main`. Creation was independently verified as `OPEN`, `isDraft=true`, base `main`, head `ce131a0767642a3dd8cf95d4307cc3e413193aa3`, after GitHub returned one transient push error, a connector `403`, and a CLI GraphQL `502`; the REST/PR read confirmed that the retry had succeeded, so no duplicate branch or PR was created. Runtime acceptance remains open at `705/697`, and the tracking card remains held.
 - 2026-08-13 23:29 +08:00 — Heartbeat read-only check: counter advanced naturally from `705/697` to `706/697` (`+1` since 22:27, `+4` from the `702/697` acceptance baseline), while `last_retro_task` remains `t0812-1747-df1a`; therefore no v2 retrospective exists yet. The new completion is business review card `t0813-2234-0c2f`: Kimi CLI K3 dispatched at 22:34, emitted final `step_ok` then `done` at 22:44, with 5 turns and recorded `cost_total=0`. Cardex is now 32 done / 52 held with no queued or running cards; tracking card `t0813-1212-9d17` remains held. The natural `707` gate is one completed business card away. No production, counter, template, service, or task-state mutation was made.
+- 2026-08-14 00:29 +08:00 — Heartbeat read-only check: counter remains `706/697`, unchanged from 23:29, and `last_retro_task` remains `t0812-1747-df1a`. Cardex remains 32 done / 52 held with no queued or running cards; no task, event, progress, archive, or retrospective file newer than 23:29 was found. Tracking card `t0813-1212-9d17` remains held. The natural `707` gate remains one completed business card away; no mutation or implementation action taken.
 
 ## Production activation and rollback evidence
 

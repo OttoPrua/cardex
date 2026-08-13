@@ -79,6 +79,9 @@ func TestMakeInstallRunsVerifiedPreflightBeforeReplacement(t *testing.T) {
 	if preflight < 0 || replace < 0 || preflight > replace {
 		t.Fatalf("install must run binary preflight before removing production target: preflight=%d replace=%d", preflight, replace)
 	}
+	if count := strings.Count(text, "$(BIN) install-preflight"); count != 2 {
+		t.Fatalf("install must recheck the production preimage immediately before replacement, got %d preflights", count)
+	}
 	for _, required := range []string{"CARDEX_INSTALL_EXPECTED_HEAD", "CARDEX_INSTALL_EXPECTED_CURRENT_SHA256"} {
 		if !strings.Contains(text, required) {
 			t.Fatalf("Makefile install is missing explicit guard %s", required)

@@ -19,6 +19,7 @@ install: build
 	$(BIN) install-preflight -target $(PREFIX)/cardex -expected-head "$(CARDEX_INSTALL_EXPECTED_HEAD)" -expected-current-sha256 "$(CARDEX_INSTALL_EXPECTED_CURRENT_SHA256)"
 	# 先删再拷（新 inode）：macOS 上 cp 原位覆盖已签名二进制会让签名缓存失效，
 	# 新起的进程被 AMFI 直接 SIGKILL（RC=137）。正在运行的旧映像不受影响。
+	$(BIN) install-preflight -target $(PREFIX)/cardex -expected-head "$(CARDEX_INSTALL_EXPECTED_HEAD)" -expected-current-sha256 "$(CARDEX_INSTALL_EXPECTED_CURRENT_SHA256)"
 	rm -f $(PREFIX)/cardex
 	cp $(BIN) $(PREFIX)/cardex
 	@echo "已安装到 $(PREFIX)/cardex（launchd 请在安装后重新运行 cardex install-launchd）"

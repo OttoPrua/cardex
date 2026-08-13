@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 22:27 +08:00
+Last updated: 2026-08-13 22:36 +08:00
 
 ## Ownership and safety envelope
 
@@ -8,6 +8,8 @@ Last updated: 2026-08-13 22:27 +08:00
 - Cardex tracking card: `t0813-1212-9d17` (`held`, tracking only; must not be dispatched).
 - Worktree: `/Users/ottoprua/Projects/cardex-retro-mvp`
 - Branch: `codex/retro-learning-mvp`
+- Remote branch: `origin/codex/retro-learning-mvp`
+- Draft PR: [OttoPrua/cardex#4](https://github.com/OttoPrua/cardex/pull/4), targeting `main`; keep it Draft until the natural runtime gate below passes.
 - Base commit: `29f3e9694d9501bff2d0c038dea6b39fb15cb92a`
 - Tested implementation commits: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`), `effcb24` (`feat(retro): validate evidence-bound reports`), and `b50b73b` (`fix(doctor): detect launchd signing drift`).
 - The main worktree `/Users/ottoprua/Projects/cardex` was already dirty before this packet (27 tracked and 8 untracked paths observed). Do not copy, clean, stage, or commit those bytes.
@@ -108,6 +110,7 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 20:27 +08:00 — Heartbeat read-only check: counter remains `705/697`, unchanged from 19:24, and `last_retro_task` remains `t0812-1747-df1a`. Cardex remains 31 done / 52 held with no queued or running cards; no task, event, or `retro-*` progress file newer than 19:24 was found. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two genuine business completions away; no action taken.
 - 2026-08-13 21:27 +08:00 — Heartbeat read-only check: counter remains `705/697`, unchanged from 20:27, and `last_retro_task` remains `t0812-1747-df1a`. Cardex remains 31 done / 52 held with no queued or running cards; no task, event, or `retro-*` progress file newer than 20:27 was found. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two genuine business completions away; no action taken.
 - 2026-08-13 22:27 +08:00 — Heartbeat read-only check: counter remains `705/697` and `last_retro_task=t0812-1747-df1a`; no v2 retrospective has triggered. Three real review attempts appeared after 21:27: `t0813-2224-1977` (OpenCode K3) and `t0813-2225-c784` (Kimi CLI K3) each dispatched, retried on exit status 1, then held/canceled without usage; successor `t0813-2226-123d` followed the same dispatch/retry path and remains held. Cardex is now 31 done / 53 held with no queued or running cards. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two completed business cards away; no mutation or implementation action taken.
+- 2026-08-13 22:36 +08:00 — Published `codex/retro-learning-mvp` to `origin` and opened Draft PR [#4](https://github.com/OttoPrua/cardex/pull/4) against `main`. Creation was independently verified as `OPEN`, `isDraft=true`, base `main`, head `ce131a0767642a3dd8cf95d4307cc3e413193aa3`, after GitHub returned one transient push error, a connector `403`, and a CLI GraphQL `502`; the REST/PR read confirmed that the retry had succeeded, so no duplicate branch or PR was created. Runtime acceptance remains open at `705/697`, and the tracking card remains held.
 
 ## Production activation and rollback evidence
 

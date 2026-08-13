@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 12:47 +08:00
+Last updated: 2026-08-13 13:24 +08:00
 
 ## Ownership and safety envelope
 
@@ -11,7 +11,7 @@ Last updated: 2026-08-13 12:47 +08:00
 - Base commit: `29f3e9694d9501bff2d0c038dea6b39fb15cb92a`
 - Tested implementation commits: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`) and `effcb24` (`feat(retro): validate evidence-bound reports`). Later commit(s) are handoff/documentation-only unless this line is explicitly revised.
 - The main worktree `/Users/ottoprua/Projects/cardex` was already dirty before this packet (27 tracked and 8 untracked paths observed). Do not copy, clean, stage, or commit those bytes.
-- Do not change `/Users/ottoprua/.cardex/config.json`, do not restart the production board, and preserve its `0.0.0.0:8788` LAN/Tailscale binding.
+- The user authorized the exact production install and one Board restart on 2026-08-13. That cutover is complete. Do not change `/Users/ottoprua/.cardex/config.json` or perform another restart without a new reason; preserve the `0.0.0.0:8788` LAN/Tailscale binding.
 
 ## MVP outcome
 
@@ -81,6 +81,31 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 12:39 +08:00 — Added the minimal report-publication fence after RED tests proved drifted hash/cohort/evidence and four recommendations were previously accepted. Invalid new-style reports now fail closed; no learning ledger or policy mutation was added.
 - 2026-08-13 12:44 +08:00 — Deployment walk found `/Users/ottoprua/.cardex/templates/retro.md` lacks the v2 facts contract. Added RED/GREEN coverage for non-destructive embedded fallback plus continued use of compatible local customization.
 - 2026-08-13 12:47 +08:00 — Full suite and mechanical gates passed after the report/template fences; created tested implementation commit `effcb24`. Still not pushed, merged, installed, or activated.
+- 2026-08-13 13:19 +08:00 — Recovered the exact production envelope before cutover: installed SHA-256 `e803020640fb94118d69000b4bd2673bb0bfba75b7282ce1c7a7453e9a819a4e`, Board PID `97428`, health `0.10.0`, bind `0.0.0.0:8788`, retrospective counter `702/697`, and no queued/running cards.
+- 2026-08-13 13:20 +08:00 — Rebuilt commit `70ebe2041222cf114401d820701a2a07a6240c69` to SHA-256 `545bd5730e51f9641a785465c280cdf4248ba5783ec98709c373a979a7378c71`; code signature verified. Backed up the old production binary before replacement.
+- 2026-08-13 13:21 +08:00 — Installed the verified candidate through a new inode and restarted only `com.cardex.board`. New PID `74082` listens on `*:8788`; `/api/health` returns `{"ok":true,"version":"0.10.0"}`. A production-path `cardex retro` read returned the unchanged facts hash `dc13e961c205584fd675f4bc50c60501ee65a10dec2074a1f191385ee5f5c976`.
+- 2026-08-13 13:22 +08:00 — Verified `com.cardex.tick` still invokes `/opt/homebrew/bin/cardex run --quiet --root /Users/ottoprua/.cardex` every 300 seconds, with last exit code 0. Natural runtime acceptance remains pending because the next threshold is 707 and the live counter is still 702.
+- 2026-08-13 13:24 +08:00 — Created current-thread heartbeat `cardex-mvp` at an hourly cadence. It is restricted to read-only watermark/report checks until a natural trigger, then owns exact v2 report acceptance and pauses itself after closure.
+
+## Production activation and rollback evidence
+
+- Installed binary: `/opt/homebrew/bin/cardex`
+- Installed candidate commit: `70ebe2041222cf114401d820701a2a07a6240c69`
+- Installed SHA-256: `545bd5730e51f9641a785465c280cdf4248ba5783ec98709c373a979a7378c71`
+- Recoverable backup: `/Users/ottoprua/.cardex/backups/cardex-0.10.0-pre-retro-mvp-20260813T131933+0800`
+- Backup SHA-256: `e803020640fb94118d69000b4bd2673bb0bfba75b7282ce1c7a7453e9a819a4e`
+- Board service: `com.cardex.board`, PID `74082`, bind `0.0.0.0:8788`, health version `0.10.0`
+- Scheduler service: `com.cardex.tick`, 300-second interval, last exit code 0
+- Continuity monitor: Codex heartbeat `cardex-mvp`, `ACTIVE`, hourly, attached to the current thread
+- Cutover did not modify the live config, retrospective counter, task state, or local retrospective template.
+- Rollback procedure: copy the backup to a new temporary inode under `/opt/homebrew/bin`, verify its SHA-256 and code signature, atomically move it to `/opt/homebrew/bin/cardex`, restart `com.cardex.board`, then re-check PID, `*:8788`, health, and scheduler exit status. Do not overwrite in place on macOS.
+
+Runtime acceptance gate:
+
+1. Wait for five real business-task completions; do not edit `retro_counter.json` or create synthetic completion cards.
+2. Confirm `triggered_at >= 707` and `last_retro_task` changes from `t0812-1747-df1a`.
+3. Verify the new retrospective task used the embedded v2 template fallback, contains a frozen `cardex.retro_facts.v1` hash/cohort, and publishes only a schema/hash/cohort/evidence-valid report with at most three recommendations.
+4. Keep the tracking card held until that report is inspected. A healthy service or successful enqueue alone is not runtime acceptance.
 
 ## Real-history evidence
 
@@ -136,7 +161,7 @@ Runtime-backed conclusion:
 - Malformed task/event files are skipped with structured gaps. No such file was present in the selected real cohort.
 - Cross-check `x_role=C` verdict recovery from old progress-only records is not implemented. Add it only if a real selected cohort shows material missing coverage.
 - Cost/turn telemetry for Codex and remote runners is 0/10 in the real window. This is frequent and blocks cost-based routing, but provider usage extraction is a separate packet because guessing subscription cost would be worse than retaining an explicit gap.
-- The candidate has not replaced the production Cardex binary and has not yet observed a naturally triggered retrospective report. Deployment and one natural trigger are the next runtime gate, not part of the offline candidate claim.
+- The candidate has replaced the production Cardex binary and passed immediate service/CLI verification. It has not yet observed a naturally triggered retrospective report; that report remains the only open runtime gate.
 
 ## Resume checklist
 
@@ -144,3 +169,4 @@ Runtime-backed conclusion:
 2. Confirm Cardex card `t0813-1212-9d17` is still held.
 3. Read this document and the latest commit before editing.
 4. Re-run focused tests before interpreting any real-history result.
+5. Check the live counter against the 707 threshold and inspect the new retrospective task only after a natural trigger.

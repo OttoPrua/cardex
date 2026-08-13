@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 13:24 +08:00
+Last updated: 2026-08-13 13:27 +08:00
 
 ## Ownership and safety envelope
 
@@ -86,6 +86,8 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 13:21 +08:00 — Installed the verified candidate through a new inode and restarted only `com.cardex.board`. New PID `74082` listens on `*:8788`; `/api/health` returns `{"ok":true,"version":"0.10.0"}`. A production-path `cardex retro` read returned the unchanged facts hash `dc13e961c205584fd675f4bc50c60501ee65a10dec2074a1f191385ee5f5c976`.
 - 2026-08-13 13:22 +08:00 — Verified `com.cardex.tick` still invokes `/opt/homebrew/bin/cardex run --quiet --root /Users/ottoprua/.cardex` every 300 seconds, with last exit code 0. Natural runtime acceptance remains pending because the next threshold is 707 and the live counter is still 702.
 - 2026-08-13 13:24 +08:00 — Created current-thread heartbeat `cardex-mvp` at an hourly cadence. It is restricted to read-only watermark/report checks until a natural trigger, then owns exact v2 report acceptance and pauses itself after closure.
+- 2026-08-13 13:24 +08:00 — The first scheduled tick after binary replacement exposed `last exit reason = OS_REASON_CODESIGNING` and `needs LWCR update`. Board health alone was therefore not sufficient deployment evidence.
+- 2026-08-13 13:26 +08:00 — Backed up the tick plist, then ran the repository-required `cardex install-launchd` refresh with the unchanged 300-second interval and data root. Its immediate RunAtLoad completed with exit code 0; the signing error and LWCR warning disappeared. Counter/task state remained unchanged at `702/697` and `t0812-1747-df1a`.
 
 ## Production activation and rollback evidence
 
@@ -95,10 +97,11 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - Recoverable backup: `/Users/ottoprua/.cardex/backups/cardex-0.10.0-pre-retro-mvp-20260813T131933+0800`
 - Backup SHA-256: `e803020640fb94118d69000b4bd2673bb0bfba75b7282ce1c7a7453e9a819a4e`
 - Board service: `com.cardex.board`, PID `74082`, bind `0.0.0.0:8788`, health version `0.10.0`
-- Scheduler service: `com.cardex.tick`, 300-second interval, last exit code 0
+- Scheduler service: `com.cardex.tick`, re-registered against the installed inode, 300-second interval, fresh RunAtLoad exit code 0
+- Scheduler plist backup: `/Users/ottoprua/.cardex/backups/com.cardex.tick.plist-pre-retro-mvp-20260813T132522+0800`, SHA-256 `3f2995f557dc7418399f6bf84e084906ee815273c3819d66ae5bcaeb0f1541b2` (identical to the regenerated plist)
 - Continuity monitor: Codex heartbeat `cardex-mvp`, `ACTIVE`, hourly, attached to the current thread
 - Cutover did not modify the live config, retrospective counter, task state, or local retrospective template.
-- Rollback procedure: copy the backup to a new temporary inode under `/opt/homebrew/bin`, verify its SHA-256 and code signature, atomically move it to `/opt/homebrew/bin/cardex`, restart `com.cardex.board`, then re-check PID, `*:8788`, health, and scheduler exit status. Do not overwrite in place on macOS.
+- Rollback procedure: copy the backup to a new temporary inode under `/opt/homebrew/bin`, verify its SHA-256 and code signature, atomically move it to `/opt/homebrew/bin/cardex`, restart `com.cardex.board`, re-run `cardex install-launchd -root /Users/ottoprua/.cardex -interval 300` to refresh launchd's inode/signing policy, then re-check PID, `*:8788`, health, and a fresh scheduler exit code. Do not overwrite in place on macOS.
 
 Runtime acceptance gate:
 

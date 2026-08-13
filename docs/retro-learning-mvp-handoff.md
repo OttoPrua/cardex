@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 14:23 +08:00
+Last updated: 2026-08-13 15:23 +08:00
 
 ## Ownership and safety envelope
 
@@ -100,6 +100,7 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 13:44 +08:00 — Backed up the prior retrospective-MVP production binary, installed `b50b73b` through a verified new inode, re-registered `com.cardex.tick`, and restarted only `com.cardex.board`. Installed SHA-256 is `9e296b0a80fb6b0a985c5c56b98c05581d9c1a2eb2bb63b21171bbae4dbbb8dd`.
 - 2026-08-13 13:45 +08:00 — Production verification passed: Board PID `87702`, bind `*:8788`, health `0.10.0`; fresh tick RunAtLoad exit 0 with no signing/LWCR marker; doctor reports launchd can execute the current binary. Doctor's overall exit remains 1 solely because the pre-existing Gemini authentication check is not ready; no credential/config change was made. Production retro facts remained hash/cohort stable and the natural counter remained `702/697`.
 - 2026-08-13 14:23 +08:00 — Heartbeat read-only check: counter remains `done_total=702`, `triggered_at=697` (delta `0/0` from the acceptance baseline), and `last_retro_task=t0812-1747-df1a`. Cardex remains 30 done / 43 held with no queued or running cards; tracking card `t0813-1212-9d17` remains held. No task or event file newer than the 13:45 production verification was found. Natural `707` trigger remains five genuine business completions away; no action taken.
+- 2026-08-13 15:23 +08:00 — Heartbeat read-only check: counter remains `702/697`, with no change from the 14:23 observation; `last_retro_task` is still `t0812-1747-df1a`. Cardex remains 30 done / 43 held, queued/running are both zero, and tracking card `t0813-1212-9d17` remains held. No task or event file newer than 14:23 was found. Natural `707` trigger remains five genuine business completions away; no action taken.
 
 ## Production activation and rollback evidence
 

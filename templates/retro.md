@@ -18,6 +18,7 @@
 - Cardex 的 done 不代表语义成功，只表示执行器完成；必须结合结构化 review verdict 与 `cards[].last_summary` 描述结果，绝不能把本窗口称为“10 张成功卡”。
 - `gaps` 是证据缺口，不得当 0、不得猜测补齐。证据不足的判断写入 `deferred_edges`，不要占用高 ROI 建议名额。
 - 建议必须引用 `cards[].id` 中的任务 ID，且只允许 proposal-only；不得声称已经修改或优化了配置。
+- 每条结论和建议的 `evidence_task_ids` 至少包含一个本 cohort 的任务 ID；引用外部卡、换 hash、换 cohort 或超过 3 条建议都会被 Cardex 拒绝落盘，并将本复盘卡标为 failed。
 - 只从本窗口能支持的事实推导结论。单例、罕见边界或无法证明会重复发生的问题，记录但不要建议立即开发。
 
 ## 输出格式

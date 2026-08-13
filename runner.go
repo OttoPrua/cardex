@@ -1682,15 +1682,19 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 		if key, err := saveProgressFromResult(root, t, res.Result); err != nil {
 			t.LastError = "进度报告落盘失败: " + err.Error()
 			logBlock(lg, "PROGRESS", t.LastError)
-			if t.XRole == "C" {
-				t.Status = statusFailed                          // C 的终局报告没落盘=终局缺失，别显示成功
+			if t.XRole == "C" || isRetroTask(t) {
+				t.Status = statusFailed                          // C/复盘的终局报告没落盘=终局缺失，别显示成功
 				_ = os.Remove(progressPath(root, t.ProgressKey)) // 清陈旧报告，别留旧的冒充当前终局
 				// 前面在 runTask 完成路径已 emit evDone(runner.go:815-817);此处终局又改判 failed 却不 emit,
 				// 事件账本终局为 done、盘上为 failed——活动流按事件流会展示"已完成"的假历史。
 				// 补一条 evFailed(actor=runner:postComplete)让终局改判有对应迁移事件,禁反推伪造。
+				reason := "progress_persist_failed"
+				if isRetroTask(t) {
+					reason = "retro_report_invalid"
+				}
 				emitTaskEvent(root, t.ID, evFailed, "runner:postComplete", statusFailed, t.Step,
 					withCostTelemetry(map[string]any{
-						"reason": "progress_persist_failed", "err": err.Error(), "role": t.XRole,
+						"reason": reason, "err": err.Error(), "role": t.XRole,
 					}, t))
 			}
 		} else {

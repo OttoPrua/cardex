@@ -143,6 +143,10 @@ type Task struct {
 	EmitProgress bool `json:"emit_progress,omitempty"`
 	// ProgressKey 是进度报告的落盘键；EmitProgress 时使用，空则用任务 ID。
 	ProgressKey string `json:"progress_key,omitempty"`
+	// RetroFactsSHA256 / RetroCohortTaskIDs 冻结新式复盘卡的输入契约。progress 落盘前必须
+	// 原样回显两者，且所有结论/建议的证据 ID 只能来自该 cohort；旧复盘卡字段为空时按旧格式兼容。
+	RetroFactsSHA256   string   `json:"retro_facts_sha256,omitempty"`
+	RetroCohortTaskIDs []string `json:"retro_cohort_task_ids,omitempty"`
 
 	ResumeAtEpoch  int64 `json:"resume_at_epoch,omitempty"`
 	NotBeforeEpoch int64 `json:"not_before_epoch,omitempty"`

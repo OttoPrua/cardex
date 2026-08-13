@@ -712,13 +712,17 @@ The deterministic facts carry exact task IDs, the selection rule, a SHA-256 dige
 5. Round-limit and divert events (cards escalated past their round cap, `limit_paused` counts, `runner=codex` diverted cards)
 6. Each card's title, directory/explicit project, lineage, and latest summary, so the model does not have to guess the workflow object from numbers alone
 
-The model must not rescan directories or recalculate the figures; it only interprets the facts and emits conclusions plus **at most 3** actionable recommendations. The facts JSON and digest are frozen in the task prompt, and the queued event also records `facts_sha256`. To recompute the same format without enqueuing a card or writing a progress report, run:
+The model must not rescan directories or recalculate the figures; it only interprets the facts and emits conclusions plus **at most 3** actionable recommendations. The facts JSON and digest are frozen in both the task prompt and task fields, and the queued event also records `facts_sha256`. Before publishing a report, Cardex validates the schema, digest, exact cohort, recommendation limit, and requires every conclusion/recommendation to cite at least one task from that cohort. A mismatch rejects publication and marks the retrospective card `failed`. Legacy retrospective cards without frozen fields remain compatible.
+
+To recompute the same format without enqueuing a card or writing a progress report, run:
 
 ```bash
 cardex retro -root ~/.cardex -n 10 -watermark 697
 ```
 
 This command only reads data and prints a `cardex.retro_facts.v1` envelope. `-watermark` is an optional audit label.
+
+An existing data root may retain a user-edited legacy `templates/retro.md`. A new retrospective uses the local template only when it contains the facts/hash, v2 schema, cohort, and evidence contract. Otherwise that task falls back to the embedded v2 template and records `template_source` on stderr and the queued event. The fallback never overwrites the user's file, so custom content can be migrated deliberately later.
 
 The report lands in `progress/retro-<watermark>.json`; read it with `cardex progress -show retro-<watermark>`.
 

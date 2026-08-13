@@ -690,13 +690,21 @@ cardex add -dir ~/proj "常规改动"                                  # 缺省 
 6. 每张卡的标题、目录/显式项目、谱系和最新摘要（不给模型只剩数字、却要求它猜工作流对象）
 
 模型不得重新扫目录或重算数字；它只解释上述事实，给出结论与**最多 3 条**可执行建议。事实 JSON 与哈希已冻结在任务
-prompt 中，任务事件也记录 `facts_sha256`。需要在不入队、不写进度报告的情况下复算，可运行：
+prompt 和卡面中，任务事件也记录 `facts_sha256`。报告落盘前，Cardex 会核对 schema、事实 hash、完整 cohort、建议上限，
+并要求每条结论/建议至少引用一个 cohort 内任务；任一不符都拒绝发布并将复盘卡改判 `failed`。旧版复盘卡没有冻结字段，
+仍按旧格式兼容。
+
+需要在不入队、不写进度报告的情况下复算，可运行：
 
 ```bash
 cardex retro -root ~/.cardex -n 10 -watermark 697
 ```
 
 该命令只读输出 `cardex.retro_facts.v1` 信封；`-watermark` 只作审计标签，可省略。
+
+已有数据根可能保留用户改过的旧 `templates/retro.md`。新复盘只在本地模板同时包含 facts/hash、v2 schema、cohort 与
+evidence 占位契约时使用它；否则本次任务回退二进制内置 v2，并在 stderr 与 queued 事件记录 `template_source`。
+回退不会覆盖用户文件，便于之后人工迁移定制内容。
 
 报告落 `progress/retro-<水位>.json`，用 `cardex progress -show retro-<水位>` 查看。
 

@@ -272,6 +272,9 @@ func TestRetroCardShape(t *testing.T) {
 	if card.ProgressKey != retroProgressKeyPrefix+"1" {
 		t.Errorf("复盘卡 progress_key = %q, 应为 %q", card.ProgressKey, retroProgressKeyPrefix+"1")
 	}
+	if len(card.RetroFactsSHA256) != 64 || len(card.RetroCohortTaskIDs) != 1 || card.RetroCohortTaskIDs[0] != "x1" {
+		t.Errorf("复盘卡未冻结 facts 契约: hash=%q cohort=%v", card.RetroFactsSHA256, card.RetroCohortTaskIDs)
+	}
 	if card.Dir != root {
 		t.Errorf("复盘卡工作目录 = %q, 应为数据根 %q(数据源都在根下)", card.Dir, root)
 	}

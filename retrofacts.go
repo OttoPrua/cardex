@@ -19,6 +19,7 @@ import (
 )
 
 const retroFactsSchema = "cardex.retro_facts.v1"
+const retroReportSchema = "cardex.retrospective_report.v2"
 
 type RetroFacts struct {
 	SchemaVersion  string             `json:"schema_version"`
@@ -327,6 +328,134 @@ func writeRetroFacts(w io.Writer, root string, n int, watermark int64) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(RetroFactsEnvelope{FactsSHA256: hash, Facts: facts})
+}
+
+// validateRetroReport prevents a fluent but detached model response from becoming durable learning
+// input. Legacy retrospective cards have no frozen metadata and remain readable/retryable.
+func validateRetroReport(task *Task, report map[string]any) error {
+	if task == nil || task.RetroFactsSHA256 == "" {
+		return nil
+	}
+	if got := retroReportString(report, "schema_version"); got != retroReportSchema {
+		return fmt.Errorf("schema_version=%q, want %q", got, retroReportSchema)
+	}
+	if got := retroReportString(report, "facts_sha256"); got != task.RetroFactsSHA256 {
+		return fmt.Errorf("facts_sha256 与冻结事实不一致")
+	}
+	cohort, err := retroReportStringSlice(report, "cohort_task_ids")
+	if err != nil {
+		return err
+	}
+	if !retroEqualStrings(cohort, task.RetroCohortTaskIDs) {
+		return fmt.Errorf("cohort_task_ids 与冻结 cohort 不一致")
+	}
+	allowed := make(map[string]bool, len(cohort))
+	for _, id := range cohort {
+		allowed[id] = true
+	}
+	conclusions, err := retroReportObjects(report, "conclusions")
+	if err != nil {
+		return err
+	}
+	for i, conclusion := range conclusions {
+		if retroReportString(conclusion, "finding") == "" {
+			return fmt.Errorf("conclusions[%d].finding 为空", i)
+		}
+		switch retroReportString(conclusion, "confidence") {
+		case "high", "medium", "low":
+		default:
+			return fmt.Errorf("conclusions[%d].confidence 非法", i)
+		}
+		if err := retroValidateEvidence(conclusion, fmt.Sprintf("conclusions[%d]", i), allowed); err != nil {
+			return err
+		}
+	}
+	recommendations, err := retroReportObjects(report, "recommendations")
+	if err != nil {
+		return err
+	}
+	if len(recommendations) > 3 {
+		return fmt.Errorf("recommendations=%d, 最多允许 3", len(recommendations))
+	}
+	for i, recommendation := range recommendations {
+		for _, field := range []string{"target", "change", "expected_effect", "validation"} {
+			if retroReportString(recommendation, field) == "" {
+				return fmt.Errorf("recommendations[%d].%s 为空", i, field)
+			}
+		}
+		if err := retroValidateEvidence(recommendation, fmt.Sprintf("recommendations[%d]", i), allowed); err != nil {
+			return err
+		}
+	}
+	if _, ok := report["deferred_edges"].([]any); !ok {
+		return fmt.Errorf("deferred_edges 必须是数组")
+	}
+	return nil
+}
+
+func retroValidateEvidence(item map[string]any, label string, allowed map[string]bool) error {
+	ids, err := retroReportStringSlice(item, "evidence_task_ids")
+	if err != nil {
+		return fmt.Errorf("%s: %w", label, err)
+	}
+	if len(ids) == 0 {
+		return fmt.Errorf("%s.evidence_task_ids 为空", label)
+	}
+	for _, id := range ids {
+		if !allowed[id] {
+			return fmt.Errorf("%s 引用了 cohort 外任务 %q", label, id)
+		}
+	}
+	return nil
+}
+
+func retroReportString(report map[string]any, key string) string {
+	value, _ := report[key].(string)
+	return strings.TrimSpace(value)
+}
+
+func retroReportStringSlice(report map[string]any, key string) ([]string, error) {
+	raw, ok := report[key].([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s 必须是字符串数组", key)
+	}
+	out := make([]string, 0, len(raw))
+	for i, value := range raw {
+		text, ok := value.(string)
+		if !ok || strings.TrimSpace(text) == "" {
+			return nil, fmt.Errorf("%s[%d] 必须是非空字符串", key, i)
+		}
+		out = append(out, strings.TrimSpace(text))
+	}
+	return out, nil
+}
+
+func retroReportObjects(report map[string]any, key string) ([]map[string]any, error) {
+	raw, ok := report[key].([]any)
+	if !ok {
+		return nil, fmt.Errorf("%s 必须是数组", key)
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for i, value := range raw {
+		object, ok := value.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("%s[%d] 必须是对象", key, i)
+		}
+		out = append(out, object)
+	}
+	return out, nil
+}
+
+func retroEqualStrings(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func loadRetroFactTasks(root string) ([]*Task, []RetroFactGap) {

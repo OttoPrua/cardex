@@ -164,7 +164,7 @@ func queueRetroTask(root string, cfg *Config, watermark, n int64, completing ...
 	if err != nil {
 		return "", fmt.Errorf("序列化复盘事实: %w", err)
 	}
-	tpl, err := loadTemplate(root, retroTemplate)
+	tpl, templateSource, err := loadRetroTemplate(root)
 	if err != nil {
 		return "", err
 	}
@@ -185,6 +185,8 @@ func queueRetroTask(root string, cfg *Config, watermark, n int64, completing ...
 	t.Model = "haiku"
 	t.EmitProgress = true
 	t.ProgressKey = key
+	t.RetroFactsSHA256 = factsHash
+	t.RetroCohortTaskIDs = append([]string(nil), facts.Window.TaskIDs...)
 	// 复盘卡无会话可续，且它是纯读盘分析——每步全新会话，永不因会话上下文上限失败。
 	t.FreshSteps = true
 	if err := saveTask(root, t); err != nil {
@@ -193,6 +195,39 @@ func queueRetroTask(root string, cfg *Config, watermark, n int64, completing ...
 	emitTaskEvent(root, t.ID, evQueued, "runner:retro", statusQueued, 0, map[string]any{
 		"type": t.Type, "reason": "retro_every_n_done",
 		"n": n, "watermark": watermark, "progress_key": key, "facts_sha256": factsHash,
+		"template_source": templateSource,
 	})
 	return t.ID, nil
+}
+
+func loadRetroTemplate(root string) (string, string, error) {
+	path := filepath.Join(templatesDir(root), retroTemplate+".md")
+	if data, err := os.ReadFile(path); err == nil {
+		tpl := string(data)
+		if retroTemplateV2Compatible(tpl) {
+			return tpl, "local_v2", nil
+		}
+		// 不覆盖用户文件：旧模板可能含用户定制。只让本次任务安全回退内置 v2，并在 stderr/event 留痕。
+		fmt.Fprintf(os.Stderr, "警告: 复盘模板 %s 是旧契约，当前任务回退内置 v2（原文件未修改）\n", path)
+	}
+	data, err := embeddedTemplates.ReadFile("templates/" + retroTemplate + ".md")
+	if err != nil {
+		return "", "", fmt.Errorf("找不到内置复盘模板: %w", err)
+	}
+	tpl := string(data)
+	if !retroTemplateV2Compatible(tpl) {
+		return "", "", fmt.Errorf("内置复盘模板不满足 v2 facts/report 契约")
+	}
+	return tpl, "embedded_v2", nil
+}
+
+func retroTemplateV2Compatible(tpl string) bool {
+	for _, required := range []string{
+		"{{FACTS_JSON}}", "{{FACTS_SHA256}}", retroReportSchema, `"cohort_task_ids"`, `"evidence_task_ids"`,
+	} {
+		if !strings.Contains(tpl, required) {
+			return false
+		}
+	}
+	return true
 }

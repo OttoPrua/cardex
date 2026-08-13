@@ -269,3 +269,185 @@ func TestRetroTriggerIncludesCompletingCardBeforeFinalSave(t *testing.T) {
 		t.Fatalf("triggering card missing from frozen cohort before final save:\n%s", card.Prompts[0])
 	}
 }
+
+func TestRetroReportValidationRejectsDrift(t *testing.T) {
+	root := retroTestRoot(t)
+	cfg := retroTestConfig(1)
+	done := &Task{ID: "report-source", Title: "source", Type: typeSequence, Status: statusDone,
+		CreatedAt: "2026-08-13T10:00:00+08:00", UpdatedAt: "2026-08-13T10:00:00+08:00"}
+	writeRetroFactTask(t, root, done, true,
+		factEvent(1, "2026-08-13T10:00:00+08:00", evDone, map[string]any{"cost_total": 0.1, "turns_total": 1}),
+	)
+	id, err := queueRetroTask(root, cfg, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := loadTask(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if card.RetroFactsSHA256 == "" || !reflect.DeepEqual(card.RetroCohortTaskIDs, []string{"report-source"}) {
+		t.Fatalf("retro task missing frozen report contract: %+v", card)
+	}
+
+	valid := map[string]any{
+		"schema_version":  retroReportSchema,
+		"facts_sha256":    card.RetroFactsSHA256,
+		"cohort_task_ids": []string{"report-source"},
+		"conclusions": []any{map[string]any{
+			"finding": "one supported finding", "evidence_task_ids": []string{"report-source"}, "confidence": "high",
+		}},
+		"recommendations": []any{map[string]any{
+			"target": "retro template", "change": "keep facts frozen", "evidence_task_ids": []string{"report-source"},
+			"expected_effect": "less drift", "validation": "next cohort keeps the same hash",
+		}},
+		"deferred_edges": []any{},
+	}
+	encode := func(report map[string]any) string {
+		data, err := json.Marshal(report)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return "```json\n" + string(data) + "\n```"
+	}
+	if _, err := saveProgressFromResult(root, card, encode(valid)); err != nil {
+		t.Fatalf("valid retrospective report rejected: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(map[string]any)
+	}{
+		{"wrong facts hash", func(report map[string]any) { report["facts_sha256"] = strings.Repeat("0", 64) }},
+		{"wrong cohort", func(report map[string]any) { report["cohort_task_ids"] = []string{"foreign"} }},
+		{"foreign evidence", func(report map[string]any) {
+			report["conclusions"] = []any{map[string]any{"finding": "x", "evidence_task_ids": []string{"foreign"}, "confidence": "high"}}
+		}},
+		{"too many recommendations", func(report map[string]any) {
+			item := map[string]any{"target": "x", "change": "x", "evidence_task_ids": []string{"report-source"}, "expected_effect": "x", "validation": "x"}
+			report["recommendations"] = []any{item, item, item, item}
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data, _ := json.Marshal(valid)
+			var report map[string]any
+			_ = json.Unmarshal(data, &report)
+			tc.mutate(report)
+			if _, err := saveProgressFromResult(root, card, encode(report)); err == nil {
+				t.Fatal("drifted retrospective report was accepted")
+			}
+		})
+	}
+}
+
+func TestPostCompleteInvalidRetroReportFailsClosed(t *testing.T) {
+	root := retroTestRoot(t)
+	cfg := retroTestConfig(1)
+	done := &Task{ID: "post-source", Title: "source", Type: typeSequence, Status: statusDone,
+		CreatedAt: "2026-08-13T10:00:00+08:00", UpdatedAt: "2026-08-13T10:00:00+08:00"}
+	writeRetroFactTask(t, root, done, true,
+		factEvent(1, "2026-08-13T10:00:00+08:00", evDone, map[string]any{"cost_total": 0.1, "turns_total": 1}),
+	)
+	id, err := queueRetroTask(root, cfg, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := loadTask(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	card.Status = statusDone
+	emitTaskEvent(root, card.ID, evDone, "runner", statusDone, 1, withCostTelemetry(nil, card))
+	lg, err := os.CreateTemp(t.TempDir(), "retro-log-*.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lg.Close()
+	postComplete(root, cfg, card, &claudeResult{Result: "```json\n{\"schema_version\":\"wrong\"}\n```"}, lg)
+	if card.Status != statusFailed || !strings.Contains(card.LastError, "复盘报告") {
+		t.Fatalf("invalid retro report must fail closed: status=%s err=%q", card.Status, card.LastError)
+	}
+	events, _, err := loadTaskEvents(root, card.ID)
+	if err != nil || len(events) == 0 || events[len(events)-1].Type != evFailed {
+		t.Fatalf("invalid report missing failed terminal event: events=%v err=%v", events, err)
+	}
+}
+
+func TestLegacyRetroReportRemainsCompatible(t *testing.T) {
+	root := retroTestRoot(t)
+	legacy := &Task{ID: "legacy-retro", Title: "legacy", Type: typeProgressPull, Status: statusDone,
+		ProgressKey: retroProgressKeyPrefix + "old", EmitProgress: true}
+	if _, err := saveProgressFromResult(root, legacy, "```json\n{\"window\":{\"cards\":1},\"recommendations\":[]}\n```"); err != nil {
+		t.Fatalf("legacy retrospective without frozen metadata must remain readable/retryable: %v", err)
+	}
+}
+
+func TestQueueRetroTaskFallsBackFromLegacyLocalTemplate(t *testing.T) {
+	root := retroTestRoot(t)
+	cfg := retroTestConfig(1)
+	if err := os.MkdirAll(templatesDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	legacy := "LEGACY_SENTINEL {{ARCHIVE_DIR}}"
+	path := filepath.Join(templatesDir(root), retroTemplate+".md")
+	if err := os.WriteFile(path, []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := &Task{ID: "template-source", Title: "source", Type: typeSequence, Status: statusDone,
+		CreatedAt: "2026-08-13T10:00:00+08:00", UpdatedAt: "2026-08-13T10:00:00+08:00"}
+	writeRetroFactTask(t, root, done, true,
+		factEvent(1, "2026-08-13T10:00:00+08:00", evDone, map[string]any{"cost_total": 0.1, "turns_total": 1}),
+	)
+	id, err := queueRetroTask(root, cfg, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := loadTask(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(card.Prompts[0], "LEGACY_SENTINEL") || !strings.Contains(card.Prompts[0], retroReportSchema) {
+		t.Fatalf("legacy local template did not fall back to embedded v2:\n%s", card.Prompts[0])
+	}
+	unchanged, err := os.ReadFile(path)
+	if err != nil || string(unchanged) != legacy {
+		t.Fatalf("fallback must not rewrite user template: data=%q err=%v", unchanged, err)
+	}
+	events, _, err := loadTaskEvents(root, id)
+	if err != nil || len(events) == 0 || retroDetailString(events[0].Detail, "template_source") != "embedded_v2" {
+		t.Fatalf("template fallback source not disclosed: events=%v err=%v", events, err)
+	}
+}
+
+func TestQueueRetroTaskKeepsCompatibleLocalTemplate(t *testing.T) {
+	root := retroTestRoot(t)
+	cfg := retroTestConfig(1)
+	if err := os.MkdirAll(templatesDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	custom := `CUSTOM_V2 {{FACTS_JSON}} {{FACTS_SHA256}} cardex.retrospective_report.v2 "cohort_task_ids" "evidence_task_ids"`
+	if err := os.WriteFile(filepath.Join(templatesDir(root), retroTemplate+".md"), []byte(custom), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := &Task{ID: "custom-template-source", Title: "source", Type: typeSequence, Status: statusDone,
+		CreatedAt: "2026-08-13T10:00:00+08:00", UpdatedAt: "2026-08-13T10:00:00+08:00"}
+	writeRetroFactTask(t, root, done, true,
+		factEvent(1, "2026-08-13T10:00:00+08:00", evDone, map[string]any{"cost_total": 0.1, "turns_total": 1}),
+	)
+	id, err := queueRetroTask(root, cfg, 1, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	card, err := loadTask(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(card.Prompts[0], "CUSTOM_V2") || strings.Contains(card.Prompts[0], "{{FACTS_JSON}}") {
+		t.Fatalf("compatible local template was not rendered: %s", card.Prompts[0])
+	}
+	events, _, err := loadTaskEvents(root, id)
+	if err != nil || len(events) == 0 || retroDetailString(events[0].Detail, "template_source") != "local_v2" {
+		t.Fatalf("local template source not disclosed: events=%v err=%v", events, err)
+	}
+}

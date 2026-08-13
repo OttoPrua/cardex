@@ -9,6 +9,7 @@ Last updated: 2026-08-13 12:33 +08:00
 - Worktree: `/Users/ottoprua/Projects/cardex-retro-mvp`
 - Branch: `codex/retro-learning-mvp`
 - Base commit: `29f3e9694d9501bff2d0c038dea6b39fb15cb92a`
+- Tested implementation commit: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`). Any later commit on this branch is handoff/documentation-only unless this line is explicitly revised.
 - The main worktree `/Users/ottoprua/Projects/cardex` was already dirty before this packet (27 tracked and 8 untracked paths observed). Do not copy, clean, stage, or commit those bytes.
 - Do not change `/Users/ottoprua/.cardex/config.json`, do not restart the production board, and preserve its `0.0.0.0:8788` LAN/Tailscale binding.
 
@@ -74,6 +75,7 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 12:27 +08:00 — Tracking card `t0813-1212-9d17` rechecked as `held`. Production binary/config/service remain unchanged.
 - 2026-08-13 12:30 +08:00 — Pre-commit source walk found the runner order `emit done → trigger retro → final save`. Added a failing integration regression test, then passed the in-memory terminal card as a facts-only overlay. Focused test turned GREEN.
 - 2026-08-13 12:33 +08:00 — Final full suite, build, vet, diff check, and real-history hash verification passed.
+- 2026-08-13 12:35 +08:00 — Created tested implementation commit `f4f4e22`; not pushed, merged, installed, or activated.
 
 ## Real-history evidence
 

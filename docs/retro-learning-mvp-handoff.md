@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 12:33 +08:00
+Last updated: 2026-08-13 12:47 +08:00
 
 ## Ownership and safety envelope
 
@@ -9,7 +9,7 @@ Last updated: 2026-08-13 12:33 +08:00
 - Worktree: `/Users/ottoprua/Projects/cardex-retro-mvp`
 - Branch: `codex/retro-learning-mvp`
 - Base commit: `29f3e9694d9501bff2d0c038dea6b39fb15cb92a`
-- Tested implementation commit: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`). Any later commit on this branch is handoff/documentation-only unless this line is explicitly revised.
+- Tested implementation commits: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`) and `effcb24` (`feat(retro): validate evidence-bound reports`). Later commit(s) are handoff/documentation-only unless this line is explicitly revised.
 - The main worktree `/Users/ottoprua/Projects/cardex` was already dirty before this packet (27 tracked and 8 untracked paths observed). Do not copy, clean, stage, or commit those bytes.
 - Do not change `/Users/ottoprua/.cardex/config.json`, do not restart the production board, and preserve its `0.0.0.0:8788` LAN/Tailscale binding.
 
@@ -44,6 +44,8 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - Cohort selection now uses `status=done` plus the final `done` event timestamp, excludes retrospective tasks, reads active and archived cards, and uses `updated_at` only as a disclosed legacy fallback.
 - The runner emits `done` before its final task-file save. The current in-memory done card is therefore overlaid during compilation so the card that triggers a retrospective cannot be omitted from its own cohort.
 - The model template no longer scans files or performs arithmetic. It produces conclusions, at most three recommendations, and deferred edges from the frozen facts.
+- New retrospective tasks persist the facts SHA-256 and exact cohort on the task. Progress publication validates schema/hash/cohort, requires cohort-scoped evidence for every conclusion/recommendation, and enforces the three-recommendation cap. Invalid output fails closed and marks the retrospective task `failed`; legacy cards without frozen metadata remain compatible.
+- The live data root currently has a legacy local retrospective template. New code checks its contract before use; incompatible local templates fall back to embedded v2 with an event/stderr disclosure and are never overwritten. Compatible local custom templates remain supported.
 - The template explicitly states that Cardex `done` means runner completion, not semantic success. Missing review verdicts remain missing rather than being inferred from titles.
 - Public Chinese and English guides describe the new boundary and preview command.
 
@@ -76,6 +78,9 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 12:30 +08:00 — Pre-commit source walk found the runner order `emit done → trigger retro → final save`. Added a failing integration regression test, then passed the in-memory terminal card as a facts-only overlay. Focused test turned GREEN.
 - 2026-08-13 12:33 +08:00 — Final full suite, build, vet, diff check, and real-history hash verification passed.
 - 2026-08-13 12:35 +08:00 — Created tested implementation commit `f4f4e22`; not pushed, merged, installed, or activated.
+- 2026-08-13 12:39 +08:00 — Added the minimal report-publication fence after RED tests proved drifted hash/cohort/evidence and four recommendations were previously accepted. Invalid new-style reports now fail closed; no learning ledger or policy mutation was added.
+- 2026-08-13 12:44 +08:00 — Deployment walk found `/Users/ottoprua/.cardex/templates/retro.md` lacks the v2 facts contract. Added RED/GREEN coverage for non-destructive embedded fallback plus continued use of compatible local customization.
+- 2026-08-13 12:47 +08:00 — Full suite and mechanical gates passed after the report/template fences; created tested implementation commit `effcb24`. Still not pushed, merged, installed, or activated.
 
 ## Real-history evidence
 
@@ -123,6 +128,7 @@ Runtime-backed conclusion:
 - `env GOCACHE=/tmp/cardex-retro-mvp-go-cache-vet go vet ./...` → exit 0.
 - `git diff --check` → exit 0.
 - Rebuilt `/tmp/cardex-retro-mvp-cardex`; a final real-history read returned the same facts hash `dc13e961c205584fd675f4bc50c60501ee65a10dec2074a1f191385ee5f5c976`.
+- After `effcb24`: `env GOCACHE=/tmp/cardex-retro-mvp-go-cache-full4 go test ./...` → exit 0, `ok cardex 55.264s`; build, vet, and `git diff --check` also exited 0. Two fresh real-history reads again returned the same hash.
 
 ## Deferred edge cases discovered
 

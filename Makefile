@@ -1,8 +1,11 @@
 BIN := bin/cardex
 PREFIX ?= /opt/homebrew/bin
+override BUILD_REVISION := $(shell git rev-parse --verify HEAD 2>/dev/null || echo unavailable)
+override BUILD_MODIFIED := $(shell if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then echo unknown; elif test -z "$$(git status --porcelain --untracked-files=normal 2>/dev/null)"; then echo false; else echo true; fi)
+override BUILD_LDFLAGS := -X main.buildRevision=$(BUILD_REVISION) -X main.buildModified=$(BUILD_MODIFIED)
 
 build:
-	go build -o $(BIN) .
+	go build -ldflags "$(BUILD_LDFLAGS)" -o $(BIN) .
 
 test: build
 	bash test/integration.sh
@@ -11,6 +14,9 @@ vet:
 	go vet ./...
 
 install: build
+	@test -n "$(CARDEX_INSTALL_EXPECTED_HEAD)" || (echo "缺少 CARDEX_INSTALL_EXPECTED_HEAD=<已审核完整提交>" >&2; exit 2)
+	@test -n "$(CARDEX_INSTALL_EXPECTED_CURRENT_SHA256)" || (echo "缺少 CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=<当前生产 SHA-256|absent>" >&2; exit 2)
+	$(BIN) install-preflight -target $(PREFIX)/cardex -expected-head "$(CARDEX_INSTALL_EXPECTED_HEAD)" -expected-current-sha256 "$(CARDEX_INSTALL_EXPECTED_CURRENT_SHA256)"
 	# 先删再拷（新 inode）：macOS 上 cp 原位覆盖已签名二进制会让签名缓存失效，
 	# 新起的进程被 AMFI 直接 SIGKILL（RC=137）。正在运行的旧映像不受影响。
 	rm -f $(PREFIX)/cardex

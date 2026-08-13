@@ -29,18 +29,28 @@ cardex install-launchd                                                   # it ru
 ## Quick start
 
 ```bash
-make build && make install     # compile and install to /opt/homebrew/bin
+CARDEX_INSTALL_EXPECTED_HEAD=<full-reviewed-commit-sha> \
+CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=<current-production-sha256-or-absent> \
+  make install                # replace one explicit preimage from a clean reviewed commit
 cardex init                    # initialize ~/.cardex (override the data dir with CARDEX_ROOT; the legacy CLAUDEGO_ROOT is still read once, with a warning)
 cardex install-launchd        # install the timer; re-register it after every binary replacement
 cardex doctor                 # check CLIs, directories, config, and whether launchd can execute the current binary
 ```
+
+Record the full candidate commit and the current `/opt/homebrew/bin/cardex` SHA-256 independently
+before installation; use `absent` only for a genuinely missing first-install target. The standard
+install rejects a dirty source tree, a candidate-commit mismatch, or a changed production preimage,
+and does not remove the current binary before preflight passes. `cardex doctor` also rejects builds
+whose Go provenance reports `vcs.modified=true`.
 
 On macOS, launchd binds its execution policy to the registered executable inode. After an upgrade,
 the plist can still exist while the timer rejects the new binary with `OS_REASON_CODESIGNING`.
 Re-run `cardex install-launchd` after replacing `/opt/homebrew/bin/cardex`, then verify with
 `cardex doctor`; a plist or a healthy Web endpoint alone is not sufficient evidence.
 
-Still need the old `claudego` command name? `make install install-shim` also lays down a `claudego → cardex` compatibility symlink (`ln -sf`, tracks the binary as it upgrades) — a transition-period aid, removable once the rename is finished.
+Still need the old `claudego` command name? Run `make install-shim` with the same two preflight
+variables; it also lays down a `claudego → cardex` compatibility symlink (`ln -sf`, tracks the
+binary as it upgrades) — a transition-period aid, removable once the rename is finished.
 
 Three common ways to enqueue — pick one to start:
 

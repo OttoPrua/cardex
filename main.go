@@ -80,6 +80,8 @@ func main() {
 		err = cmdEngines(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
+	case "install-preflight":
+		err = cmdInstallPreflight(os.Args[2:])
 	case "version", "-v", "--version":
 		fmt.Println("cardex", version)
 	case "help", "-h", "--help":
@@ -1716,6 +1718,9 @@ func cmdDoctor(args []string) error {
 	}
 	fmt.Println("cardex doctor")
 	fmt.Println("数据目录:", root)
+	provenance := currentBuildProvenance()
+	check("当前二进制来自干净提交 ("+provenance.Revision+")", validateCleanBuildProvenance(provenance),
+		"从已提交且干净的受审 worktree 构建；不要从脏主工作树安装")
 
 	cfg, err := loadConfig(root)
 	check("配置文件", err, "运行 cardex init")

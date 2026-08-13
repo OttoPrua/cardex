@@ -29,17 +29,24 @@ cardex install-launchd                                            # 之后它自
 ## 快速开始
 
 ```bash
-make build && make install     # 编译并装到 /opt/homebrew/bin
+CARDEX_INSTALL_EXPECTED_HEAD=<已审核的完整提交SHA> \
+CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=<当前生产二进制SHA256或absent> \
+  make install                # 只从干净受审提交替换明确的生产预像
 cardex init                    # 初始化 ~/.cardex（数据目录可用 CARDEX_ROOT 覆盖；旧变量名 CLAUDEGO_ROOT 仍兼容读一次并提示）
 cardex install-launchd        # 安装定时器；以后每次替换二进制也要重新注册
 cardex doctor                 # 自检 CLI、目录、配置，以及 launchd 是否能执行当前二进制
 ```
 
+安装前先独立记录完整候选提交与当前 `/opt/homebrew/bin/cardex` 的 SHA-256；只有首次安装且目标确实
+不存在时才使用 `absent`。标准安装会拒绝脏工作树、候选提交不一致和生产预像漂移，且在通过预检
+前不会删除现有二进制。`cardex doctor` 也会拒绝 `vcs.modified=true` 的脏树构建。
+
 macOS 会把 launchd 的执行策略绑定到已注册的二进制 inode。升级时即使 plist 仍在，定时器也可能因
 `OS_REASON_CODESIGNING` 拒绝新二进制；因此替换 `/opt/homebrew/bin/cardex` 后必须重新运行
 `cardex install-launchd`，再以 `cardex doctor` 验证，不能只看 plist 或 Web 健康接口。
 
-旧名 `claudego` 命令仍要保留：`make install install-shim` 会额外铺一条 `claudego → cardex` 的兼容软链（`ln -sf`，跟随二进制升级），过渡期用，改名收尾后可移除。
+旧名 `claudego` 命令仍要保留：带上相同两个预检变量运行 `make install-shim`，会额外铺一条
+`claudego → cardex` 的兼容软链（`ln -sf`，跟随二进制升级），过渡期用，改名收尾后可移除。
 
 三种最常用的入队方式，挑一个开始：
 

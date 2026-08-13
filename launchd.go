@@ -4,7 +4,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
+	"strings"
 )
 
 const launchdLabel = "com.cardex.tick"
@@ -46,6 +49,39 @@ func plistPath() (string, error) {
 		return "", err
 	}
 	return filepath.Join(home, "Library", "LaunchAgents", launchdLabel+".plist"), nil
+}
+
+// doctorLaunchdStatus verifies the loaded job rather than treating a plist on disk as proof that
+// the scheduler can execute the current binary. macOS caches a Lightweight Code Requirement (LWCR)
+// for the executable inode; replacing the binary can leave the plist present while launchd rejects
+// every tick with OS_REASON_CODESIGNING until install-launchd re-registers the job.
+func doctorLaunchdStatus() error {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	current, err := user.Current()
+	if err != nil {
+		return fmt.Errorf("读取当前用户: %w", err)
+	}
+	target := fmt.Sprintf("gui/%s/%s", current.Uid, launchdLabel)
+	out, err := exec.Command("launchctl", "print", target).CombinedOutput()
+	if err != nil {
+		detail := strings.TrimSpace(string(out))
+		if detail == "" {
+			detail = err.Error()
+		}
+		return fmt.Errorf("launchctl 未加载 %s: %s", target, detail)
+	}
+	return validateLaunchdDoctorOutput(string(out))
+}
+
+func validateLaunchdDoctorOutput(output string) error {
+	for _, marker := range []string{"OS_REASON_CODESIGNING", "needs LWCR update"} {
+		if strings.Contains(output, marker) {
+			return fmt.Errorf("launchd 签名策略未跟随当前二进制（%s）", marker)
+		}
+	}
+	return nil
 }
 
 // legacyPlistPath 是旧 label 的 plist 路径,只用于"还在不在"的探测与告警,不做任何写/删。

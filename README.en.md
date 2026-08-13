@@ -31,8 +31,14 @@ cardex install-launchd                                                   # it ru
 ```bash
 make build && make install     # compile and install to /opt/homebrew/bin
 cardex init                    # initialize ~/.cardex (override the data dir with CARDEX_ROOT; the legacy CLAUDEGO_ROOT is still read once, with a warning)
-cardex doctor                  # self-check: claude CLI, directories, config
+cardex install-launchd        # install the timer; re-register it after every binary replacement
+cardex doctor                 # check CLIs, directories, config, and whether launchd can execute the current binary
 ```
+
+On macOS, launchd binds its execution policy to the registered executable inode. After an upgrade,
+the plist can still exist while the timer rejects the new binary with `OS_REASON_CODESIGNING`.
+Re-run `cardex install-launchd` after replacing `/opt/homebrew/bin/cardex`, then verify with
+`cardex doctor`; a plist or a healthy Web endpoint alone is not sufficient evidence.
 
 Still need the old `claudego` command name? `make install install-shim` also lays down a `claudego → cardex` compatibility symlink (`ln -sf`, tracks the binary as it upgrades) — a transition-period aid, removable once the rename is finished.
 

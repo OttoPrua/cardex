@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 13:27 +08:00
+Last updated: 2026-08-13 13:40 +08:00
 
 ## Ownership and safety envelope
 
@@ -12,12 +12,16 @@ Last updated: 2026-08-13 13:27 +08:00
 - Tested implementation commits: `f4f4e22` (`feat(retro): freeze deterministic retrospective facts`) and `effcb24` (`feat(retro): validate evidence-bound reports`). Later commit(s) are handoff/documentation-only unless this line is explicitly revised.
 - The main worktree `/Users/ottoprua/Projects/cardex` was already dirty before this packet (27 tracked and 8 untracked paths observed). Do not copy, clean, stage, or commit those bytes.
 - The user authorized the exact production install and one Board restart on 2026-08-13. That cutover is complete. Do not change `/Users/ottoprua/.cardex/config.json` or perform another restart without a new reason; preserve the `0.0.0.0:8788` LAN/Tailscale binding.
+- The user subsequently authorized direct modification of already-evidenced problems. Apply that only to reproducible, recurring/core-path, narrow, reversible defects with a focused RED and no authority expansion; keep policy/routing/promotion changes evidence-gated.
 
 ## MVP outcome
 
 Turn retrospective input into reproducible facts before asking a model for recommendations. Prove the smallest useful path on real Cardex history, then use the result to choose the next change.
 
 The MVP is intentionally not a knowledge base, automatic policy editor, DAG engine, intent classifier, or automatic promotion system.
+
+Reusable conclusions and the direct-fix decision rule are maintained in
+[`docs/retrospective-development-lessons.md`](retrospective-development-lessons.md).
 
 ## Confirmed starting point
 
@@ -88,6 +92,10 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 13:24 +08:00 — Created current-thread heartbeat `cardex-mvp` at an hourly cadence. It is restricted to read-only watermark/report checks until a natural trigger, then owns exact v2 report acceptance and pauses itself after closure.
 - 2026-08-13 13:24 +08:00 — The first scheduled tick after binary replacement exposed `last exit reason = OS_REASON_CODESIGNING` and `needs LWCR update`. Board health alone was therefore not sufficient deployment evidence.
 - 2026-08-13 13:26 +08:00 — Backed up the tick plist, then ran the repository-required `cardex install-launchd` refresh with the unchanged 300-second interval and data root. Its immediate RunAtLoad completed with exit code 0; the signing error and LWCR warning disappeared. Counter/task state remained unchanged at `702/697` and `t0812-1747-df1a`.
+- 2026-08-13 13:35 +08:00 — User authorized direct fixes for already-evidenced defects while retaining the minimal-MVP/high-ROI rule. Quantified 54 legacy reports/158 recommendations, but classified their canceled/archive-heavy sampling as biased rather than turning those counts into global policy.
+- 2026-08-13 13:37 +08:00 — Added a focused RED showing doctor had no parser for `OS_REASON_CODESIGNING` or `needs LWCR update`; the test failed to compile on the missing behavior as intended.
+- 2026-08-13 13:40 +08:00 — Minimal GREEN added: on macOS, doctor now verifies the loaded `com.cardex.tick` job and rejects the two known signing-policy drift markers. An idle periodic timer with last exit 0 remains healthy. A freshly built candidate correctly passed the live launchd check; doctor still exited 1 for the unrelated, pre-existing Gemini-auth gap.
+- 2026-08-13 13:40 +08:00 — Added the durable lessons/checklist document and updated both README quick starts to require launchd re-registration after binary replacement. Full regression, commit, and production replacement remain pending at this log point.
 
 ## Production activation and rollback evidence
 

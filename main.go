@@ -1767,7 +1767,8 @@ func cmdDoctor(args []string) error {
 
 	if pp, err := plistPath(); err == nil {
 		if _, err := os.Stat(pp); err == nil {
-			fmt.Printf("  ✔ launchd 定时器已安装 (%s)\n", pp)
+			check("launchd 定时器已安装且可执行当前二进制 ("+pp+")", doctorLaunchdStatus(),
+				"运行 cardex install-launchd 重新注册当前二进制，再运行 cardex doctor")
 		} else {
 			fmt.Println("  - launchd 定时器未安装（可运行 cardex install-launchd）")
 		}

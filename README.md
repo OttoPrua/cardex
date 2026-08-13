@@ -29,8 +29,8 @@ cardex install-launchd                                            # 之后它自
 ## 快速开始
 
 ```bash
-CARDEX_INSTALL_EXPECTED_HEAD=<已审核的完整提交SHA> \
-CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=<当前生产二进制SHA256或absent> \
+CARDEX_INSTALL_EXPECTED_HEAD=FULL_REVIEWED_COMMIT_SHA \
+CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=CURRENT_PRODUCTION_SHA256_OR_ABSENT \
   make install                # 只从干净受审提交替换明确的生产预像
 cardex init                    # 初始化 ~/.cardex（数据目录可用 CARDEX_ROOT 覆盖；旧变量名 CLAUDEGO_ROOT 仍兼容读一次并提示）
 cardex install-launchd        # 安装定时器；以后每次替换二进制也要重新注册

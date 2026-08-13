@@ -29,8 +29,8 @@ cardex install-launchd                                                   # it ru
 ## Quick start
 
 ```bash
-CARDEX_INSTALL_EXPECTED_HEAD=<full-reviewed-commit-sha> \
-CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=<current-production-sha256-or-absent> \
+CARDEX_INSTALL_EXPECTED_HEAD=FULL_REVIEWED_COMMIT_SHA \
+CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=CURRENT_PRODUCTION_SHA256_OR_ABSENT \
   make install                # replace one explicit preimage from a clean reviewed commit
 cardex init                    # initialize ~/.cardex (override the data dir with CARDEX_ROOT; the legacy CLAUDEGO_ROOT is still read once, with a warning)
 cardex install-launchd        # install the timer; re-register it after every binary replacement

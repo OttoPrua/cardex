@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 17:24 +08:00
+Last updated: 2026-08-13 18:24 +08:00
 
 ## Ownership and safety envelope
 
@@ -103,6 +103,7 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 15:23 +08:00 — Heartbeat read-only check: counter remains `702/697`, with no change from the 14:23 observation; `last_retro_task` is still `t0812-1747-df1a`. Cardex remains 30 done / 43 held, queued/running are both zero, and tracking card `t0813-1212-9d17` remains held. No task or event file newer than 14:23 was found. Natural `707` trigger remains five genuine business completions away; no action taken.
 - 2026-08-13 16:23 +08:00 — Heartbeat read-only check: counter remains `702/697`, unchanged from 15:23, and the latest retrospective remains `retro-697` (`t0812-1747-df1a`). Cardex remains 30 done / 43 held with no queued or running cards; tracking card `t0813-1212-9d17` remains held. No task or event file newer than 15:23 was found. Natural `707` trigger remains five genuine business completions away; no action taken.
 - 2026-08-13 17:27 +08:00 — Heartbeat read-only check: counter remains `702/697` and `last_retro_task=t0812-1747-df1a`, so no natural retrospective has triggered. Business activity resumed after 16:23; by the final read Cardex was 30 done / 43 held / 7 queued and zero running. Observed new ledgers repeatedly reached `dispatched` then `retry → queued` with `codex_error: exit status 1`; one initial review card (`t0813-1724-4ddb`) was archived while successors appeared. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains five completed business cards away; this heartbeat made no mutation or implementation change.
+- 2026-08-13 18:24 +08:00 — Heartbeat read-only check: counter advanced naturally from `702/697` to `705/697` (`+3` done events), while `last_retro_task` remains `t0812-1747-df1a`; therefore no v2 retrospective exists yet. The three new done events were `t0813-1734-7fef` (measured `$0.045433205` / 27 turns), `t0813-1728-ecbd` (usage unavailable; later canceled), and `t0813-1735-fa67` (usage unavailable). Cardex's final task snapshot was 31 done / 52 held with no queued or running cards; the difference between done-event count and current done-card count is preserved rather than normalized. Tracking card `t0813-1212-9d17` remains held. The `707` gate is now two genuine business completions away; no mutation or implementation action taken.
 
 ## Production activation and rollback evidence
 

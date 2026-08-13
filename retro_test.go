@@ -292,13 +292,13 @@ func TestRetroCardShape(t *testing.T) {
 	}
 	// prompt 必须已把模板占位符替换掉（否则执行器读到的是字面 {{ARCHIVE_DIR}}）。
 	prompt := card.Prompts[0]
-	for _, ph := range []string{"{{N}}", "{{ARCHIVE_DIR}}", "{{PROGRESS_DIR}}", "{{TASKS_DIR}}", "{{ROOT}}"} {
+	for _, ph := range []string{"{{N}}", "{{FACTS_JSON}}", "{{FACTS_SHA256}}"} {
 		if strings.Contains(prompt, ph) {
 			t.Errorf("复盘 prompt 残留未替换的占位符 %s", ph)
 		}
 	}
-	if !strings.Contains(prompt, archiveDir(root)) {
-		t.Errorf("复盘 prompt 未注入归档目录 %s", archiveDir(root))
+	if !strings.Contains(prompt, retroFactsSchema) || !strings.Contains(prompt, "selection_rule") {
+		t.Error("复盘 prompt 未冻结确定性事实或选择规则")
 	}
 	if !strings.Contains(prompt, "只读") {
 		t.Error("复盘 prompt 缺少只读纪律声明")
@@ -313,7 +313,7 @@ func TestRetroTemplateEmbedded(t *testing.T) {
 		t.Fatalf("内置复盘模板缺失: %v", err)
 	}
 	tpl := string(data)
-	for _, ph := range []string{"{{N}}", "{{ARCHIVE_DIR}}", "{{PROGRESS_DIR}}", "{{TASKS_DIR}}"} {
+	for _, ph := range []string{"{{N}}", "{{FACTS_JSON}}", "{{FACTS_SHA256}}"} {
 		if !strings.Contains(tpl, ph) {
 			t.Errorf("模板缺占位符 %s", ph)
 		}
@@ -326,6 +326,9 @@ func TestRetroTemplateEmbedded(t *testing.T) {
 	}
 	if !strings.Contains(tpl, "不要改 config.json") {
 		t.Error("模板缺 proposal-only 纪律(不得改配置)")
+	}
+	if !strings.Contains(tpl, "done 不代表") {
+		t.Error("模板必须声明 done 只是执行终态，不得冒充语义成功")
 	}
 	// writeDefaultTemplates 会把它铺到数据目录，供用户改写。
 	root := t.TempDir()

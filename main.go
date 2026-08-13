@@ -42,6 +42,8 @@ func main() {
 		err = cmdBrief(os.Args[2:])
 	case "progress":
 		err = cmdProgress(os.Args[2:])
+	case "retro":
+		err = cmdRetro(os.Args[2:])
 	case "sessions":
 		err = cmdSessions(os.Args[2:])
 	case "cmd":
@@ -123,6 +125,7 @@ func printUsage() {
   plan      [-dir D] [-priority N] "总体目标"    # 分工协调：按队列+进度报告拆分任务，
                                                 # 产出各任务 prompt/模型建议并自动入队
   progress  [-show K | -rm K | -in [file] -key K]  # 查看/删除/手动导入进度报告
+  retro     [-root D] [-n 10] [-watermark N]        # 只读输出确定性复盘事实与 SHA-256
   cmd <id>                                     # 打印手动接管某任务的 claude 命令与 prompt
 
 调度与执行

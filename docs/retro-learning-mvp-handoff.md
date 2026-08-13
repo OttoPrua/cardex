@@ -1,0 +1,138 @@
+# Cardex retrospective learning MVP handoff
+
+Last updated: 2026-08-13 12:33 +08:00
+
+## Ownership and safety envelope
+
+- Owner: current Codex desktop session; do not start a second writer.
+- Cardex tracking card: `t0813-1212-9d17` (`held`, tracking only; must not be dispatched).
+- Worktree: `/Users/ottoprua/Projects/cardex-retro-mvp`
+- Branch: `codex/retro-learning-mvp`
+- Base commit: `29f3e9694d9501bff2d0c038dea6b39fb15cb92a`
+- The main worktree `/Users/ottoprua/Projects/cardex` was already dirty before this packet (27 tracked and 8 untracked paths observed). Do not copy, clean, stage, or commit those bytes.
+- Do not change `/Users/ottoprua/.cardex/config.json`, do not restart the production board, and preserve its `0.0.0.0:8788` LAN/Tailscale binding.
+
+## MVP outcome
+
+Turn retrospective input into reproducible facts before asking a model for recommendations. Prove the smallest useful path on real Cardex history, then use the result to choose the next change.
+
+The MVP is intentionally not a knowledge base, automatic policy editor, DAG engine, intent classifier, or automatic promotion system.
+
+## Confirmed starting point
+
+- `retro_every_n_done` is currently `10` in the live Cardex config.
+- Existing `retro.go` increments a durable watermark, enqueues a read-only `progress-pull`, and keeps recommendations proposal-only.
+- Existing `templates/retro.md` asks the model to select recent cards and calculate all metrics itself.
+- The latest observed report, `retro-697`, selected 10 canceled cards and marked every card's cost unavailable. This is useful evidence, but the cohort selection and arithmetic are not independently reproducible from the report alone.
+- Earlier `retro-77` already produced a high-ROI fix: terminal cost telemetry was added to previously uncovered early-exit paths. That validates focusing on retrospective evidence before broader orchestration work.
+
+## Current implementation decision
+
+Implement one deterministic facts compiler shared by:
+
+1. a read-only CLI preview against an explicit data root, so the current session can validate real history without changing live state; and
+2. automatic retrospective task creation, which freezes the selected cohort and facts into the task prompt before the model interprets them.
+
+Core statistics should come from Go code. The model may explain the facts and propose at most three changes; it must not recalculate or silently replace them.
+
+## Implemented candidate
+
+- Added the read-only `cardex retro -root D -n N -watermark W` preview command.
+- Added `cardex.retro_facts.v1`, including an exact done cohort, per-card context, counts, cost coverage, review-verdict coverage, limit events, structured gaps, and a SHA-256 over the facts JSON.
+- Automatic retrospective enqueue now compiles and freezes the same facts JSON/hash in the task prompt and records the hash on the queued event.
+- Cohort selection now uses `status=done` plus the final `done` event timestamp, excludes retrospective tasks, reads active and archived cards, and uses `updated_at` only as a disclosed legacy fallback.
+- The runner emits `done` before its final task-file save. The current in-memory done card is therefore overlaid during compilation so the card that triggers a retrospective cannot be omitted from its own cohort.
+- The model template no longer scans files or performs arithmetic. It produces conclusions, at most three recommendations, and deferred edges from the frozen facts.
+- The template explicitly states that Cardex `done` means runner completion, not semantic success. Missing review verdicts remain missing rather than being inferred from titles.
+- Public Chinese and English guides describe the new boundary and preview command.
+
+## Acceptance criteria
+
+- Same on-disk input produces byte-stable semantic JSON (timestamps from source data only).
+- Cohort task IDs and selection rule are explicit.
+- Cost gaps remain gaps and are never coerced to zero.
+- Missing or malformed card/event data is disclosed without crashing the whole report.
+- Automatic retrospective remains read-only and proposal-only.
+- Focused tests pass, then `go test ./...` and `go build ./...` pass.
+- A real-history run under `/Users/ottoprua/.cardex` is captured in this document with exact command, result summary, and limitations.
+
+## Deferred until the MVP has runtime evidence
+
+- Learning-candidate ledger, semantic deduplication, contradiction handling, promotion receipts, and policy canaries.
+- Front-of-pipeline intent extraction.
+- Generic workflow/DAG or Team/Wave/Swarm orchestration.
+- Rare legacy event variants that do not affect the selected real-history window; record exact examples below instead of widening the first implementation.
+
+## Running log
+
+- 2026-08-13 12:12 +08:00 — Read-only recovery complete. Created isolated worktree and held tracking card. No production config or service changes.
+- 2026-08-13 12:15 +08:00 — Clean-base `env GOCACHE=/tmp/cardex-retro-mvp-go-cache go test ./...` passed. The default macOS Go cache is outside the managed sandbox, so all recorded test commands use this isolated cache.
+- 2026-08-13 12:16 +08:00 — Highest-ROI live defect confirmed: `retro-697` says "10 done" but selected 10 canceled cards because the prompt used archive file modification time rather than done evidence.
+- 2026-08-13 12:18 +08:00 — Focused RED established for done-only event selection and byte-stable facts; implementation turned it GREEN.
+- 2026-08-13 12:21 +08:00 — First real-history run selected the correct done cohort but emitted gaps for hundreds of unselected legacy cards (~52 KB output). Added a failing regression test, then restricted event/data gaps to the selected cohort.
+- 2026-08-13 12:24 +08:00 — Second real-history run showed that `done` includes PASS, READY, BLOCK, and BLOCKED summaries. Added the explicit semantic boundary and structured review-verdict coverage rather than parsing titles.
+- 2026-08-13 12:27 +08:00 — Tracking card `t0813-1212-9d17` rechecked as `held`. Production binary/config/service remain unchanged.
+- 2026-08-13 12:30 +08:00 — Pre-commit source walk found the runner order `emit done → trigger retro → final save`. Added a failing integration regression test, then passed the in-memory terminal card as a facts-only overlay. Focused test turned GREEN.
+- 2026-08-13 12:33 +08:00 — Final full suite, build, vet, diff check, and real-history hash verification passed.
+
+## Real-history evidence
+
+Exact candidate command:
+
+```bash
+/tmp/cardex-retro-mvp-cardex retro -root /Users/ottoprua/.cardex -n 10 -watermark 697
+```
+
+Final facts SHA-256: `dc13e961c205584fd675f4bc50c60501ee65a10dec2074a1f191385ee5f5c976`. Two immediate independent reads returned the same hash.
+
+Selected cohort, newest first:
+
+1. `t0813-1212-3600`
+2. `t0812-1930-d456`
+3. `t0812-1905-df99`
+4. `t0812-1824-cbf1`
+5. `t0812-1727-dff6`
+6. `t0812-1720-d03d`
+7. `t0812-1720-2d53`
+8. `t0812-1720-8a92`
+9. `t0812-1655-27c8`
+10. `t0812-1711-0231`
+
+Recomputed facts:
+
+- Cohort/event integrity: 10 selected, 10 event ledgers, 10 done events, no timestamp fallback.
+- Work mix: 7 sequence, 3 design-review; 5 local Codex, 5 remote `qmthost`; all 10 xhigh.
+- Fix rounds: 7 at round 0, 1 at round 1, 2 at round 2.
+- Structured review evidence: 3 review cards, 2 structured verdicts, both `block`; `t0812-1930-d456` has no structured verdict and is disclosed as a gap.
+- Cost evidence: 0/10 available; all ten terminal events explicitly report `no_usage_recorded`. No model/runner cost comparison is authorized from this cohort.
+- Semantic summaries include PASS, READY, BLOCK, and BLOCKED despite every selected card having Cardex status `done`; therefore `done` must not be reported as success.
+
+Runtime-backed conclusion:
+
+1. The cohort-selection bug was the immediate high-ROI defect and is closed in the candidate.
+2. The candidate now provides enough contextual evidence for a useful human/model conclusion without letting the model invent arithmetic.
+3. It is not currently safe to optimize model or runner choice by cost; the measured coverage is 0/10.
+4. Two structured review blocks and three cards beyond round 0 are a useful candidate signal, but this window is dominated by one Trading delivery cluster. Do not generalize a global policy from this single correlated cohort.
+
+## Final verification
+
+- `env GOCACHE=/tmp/cardex-retro-mvp-go-cache-full2 go test ./...` → exit 0, `ok cardex 56.976s`.
+- `env GOCACHE=/tmp/cardex-retro-mvp-go-cache-build go build ./...` → exit 0.
+- `env GOCACHE=/tmp/cardex-retro-mvp-go-cache-vet go vet ./...` → exit 0.
+- `git diff --check` → exit 0.
+- Rebuilt `/tmp/cardex-retro-mvp-cardex`; a final real-history read returned the same facts hash `dc13e961c205584fd675f4bc50c60501ee65a10dec2074a1f191385ee5f5c976`.
+
+## Deferred edge cases discovered
+
+- Older done cards without event ledgers use `updated_at` fallback and disclose `done_event_missing`; they do not affect the observed newest-ten window.
+- Malformed task/event files are skipped with structured gaps. No such file was present in the selected real cohort.
+- Cross-check `x_role=C` verdict recovery from old progress-only records is not implemented. Add it only if a real selected cohort shows material missing coverage.
+- Cost/turn telemetry for Codex and remote runners is 0/10 in the real window. This is frequent and blocks cost-based routing, but provider usage extraction is a separate packet because guessing subscription cost would be worse than retaining an explicit gap.
+- The candidate has not replaced the production Cardex binary and has not yet observed a naturally triggered retrospective report. Deployment and one natural trigger are the next runtime gate, not part of the offline candidate claim.
+
+## Resume checklist
+
+1. Confirm `git status --short --branch` in this worktree.
+2. Confirm Cardex card `t0813-1212-9d17` is still held.
+3. Read this document and the latest commit before editing.
+4. Re-run focused tests before interpreting any real-history result.

@@ -699,14 +699,26 @@ After the queue has chewed through a few dozen cards, nobody is doing the books 
 "retro_every_n_done": 10    // 0 = off (default); 10 is a reasonable starting point
 ```
 
-Every N cards that reach the `done` terminal state, a `progress-pull` + `haiku` retrospective card is enqueued automatically (template `templates/retro.md`, editable). Its working directory is pinned to the data root, and it read-only tallies the most recent N archived cards along:
+Every N cards that reach the `done` terminal state, the scheduler first freezes deterministic facts in Go and then enqueues a `progress-pull` + `haiku` retrospective card (template `templates/retro.md`, editable). The cohort contains only business cards whose status is `done`, excludes retrospective cards themselves, and is ordered by the last `done` event timestamp. A legacy card with no `done` event falls back to `updated_at` and discloses that fallback under `gaps`. File modification time is never selection evidence, so `clean`, migration, or `touch` cannot silently replace the sample.
+
+Here `done` means that the runner finished; it is not a semantic success verdict. A retrospective must interpret PASS/BLOCK/READY through structured review verdicts and each card's latest summary. A completed review with no structured verdict is reported as a coverage gap; title text is never parsed to invent one.
+
+The deterministic facts carry exact task IDs, the selection rule, a SHA-256 digest, evidence coverage, and:
 
 1. Failure-class distribution (reasons on `failed`/`retry` events plus each card's `last_error`)
 2. Fix-round distribution (`fix_round`)
 3. Per-card cost and model distribution (`cost_usd` grouped by `model` / `runner`; cards carrying a `cost_unavailable` marker are counted separately and itemised under `gaps` — never folded into the total as zero)
 4. Review verdict distribution (`design-review` and `x_role=C` outcomes)
 5. Round-limit and divert events (cards escalated past their round cap, `limit_paused` counts, `runner=codex` diverted cards)
-6. **At most 3** actionable recommendations (e.g. "file this card class with `-stakes low`", "template X lacks Y, causing repeated rework")
+6. Each card's title, directory/explicit project, lineage, and latest summary, so the model does not have to guess the workflow object from numbers alone
+
+The model must not rescan directories or recalculate the figures; it only interprets the facts and emits conclusions plus **at most 3** actionable recommendations. The facts JSON and digest are frozen in the task prompt, and the queued event also records `facts_sha256`. To recompute the same format without enqueuing a card or writing a progress report, run:
+
+```bash
+cardex retro -root ~/.cardex -n 10 -watermark 697
+```
+
+This command only reads data and prints a `cardex.retro_facts.v1` envelope. `-watermark` is an optional audit label.
 
 The report lands in `progress/retro-<watermark>.json`; read it with `cardex progress -show retro-<watermark>`.
 

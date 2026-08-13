@@ -120,7 +120,9 @@ func noteTaskDone(root string, cfg *Config, t *Task) (string, error) {
 	if err := saveRetroCounter(root, c); err != nil {
 		return "", err
 	}
-	id, err := queueRetroTask(root, cfg, watermark, n)
+	// runner 的终态顺序是 emit done → 记复盘 → 最终 saveTask；把内存里的 done 卡显式传入，
+	// 否则事实编译器会从盘上读到它仍是 running，并把真正触发本轮的卡漏出 cohort。
+	id, err := queueRetroTask(root, cfg, watermark, n, t)
 	if err != nil {
 		return "", err
 	}
@@ -153,7 +155,15 @@ func noteTaskDoneLogged(root string, cfg *Config, t *Task, lg *os.File) {
 //
 // 工作目录钉在数据根：复盘的数据源全在 <root>/archive、<root>/events、<root>/progress 下，
 // 钉在业务仓反而让只读工具的相对路径落空。
-func queueRetroTask(root string, cfg *Config, watermark, n int64) (string, error) {
+func queueRetroTask(root string, cfg *Config, watermark, n int64, completing ...*Task) (string, error) {
+	facts, err := buildRetroFacts(root, int(n), watermark, completing...)
+	if err != nil {
+		return "", fmt.Errorf("编译复盘事实: %w", err)
+	}
+	factsJSON, factsHash, err := marshalRetroFacts(facts)
+	if err != nil {
+		return "", fmt.Errorf("序列化复盘事实: %w", err)
+	}
 	tpl, err := loadTemplate(root, retroTemplate)
 	if err != nil {
 		return "", err
@@ -166,6 +176,8 @@ func queueRetroTask(root string, cfg *Config, watermark, n int64) (string, error
 		"TASKS_DIR":    tasksDir(root),
 		"PROGRESS_DIR": progressDir(root),
 		"PROGRESS_KEY": key,
+		"FACTS_JSON":   string(factsJSON),
+		"FACTS_SHA256": factsHash,
 	})
 	title := fmt.Sprintf("复盘: 最近 %d 张 done（累计 %d）", n, watermark)
 	t := newTask(root, cfg, typeProgressPull, title, root, []string{prompt}, 0)
@@ -180,7 +192,7 @@ func queueRetroTask(root string, cfg *Config, watermark, n int64) (string, error
 	}
 	emitTaskEvent(root, t.ID, evQueued, "runner:retro", statusQueued, 0, map[string]any{
 		"type": t.Type, "reason": "retro_every_n_done",
-		"n": n, "watermark": watermark, "progress_key": key,
+		"n": n, "watermark": watermark, "progress_key": key, "facts_sha256": factsHash,
 	})
 	return t.ID, nil
 }

@@ -672,15 +672,31 @@ cardex add -dir ~/proj "常规改动"                                  # 缺省 
 "retro_every_n_done": 10    // 0 = 关闭（默认）；建议 10
 ```
 
-每累计 N 张卡进入 `done` 终态，自动入队一张 `progress-pull` + `haiku` 的复盘卡（模板 `templates/retro.md`，可自行修改），
-工作目录钉在数据根，只读统计最近 N 张归档卡的：
+每累计 N 张卡进入 `done` 终态，调度器先用 Go 代码冻结一份确定性事实，再入队一张 `progress-pull` + `haiku`
+复盘卡（模板 `templates/retro.md`，可自行修改）。cohort 只选 `status=done` 的业务卡、排除复盘卡自身，按最后一条
+`done` 事件时间排序；旧卡缺 `done` 事件时才回落 `updated_at`，并把回落明确列进 `gaps`。文件修改时间不参与选择，
+所以 `clean`、迁移或 `touch` 不会悄悄换样本。
+
+这里的 `done` 只表示执行器完成，不是业务成功判据。复盘必须结合结构化 review verdict 与卡的最新摘要解释 PASS/BLOCK/READY；
+缺结构化 verdict 的审核卡只报告覆盖缺口，禁止从标题文本猜一个 verdict。
+
+确定性事实包含准确 task ID、选择规则、SHA-256、证据覆盖率，以及：
 
 1. 失败类分布（`failed`/`retry` 事件的 reason 与卡的 `last_error`）
 2. 修复轮数分布（`fix_round`）
 3. 每卡成本与模型分布（`cost_usd` 按 `model` / `runner` 分组；带 `cost_unavailable` 标记的卡另计并在 `gaps` 分列，绝不当 0 计入总额）
 4. 复审 verdict 分布（`design-review` 与 `x_role=C` 的结论）
 5. 超轮限与改道事件（超轮限的升级卡、`limit_paused` 次数、`runner=codex` 的改道卡）
-6. **最多 3 条**可执行建议（如"某类卡建议派卡时用 `-stakes low`"、"某模板缺 X 导致反复返工"）
+6. 每张卡的标题、目录/显式项目、谱系和最新摘要（不给模型只剩数字、却要求它猜工作流对象）
+
+模型不得重新扫目录或重算数字；它只解释上述事实，给出结论与**最多 3 条**可执行建议。事实 JSON 与哈希已冻结在任务
+prompt 中，任务事件也记录 `facts_sha256`。需要在不入队、不写进度报告的情况下复算，可运行：
+
+```bash
+cardex retro -root ~/.cardex -n 10 -watermark 697
+```
+
+该命令只读输出 `cardex.retro_facts.v1` 信封；`-watermark` 只作审计标签，可省略。
 
 报告落 `progress/retro-<水位>.json`，用 `cardex progress -show retro-<水位>` 查看。
 

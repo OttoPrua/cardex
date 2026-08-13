@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-13 21:27 +08:00
+Last updated: 2026-08-13 22:27 +08:00
 
 ## Ownership and safety envelope
 
@@ -107,6 +107,7 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-13 19:24 +08:00 — Heartbeat read-only check: counter remains `705/697`, unchanged from 18:24, and `last_retro_task` remains `t0812-1747-df1a`. Cardex remains 31 done / 52 held with no queued or running cards; no task, event, or `retro-*` progress file newer than 18:24 was found. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two genuine business completions away; no action taken.
 - 2026-08-13 20:27 +08:00 — Heartbeat read-only check: counter remains `705/697`, unchanged from 19:24, and `last_retro_task` remains `t0812-1747-df1a`. Cardex remains 31 done / 52 held with no queued or running cards; no task, event, or `retro-*` progress file newer than 19:24 was found. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two genuine business completions away; no action taken.
 - 2026-08-13 21:27 +08:00 — Heartbeat read-only check: counter remains `705/697`, unchanged from 20:27, and `last_retro_task` remains `t0812-1747-df1a`. Cardex remains 31 done / 52 held with no queued or running cards; no task, event, or `retro-*` progress file newer than 20:27 was found. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two genuine business completions away; no action taken.
+- 2026-08-13 22:27 +08:00 — Heartbeat read-only check: counter remains `705/697` and `last_retro_task=t0812-1747-df1a`; no v2 retrospective has triggered. Three real review attempts appeared after 21:27: `t0813-2224-1977` (OpenCode K3) and `t0813-2225-c784` (Kimi CLI K3) each dispatched, retried on exit status 1, then held/canceled without usage; successor `t0813-2226-123d` followed the same dispatch/retry path and remains held. Cardex is now 31 done / 53 held with no queued or running cards. Tracking card `t0813-1212-9d17` remains held. The `707` gate remains two completed business cards away; no mutation or implementation action taken.
 
 ## Production activation and rollback evidence
 

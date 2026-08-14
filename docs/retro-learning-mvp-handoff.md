@@ -1,6 +1,6 @@
 # Cardex retrospective learning MVP handoff
 
-Last updated: 2026-08-15 06:54 +08:00
+Last updated: 2026-08-15 07:54 +08:00
 
 ## Ownership and safety envelope
 
@@ -150,6 +150,7 @@ Core statistics should come from Go code. The model may explain the facts and pr
 - 2026-08-15 04:49 +08:00 — Heartbeat read-only check: counter remains `711/707` and `last_retro_task=t0814-0217-a0c9`, unchanged from 03:48; no new retrospective exists. One real priority-95 backend business sequence, `t0815-0359-ac7c`, appeared at 03:59. Kimi CLI K3 dispatched twice, and both attempts immediately retried on `exit status 1` with only `system.version=0.36.1`; the card was naturally put on hold at 04:04 with no usage and emitted no `done` event. Cardex is therefore 37 done / 55 held with no queued or running cards, and the retrospective counter correctly did not advance. This repeat of the separately scoped runner failure is recorded without expanding the retrospective MVP. Tracking card remains held, and installed/Board Cardex remains version `0.10.3`, SHA-256 `7a73d7…`, without the v2 facts marker. The next natural gate remains 717, six completed business cards away. No production, counter, config, service, template, or task-state mutation was made by this heartbeat.
 - 2026-08-15 05:50 +08:00 — Heartbeat read-only check: counter remains `711/707` and `last_retro_task=t0814-0217-a0c9`, unchanged from 04:49. No task, event, or retrospective progress file is newer than the prior observation; Cardex remains 37 done / 55 held with no queued or running cards. Tracking card remains held, and installed/Board Cardex remains version `0.10.3`, SHA-256 `7a73d7…`, without the v2 facts marker. The next natural gate remains 717, six completed business cards away. No production, counter, config, service, template, or task-state mutation was made.
 - 2026-08-15 06:54 +08:00 — Heartbeat read-only check: counter remains `711/707` and `last_retro_task=t0814-0217-a0c9`, unchanged from 05:50. No task, event, or retrospective progress file is newer than the prior observation; Cardex remains 37 done / 55 held with no queued or running cards. Tracking card remains held, and installed/Board Cardex remains version `0.10.3`, SHA-256 `7a73d7…`, without the v2 facts marker. The next natural gate remains 717, six completed business cards away. No production, counter, config, service, template, or task-state mutation was made.
+- 2026-08-15 07:54 +08:00 — Heartbeat read-only check: counter remains `711/707` and `last_retro_task=t0814-0217-a0c9`, unchanged from 06:54. No task, event, or retrospective progress file is newer than the prior observation; Cardex remains 37 done / 55 held with no queued or running cards. Tracking card remains held, and installed/Board Cardex remains version `0.10.3`, SHA-256 `7a73d7…`, without the v2 facts marker. The next natural gate remains 717, six completed business cards away. No production, counter, config, service, template, or task-state mutation was made.
 
 ## Production activation and rollback evidence
 

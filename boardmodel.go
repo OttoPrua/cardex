@@ -700,6 +700,17 @@ func modelTierKeyword(cfg *Config, model string) string {
 	case strings.Contains(m, "sonnet"), strings.Contains(m, "luna"), strings.Contains(m, "glm-5.2"),
 		strings.Contains(m, "kimi-for-coding"):
 		return "sonnet"
+	// gemini（AA II v4.1 快照 2026-08-03）：flash 线 50 ≈ sonnet 档；pro 线 46（haiku 档上沿，
+	// 距 sonnet 下沿 47 差 1 分）与 flash-lite(36)/2.5 系(≤26) 轻量档。**flash 线反超 pro 线**是
+	// 标准线事实（Google 的 Flash 迭代快过 Pro），编码交叉信号（SWE-bench pro 80.6%）偏 sonnet，
+	// 要按牌面抬档用 model_tiers 覆写。裸别名（gemini CLI 官方稳定别名）只精确匹配——
+	// 防误吃他家 *-pro/*-flash（mimo-v2.5-pro / deepseek-v4-flash 属轻量档）。
+	case strings.HasPrefix(m, "gemini") && strings.Contains(m, "flash-lite"), m == "flash-lite":
+		return "haiku"
+	case strings.HasPrefix(m, "gemini") && strings.Contains(m, "flash"), m == "flash":
+		return "sonnet"
+	case strings.HasPrefix(m, "gemini"), m == "pro":
+		return "haiku"
 	case strings.Contains(m, "haiku"), strings.Contains(m, "glm-"), strings.Contains(m, "minimax"),
 		strings.Contains(m, "kimi-k2"), strings.Contains(m, "mimo"), strings.Contains(m, "deepseek"),
 		strings.Contains(m, "qwen"):
@@ -729,6 +740,13 @@ func effectiveModel(cfg *Config, t *Task) (model, source string) {
 	if codexSide {
 		if m := resolveCodexModel(cfg, t); m != "" {
 			return m, "codex_model"
+		}
+	}
+	// gemini 系：卡面 Model 是 sonnet 这类档位别名时，真跑的是槽映射结果（pro/flash），
+	// 看板必须显示真跑的那个（与引擎系同一纪律）。
+	if t.Runner == "gemini" || t.PreferRunner == "gemini" {
+		if m, _ := resolveGeminiModel(cfg, t); m != "" {
+			return m, "gemini_model"
 		}
 	}
 	if name := taskEngineName(cfg, t); name != "" {

@@ -58,8 +58,8 @@ type EngineProfile struct {
 	Tier string `json:"tier,omitempty"`
 }
 
-// 引擎名保留字：与 Runner 标签的既有语义冲突（""=claude、"codex"、"remote:<host>"）。
-var engineReservedNames = map[string]bool{"claude": true, "codex": true, "remote": true}
+// 引擎名保留字：与 Runner 标签的既有语义冲突（""=claude、"codex"、"gemini"、"remote:<host>"）。
+var engineReservedNames = map[string]bool{"claude": true, "codex": true, "gemini": true, "remote": true}
 
 // engineNameRe 引擎名要进文件名（cooldown-<name>.json）与 Runner 标签，限小写字母数字与连字符。
 var engineNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
@@ -93,8 +93,8 @@ func validateEngines(cfg *Config) error {
 		}
 	}
 	for _, name := range cfg.FallbackOrder {
-		if name == "codex" {
-			continue
+		if name == "codex" || name == "gemini" {
+			continue // 异构执行器白名单：可用性各由 codex_bin / gemini_bin 在派发时把门
 		}
 		if _, ok := cfg.Engines[name]; !ok {
 			return fmt.Errorf("fallback_order 含未配置的引擎 %q（engines 里没有这个键）", name)
@@ -440,18 +440,23 @@ func isLimitHitEngine(res *claudeResult, combined string) bool {
 	return engineQuotaRe.MatchString(text)
 }
 
-// limitHitForRunner 把 runTask 的限额判据路由从 (useCodex, remote) 二布尔扩展到 via 三态：
-// via=引擎名（本机）→ isLimitHitEngine；其余组合原样走 limitHitForEngine（该函数与其测试
-// TestLimitHitForEngineRoutesByFlags 一字未动——引擎是新增维度，不重排旧映射）。
+// limitHitForRunner 把 runTask 的限额判据路由从 (useCodex, remote) 二布尔扩展到 via 多态：
+// via="gemini"（本机）→ isLimitHitGemini；via=引擎名（本机）→ isLimitHitEngine；其余组合
+// 原样走 limitHitForEngine（该函数与其测试 TestLimitHitForEngineRoutesByFlags 一字未动——
+// gemini/引擎是新增维度，不重排旧映射）。
 func limitHitForRunner(via string, remote bool, t *Task, res *claudeResult, combined string) bool {
+	if geminiVia(via) && !remote {
+		return isLimitHitGemini(res, combined)
+	}
 	if engineVia(via) && !remote {
 		return isLimitHitEngine(res, combined)
 	}
 	return limitHitForEngine(via == "codex", remote, t, res, combined)
 }
 
-// engineVia 判断 via 标签是否引擎名（""=claude、"codex"=备用执行器，其余为引擎）。
-func engineVia(via string) bool { return via != "" && via != "codex" }
+// engineVia 判断 via 标签是否引擎名（""=claude、"codex"/"gemini"=异构执行器，其余为引擎）。
+// "gemini" 必须排除：它是保留字执行器，误入引擎分支会撞「档案不存在」（cfg.engines 无此键）。
+func engineVia(via string) bool { return via != "" && via != "codex" && via != "gemini" }
 
 // engineResetEpoch 解析引擎限额的恢复时刻：瀑布解析（parseResetEpoch）原样复用，只把
 // 兜底回退换成档案级 limit_fallback_min；scanText（已收敛的限额措辞段）命中月度/计费周期
@@ -548,21 +553,27 @@ func engineDivertOK(root string, cfg *Config, name string, t *Task, now time.Tim
 }
 
 // pickDivertRunner 按 fallback_order 逐个找 claude 空窗期的第一个可用出路：
-// "codex" 项走 codexDivertOK（五道闸原样），引擎项走 engineDivertOK。找不到返回 ""。
-// 顺序即优先级——用户按能力/成本自定义（推荐序见 docs/guide.md 分级表）。
+// "codex" 项走 codexDivertOK（五道闸原样），"gemini" 项走 geminiDivertOK（同规 + 车道冷却），
+// 引擎项走 engineDivertOK。找不到返回 ""。
+// 顺序即优先级——用户按能力/成本自定义（编程类质价比推荐序见 docs/guide.md 分级表）。
 func pickDivertRunner(root string, cfg *Config, t *Task, now time.Time) string {
 	if cfg == nil {
 		return ""
 	}
 	for _, name := range cfg.FallbackOrder {
-		if name == "codex" {
+		switch name {
+		case "codex":
 			if codexDivertOK(cfg, t) {
 				return "codex"
 			}
-			continue
-		}
-		if engineDivertOK(root, cfg, name, t, now) {
-			return name
+		case "gemini":
+			if geminiDivertOK(root, cfg, t, now) {
+				return "gemini"
+			}
+		default:
+			if engineDivertOK(root, cfg, name, t, now) {
+				return name
+			}
 		}
 	}
 	return ""

@@ -69,6 +69,11 @@ func saveProgressFromResult(root string, t *Task, result string) (string, error)
 		return "", fmt.Errorf("输出为空，无法生成进度报告")
 	}
 	report := parseReportLoose(result)
+	if isRetroTask(t) {
+		if err := validateRetroReport(t, report); err != nil {
+			return "", fmt.Errorf("复盘报告契约不合格: %w", err)
+		}
+	}
 	key := t.ProgressKey
 	if key == "" {
 		key = t.ID

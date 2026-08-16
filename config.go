@@ -100,6 +100,29 @@ type Config struct {
 	// 这是**全局兜底值**：stakes_policy.<档>.max_fix_rounds 非 0 时按档覆盖它（add 时钉到卡面）。
 	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 
+	// ---- Gemini CLI 备用执行器（第二异构执行器；Google 订阅额度，设计规格
+	// docs/2026-08-03-gemini-executor-design.md）----
+	// GeminiBin 非空即启用：`-runner gemini` 可钉定主跑；fallback_order 含 "gemini" 时
+	// claude 空窗期还可改道（五道闸与 codex 全量同规）。车道冷却 cooldown-gemini.json（每日
+	// 配额是账号级的，挂车道不挂单卡）；账本打 engine:"gemini" 标，不占 claude 红线预算。
+	GeminiBin string `json:"gemini_bin,omitempty"`
+	// GeminiModel 卡无模型时的默认；推荐官方稳定别名（pro/flash/flash-lite，核实 2026-08-03）。
+	// 空 = 内置 "pro"。**永不落空传给 CLI**——空即 auto 路由，撞配额静默换模型，已否决。
+	GeminiModel string `json:"gemini_model,omitempty"`
+	// GeminiModels 档位槽映射（fable/opus/sonnet/haiku → gemini 模型/别名），claude 卡改道
+	// gemini 时按 t.Model 档位查此表。缺省 = fable/opus→pro、sonnet→flash、haiku→flash-lite
+	// （高档取 pro 是按编码交叉信号 SWE-bench 的显式决定，见设计规格 §2）。
+	GeminiModels map[string]string `json:"gemini_models,omitempty"`
+	// GeminiApprovalMode sequence 卡的 --approval-mode（default/auto_edit/yolo/plan；空=yolo）。
+	// 非 sequence 卡（复审/协调/装配/交叉/进度回收）恒强制 plan（只读）——gemini 无 OS 沙箱，
+	// plan 是唯一硬护栏，与 codex「非 sequence 默认 read-only」同一纪律。
+	GeminiApprovalMode string `json:"gemini_approval_mode,omitempty"`
+	// GeminiAuthEnv 可选：命名一个环境变量，其值在执行时注入 GEMINI_API_KEY（密钥不进
+	// config，与引擎档案 auth_env 同一纪律）。空 = 继承环境（OAuth 缓存凭据 / 已 export 的
+	// GEMINI_API_KEY）。注意 2026-08-03 实测：OAuth 个人免费档已被 gemini-cli 0.42 拒绝
+	// （IneligibleTierError），需 API key 或 Google AI Pro/Ultra 订阅 OAuth。
+	GeminiAuthEnv string `json:"gemini_auth_env,omitempty"`
+
 	// ---- 多订阅引擎档案（Kimi Code / GLM Coding Plan / MiniMax / MiMo / OpenCode Go / Ollama Cloud…）----
 	// Engines 键 = 引擎名（进 Runner 标签与 cooldown-<名>.json，限小写字母数字连字符；
 	// claude/codex/remote 是保留字）。执行复用 claude CLI + 按档案注入环境变量（base_url/
@@ -222,7 +245,8 @@ type XFrozenEngine struct {
 	Effort       string `json:"effort,omitempty"`
 	PreferRunner string `json:"prefer_runner,omitempty"`
 	RemoteHost   string `json:"remote_host,omitempty"`
-	CodexModel   string `json:"codex_model,omitempty"` // codex/远端 codex 引擎冻结的具体模型
+	CodexModel   string `json:"codex_model,omitempty"`  // codex/远端 codex 引擎冻结的具体模型
+	GeminiModel  string `json:"gemini_model,omitempty"` // gemini 引擎冻结的具体模型（kind=gemini）
 	Label        string `json:"label,omitempty"`
 }
 
@@ -601,6 +625,9 @@ func loadConfig(root string) (*Config, error) {
 	// 引擎档案的配置面错误在读入时就炸：等到派发/执行时才发现，卡已经在队里静默跳过
 	// 或把额度花错账号（auth_var 注错的表现是 claude CLI 静默用本机订阅跑）。
 	if err := validateEngines(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
+	if err := validateGemini(cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath(root), err)
 	}
 	return cfg, nil

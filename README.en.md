@@ -29,12 +29,28 @@ cardex install-launchd                                                   # it ru
 ## Quick start
 
 ```bash
-make build && make install     # compile and install to /opt/homebrew/bin
+CARDEX_INSTALL_EXPECTED_HEAD=FULL_REVIEWED_COMMIT_SHA \
+CARDEX_INSTALL_EXPECTED_CURRENT_SHA256=CURRENT_PRODUCTION_SHA256_OR_ABSENT \
+  make install                # replace one explicit preimage from a clean reviewed commit
 cardex init                    # initialize ~/.cardex (override the data dir with CARDEX_ROOT; the legacy CLAUDEGO_ROOT is still read once, with a warning)
-cardex doctor                  # self-check: claude CLI, directories, config
+cardex install-launchd        # install the timer; re-register it after every binary replacement
+cardex doctor                 # check CLIs, directories, config, and whether launchd can execute the current binary
 ```
 
-Still need the old `claudego` command name? `make install install-shim` also lays down a `claudego → cardex` compatibility symlink (`ln -sf`, tracks the binary as it upgrades) — a transition-period aid, removable once the rename is finished.
+Record the full candidate commit and the current `/opt/homebrew/bin/cardex` SHA-256 independently
+before installation; use `absent` only for a genuinely missing first-install target. The standard
+install rejects a dirty source tree, a candidate-commit mismatch, or a changed production preimage,
+and does not remove the current binary before preflight passes. `cardex doctor` also rejects builds
+whose Go provenance reports `vcs.modified=true`.
+
+On macOS, launchd binds its execution policy to the registered executable inode. After an upgrade,
+the plist can still exist while the timer rejects the new binary with `OS_REASON_CODESIGNING`.
+Re-run `cardex install-launchd` after replacing `/opt/homebrew/bin/cardex`, then verify with
+`cardex doctor`; a plist or a healthy Web endpoint alone is not sufficient evidence.
+
+Still need the old `claudego` command name? Run `make install-shim` with the same two preflight
+variables; it also lays down a `claudego → cardex` compatibility symlink (`ln -sf`, tracks the
+binary as it upgrades) — a transition-period aid, removable once the rename is finished.
 
 Three common ways to enqueue — pick one to start:
 
@@ -110,6 +126,7 @@ Once it's running, pick what you need — each of these is covered in full in th
 - **[Web board](docs/guide.en.md#web-board-board-command)** — projects side by side as a horizontal rail, **remaining**-quota burndown, progress split by kind of work (design / impl / fix / review), goal-anchored "landed progress", and dual progress scales (existing cards / estimated-remaining via planned anchor or spawn factor, basis always disclosed); insufficient data is always disclosed rather than estimated, and queue data stays read-only (the only write is the board's own project-collapse state).
 - **[5-hour quota redline](docs/guide.en.md#5-hour-quota-redline-reserve-headroom)** — reserve headroom for interactive work: a local ledger + CodexBar usage feed + the subscription endpoint, taking the most conservative reading when they disagree; time-window redlines supported.
 - **[Codex backup executor](docs/guide.en.md#codex-backup-executor-no-downtime-during-limit-gaps)** — divert single-step orchestration cards to codex during claude cooldown; design-tier models are pinned and never downgraded, so cross-verification's engine independence is never swapped out.
+- **[Gemini CLI fallback executor](docs/guide.en.md#gemini-cli-fallback-executor-second-heterogeneous-executor)** — a second heterogeneous executor: pinned via `-runner gemini` (has sessions, multi-step works), diverts into the fallback chain, a fifth cross-verification engine; account-level daily quota cools down the whole lane, auth failures self-heal; model mapping uses the official stable aliases (pro/flash/flash-lite), tiered on the standard line.
 - **[Multi-subscription engines](docs/guide.en.md#multi-subscription-engines-engine-profiles-kimi--glm--minimax--mimo--opencode-go--ollama-cloud)** — Kimi Code / GLM Coding Plan / MiniMax / Xiaomi MiMo / OpenCode Go / Ollama Cloud plug in via engine profiles: the same claude CLI with per-task env injection, per-engine cooldowns and ledgers, one unified capability scale (anchored to Claude's own tiers), and a user-defined fallback order.
 - **[Taking over existing role sessions](docs/guide.en.md#taking-over-existing-role-sessions-the-reviewassemblyexecute-sessions-you-maintained-by-hand)** — fold hand-maintained review/assembly/execute sessions into the queue by role.
 
@@ -134,8 +151,10 @@ The keys you'll actually touch; the full table lives in the [configuration refer
 | `no_fallback_models` | ["claude-fable-5","fable"] | design-tier models never downgraded to the codex backup — they wait for Claude |
 | `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the [guide](docs/guide.en.md#codex-backup-executor-no-downtime-during-limit-gaps) |
 | `codex_fallback_model` | "" | model used when a claude card downgrades to codex (tier-parity: opus→terra, not sol); empty falls back to `codex_model` |
+| `gemini_bin` / `gemini_model` | empty / "" (built-in pro) | Gemini CLI, the second heterogeneous executor (pinned / fallback chain / cross-verification) — see the [guide](docs/guide.en.md#gemini-cli-fallback-executor-second-heterogeneous-executor) |
+| `gemini_models` | fable/opus→pro, sonnet→flash, haiku→flash-lite | tier slot mapping (official stable aliases); non-`sequence` cards always run read-only `--approval-mode plan` |
 | `engines` | {} (empty) | multi-subscription engine profiles (Kimi/GLM/MiniMax/MiMo/OpenCode Go/Ollama Cloud); merge presets with `cardex engines add <name>` — see the [guide](docs/guide.en.md#multi-subscription-engines-engine-profiles-kimi--glm--minimax--mimo--opencode-go--ollama-cloud) |
-| `fallback_order` | ["codex"] | divert order during claude cooldown/redline (codex and engine names interleaved; quality floors apply to the whole chain) |
+| `fallback_order` | ["codex"] | divert order during claude cooldown/redline (codex/gemini interleaved with engine names; quality floors apply to the whole chain) |
 | `model_tiers` | {} (empty) | custom tier table (model → tier, overrides the built-in standard line): fleets without stronger models rank by the cards they hold |
 | `default_review_host` / `remote_mirror_root` / `default_review_sync` | "" | the review-divert trio: with all three set, auto-review of local impl cards diverts to the remote host by default |
 | `remote_hosts.<name>.codex_only` | false | Host-level quota boundary: when true, the remote host runs Codex only, including automatic reviews |

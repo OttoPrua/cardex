@@ -476,21 +476,156 @@ func grokBuildPolicyFallbackTask(t *Task) bool {
 	}
 }
 
+type grokBuildUsage struct {
+	InputTokens              int `json:"input_tokens"`
+	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	OutputTokens             int `json:"output_tokens"`
+}
+
 type grokBuildEvent struct {
-	Type         string  `json:"type"`
-	Data         string  `json:"data"`
-	Message      string  `json:"message"`
-	StopReason   string  `json:"stopReason"`
-	SessionID    string  `json:"sessionId"`
-	NumTurns     int     `json:"num_turns"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-	DurationMS   int64   `json:"duration_ms"`
-	Usage        *struct {
-		InputTokens              int `json:"input_tokens"`
-		CacheReadInputTokens     int `json:"cache_read_input_tokens"`
-		CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
-		OutputTokens             int `json:"output_tokens"`
-	} `json:"usage"`
+	Type         string          `json:"type"`
+	Data         string          `json:"data"`
+	Message      string          `json:"message"`
+	StopReason   string          `json:"stopReason"`
+	SessionID    string          `json:"sessionId"`
+	NumTurns     int             `json:"num_turns"`
+	TotalCostUSD float64         `json:"total_cost_usd"`
+	DurationMS   int64           `json:"duration_ms"`
+	Usage        *grokBuildUsage `json:"usage"`
+}
+
+func grokBuildJSONType(raw json.RawMessage) string {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 {
+		return ""
+	}
+	switch raw[0] {
+	case '"':
+		return "string"
+	case '{':
+		return "object"
+	case '[':
+		return "array"
+	case 'n':
+		return "null"
+	case 't', 'f':
+		return "boolean"
+	default:
+		return "number"
+	}
+}
+
+func grokBuildExactShape(fields map[string]json.RawMessage, keyTypes ...string) bool {
+	if len(keyTypes)%2 != 0 || len(fields) != len(keyTypes)/2 {
+		return false
+	}
+	for i := 0; i < len(keyTypes); i += 2 {
+		raw, ok := fields[keyTypes[i]]
+		if !ok || grokBuildJSONType(raw) != keyTypes[i+1] {
+			return false
+		}
+	}
+	return true
+}
+
+func grokBuildEndShape(fields map[string]json.RawMessage) bool {
+	allowed := map[string]string{
+		"type": "string", "stopReason": "string", "sessionId": "string",
+		"num_turns": "number", "total_cost_usd": "number", "duration_ms": "number",
+		"usage": "object",
+	}
+	if _, ok := fields["type"]; !ok {
+		return false
+	}
+	if _, ok := fields["stopReason"]; !ok {
+		return false
+	}
+	for key, raw := range fields {
+		want, ok := allowed[key]
+		if !ok || grokBuildJSONType(raw) != want {
+			return false
+		}
+	}
+	return true
+}
+
+func grokBuildAvailableCommandsShape(fields map[string]json.RawMessage) bool {
+	return grokBuildExactShape(fields,
+		"commands", "array", "tools", "array", "type", "string") ||
+		grokBuildExactShape(fields, "tools", "array", "type", "string")
+}
+
+func grokBuildToolCallShape(fields map[string]json.RawMessage) bool {
+	return grokBuildExactShape(fields,
+		"content", "array", "kind", "string", "locations", "array", "rawInput", "object",
+		"status", "string", "title", "string", "toolCallId", "string", "toolName", "string",
+		"type", "string") ||
+		grokBuildExactShape(fields,
+			"status", "string", "toolCallId", "string", "toolName", "string", "type", "string")
+}
+
+func grokBuildToolCallUpdateShape(fields map[string]json.RawMessage) bool {
+	if len(fields) != 6 ||
+		grokBuildJSONType(fields["content"]) != "array" ||
+		grokBuildJSONType(fields["locations"]) != "array" ||
+		grokBuildJSONType(fields["toolCallId"]) != "string" ||
+		grokBuildJSONType(fields["type"]) != "string" {
+		return false
+	}
+	rawOutputType := grokBuildJSONType(fields["rawOutput"])
+	statusType := grokBuildJSONType(fields["status"])
+	return rawOutputType == "null" && statusType == "null" ||
+		rawOutputType == "object" && statusType == "string"
+}
+
+func grokBuildHasContent(fields map[string]json.RawMessage) bool {
+	for _, key := range []string{"content", "data", "error", "message", "rawInput", "rawOutput", "result", "text"} {
+		if raw, ok := fields[key]; ok && grokBuildJSONType(raw) != "null" {
+			return true
+		}
+	}
+	return false
+}
+
+func grokBuildCountUnclassified(res *claudeResult, typ string, fields map[string]json.RawMessage) {
+	lower := strings.ToLower(typ)
+	if strings.Contains(lower, "tool") {
+		res.ToolEvents++
+		return
+	}
+	if strings.Contains(lower, "model") {
+		res.ModelEvents++
+	}
+	if grokBuildHasContent(fields) {
+		res.SemanticEvents++
+		res.ModelEvents++
+	}
+}
+
+func observeGrokBuildUsage(res *claudeResult, usage *grokBuildUsage, authoritative bool) {
+	if usage == nil {
+		return
+	}
+	if authoritative {
+		res.Usage = &usageInfo{
+			InputTokens:              usage.InputTokens,
+			CacheReadInputTokens:     usage.CacheReadInputTokens,
+			CacheCreationInputTokens: usage.CacheCreationInputTokens,
+			OutputTokens:             usage.OutputTokens,
+		}
+	}
+	if usage.InputTokens != 0 || usage.OutputTokens != 0 ||
+		usage.CacheReadInputTokens != 0 || usage.CacheCreationInputTokens != 0 {
+		res.ModelEvents++
+	}
+}
+
+func markGrokBuildInvalidTerminal(res *claudeResult) {
+	res.IsError = true
+	res.Subtype = "grok_build_invalid_terminal"
+	res.Result = "Grok Build 未正常完成: 终局 end 事件无效或不是最后事件"
+	res.ObservationComplete = false
 }
 
 func parseGrokBuildJSONL(raw string) *claudeResult {
@@ -504,80 +639,115 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 		if line == "" {
 			continue
 		}
-		var ev grokBuildEvent
-		if json.Unmarshal([]byte(line), &ev) != nil || ev.Type == "" {
+		if sawEnd {
+			markGrokBuildInvalidTerminal(res)
+		}
+		var fields map[string]json.RawMessage
+		if json.Unmarshal([]byte(line), &fields) != nil || fields == nil {
 			res.ObservationComplete = false
 			continue
 		}
-		if ev.NumTurns > res.NumTurns {
-			res.NumTurns = ev.NumTurns
+		var typ string
+		if json.Unmarshal(fields["type"], &typ) != nil || typ == "" {
+			res.ObservationComplete = false
+			grokBuildCountUnclassified(res, "", fields)
+			continue
+		}
+		var ev grokBuildEvent
+		if json.Unmarshal([]byte(line), &ev) != nil {
+			res.ObservationComplete = false
+			grokBuildCountUnclassified(res, typ, fields)
+			continue
 		}
 		switch ev.Type {
 		case "text":
 			text.WriteString(ev.Data)
 			res.SemanticEvents++
 			res.ModelEvents++
+			if !grokBuildExactShape(fields, "data", "string", "type", "string") {
+				res.ObservationComplete = false
+			}
 		case "thinking", "thought", "reasoning":
 			res.SemanticEvents++
 			res.ModelEvents++
+			if !grokBuildExactShape(fields, "data", "string", "type", "string") {
+				res.ObservationComplete = false
+			}
 		case "model", "model_start", "model_end":
 			res.ModelEvents++
-		case "tool", "tool_use", "tool_result", "tool_call":
+			if !grokBuildExactShape(fields, "type", "string") {
+				res.ObservationComplete = false
+			}
+		case "tool", "tool_use", "tool_result":
 			res.ToolEvents++
-		case "start", "system", "system.version", "metadata", "available_commands":
+			if !grokBuildExactShape(fields, "type", "string") {
+				res.ObservationComplete = false
+			}
+		case "tool_call":
+			res.ToolEvents++
+			if !grokBuildToolCallShape(fields) {
+				res.ObservationComplete = false
+			}
+		case "tool_call_update":
+			res.ToolEvents++
+			if !grokBuildToolCallUpdateShape(fields) {
+				res.ObservationComplete = false
+			}
+		case "start", "system", "metadata":
 			// Invocation metadata is not model/tool work.
+			if !grokBuildExactShape(fields, "type", "string") {
+				res.ObservationComplete = false
+				grokBuildCountUnclassified(res, ev.Type, fields)
+			}
+		case "system.version":
+			if !grokBuildExactShape(fields, "type", "string", "version", "string") {
+				res.ObservationComplete = false
+				grokBuildCountUnclassified(res, ev.Type, fields)
+			}
+		case "available_commands":
+			if !grokBuildAvailableCommandsShape(fields) {
+				res.ObservationComplete = false
+				grokBuildCountUnclassified(res, ev.Type, fields)
+			}
 		case "usage":
-			// Grok 1.0.5 emits usage as a standalone stream event before the terminal end event.
-			// It is known accounting metadata: it never breaks the observation, and the same
-			// non-zero rule as the end-embedded usage decides whether it proves model work.
-			if ev.Usage != nil {
-				res.Usage = &usageInfo{
-					InputTokens:              ev.Usage.InputTokens,
-					CacheReadInputTokens:     ev.Usage.CacheReadInputTokens,
-					CacheCreationInputTokens: ev.Usage.CacheCreationInputTokens,
-					OutputTokens:             ev.Usage.OutputTokens,
-				}
-				if ev.Usage.InputTokens != 0 || ev.Usage.OutputTokens != 0 ||
-					ev.Usage.CacheReadInputTokens != 0 || ev.Usage.CacheCreationInputTokens != 0 {
-					res.ModelEvents++
-				}
+			// The host probe proved only the signed 1.0.5 envelope. Usage remains accounting
+			// metadata, never a terminal, and non-zero usage conservatively proves model work.
+			valid := grokBuildExactShape(fields,
+				"signature", "string", "type", "string", "usage", "object")
+			observeGrokBuildUsage(res, ev.Usage, valid)
+			if !valid {
+				res.ObservationComplete = false
+				grokBuildCountUnclassified(res, ev.Type, fields)
 			}
 		case "error":
 			res.IsError = true
 			res.Subtype = "grok_build_error"
-			res.Result = strings.TrimSpace(ev.Message)
+			if grokBuildExactShape(fields, "message", "string", "type", "string") {
+				res.Result = strings.TrimSpace(ev.Message)
+			} else {
+				res.ObservationComplete = false
+				res.Result = "Grok Build 返回未识别 error 事件"
+			}
 		case "end":
 			sawEnd = true
 			res.TerminalEvents++
+			if !grokBuildEndShape(fields) || ev.StopReason != "end_turn" || res.TerminalEvents != 1 {
+				observeGrokBuildUsage(res, ev.Usage, false)
+				grokBuildCountUnclassified(res, ev.Type, fields)
+				markGrokBuildInvalidTerminal(res)
+				break
+			}
 			res.SessionID = ev.SessionID
+			res.NumTurns = ev.NumTurns
 			res.TotalCostUSD = ev.TotalCostUSD
 			res.DurationMS = ev.DurationMS
-			if ev.Usage != nil {
-				res.Usage = &usageInfo{
-					InputTokens:              ev.Usage.InputTokens,
-					CacheReadInputTokens:     ev.Usage.CacheReadInputTokens,
-					CacheCreationInputTokens: ev.Usage.CacheCreationInputTokens,
-					OutputTokens:             ev.Usage.OutputTokens,
-				}
-				if ev.Usage.InputTokens != 0 || ev.Usage.OutputTokens != 0 ||
-					ev.Usage.CacheReadInputTokens != 0 || ev.Usage.CacheCreationInputTokens != 0 {
-					res.ModelEvents++
-				}
-			}
+			observeGrokBuildUsage(res, ev.Usage, true)
 			if ev.TotalCostUSD != 0 {
 				res.ModelEvents++
 			}
-			if ev.StopReason != "" && ev.StopReason != "end_turn" {
-				res.IsError = true
-				res.Subtype = "grok_build_invalid_terminal"
-				res.Result = "Grok Build 未正常完成: stopReason=" + ev.StopReason
-			}
 		default:
-			if strings.Contains(strings.ToLower(ev.Type), "tool") {
-				res.ToolEvents++
-			} else {
-				res.ObservationComplete = false
-			}
+			res.ObservationComplete = false
+			grokBuildCountUnclassified(res, ev.Type, fields)
 		}
 	}
 	if s.Err() != nil {
@@ -589,13 +759,16 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 	if res.NumTurns > res.ModelEvents {
 		res.ModelEvents = res.NumTurns
 	}
-	if !res.IsError && text.Len() > 0 {
-		res.Result = text.String()
-	}
-	if !res.IsError && !sawEnd {
+	if !res.IsError && (!sawEnd || !res.ObservationComplete) {
 		res.IsError = true
 		res.Subtype = "grok_build_stream_incomplete"
-		res.Result = "Grok Build 流缺少终局 end 事件"
+		if !sawEnd {
+			res.Result = "Grok Build 流缺少终局 end 事件"
+		} else {
+			res.Result = "Grok Build 流包含未完整识别事件"
+		}
+	} else if !res.IsError && text.Len() > 0 {
+		res.Result = text.String()
 	}
 	return res
 }

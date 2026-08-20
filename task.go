@@ -20,7 +20,36 @@ const (
 	statusDone        = "done"
 	statusFailed      = "failed"
 	statusCanceled    = "canceled"
+
+	routeClassGeneral = "general"
+	routeClassBackend = "backend"
 )
+
+// RouteAttemptReadback is the secret-free, durable identity and proof record for the most recent
+// provider invocation. Task fields describe the currently selected leg; this record deliberately
+// survives a serial fallback so the failed leg and its zero-work proof are not erased when the task
+// is queued on the next leg. The same keys are copied into task events for append-only history.
+type RouteAttemptReadback struct {
+	RequestedProvider string `json:"requested_provider"`
+	RequestedModel    string `json:"requested_model"`
+	RequestedEffort   string `json:"requested_effort"`
+	ActualProvider    string `json:"actual_provider"`
+	ActualModel       string `json:"actual_model"`
+	ActualEffort      string `json:"actual_effort"`
+	OwnerRouteName    string `json:"owner_route_name,omitempty"`
+	OwnerRouteLeg     int    `json:"owner_route_leg,omitempty"`
+	Attempt           int    `json:"attempt"`
+	FailureClass      string `json:"failure_class,omitempty"`
+	FailureKind       string `json:"failure_kind,omitempty"`
+	ObservationSeen   bool   `json:"observation_seen,omitempty"`
+	ObservationOK     bool   `json:"observation_complete,omitempty"`
+	SemanticEvents    int    `json:"semantic_events,omitempty"`
+	ModelEvents       int    `json:"model_events,omitempty"`
+	ToolEvents        int    `json:"tool_events,omitempty"`
+	ProcessResidue    bool   `json:"process_residue,omitempty"`
+	WorkspaceBefore   string `json:"workspace_fingerprint_before,omitempty"`
+	WorkspaceAfter    string `json:"workspace_fingerprint_after,omitempty"`
+}
 
 type Task struct {
 	ID       string `json:"id"`
@@ -46,6 +75,10 @@ type Task struct {
 	// PreferRunner 为 "codex" 时任务钉在 codex 上执行（不管 claude 忙闲），
 	// 用独立的 GPT 额度跑填充类任务；要求任务满足 codexEligible（fresh 或单步无会话）。
 	PreferRunner string `json:"runner_pref,omitempty"`
+	// RunnerExplicit distinguishes an owner/operator `-runner` pin from default_runner=codex baked
+	// routing. Legacy cards predate this bit and remain compatible (false); concrete provider/model
+	// fields, sessions, remote hosts, and cross roles still independently block automatic rewriting.
+	RunnerExplicit bool `json:"runner_explicit,omitempty"`
 	// CodexModel 钉定本卡经 codex 执行时的具体模型（-codex-model，如 gpt-5.6-terra）。
 	// 两条路径生效：①runner_pref=codex 主跑；②claude 卡触发 codex_fallback 降级改道。
 	// 空 = 按径回落（降级径先看 config.codex_fallback_model，再全局 codex_model；主跑径直接全局）。
@@ -55,6 +88,38 @@ type Task struct {
 	// flash-lite）。主跑（runner_pref=gemini）与降级改道两径都生效；空 = 按 t.Model 档位查
 	// config.gemini_models 槽映射（见 resolveGeminiModel 优先序）。XGeminiModel 恒优先。
 	GeminiModel string `json:"gemini_model,omitempty"`
+	// OpenCodeModel 钉定原生 OpenCode CLI 的 provider/model。
+	OpenCodeModel string `json:"opencode_model,omitempty"`
+	// KimiModel 钉定原生 Kimi Code CLI 的模型别名（如 kimi-code/k3）。
+	KimiModel string `json:"kimi_model,omitempty"`
+	// GrokModel / GrokEffort 钉定原生 Grok Build CLI 的真实模型与推理档。
+	// 自动接力时二者一并固化，防配置热更新让已排队的接力卡静默换模型。
+	GrokModel  string `json:"grok_model,omitempty"`
+	GrokEffort string `json:"grok_effort,omitempty"`
+	// CursorModel 钉定 Cursor CLI 账号模型清单中的完整模型 ID。Cursor 把思考档编码在
+	// 模型 ID 内（如 claude-fable-5-thinking-max / cursor-grok-4.6-xhigh）。
+	CursorModel string `json:"cursor_model,omitempty"`
+	// RouteClass 是与模型档位正交的 Owner 工作负载分类。backend 覆盖 service、persistence、
+	// protocol、database、network execution、identity/credential、manifest/launchd、
+	// Control/authority 与 live cutover；general 明确非 backend。显式值权威；空值仅对 eligible
+	// implementation/sequence 存量卡做保守文本兼容判定，不覆盖 session/remote/cross/显式 pin。
+	RouteClass string `json:"route_class,omitempty"`
+	// RouteReason 记录最近一次实际派发为何选择该执行器。策略安全接力的 pending 值保证
+	// 同一卡不会在冷却到点后又弹回上一腿；同时供看板/事件按实际组合复盘。
+	RouteReason string `json:"route_reason,omitempty"`
+	// OwnerRouteName/OwnerRouteLeg freeze the resolver result that Cardex itself selected. Readback
+	// never reconstructs an Owner chain from route_reason alone: a later manual pin/session/remote
+	// edit must win instead of being erased in a display/fallback-only copy. Leg is one-based.
+	OwnerRouteName string `json:"owner_route_name,omitempty"`
+	OwnerRouteLeg  int    `json:"owner_route_leg,omitempty"`
+	// LastRouteAttempt preserves requested/actual identity and the latest observation/proof even
+	// after the task advances to another route leg. It contains no prompt, output, or credential data.
+	LastRouteAttempt *RouteAttemptReadback `json:"last_route_attempt,omitempty"`
+	// FableFirstPrinciplesReview 是旧版 Fable 限额异构接力卡的兼容标记，完成后必须且只需
+	// 派一张本地 Sol/max 第一性补盲卡。AdvisoryReview 标记那张补盲卡本身：其结论供人工
+	// 判断，不喂给实现→审核→自动修复闭环，避免审查意见自动改写原设计。
+	FableFirstPrinciplesReview bool `json:"fable_first_principles_review,omitempty"`
+	AdvisoryReview             bool `json:"advisory_review,omitempty"`
 	// RemoteHost 非空时任务在该远程主机执行（SSH → 远端 codex），键入 Config.RemoteHosts。
 	// 让远端机器进编排（跨机 dev）；要求 remoteEligible（单步/fresh、无 claude 会话）。
 	RemoteHost string `json:"remote_host,omitempty"`
@@ -72,8 +137,19 @@ type Task struct {
 
 	EmitTasks   bool `json:"emit_tasks,omitempty"`
 	ReviewAfter bool `json:"review_after,omitempty"`
+	// SolMaxAdversarialReview 是在任务实际进入 Opus/Grok 实现腿时冻结的复审义务。它不依赖
+	// 完成时重新加载的配置：即使生产配置热更新，下一张审核卡仍必须是新的干净 Codex
+	// GPT-5.6 Sol/max 会话。普通 review_after 与 Sonnet/Haiku 策略不设置此位。
+	SolMaxAdversarialReview bool `json:"sol_max_adversarial_review,omitempty"`
+	// Mandatory Opus review is persisted before the parent may become done. If child creation fails or
+	// Cardex crashes in between, the parent remains held with ReviewObligationPending and tick can
+	// idempotently reconcile by ReviewOf without rerunning the completed implementation step.
+	ReviewObligationPending bool   `json:"review_obligation_pending,omitempty"`
+	ReviewTaskID            string `json:"review_task_id,omitempty"`
 	// Effort 非空时以 --effort 传给 claude（low/medium/high/xhigh/max），按任务难度调思考等级。
 	Effort string `json:"effort,omitempty"`
+	// EffortExplicit 区分命令/emit 显式指定的 effort 与类型默认或 stakes 地板，供降级径保留用户意图。
+	EffortExplicit bool `json:"effort_explicit,omitempty"`
 	// Stakes 是本卡的投入产出档位（low|normal|high，缺省 normal）。**只作审计留档**：
 	// add 时按 config.stakes_policy 查表，把复核深度固化进 ReviewAfter/Effort，运行期不再据本字段
 	// 判定任何行为（入队即钉，防"改配置让在队卡的复核深度静默漂移"）。见 stakes.go 文件头。
@@ -125,6 +201,8 @@ type Task struct {
 	// B/C 由它套用，绝不再从当前 config.cross_profiles 重解析——否则入队后改 profile 会静默换乙引擎/
 	// 令甲乙相同（身份漂移）。
 	XEngineB *XFrozenEngine `json:"x_engine_b,omitempty"`
+	// XEngineC 非空时冻结独立的合并复审引擎；空时兼容旧链，由 XEngineB 承担 C。
+	XEngineC *XFrozenEngine `json:"x_engine_c,omitempty"`
 	// XCodexModel 是本卡冻结的 codex 模型（codex/远端 codex 引擎）。invokeCodex/invokeRemoteCodex 优先用它，
 	// 空才回落全局 codex_model——否则入队后改/清 codex_model 会静默换模型或掉 -m 跑默认模型。
 	XCodexModel string `json:"x_codex_model,omitempty"`
@@ -207,7 +285,48 @@ func newTask(root string, cfg *Config, typ, title, dir string, prompts []string,
 		t.Model = td.Model
 		t.Effort = td.Effort
 	}
+	applyDefaultRunner(cfg, t)
 	return t
+}
+
+// applyDefaultRunner 把全局默认主路由烘焙到新卡。只填空白偏好，不覆盖 cross profile、
+// -runner 或其他显式执行器选择；会话续跑由各入口在写入 SessionID 后清除此默认 Codex 偏好。
+func applyDefaultRunner(cfg *Config, t *Task) bool {
+	if cfg == nil || t == nil || t.PreferRunner != "" {
+		return false
+	}
+	switch cfg.DefaultRunner {
+	case "codex", "gemini":
+		t.PreferRunner = cfg.DefaultRunner
+		t.RunnerExplicit = false
+		return true
+	default:
+		return false
+	}
+}
+
+// applyDefaultRunnerToPending 给配置切换前已存在、尚未派发的卡补烘焙默认路由。
+// cross 卡的显式引擎身份与 Claude 会话续跑不能改写；running 卡由启动它的配置快照负责，
+// 避免调度器和在途 goroutine 同时写同一卡面。
+func applyDefaultRunnerToPending(cfg *Config, t *Task) bool {
+	if t == nil || t.XRole != "" || t.SessionID != "" || t.MidStep {
+		return false
+	}
+	switch t.Status {
+	case statusQueued, statusHeld, statusLimitPaused, statusFailed:
+		return applyDefaultRunner(cfg, t)
+	default:
+		return false
+	}
+}
+
+// preserveSessionRunner 处理显式的 Claude 会话续跑。Codex 不可续接 Claude session；
+// 只有 default_runner 自动填入的 Codex 偏好会在这些明确带 session 的入口被撤回。
+func preserveSessionRunner(t *Task) {
+	if t != nil && t.SessionID != "" && t.PreferRunner == "codex" {
+		t.PreferRunner = ""
+		t.RunnerExplicit = false
+	}
 }
 
 // findTaskAnywhere 先在 tasks/ 再在 archive/ 按精确 ID 找任务

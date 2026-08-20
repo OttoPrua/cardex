@@ -48,6 +48,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	// 审核卡可与同仓下一批并行（依赖护栏在排批层：批内叶组互不依赖、不消费未过审契约）。
 	readOnly := func(t *Task) bool { return t.Type == typeReview || t.Type == typeProgressPull }
 	launched := 0
+	lastConfigReloadErr := ""
 
 	report := func(t *Task) {
 		if quiet {
@@ -68,6 +69,16 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	}
 
 	for {
+		// 长 drain 期间配置可能已被确认并更新。每轮重读一份完整、通过校验的新快照；
+		// 失败则沿用上一份 last-known-good，避免半写配置把在途任务打断。每个新 goroutine
+		// 在派发时冻结自己的 cfg 指针（见下方 runCfg），因此热切换不会与在途调用数据竞争。
+		if latest, err := loadConfig(root); err == nil {
+			cfg = latest
+			lastConfigReloadErr = ""
+		} else if !quiet && err.Error() != lastConfigReloadErr {
+			fmt.Fprintf(os.Stderr, "警告: 配置热重载失败，继续使用上一份有效配置: %v\n", err)
+			lastConfigReloadErr = err.Error()
+		}
 		now := time.Now()
 		_ = os.Chtimes(lockPath(root), now, now) // 长时间 drain 时刷新锁，防止被当作陈旧锁清除
 
@@ -118,9 +129,20 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				}
 			} else {
 				reconcileCrossChains(root, tasks, activeIDs) // 崩溃对账：单腿孤儿交叉卡置 failed
-				viaRunner := map[string]string{}             // 任务ID → ""(claude) / "codex" / 引擎名
+				reconcileMandatoryReviewObligations(root, cfg, tasks, activeIDs)
+				viaRunner := map[string]string{} // 任务ID → ""(claude) / "codex" / 引擎名
 				var cands []*Task
 				for _, t := range tasks {
+					if applyDefaultRunnerToPending(cfg, t) {
+						// 补烘焙必须先持久化再参与候选选择：若写盘失败却只改内存，本轮看似走
+						// Codex，daemon 重启后又会掉回旧执行器，形成不可见漂移。
+						if err := saveTask(root, t); err != nil {
+							if !quiet {
+								fmt.Fprintf(os.Stderr, "警告: 任务 %s 默认路由落盘失败，本轮不派发: %v\n", t.ID, err)
+							}
+							continue
+						}
+					}
 					if t.Status == statusCanceled {
 						if !activeIDs[t.ID] {
 							_ = archiveTask(root, t) // cancel 时执行器已不在场（如 daemon 重启过）的收尾归档
@@ -130,6 +152,12 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 					if activeIDs[t.ID] || (activeDirs[t.Dir] && !readOnly(t)) {
 						continue
 					}
+					if ownerRoutingPolicyWaitReason(cfg, t) != "" {
+						// Invalid persisted classification and unsupported explicit Fable shapes are visible
+						// policy waits. They never fall through to a generic/default provider.
+						continue
+					}
+					ownerRunner, ownerMatched := ownerPrimaryDispatch(root, cfg, t, now)
 					switch {
 					case t.RemoteHost != "":
 						// 远端 codex 执行器：SSH 到远端跑 codex，走自己的 GPT 额度，不受 claude 冷却/红线阻塞。
@@ -138,7 +166,20 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						if _, ok := cfg.RemoteHosts[t.RemoteHost]; !ok || !codexEligible(t) {
 							continue
 						}
+					case ownerMatched:
+						// 六行 Owner 主路由只由 resolveOwnerRoute→ownerPrimaryDispatch 解析。
+						// 空 runner 表示第一腿冷却/不可派；不得据另一 provider 的可用性跳腿。
+						if ownerRunner == "" {
+							continue
+						}
+						viaRunner[t.ID] = ownerRunner
+					case openCodeNightOpusEligible(root, cfg, t, now):
+						// 旧版可选夜间 OpenCode 路由仍兼容；生产 K3 主路由使用上面的 Kimi CLI。
+						viaRunner[t.ID] = "opencode"
 					case t.PreferRunner == "codex" && cfg.CodexBin != "" && codexEligible(t):
+						if t.RouteReason == routeReasonCodexBackendExcluded || t.RouteReason == routeReasonKimiCLICooldownFallback {
+							t.RouteReason = ""
+						}
 						viaRunner[t.ID] = "codex"
 					case t.PreferRunner == "codex":
 						// codex 钉定但上面条件没满足（codex_bin 缺失/不 eligible）：绝不 fail-open 到 claude。
@@ -152,6 +193,37 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							continue
 						}
 						viaRunner[t.ID] = "gemini"
+					case t.PreferRunner == "opencode":
+						// 显式钉定 OpenCode：缺二进制或车道冷却时等待，绝不偷换执行器。
+						if !openCodePinnedReady(root, cfg, t, now) {
+							continue
+						}
+						viaRunner[t.ID] = "opencode"
+					case t.PreferRunner == kimiCLIRunnerName:
+						// 人工钉定 Kimi CLI 时等待其独立车道恢复，绝不偷换执行器。
+						if !kimiCLIPinnedReady(root, cfg, now) {
+							continue
+						}
+						viaRunner[t.ID] = kimiCLIRunnerName
+					case t.PreferRunner == grokBuildRunnerName:
+						// 无论策略接力还是人工钉定，冷却都只让本腿等待；不得据另一张卡的
+						// 可用性收据跳到下一 writer。
+						if !grokBuildPinnedReady(root, cfg, now) {
+							continue
+						} else {
+							viaRunner[t.ID] = grokBuildRunnerName
+						}
+					case t.PreferRunner == cursorRunnerName:
+						// 人工钉定 Cursor：只等自己的独立车道，绝不偷换模型或执行器。
+						if !cursorPinnedReady(root, cfg, now) || resolveCursorModel(cfg, t) == "" {
+							continue
+						}
+						viaRunner[t.ID] = cursorRunnerName
+					case t.PreferRunner == "claude":
+						// 显式 Claude 身份在非 Fable 或无法无损接力时保持原账号，不吃通用 fallback_order。
+						if blockReason != "" {
+							continue
+						}
 					case engineVia(t.PreferRunner):
 						// 引擎钉定：档案在且该引擎不在冷却才派。缺档案/冷却中一律跳过等待——与 codex
 						// 钉定同一纪律，绝不 fail-open 回 claude（额度归属是用户显式划的边界）。
@@ -190,12 +262,13 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						fmt.Printf("▶ 运行 %s [%s] %s（第 %d/%d 步，并行 %d/%d%s）\n",
 							next.ID, next.Type, next.Title, next.Step+1, len(next.Prompts), len(activeIDs), maxPar, runner)
 					}
-					go func(t *Task, via string) {
-						if err := runTaskVia(runCtx, root, cfg, t, via); err != nil && !quiet {
+					runCfg := cfg
+					go func(t *Task, via string, taskCfg *Config) {
+						if err := runTaskVia(runCtx, root, taskCfg, t, via); err != nil && !quiet {
 							fmt.Printf("✖ %s 执行出错: %v\n", t.ID, err)
 						}
 						ch <- doneMsg{t}
-					}(next, via)
+					}(next, via, runCfg)
 					continue // 尝试继续填下一个槽位
 				}
 			}

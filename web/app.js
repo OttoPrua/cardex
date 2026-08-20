@@ -165,18 +165,127 @@ function statusBadge(status) {
     STATUS_ZH[status] || status);
 }
 
+function modelDisplayName(model) {
+  const raw = String(model || '').trim();
+  switch (raw.toLowerCase()) {
+    case 'kimi-code/k3':
+    case 'opencode-go/kimi-k3':
+    case 'kimi-k3':
+    case 'k3':
+      return 'Kimi K3';
+	case 'claude-fable-5-thinking-max':
+	  return 'Fable 5 Thinking Max';
+	case 'grok-4.6':
+	  return 'Grok 4.6';
+	case 'cursor-grok-4.6-xhigh':
+	  return 'Grok 4.6 Extra High';
+	case 'gpt-5.6-sol':
+	  return 'GPT-5.6 Sol';
+	case 'gpt-5.6-terra':
+	  return 'GPT-5.6 Terra';
+	case 'gpt-5.6-luna':
+	  return 'GPT-5.6 Luna';
+    default:
+      return raw || '(账号默认)';
+  }
+}
+
 function tierBadge(model, tier) {
+  const label = modelDisplayName(model);
+  const raw = String(model || '').trim();
   return h('span', {
     class: `tier tier-${tier || '未知'}`,
-    title: `模型 ${model || '(账号默认)'}／${tier || '未知'} 档`,
+    title: raw && raw !== label
+      ? `模型 ${label}（${raw}）／${tier || '未知'} 档`
+      : `模型 ${label}／${tier || '未知'} 档`,
   },
     h('span', { class: 'tier-bar', 'aria-hidden': 'true' }),
-    model || '(账号默认)');
+    label);
 }
 
 function metaChip(text, opts) {
   const o = opts || {};
-  return h('span', { class: `meta-chip${o.mono ? ' is-mono' : ''}`, title: o.title || text, text });
+  return h('span', {
+    class: `meta-chip${o.mono ? ' is-mono' : ''}${o.kind ? ` is-${o.kind}` : ''}`,
+    title: o.title || text,
+    text,
+  });
+}
+
+const RUNNER_ZH = { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode', gemini: 'Gemini', 'kimi-cli': 'Kimi CLI', 'grok-build': 'Grok Build', cursor: 'Cursor CLI' };
+const ROUTE_REASON_ZH = {
+  opencode_explicit: '显式 OpenCode',
+  opencode_night_opus_preferred: '夜间 K3 优先',
+  kimi_cli_explicit: '显式 Kimi CLI',
+  kimi_cli_opus_preferred: 'Kimi CLI K3 全时段优先',
+  kimi_cli_cooldown_fallback: '旧版 Kimi CLI 冷却 → Sol',
+  kimi_cli_limit_fallback_pending: '旧版 Kimi CLI 限额链，待转 Sol',
+  kimi_cli_limit_fallback: '旧版 Kimi CLI → Sol',
+  grok_build_explicit: '显式 Grok Build',
+  kimi_to_grok_pending: 'Kimi 安全失败已证明，待串行转 Grok 4.6',
+  kimi_to_grok: 'Kimi 安全失败 → Grok 4.6',
+  fable_to_grok_pending: '旧版 Fable 5 限额链，待转 Grok 4.6',
+  fable_to_grok: '旧版 Fable 5 → Grok 4.6',
+  grok_to_sol_pending: 'Grok 安全失败已证明，待串行转 Sol 末腿',
+  grok_to_sol: 'Grok 安全失败 → Sol 末腿',
+  grok_opus_backend_preferred: '后端 Opus → Grok 4.6/xhigh',
+  grok_sonnet_preferred: 'Sonnet → Grok 4.6/high',
+  grok_haiku_preferred: 'Haiku → Grok 4.6/high',
+  grok_sonnet_to_luna_pending: 'Grok 安全失败已证明，Sonnet 待串行转 Luna/max',
+  grok_sonnet_to_luna: 'Grok 安全失败 → Luna/max',
+  grok_haiku_to_luna_pending: 'Grok 安全失败已证明，Haiku 待串行转 Luna/xhigh',
+  grok_haiku_to_luna: 'Grok 安全失败 → Luna/xhigh',
+  cursor_explicit: '显式 Cursor CLI',
+  cursor_fable_preferred: 'Cursor Fable 5/max 优先',
+  cursor_fable_policy_wait: 'Fable Owner 形态或配置待修复，未派发',
+  cursor_fable_dual_fallback_pending: 'Fable 限额/合格前语义失败 → Grok 后 Sol 串行双解，待 Sol/max 第一性合并',
+  cursor_fable_dual_fallback: 'Fable 限额/合格前语义失败 → Grok 后 Sol 串行双解 + Sol/max 第一性合并',
+  owner_review_sol_max: '独立审核卡 → Sol/max',
+  fable_grok_unavailable_to_sol_pending: '旧版 Fable 链，待转 Sol/max',
+  fable_grok_unavailable_to_sol: '旧版 Fable → Sol/max',
+  codex_backend_excluded: '旧版后端排除 → Sol',
+  opencode_limit_fallback_pending: 'K3 限额，待转 Sol',
+  opencode_limit_fallback: 'K3 → Sol',
+};
+
+const ROUTE_CLASS_ZH = { general: '通用任务', backend: '后端/控制面' };
+
+function routeClassChip(routeClass) {
+  if (!routeClass) return null;
+  return metaChip(ROUTE_CLASS_ZH[routeClass] || routeClass, { title: `任务路由分类 ${routeClass}` });
+}
+
+function runnerDisplayName(runner) {
+  const raw = String(runner || '').trim();
+  if (raw.startsWith('remote:')) return `远端 ${raw.slice('remote:'.length)}`;
+  return RUNNER_ZH[raw] || raw || 'Claude';
+}
+
+function runnerChip(runner) {
+  if (!runner || runner === 'claude') return null;
+  const kind = runner === 'opencode' ? 'opencode' : (runner === 'codex' ? 'codex' : 'runner');
+  return metaChip(runnerDisplayName(runner), { mono: true, kind, title: `执行器 ${runner}` });
+}
+
+function routeReasonText(reason) {
+  if (!reason) return null;
+  return ROUTE_REASON_ZH[reason] || reason;
+}
+
+function routeChip(reason) {
+  const text = routeReasonText(reason);
+  return text ? metaChip(text, { kind: 'route', title: `路由原因：${reason}` }) : null;
+}
+
+function modelRouteChip(route) {
+  if (!route) return null;
+  return metaChip(`模型链 · ${route}`, { kind: 'model-route', title: `完整模型链：${route}` });
+}
+
+function effortChip(t) {
+  if (!t || !t.effort) return null;
+  const label = t.effort_source === 'opencode_variant' ? `variant ${t.effort}` : `档位 ${t.effort}`;
+  return metaChip(label, { kind: t.effort_source === 'opencode_variant' ? 'opencode' : null });
 }
 
 /** 分段进度条：展示状态构成，而不是只给一个百分比。 */
@@ -246,6 +355,216 @@ const KIND_SCOPE = {
   coord: '协调／收口／进度回收类记账卡（coordinate、progress-pull、prompt-assembly 等）',
 };
 
+const MATURITY_STATE_TIP = {
+  '设计/待开发': '0/4：只有设计或尚未开始开发',
+  '遗留待迁移': '1/4：已有遗留能力，但尚未迁入当前权威',
+  '开发/复审中': '1/4：已有实质实现，但候选门尚未闭合',
+  '隔离候选': '2/4：clean exact SHA、相关测试可复算、fresh review P0/P1=0',
+  '主线/集成已有': '3/4：已进入目标主线或 managed integration，并通过必需门禁',
+  'Live/有界 Canary': '4/4：有 fresh、真实且有界的用户/业务路径证据',
+};
+
+const MATURITY_KIND_BASIS = '每个能力切片在版本化合同中只指定一个主要工作性质；分类只拆分展示，不改变 0–4 成熟度分。'
+  + '总条左侧各颜色的宽度＝该类已取得分 ÷ 项目满分，所有尚未取得的分合并在最右侧。';
+
+function maturityBar(pct, state, kind) {
+  const safe = Math.max(0, Math.min(100, isNum(pct) ? pct : 0));
+  const earnedClass = kind && KIND_ZH[kind]
+    ? `prog-seg is-maturity-earned is-maturity-kind mk-${kind}`
+    : 'prog-seg is-maturity-earned';
+  return h('div', { class: 'prog-wrap maturity-bar-wrap' },
+    h('div', {
+      class: 'prog maturity-bar', role: 'img',
+      'aria-label': `${state || '结构成熟度'} ${safe}%`,
+    },
+      h('span', {
+        class: earnedClass,
+        style: `width:${safe}%`,
+        title: `${state || '已取得成熟度分'} ${safe}%`,
+      }),
+      safe < 100 ? h('span', {
+        class: 'prog-seg is-maturity-gap', style: `width:${100 - safe}%`,
+        title: `距离 Live/有界 Canary 尚余 ${Math.round((100 - safe) * 10) / 10}%`,
+      }) : null),
+    h('span', { class: 'prog-pct', text: `${safe}%` }));
+}
+
+function maturityTotalBar(kinds, work, points, max, pct, label) {
+  if (!Array.isArray(kinds) || !kinds.length || !isNum(max) || max <= 0) {
+    return maturityBar(pct, label);
+  }
+  const segs = [];
+  const aria = [];
+  let earned = 0;
+  for (const k of kinds) {
+    const value = work ? k.work_points : k.points;
+    const kindMax = work ? k.work_max_points : k.max_points;
+    if (!isNum(value) || value <= 0) continue;
+    earned += value;
+    const contribution = Math.max(0, Math.min(100, value / max * 100));
+    const withinKind = isNum(kindMax) && kindMax > 0 ? Math.round(value / kindMax * 1000) / 10 : 0;
+    const kindLabel = KIND_ZH[k.key] || k.label || k.key;
+    aria.push(`${kindLabel} ${fmtNum(value)}/${fmtNum(kindMax)}`);
+    segs.push(h('span', {
+      class: `prog-seg is-maturity-kind mk-${k.key}`,
+      style: `width:${contribution}%`,
+      title: `${kindLabel}已取得 ${fmtNum(value)}/${fmtNum(kindMax)}（该类完成 ${withinKind}%；占项目满分 ${Math.round(contribution * 10) / 10}%）`,
+    }));
+  }
+  const remaining = Math.max(0, max - earned);
+  if (remaining > 0) {
+    segs.push(h('span', {
+      class: 'prog-seg is-maturity-gap',
+      style: `width:${Math.max(0, Math.min(100, remaining / max * 100))}%`,
+      title: `未完成合计 ${fmtNum(remaining)}/${fmtNum(max)}`,
+    }));
+  }
+  const safe = Math.max(0, Math.min(100, isNum(pct) ? pct : 0));
+  return h('div', { class: 'prog-wrap maturity-bar-wrap' },
+    h('div', {
+      class: 'prog maturity-bar maturity-total-bar', role: 'img',
+      'aria-label': `${label} ${safe}%；${aria.join('，')}；未完成 ${fmtNum(remaining)}/${fmtNum(max)}`,
+    }, segs),
+    h('span', { class: 'prog-pct', text: `${safe}%` }));
+}
+
+function maturityKindLabel(k) {
+  return h('span', {
+    class: 'prog-key maturity-kind-key',
+    title: `${MATURITY_KIND_BASIS} 本类包含 ${k.slice_count || 0} 个能力切片。`,
+  },
+    h('span', { class: `maturity-kind-dot mk-${k.key}`, 'aria-hidden': 'true' }),
+    KIND_ZH[k.key] || k.label || k.key);
+}
+
+function maturityEvidenceTitle(slice) {
+  const lines = [MATURITY_STATE_TIP[slice.state] || slice.state];
+  for (const e of slice.evidence || []) {
+    lines.push(`${e.layer}: ${e.summary}${e.ref ? `（${e.ref}）` : ''} @ ${e.observed_at}`);
+  }
+  if (slice.acceptance_gate) lines.push(`尚待：${slice.acceptance_gate}`);
+  return lines.filter(Boolean).join('\n');
+}
+
+function maturityETAText(eta) {
+  if (!eta) return '预计完成：数据不足——合同未提供风险修正 ETA';
+  const earliest = fmtTime(eta.earliest_at);
+  const latest = fmtTime(eta.latest_at);
+  const floor = fmtTime(eta.observation_floor_at);
+  let range = '时间范围不足';
+  if (earliest && latest) range = `${earliest} ～ ${latest}${eta.open_ended ? '+' : ''}`;
+  else if (earliest) range = `不早于 ${earliest}${eta.open_ended ? '，上限开放' : ''}`;
+  else if (latest) range = `不晚于 ${latest}${eta.open_ended ? '+' : ''}`;
+  if (floor) range += `；观测下限 ${floor}`;
+  return `${eta.target}：${range}（置信度 ${eta.confidence || '未声明'}）`;
+}
+
+/**
+ * 成熟度口径。预估档=非加权 0–4 结构成熟度；工时档=合同显式 effort_weight 加权。
+ * 合同缺失/超龄/无效时只显示数据不足，严禁静默回退到 Cardex done 或 turns。
+ */
+function maturityProgress(m, mode, compact) {
+  const wrap = h('div', { class: 'prog-group maturity-group' });
+  const label = mode === 'work' ? '工时成熟度' : '结构成熟度';
+  if (!m || !m.available) {
+    const reason = m && m.insufficient_reason
+      ? m.insufficient_reason
+      : '未配置版本化成熟度合同；为避免把 Cardex done 率冒充项目进度，本档不显示百分比。';
+    wrap.append(h('div', { class: 'prog-row is-total maturity-na' },
+      h('span', { class: 'prog-key', text: label }),
+      h('span', { class: 'prog-n', text: 'N/A' }),
+      h('span', { class: 'maturity-na-text', title: reason, text: '数据不足' })));
+    wrap.append(h('p', { class: 'prog-note', title: reason, text: `⚠ ${reason}` }));
+    return wrap;
+  }
+
+  const work = mode === 'work';
+  const points = work ? m.work_points : m.points;
+  const max = work ? m.work_max_points : m.max_points;
+  const pct = work ? m.work_percent : m.percent;
+  const totalTip = work ? m.work_basis : m.basis;
+  wrap.append(h('div', { class: 'prog-row is-total' },
+    h('span', { class: 'prog-key', title: totalTip, text: label }),
+    h('span', {
+      class: 'prog-n', title: totalTip,
+      text: `${fmtNum(points)}/${fmtNum(max)}${work && !m.effort_weighted ? '（未加权）' : ''}`,
+    }),
+    maturityTotalBar(m.kinds, work, points, max, pct, label)));
+
+  for (const k of m.kinds || []) {
+    const kindPoints = work ? k.work_points : k.points;
+    const kindMax = work ? k.work_max_points : k.max_points;
+    const kindPct = work ? k.work_percent : k.percent;
+    wrap.append(h('div', { class: 'prog-row maturity-kind-row' },
+      maturityKindLabel(k),
+      h('span', {
+        class: 'prog-n',
+        title: `${k.slice_count || 0} 个能力切片；${MATURITY_KIND_BASIS}`,
+        text: `${fmtNum(kindPoints)}/${fmtNum(kindMax)}`,
+      }),
+      maturityBar(kindPct, `${KIND_ZH[k.key] || k.label}成熟度`, k.key)));
+  }
+  if ((m.kinds || []).length) {
+    wrap.append(compact
+      ? h('p', { class: 'prog-note maturity-kind-basis', title: MATURITY_KIND_BASIS, text: '彩色段＝五类已取得成熟度；右侧斜纹＝合并未完成 ⓘ' })
+      : h('p', { class: 'prog-note maturity-kind-basis', text: MATURITY_KIND_BASIS }));
+  }
+
+  const delta = m.delta || {};
+  if (delta.reference_at) {
+    const sign = delta.net_points > 0 ? '+' : '';
+    wrap.append(h('p', {
+      class: 'prog-note maturity-delta',
+      text: `相对历史基准 ${fmtTime(delta.reference_at) || delta.reference_at}：${sign}${delta.net_points || 0} 点 / ${sign}${delta.net_delta_pp || 0}pp`,
+    }));
+  }
+  const led = m.snapshot_ledger || {};
+  if ((led.phase_rows_changed || 0) > 0) {
+    wrap.append(h('p', {
+      class: 'prog-note maturity-ledger',
+      text: `本快照迁移：${led.forward_transitions || 0} 项前进、${led.evidence_regressions || 0} 项回退，净 ${led.net_point_gain > 0 ? '+' : ''}${led.net_point_gain || 0} 点；literal main/live/用户验收晋级 ${led.literal_main_merges || 0}/${led.live_promotions || 0}/${led.user_acceptance_promotions || 0}`,
+    }));
+  }
+  if (work) {
+    wrap.append(h('p', { class: 'prog-note', title: m.work_basis, text: maturityETAText(m.eta) }));
+    if (m.eta && m.eta.acceptance_gate) {
+      wrap.append(h('p', { class: 'prog-note', title: m.eta.basis, text: `ETA 出口门：${m.eta.acceptance_gate}` }));
+    }
+  }
+
+  const allSlices = m.slices || [];
+  let slices = allSlices;
+  if (compact && allSlices.length > 6) {
+    const unfinished = allSlices.filter((s) => (s.score || 0) < (s.max_points || 4));
+    slices = (unfinished.length ? unfinished : allSlices).slice(0, 6);
+  }
+  for (const s of slices) {
+    const tip = maturityEvidenceTitle(s);
+    wrap.append(h('div', { class: 'prog-row maturity-slice' },
+      h('span', { class: 'prog-key', title: tip, text: s.phase || s.id }),
+      h('span', {
+        class: 'prog-n', title: tip,
+        text: `${s.score}/${s.max_points}${work && s.effort_weight ? ` ×${fmtNum(s.effort_weight)}` : ''}`,
+      }),
+      maturityBar(s.percent, s.state, s.kind)));
+    wrap.append(h('p', {
+      class: 'prog-note maturity-state', title: tip,
+      text: `${KIND_ZH[s.kind] ? `${KIND_ZH[s.kind]} · ` : ''}${s.state}${s.user_accepted ? ' · USER_ACCEPTED' : ''}　·　尚待 ${s.acceptance_gate}`,
+    }));
+  }
+  if (compact && slices.length < allSlices.length) {
+    wrap.append(h('p', {
+      class: 'prog-note',
+      text: `总览显示 ${slices.length}/${allSlices.length} 个未成熟关键阶段；进入项目页查看完整阶段与证据。`,
+    }));
+  }
+  wrap.append(h('p', {
+    class: 'prog-note maturity-source', title: m.source,
+    text: `快照 ${fmtTime(m.snapshot_at) || m.snapshot_at} · 分母 ${m.denominator_version} · 全体系 ${m.portfolio.points}/${m.portfolio.max_points}（${m.portfolio.percent}%）`,
+  }));
+  return wrap;
+}
+
 /**
  * 按工作性质拆分的进度块。与总条**并列而非替换**。
  *
@@ -259,6 +578,9 @@ const KIND_SCOPE = {
  */
 function kindProgress(stats, pct, kinds, opts) {
   const o = opts || {};
+  if (progressScale === 'est' || progressScale === 'work') {
+    return maturityProgress(o.maturity, progressScale, !!o.compact);
+  }
   const wrap = h('div', { class: 'prog-group' });
   const done = stats.done || 0;
   const denCards = (stats.total || 0) - (stats.canceled || 0);
@@ -595,22 +917,27 @@ const el = {
   live: document.getElementById('live'),
 };
 
-/* ---- 进度口径全局开关（实发进度 / 预估进度）----
+/* ---- 进度口径全局开关（实发进度 / 结构成熟度 / 工时成熟度）----
  * 「实发进度」：分母 = 已经真派出去的卡（现存非取消卡，原口径，默认）。
- * 「预估进度」：分母 = 预估最终总卡数（后端 estimate 字段：计划锚点或派生耦合模型，
- *   basis 随条悬停披露）。项目总条与 kind 分桶同步切换（余量按历史派生构成分摊进桶）；
- *   阶段条保持实发口径（阶段是执行切片，预估分摊到阶段没有历史构成可依）。
+ * 「预估进度」：版本化能力切片的 0–4 结构成熟度。
+ * 「工时进度」：同一成熟度合同的 effort_weight 独立指数 + 风险修正 ETA；无权重时
+ *   明示回退未加权成熟度。两档都不从 done/turns/代码量/测试量/进程数推导晋级。
  * 开关渲染在状态芯片同一排（progressScaleSeg），与筛选芯片并列——两者都是"看板怎么读"
  * 的视图开关，散在两处会让人以为口径是某个页面的局部设置。 */
 const PROGRESS_SCALE_KEY = 'cardex.board.progressScale';
 let progressScale = 'cards';
-try { if (localStorage.getItem(PROGRESS_SCALE_KEY) === 'est') progressScale = 'est'; } catch { /* 私隐模式等，保默认 */ }
+try {
+  const savedScale = localStorage.getItem(PROGRESS_SCALE_KEY);
+  if (savedScale === 'est' || savedScale === 'work') progressScale = savedScale;
+} catch { /* 私隐模式等，保默认 */ }
 
 function setProgressScale(v) {
   if (v === progressScale) return;
   progressScale = v;
   try { localStorage.setItem(PROGRESS_SCALE_KEY, v); } catch { /* 存不进就只影响本次会话 */ }
-  el.live.textContent = v === 'est' ? '进度口径已切到预估进度' : '进度口径已切回实发进度';
+  el.live.textContent = v === 'est'
+    ? '进度口径已切到结构成熟度'
+    : (v === 'work' ? '进度口径已切到工时成熟度' : '进度口径已切回实发进度');
   load({ silent: true });
 }
 
@@ -618,11 +945,9 @@ function setProgressScale(v) {
 function progressScaleSeg() {
   const opts = [
     ['cards', '实发进度', '分母＝已经派出去的卡（现存非取消卡）。这是"手上这些活干完了多少"。'],
-    ['est', '预估进度', '分母＝预估最终总卡数：把复审/修复/emit 还会派生出来的卡提前算进来。'
-      + '来源与口径（计划锚点或派生耦合系数）见各进度条的悬停说明；数据不足时自动回落实发口径并标注。'],
-    ['work', '工时进度', '不按卡数计，按每张卡的**工作量**（turns 回合数作代理）加权，并给出预估完成时刻。'
-      + '实测本账本类型间工作量差 28 倍（sequence 中位 57 turns vs progress-pull 2），'
-      + '"完成 7/10 张"在剩下都是大卡时会严重高估。样本不足或缺实测的项目自动回落实发口径并标注。'],
+    ['est', '预估进度', '按版本化能力切片的 0–4 结构成熟度计分。Cardex done、代码/提交/测试数量与进程存在只作诊断，不触发晋级；fresh review 反例可让状态回退。'],
+    ['work', '工时进度', '在结构成熟度之上使用合同显式声明的 effort_weight，并显示风险修正 ETA。'
+      + '没有可靠权重时透明回退到未加权成熟度；绝不回退到 turns 或 Cardex done 率。'],
   ];
   // 复用仓内既有的分段控件惯例 .seg（总列/阶段泳道同款，选中态由 aria-pressed 驱动）：
   // 本仓只该有一种"互斥一组"的视觉语言，自创第二套会让人以为它是另一类控件。
@@ -1406,7 +1731,7 @@ function projectCard(p) {
           { mono: true, title: p.dirs.join('\n') })
         : null,
       relTime(p.last_activity) ? metaChip(`活动 ${relTime(p.last_activity)}`) : null),
-    kindProgress(p.stats, p.progress_percent, p.kinds, { compact: true, estimate: p.estimate, weighted: p.weighted }),
+    kindProgress(p.stats, p.progress_percent, p.kinds, { compact: true, estimate: p.estimate, weighted: p.weighted, maturity: p.maturity }),
     p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     statusLegend(p.stats),
@@ -1498,8 +1823,11 @@ function taskList(tasks, total) {
 function taskRow(t) {
   const tags = [];
   if (t.model) tags.push(tierBadge(t.model, t.model_tier));
-  if (t.runner && t.runner !== 'claude') tags.push(metaChip(t.runner, { mono: true }));
-  if (t.effort) tags.push(metaChip(`档位 ${t.effort}`));
+  tags.push(runnerChip(t.runner));
+  tags.push(effortChip(t));
+  tags.push(routeChip(t.route_reason));
+  tags.push(modelRouteChip(t.model_route));
+  tags.push(routeClassChip(t.route_class));
   // step 是 0-based（契约如此），展示成「第 N/M 步」必须 +1，与活动流文案对齐。
   if (t.steps_total > 1) tags.push(metaChip(`第 ${t.step + 1}/${t.steps_total} 步`));
   if (t.status === 'running' && t.elapsed_minutes > 0) tags.push(metaChip(`已跑 ${fmtDur(t.elapsed_minutes)}`));
@@ -1548,7 +1876,7 @@ async function viewProject(id) {
     p.archive_revived
       ? callout('warning', 'ⓘ', p.archive_revived_reason || '归档后检测到新卡，已自动切回活跃')
       : null,
-    kindProgress(p.stats, p.progress_percent, p.kinds, { estimate: p.estimate, weighted: p.weighted }),
+    kindProgress(p.stats, p.progress_percent, p.kinds, { estimate: p.estimate, weighted: p.weighted, maturity: p.maturity }),
     p.kind_rule_error ? callout('warning', '⚠', p.kind_rule_error) : null,
     goalBlock(p.goal),
     etaLine(p.eta),
@@ -1630,7 +1958,38 @@ function kanbanColumn(c) {
     body);
 }
 
-const MODEL_SOURCE_ZH = { task: '卡上指定', codex_model: 'codex 侧解析', type_default: '类型默认' };
+const MODEL_SOURCE_ZH = {
+  task: '卡上指定',
+  codex_model: 'Codex 实际模型',
+  opencode_model: 'OpenCode 实际模型',
+  kimi_model: 'Kimi CLI 实际模型',
+  grok_model: 'Grok Build 实际模型',
+	cursor_model: 'Cursor CLI 实际模型',
+  gemini_model: 'Gemini 实际模型',
+  type_default: '类型默认',
+};
+const EFFORT_SOURCE_ZH = {
+  task: '卡上指定',
+  codex_reasoning: 'Codex reasoning',
+  opencode_variant: 'OpenCode variant',
+  kimi_effort: 'Kimi CLI effort',
+  grok_effort: 'Grok Build reasoning',
+	cursor_model: 'Cursor 模型内置档位',
+  type_default: '类型默认',
+};
+const RUNNER_SOURCE_ZH = {
+  actual: '已派发记录',
+  route_reason: '路由接力状态',
+  route_policy: '自动路由策略',
+  remote_host: '固定远端位置',
+  runner_pref: '任务首选执行器',
+  default: '系统默认',
+};
+
+function modelSourceText(source) {
+  if (source && source.startsWith('engine:')) return `订阅引擎 ${source.slice('engine:'.length)}`;
+  return MODEL_SOURCE_ZH[source] || source;
+}
 
 function taskCard(t) {
   const tags = [];
@@ -1638,7 +1997,11 @@ function taskCard(t) {
   // 状态徽章承载——避免「状态只靠颜色」，也把左缘这条最显眼的色带让给用户要的模型区分。
   tags.push(statusBadge(t.status));
   if (t.model) tags.push(tierBadge(t.model, t.model_tier));
-  if (t.runner && t.runner !== 'claude') tags.push(metaChip(t.runner, { mono: true }));
+  tags.push(runnerChip(t.runner));
+  tags.push(effortChip(t));
+  tags.push(routeChip(t.route_reason));
+  tags.push(modelRouteChip(t.model_route));
+  tags.push(routeClassChip(t.route_class));
   if (t.remote_host) tags.push(metaChip(`@${t.remote_host}`, { mono: true }));
   if (t.steps_total > 1) tags.push(metaChip(`第 ${t.step + 1}/${t.steps_total} 步`));
   if (t.status === 'running' && t.elapsed_minutes > 0) tags.push(metaChip(`已跑 ${fmtDur(t.elapsed_minutes)}`));
@@ -1661,8 +2024,15 @@ function taskCard(t) {
       row('工作性质', `${KIND_ZH[t.kind] || t.kind}（判定来源：${KIND_SOURCE_ZH[t.kind_source] || t.kind_source || '未知'}）`);
     }
     row('优先级', t.priority);
-    row('模型来源', MODEL_SOURCE_ZH[t.model_source] || t.model_source);
+    row('执行器', runnerDisplayName(t.runner));
+    row('执行器来源', RUNNER_SOURCE_ZH[t.runner_source] || t.runner_source);
+    row('实际模型', t.model, true);
+    row('模型来源', modelSourceText(t.model_source));
     row('执行档位', t.effort);
+    row('档位来源', EFFORT_SOURCE_ZH[t.effort_source] || t.effort_source);
+    row('路由说明', routeReasonText(t.route_reason));
+    row('完整模型链', t.model_route);
+    row('任务路由分类', ROUTE_CLASS_ZH[t.route_class] || t.route_class);
     row('目录', t.dir, true);
     row('创建', fmtTime(t.created_at));
     row('更新', fmtTime(t.updated_at));

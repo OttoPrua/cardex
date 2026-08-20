@@ -103,7 +103,7 @@ func TestCodexOnlyRemoteHostOverridesReviewClaudeDefaults(t *testing.T) {
 
 	enforceRemoteHostPolicy(cfg, task)
 
-	if task.PreferRunner != "codex" || task.Model != "" || task.CodexModel != "gpt-5.6-sol" {
+	if task.PreferRunner != "codex" || task.Model != "claude-opus-5" || task.CodexModel != "gpt-5.6-sol" {
 		t.Fatalf("codex_only 主机应把远端审核机械改道到指定 Codex 模型: %+v", task)
 	}
 	if remoteUsesClaude(task) {
@@ -114,6 +114,25 @@ func TestCodexOnlyRemoteHostOverridesReviewClaudeDefaults(t *testing.T) {
 	enforceRemoteHostPolicy(cfg, mixed)
 	if !remoteUsesClaude(mixed) || mixed.PreferRunner != "" || mixed.Model != "claude-opus-5" {
 		t.Fatalf("未声明 codex_only 的主机必须保持既有混合路由: %+v", mixed)
+	}
+}
+
+func TestCodexOnlyRemoteHostPreservesTierMapping(t *testing.T) {
+	cfg := &Config{
+		CodexModel: "gpt-5.6-sol",
+		CodexTierModels: map[string]string{
+			"opus": "gpt-5.6-sol", "sonnet": "gpt-5.6-luna",
+		},
+		RemoteHosts: map[string]RemoteHostConfig{
+			"qmthost": {CodexOnly: true},
+		},
+	}
+	task := &Task{Model: "claude-sonnet-5", RemoteHost: "qmthost"}
+
+	enforceRemoteHostPolicy(cfg, task)
+
+	if task.PreferRunner != "codex" || task.Model != "claude-sonnet-5" || task.CodexModel != "gpt-5.6-luna" {
+		t.Fatalf("codex_only 应保留来源档位并冻结对应 Codex 模型: %+v", task)
 	}
 }
 

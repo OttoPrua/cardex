@@ -65,11 +65,11 @@ Not on macOS: run `cardex daemon` as a foreground resident, or have systemd time
 
 | Type | Purpose | Default permissions / model |
 |---|---|---|
-| `design-review` | Design-review session: read-only review of code/architecture, producing P0/P1/P2 graded findings | Read-only tools + git log/diff |
-| `prompt-assembly` | Prompt-assembly session: researches the project, then decomposes a goal into a prompt sequence — **the tasks it produces auto-enqueue** | Read-only tools |
-| `sequence` | Preset prompt sequence: several steps run in order within the same session (chained via `--resume` for continuous context) | acceptEdits + common build/test commands |
-| `coordinate` | Coordination session: reads a **live** queue snapshot + per-session progress reports and splits a goal into division-of-labor tasks (with model suggestions) that auto-enqueue | Read-only tools, defaults to opus |
-| `progress-pull` | Progress-pull session: `--resume` a session and have it emit a structured progress report to disk | Read-only tools, defaults to haiku |
+| `design-review` | Design-review session: read-only review of code/architecture, producing P0/P1/P2 graded findings | Read-only; Opus source tier, dispatched through the active Opus route |
+| `prompt-assembly` | Prompt-assembly session: researches the project, then decomposes a goal into a prompt sequence — **the tasks it produces auto-enqueue** | Read-only; Opus source tier, dispatched through the active Opus route |
+| `sequence` | Preset prompt sequence: several steps run in order within the same session (chained via `--resume` for continuous context) | acceptEdits; Sonnet→Grok 4.6/high, then Luna/max only after a three-axis proven safe failure |
+| `coordinate` | Coordination session: reads a **live** queue snapshot + per-session progress reports and splits a goal into division-of-labor tasks (with model suggestions) that auto-enqueue | Read-only; Opus source tier, dispatched through the active Opus route |
+| `progress-pull` | Progress-pull session: `--resume` a session and have it emit a structured progress report to disk | Read-only; Haiku→Grok 4.6/high, then Luna/xhigh only after a three-axis proven safe failure |
 
 Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs to completion → `review_after` auto-enqueues a `design-review` of the changes just made.
 
@@ -129,12 +129,18 @@ The keys you'll actually touch; the full table lives in the [configuration refer
 | `retry_backoff_min` | 5 | base backoff between retries on non-limit errors |
 | `resume_first` | true | interrupted tasks resume before new ones start |
 | `type_order` | progress-pull > coordinate > review > sequence > assembly | type order at equal priority |
-| `type_defaults.*.model` | coordinate opus; progress-pull haiku | default model per type (--model value); empty uses the account default |
+| `type_defaults.*.model` | assembly/coordinate/review Opus; implementation Sonnet; pull Haiku | source tier per type; the Codex primary route maps it to the concrete GPT-5.6 model; Fable is explicit hardest-adjudication only |
 | `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types are exempt) |
+| `default_runner` | "" (legacy Claude) | Primary runner for unpinned new cards. `codex` covers manual cards plus generated reviews, fixes, closeouts, retrospectives, and emitted cards. Explicit Claude session resumes and cross profiles retain their declared identity |
+| `owner_routing_enforced` | `false` | Load-time lock for the exact six-row Owner production route. When `true`, any drift in Kimi/Grok/Cursor, exact model/effort identities, the quota-only Fable dual-answer/merge chain, or the standalone Sol/max review lane rejects the config; every new `sequence` card must declare `route_class=backend|general`. Managed board/tick units should set `CARDEX_REQUIRE_OWNER_ROUTING=1` so deleting the key fails startup instead of silently downgrading |
 | `queue_budget_tokens` etc. | 0 (off) | 5-hour quota redline — see the [guide](docs/guide.en.md#5-hour-quota-redline-reserve-headroom) |
 | `no_fallback_models` | ["claude-fable-5","fable"] | design-tier models never downgraded to the codex backup — they wait for Claude |
 | `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the [guide](docs/guide.en.md#codex-backup-executor-no-downtime-during-limit-gaps) |
-| `codex_fallback_model` | "" | model used when a claude card downgrades to codex (tier-parity: opus→terra, not sol); empty falls back to `codex_model` |
+| `codex_fallback_model` | "" | generic model for non-Opus Claude cards downgraded to Codex; empty falls back to `codex_model` |
+| `codex_fallback_opus_model` / `codex_fallback_opus_reasoning` | `gpt-5.6-sol` / `xhigh` | default model and reasoning effort for Opus-tier Claude cards downgraded to Codex; `stakes=low` does not downgrade by default |
+| `codex_tier_models` / `codex_tier_reasoning` | see built-in map | Codex tier slots still govern explicit Codex runs and terminal fallbacks. The six-row Owner resolver overrides them with general Opus→Grok 4.6/xhigh→Kimi K3/max→Sol/xhigh, backend Opus→Grok 4.6/xhigh→Sol/max, and Sonnet/Haiku→Grok 4.6/high→their Luna tier |
+| `grok_build_bin` / `grok_build` | empty / disabled | Owner Grok first legs: an eligible general-Opus failure advances to Kimi K3/max and then Sol/xhigh; backend Opus=xhigh→Sol/max, Sonnet=high→Luna/max, and Haiku=high→Luna/xhigh. Production should pin a versioned binary and each job runs a no-model `--no-auto-update models` login probe. Only the complete trusted 401/expired/auth_kind/upstream/reason diagnostic family opens the engine-wide auth circuit. The first card is held without consuming attempts; followers stay on the same Grok leg, and authentication never advances to Kimi or Sol. A successful real `cardex doctor` probe clears only that auth circuit. Other eligible failures still require zero semantic/model/tool work, unchanged worktree fingerprint, and no process residue. Task/event persistence records requested and actual provider/model/effort, leg, attempt, observation, and proof readback; standalone reviews go directly to a fresh Sol/max session |
+| `cursor_bin` / `cursor_model` / `cursor_fable` | empty / disabled | Explicit Fable runs on `claude-fable-5-thinking-max`. Only a confirmed eligible Fable quota-limit may start the serial read-only Grok 4.6/xhigh and Sol/ultra answers followed by a fresh Sol/max first-principles merge. Transport, stream, stall, and other non-quota failures remain held and create no fallback legs |
 | `gemini_bin` / `gemini_model` | empty / "" (built-in pro) | Gemini CLI, the second heterogeneous executor (pinned / fallback chain / cross-verification) — see the [guide](docs/guide.en.md#gemini-cli-fallback-executor-second-heterogeneous-executor) |
 | `gemini_models` | fable/opus→pro, sonnet→flash, haiku→flash-lite | tier slot mapping (official stable aliases); non-`sequence` cards always run read-only `--approval-mode plan` |
 | `engines` | {} (empty) | multi-subscription engine profiles (Kimi/GLM/MiniMax/MiMo/OpenCode Go/Ollama Cloud); merge presets with `cardex engines add <name>` — see the [guide](docs/guide.en.md#multi-subscription-engines-engine-profiles-kimi--glm--minimax--mimo--opencode-go--ollama-cloud) |

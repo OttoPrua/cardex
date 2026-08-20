@@ -173,6 +173,26 @@ func TestEnqueueEmittedStampsLineage(t *testing.T) {
 	}
 }
 
+// 模型输出是不可信输入：即使协调器误给审核卡 review_after=true，入队层也必须归零，
+// 避免实际生产再次出现“审核: 审核…”卡。
+func TestEnqueueEmittedDisablesReviewAfterForReviewCards(t *testing.T) {
+	root := testRoot(t)
+	cfg := defaultConfig("claude")
+	parent := newTask(root, cfg, typeAssembly, "装配父", t.TempDir(), []string{"p"}, 1)
+	result := "```json\n{\"tasks\":[{\"title\":\"独立复审\",\"type\":\"design-review\",\"review_after\":true,\"prompt\":\"只读审核\"}]}\n```"
+	ids, err := enqueueEmitted(root, cfg, parent, result)
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("emit 入队失败: ids=%v err=%v", ids, err)
+	}
+	child, err := loadTask(root, ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.ReviewAfter {
+		t.Fatal("模型误发的 design-review review_after=true 未被入队护栏归零")
+	}
+}
+
 // 已取消卡两侧都不计：既不进现存分母，也不进系数样本。
 func TestEstimateExcludesCanceled(t *testing.T) {
 	ts := []*Task{estCard(statusDone), estCard(statusCanceled), estCard(statusCanceled, asReview)}

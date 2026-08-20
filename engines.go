@@ -58,8 +58,11 @@ type EngineProfile struct {
 	Tier string `json:"tier,omitempty"`
 }
 
-// 引擎名保留字：与 Runner 标签的既有语义冲突（""=claude、"codex"、"gemini"、"remote:<host>"）。
-var engineReservedNames = map[string]bool{"claude": true, "codex": true, "gemini": true, "remote": true}
+// 引擎名保留字：与原生 Runner 标签的既有语义冲突。
+var engineReservedNames = map[string]bool{
+	"claude": true, "codex": true, "gemini": true, "opencode": true,
+	"kimi-cli": true, "grok-build": true, "cursor": true, "remote": true,
+}
 
 // engineNameRe 引擎名要进文件名（cooldown-<name>.json）与 Runner 标签，限小写字母数字与连字符。
 var engineNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
@@ -73,7 +76,7 @@ var validAuthVars = map[string]bool{"ANTHROPIC_AUTH_TOKEN": true, "ANTHROPIC_API
 func validateEngines(cfg *Config) error {
 	for name, p := range cfg.Engines {
 		if engineReservedNames[name] {
-			return fmt.Errorf("engines.%s: %q 是保留字（claude/codex/remote），不能作引擎名", name, name)
+			return fmt.Errorf("engines.%s: %q 是原生执行器保留字，不能作引擎名", name, name)
 		}
 		if !engineNameRe.MatchString(name) {
 			return fmt.Errorf("engines.%s: 引擎名只能是小写字母/数字/连字符（要进 cooldown-<名>.json 文件名与 runner 标签）", name)
@@ -448,15 +451,31 @@ func limitHitForRunner(via string, remote bool, t *Task, res *claudeResult, comb
 	if geminiVia(via) && !remote {
 		return isLimitHitGemini(res, combined)
 	}
+	if via == "opencode" && !remote {
+		return isLimitHitOpenCode(res, combined)
+	}
+	if kimiCLIVia(via) && !remote {
+		return isLimitHitKimiCLI(res, combined)
+	}
+	if grokBuildVia(via) && !remote {
+		return isLimitHitGrokBuild(res, combined)
+	}
+	if cursorVia(via) && !remote {
+		return isLimitHitCursor(res, combined)
+	}
 	if engineVia(via) && !remote {
 		return isLimitHitEngine(res, combined)
 	}
 	return limitHitForEngine(via == "codex", remote, t, res, combined)
 }
 
-// engineVia 判断 via 标签是否引擎名（""=claude、"codex"/"gemini"=异构执行器，其余为引擎）。
-// "gemini" 必须排除：它是保留字执行器，误入引擎分支会撞「档案不存在」（cfg.engines 无此键）。
-func engineVia(via string) bool { return via != "" && via != "codex" && via != "gemini" }
+// engineVia 判断 via 标签是否引擎名。原生异构执行器 codex/gemini/opencode/kimi-cli/grok-build/cursor
+// 以及显式本机 claude 哨兵必须排除，
+// 否则会误入档案分支撞「档案不存在」。
+func engineVia(via string) bool {
+	return via != "" && via != "claude" && via != "codex" && via != "gemini" && via != "opencode" &&
+		!kimiCLIVia(via) && !grokBuildVia(via) && !cursorVia(via)
+}
 
 // engineResetEpoch 解析引擎限额的恢复时刻：瀑布解析（parseResetEpoch）原样复用，只把
 // 兜底回退换成档案级 limit_fallback_min；scanText（已收敛的限额措辞段）命中月度/计费周期

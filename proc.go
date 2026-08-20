@@ -41,7 +41,127 @@ var (
 var (
 	taskPGMu sync.Mutex
 	taskPG   = map[string]map[int]bool{}
+	// taskPGResidue records every process group that remained alive after its direct executor
+	// returned. A later attempt may prune a group only after the OS proves it dead; simply starting
+	// another invocation must never erase a still-live writer from the fallback proof.
+	taskPGResidue = map[string]map[int]bool{}
+	// taskLeaseResidue complements process-group probing. A provider or shell can call setsid(2)
+	// and leave the original PGID while a detached descendant still owns the task workspace. The
+	// inherited lease pipe remains open across that ordinary detach, so fallback stays fail-closed
+	// until every inheriting descendant exits. This is an accidental-residue guard, not a hostile
+	// sandbox: a program that deliberately closes unknown file descriptors can opt out.
+	taskLeaseResidue = map[string][]<-chan struct{}{}
 )
+
+// taskProcessLease is prepared by the platform-specific helper before cmd.Start. On Unix, done is
+// closed only after EOF on an inherited pipe; on Windows the helper returns nil and the existing
+// conservative processGroupAlive implementation keeps policy fallback fail-closed.
+type taskProcessLease struct {
+	done   <-chan struct{}
+	commit func()
+	abort  func()
+}
+
+func pruneTaskLeaseResidueLocked(taskID string) {
+	leasing := taskLeaseResidue[taskID]
+	if len(leasing) == 0 {
+		return
+	}
+	alive := leasing[:0]
+	for _, done := range leasing {
+		select {
+		case <-done:
+			// EOF proves every ordinary inheritor has closed the lease.
+		default:
+			alive = append(alive, done)
+		}
+	}
+	if len(alive) == 0 {
+		delete(taskLeaseResidue, taskID)
+		return
+	}
+	taskLeaseResidue[taskID] = alive
+}
+
+func resetTaskProcessResidue(taskID string) {
+	if taskID == "" {
+		return
+	}
+	taskPGMu.Lock()
+	pruneTaskLeaseResidueLocked(taskID)
+	pgids := make([]int, 0, len(taskPGResidue[taskID]))
+	for pgid := range taskPGResidue[taskID] {
+		pgids = append(pgids, pgid)
+	}
+	taskPGMu.Unlock()
+	for _, pgid := range pgids {
+		if processGroupAlive(pgid) {
+			continue
+		}
+		taskPGMu.Lock()
+		if groups := taskPGResidue[taskID]; groups != nil {
+			delete(groups, pgid)
+			if len(groups) == 0 {
+				delete(taskPGResidue, taskID)
+			}
+		}
+		taskPGMu.Unlock()
+	}
+}
+
+func markTaskLeaseResidue(taskID string, done <-chan struct{}) {
+	if taskID == "" || done == nil {
+		return
+	}
+	taskPGMu.Lock()
+	pruneTaskLeaseResidueLocked(taskID)
+	taskLeaseResidue[taskID] = append(taskLeaseResidue[taskID], done)
+	taskPGMu.Unlock()
+	// Remove a completed lease even when this task never asks for another residue probe. Without this
+	// waiter, closed channels remain in the global map until an unrelated later query for the same ID.
+	go func() {
+		<-done
+		taskPGMu.Lock()
+		leasing := taskLeaseResidue[taskID]
+		kept := leasing[:0]
+		for _, candidate := range leasing {
+			if candidate != done {
+				kept = append(kept, candidate)
+			}
+		}
+		if len(kept) == 0 {
+			delete(taskLeaseResidue, taskID)
+		} else {
+			taskLeaseResidue[taskID] = kept
+		}
+		taskPGMu.Unlock()
+	}()
+}
+
+func markTaskProcessResidue(taskID string, pgid int) {
+	if taskID == "" || pgid <= 0 {
+		return
+	}
+	taskPGMu.Lock()
+	groups := taskPGResidue[taskID]
+	if groups == nil {
+		groups = make(map[int]bool)
+		taskPGResidue[taskID] = groups
+	}
+	groups[pgid] = true
+	taskPGMu.Unlock()
+}
+
+func taskProcessResidue(taskID string) bool {
+	if taskID == "" {
+		return false
+	}
+	resetTaskProcessResidue(taskID)
+	taskPGMu.Lock()
+	defer taskPGMu.Unlock()
+	pruneTaskLeaseResidueLocked(taskID)
+	return len(taskPGResidue[taskID]) != 0 || len(taskLeaseResidue[taskID]) != 0
+}
 
 func registerTaskInvoke(taskID string, pid int) {
 	if taskID == "" || pid <= 0 {
@@ -100,7 +220,13 @@ func runCmdRegistered(cmd *exec.Cmd) error {
 // 【为什么单独一支而非改 runCmdRegistered 签名】改现有签名会打断 runReviewSync/tests 等大量调用
 // 点;新增函数只让 4 处 invoke(claude/codex/远端×2)接入巡逻,其它路径无需触巡逻不变。
 func runCmdRegisteredForTask(cmd *exec.Cmd, taskID string) error {
-	return runCmdRegisteredHarvestForTask(cmd, nil, taskID)
+	return runCmdRegisteredForTaskWorkspace(cmd, taskID, cmd.Dir)
+}
+
+// runCmdRegisteredForTaskWorkspace binds the inherited writer lease to the authoritative product
+// workspace even when the executable itself runs in a disposable review copy.
+func runCmdRegisteredForTaskWorkspace(cmd *exec.Cmd, taskID, workspaceDir string) error {
+	return runCmdRegisteredHarvestForTaskWorkspace(cmd, nil, taskID, workspaceDir)
 }
 
 // remoteHarvestPoll 早收割看门狗的轮询间隔；两拍（发现结果+一拍宽限）后仍不退即击杀。
@@ -114,13 +240,27 @@ var remoteHarvestPoll = 15 * time.Second
 // 且进程仍在 → 整组击杀让 Wait 立刻返回，上层「结果在手即成功」救援把击杀退出码洗白。
 // 两拍宽限防结果行刚落缓冲、stdout 尾部仍在冲刷时误杀。
 func runCmdRegisteredHarvest(cmd *exec.Cmd, resultInBuf func() bool) error {
-	return runCmdRegisteredHarvestForTask(cmd, resultInBuf, "")
+	return runCmdRegisteredHarvestForTaskWorkspace(cmd, resultInBuf, "", cmd.Dir)
 }
 
 // runCmdRegisteredHarvestForTask 同 runCmdRegisteredHarvest,额外把 pid 登记到 taskPG(taskID 非空时)。
 func runCmdRegisteredHarvestForTask(cmd *exec.Cmd, resultInBuf func() bool, taskID string) error {
+	return runCmdRegisteredHarvestForTaskWorkspace(cmd, resultInBuf, taskID, cmd.Dir)
+}
+
+func runCmdRegisteredHarvestForTaskWorkspace(cmd *exec.Cmd, resultInBuf func() bool, taskID, workspaceDir string) error {
+	lease, leaseErr := prepareTaskProcessLease(cmd, taskID, workspaceDir)
+	if leaseErr != nil {
+		return leaseErr
+	}
 	if err := cmd.Start(); err != nil {
+		if lease != nil && lease.abort != nil {
+			lease.abort()
+		}
 		return err
+	}
+	if lease != nil && lease.commit != nil {
+		lease.commit()
 	}
 	pid := cmd.Process.Pid
 	procMu.Lock()
@@ -158,7 +298,25 @@ func runCmdRegisteredHarvestForTask(cmd *exec.Cmd, resultInBuf func() bool, task
 			}
 		}()
 	}
-	return cmd.Wait()
+	err := cmd.Wait()
+	// Direct-child exit normally closes the lease immediately. Give the pipe reader a bounded
+	// scheduling window; if it is still open, a descendant retained the execution lease and the
+	// policy proof must block the next writer until EOF is observed later.
+	if lease != nil && lease.done != nil {
+		timer := time.NewTimer(100 * time.Millisecond)
+		select {
+		case <-lease.done:
+			timer.Stop()
+		case <-timer.C:
+			markTaskLeaseResidue(taskID, lease.done)
+		}
+	}
+	// Wait reaps the direct child. A surviving member of its process group is therefore writer/process
+	// residue, even though the leader pid itself is gone; preserve that fact for the fallback proof.
+	if taskID != "" && processGroupAlive(pid) {
+		markTaskProcessResidue(taskID, pid)
+	}
+	return err
 }
 
 // syncBuffer 是给 exec.Cmd 输出用的并发安全缓冲：exec 的内部拷贝 goroutine 写，

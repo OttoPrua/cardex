@@ -136,7 +136,7 @@ fid=$("$BIN" list -json | python3 -c "import json,sys;print([t['id'] for t in js
 printf 'coord\nok\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 "$BIN" plan -dir "$PROJ" -priority 10 -title coord-plan "把剩余工作分工推进" >/dev/null
 "$BIN" run -quiet   # 排空：协调 → 产出任务接力执行
-assert "协调任务完成（默认最强模型 opus）" "one(title='coord-plan')['status']=='done' and one(title='coord-plan')['type']=='coordinate' and one(title='coord-plan')['model']=='opus'"
+assert "协调任务完成（默认 Opus 档）" "one(title='coord-plan')['status']=='done' and one(title='coord-plan')['type']=='coordinate' and one(title='coord-plan')['model']=='claude-opus-5'"
 grep -q "目标X" "$MOCK_DIR/calls.log" && echo "  ✔ 协调 prompt 注入了进度报告" && pass=$((pass+1)) || { echo "  ✖ 未注入进度报告"; fail=$((fail+1)); }
 grep -q "{{QUEUE}}" "$MOCK_DIR/calls.log" && { echo "  ✖ 队列占位符未被替换"; fail=$((fail+1)); } || { echo "  ✔ 队列快照已实时注入"; pass=$((pass+1)); }
 assert "分工产出任务接力完成且带模型" "one(title='coord-task')['status']=='done' and one(title='coord-task')['model']=='haiku'"
@@ -265,7 +265,7 @@ json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
 json.dump({"until_epoch":int(time.time())+3600,"reason":"mock limit","set_at":"t"},
           open(p.replace("config.json","cooldown.json"),"w"))
 EOF
-"$BIN" add -dir "$PROJ"  -title cx-single -priority 2 "single step work" >/dev/null
+"$BIN" add -dir "$PROJ"  -title cx-single -priority 2 -model sonnet "single step work" >/dev/null
 "$BIN" add -dir "$PROJ2" -title cx-multi -priority 9 -file /dev/stdin <<'EOF' >/dev/null
 multi step one
 ---
@@ -316,7 +316,7 @@ printf 'ok\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
 "$BIN" run -quiet
 assert "钉定任务在 claude 空闲时仍走 codex" "one(title='pin-codex')['status']=='done' and one(title='pin-codex')['runner']=='codex'"
 assert "普通任务同轮由 claude 执行" "one(title='think-claude')['status']=='done' and one(title='think-claude').get('runner') is None"
-grep -q "model_reasoning_effort=high" "$MOCK_DIR/codex-calls.log" && echo "  ✔ codex 推理等级已拉高" && pass=$((pass+1)) || { echo "  ✖ codex 推理等级未透传"; fail=$((fail+1)); }
+grep -q "model_reasoning_effort=xhigh" "$MOCK_DIR/codex-calls.log" && echo "  ✔ 默认实现→Luna/xhigh 推理等级已透传" && pass=$((pass+1)) || { echo "  ✖ 默认实现推理等级未按 Luna/xhigh 新标准透传"; fail=$((fail+1)); }
 grep -q "thinking=12345" "$MOCK_DIR/calls.log" && echo "  ✔ claude 思考预算已透传" && pass=$((pass+1)) || { echo "  ✖ MAX_THINKING_TOKENS 未透传"; fail=$((fail+1)); }
 "$BIN" add -dir "$PROJ" -runner codex -title bad-pin -file /dev/stdin <<'EOF' >/dev/null 2>&1 && { echo "  ✖ 多步非 fresh 任务不该允许钉 codex"; fail=$((fail+1)); } || { echo "  ✔ 多步非 fresh 钉 codex 被拒绝"; pass=$((pass+1)); }
 s1
@@ -399,7 +399,7 @@ import json,sys
 p,mock=sys.argv[1],sys.argv[2]
 c=json.load(open(p))
 c["ssh_bin"]=mock
-c["remote_hosts"]={"rhost":{"sandbox":"danger-full-access","tmp_dir":"/tmp","shell":"posix"}}
+c["remote_hosts"]={"rhost":{"codex_only":True,"sandbox":"danger-full-access","tmp_dir":"/tmp","shell":"posix"}}
 json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
 EOF
 chmod +x test/mock-ssh.sh
@@ -411,6 +411,13 @@ grep -q "remote work step" "$MOCK_DIR/ssh-calls.log" && echo "  ✔ prompt 经 s
 assert "结果取 marker 之后内容（Windows codex 非零退出不算失败）" "'remote step done' in (one(title='r-remote').get('last_summary') or '')"
 
 echo "== 场景25: 远端 claude/fable（带 model 走远端 claude；输出 JSON 直接 parse）=="
+python3 - "$CARDEX_ROOT/config.json" <<'EOF'
+import json,sys
+p=sys.argv[1]
+c=json.load(open(p))
+c["remote_hosts"]["rhost"]["codex_only"]=False
+json.dump(c,open(p,"w"),indent=2,ensure_ascii=False)
+EOF
 echo "claude-ok" > "$MOCK_DIR/ssh-behavior"
 : > "$MOCK_DIR/ssh-calls.log"
 "$BIN" add -dir "D:/Project/MyApp" -host rhost -model claude-fable-5 -fresh -title r-fable -priority 8 "remote fable design step" >/dev/null
@@ -507,10 +514,10 @@ printf 'ok\nreview_concerns\nok\nreview_pass\n' > "$MOCK_DIR/plan"; echo 0 > "$M
 assert "实现卡完成" "one(title='fixloop-impl')['status']=='done'"
 assert "审核卡带谱系(review_of=实现卡)" "one(title='审核: fixloop-impl')['review_of']==one(title='fixloop-impl')['id']"
 assert "concerns 自动派修复R1卡且完成" "one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['status']=='done'"
-assert "修复卡继承模型并抬 effort=high" "one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['model']=='opus' and one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['effort']=='high'"
+assert "修复卡继承模型并保持 effort=xhigh" "one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['model']=='opus' and one(title='修复R1: fixloop-impl [concerns:1P0+1P1]')['effort']=='xhigh'"
 assert "修复卡自动挂再审且 pass 后停（无修复R2）" "one(title='审核: 修复R1: fixloop-impl [concerns:1P0+1P1]')['status']=='done' and len([t for t in tasks if t['title'].startswith('修复R2')])==0"
 grep -q "按类闭合" "$MOCK_DIR/calls.log" && echo "  ✔ 修复 prompt 含按类闭合纪律" && pass=$((pass+1)) || { echo "  ✖ 修复 prompt 缺按类闭合"; fail=$((fail+1)); }
-grep -q -- "--effort high" "$MOCK_DIR/calls.log" && echo "  ✔ 修复调用传了 --effort high" && pass=$((pass+1)) || { echo "  ✖ 未传 --effort"; fail=$((fail+1)); }
+grep -q -- "--effort xhigh" "$MOCK_DIR/calls.log" && echo "  ✔ 修复调用传了 --effort xhigh" && pass=$((pass+1)) || { echo "  ✖ 未传 --effort xhigh"; fail=$((fail+1)); }
 
 echo "== 场景30: 修复闭环——超轮限挂 held 升级卡不再自动修 =="
 # 手工造一张已到第 3 轮的修复卡(带 review-after),模拟循环打转到轮限

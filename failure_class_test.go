@@ -35,6 +35,7 @@ func TestClassifyFailure_Enumerations(t *testing.T) {
 	}{
 		// 认证类:401/invalid key/oauth 过期/需重新登录
 		{"401", "codex_error: 401 Unauthorized from api", failureAuth, "401 应判 auth"},
+		{"grok_401_reversed", "grok_build_process_error: Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/responses: Invalid or expired credentials (auth_kind=none, reason=no auth context)", failureAuth, "Grok 生产 Unauthorized (401) 应判 auth"},
 		{"invalid_key", "authentication failed: invalid api key", failureAuth, "invalid api key 应判 auth"},
 		{"oauth_expired", "oauth token has expired, please re-login", failureAuth, "oauth expired 应判 auth"},
 		{"chinese_relogin", "认证错误: 请重新登录", failureAuth, "请重新登录 应判 auth"},
@@ -447,11 +448,11 @@ func TestAnnotatedError_PrefixOnlyForTerminalClasses(t *testing.T) {
 // ---------- classificationFromTranscript 单元 & 反例注入(P1 · Round-3) ----------
 
 // TestClassificationFromTranscript_ByErrorSummaryPath 断言判据与 errorSummary 三条 msg 构造路径一一对齐:
-//  1) path 1 (res != nil && res.IsError, res.Result 拼 msg) → 由 invoke 侧的 ResultFromTranscript 标决定;
+//  1. path 1 (res != nil && res.IsError, res.Result 拼 msg) → 由 invoke 侧的 ResultFromTranscript 标决定;
 //     标 true(codexErrorLine/agent -o 终稿/invokeRemoteClaude 挑行) → true;
 //     标 false(claude 结构化 JSON 的 API 错误) → false。
-//  2) path 2 (runErr != nil 且 !path1) → msg 恒含 firstLine(combined) → true。
-//  3) path 3 (res==nil && runErr==nil) → msg 恒含 firstLine(combined) → true。
+//  2. path 2 (runErr != nil 且 !path1) → msg 恒含 firstLine(combined) → true。
+//  3. path 3 (res==nil && runErr==nil) → msg 恒含 firstLine(combined) → true。
 //
 // 【为什么覆盖 path 3】invokeClaude 在 claude CLI 退出 0 但 stdout 非 JSON 时返回 (nil, combined, nil);
 // errorSummary 走 path 3 拼 firstLine(combined) 进 msg,若 combined 首行含 "permission denied"/

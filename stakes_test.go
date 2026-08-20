@@ -19,7 +19,7 @@ func TestDefaultStakesPolicyTable(t *testing.T) {
 	want := map[string]StakesRule{
 		stakesLow:    {Review: stakesReviewOff},
 		stakesNormal: {Review: stakesReviewFollow},
-		stakesHigh:   {Review: stakesReviewOn, DefaultEffort: "high"},
+		stakesHigh:   {Review: stakesReviewOn, DefaultEffort: "high", MaxFixRounds: 1},
 	}
 	for k, w := range want {
 		got, ok := p[k]
@@ -32,6 +32,9 @@ func TestDefaultStakesPolicyTable(t *testing.T) {
 		if got.DefaultEffort != w.DefaultEffort {
 			t.Errorf("stakes_policy[%s].default_effort = %q, 应为 %q", k, got.DefaultEffort, w.DefaultEffort)
 		}
+		if got.MaxFixRounds != w.MaxFixRounds {
+			t.Errorf("stakes_policy[%s].max_fix_rounds = %d, 应为 %d", k, got.MaxFixRounds, w.MaxFixRounds)
+		}
 	}
 	// defaultConfig 必须真的把这张表挂上去——否则 add 会走 stakesRule 的兜底路径，
 	// 表看着对、生产里却没生效。
@@ -42,6 +45,34 @@ func TestDefaultStakesPolicyTable(t *testing.T) {
 	if cfg.StakesPolicy[stakesHigh].Review != stakesReviewOn {
 		t.Errorf("defaultConfig.stakes_policy.high.review = %q, 应为 %q",
 			cfg.StakesPolicy[stakesHigh].Review, stakesReviewOn)
+	}
+}
+
+// TestReviewAfterOnlyForImplementationCards 钉死类型级护栏：high 仍可抬审核/协调卡的 effort，
+// 但绝不能再生成“审核: 审核…”或“审核: 协调报告…”的二次复审。
+func TestReviewAfterOnlyForImplementationCards(t *testing.T) {
+	cfg := defaultConfig("claude")
+	for _, typ := range []string{typeReview, typeAssembly, typeCoordinate, typeProgressPull} {
+		t.Run(typ, func(t *testing.T) {
+			task := &Task{Type: typ, ReviewAfter: true}
+			if err := applyStakes(task, cfg, stakesHigh, false); err != nil {
+				t.Fatalf("applyStakes: %v", err)
+			}
+			if task.ReviewAfter {
+				t.Fatalf("非实现卡 type=%s 不得开启 review_after", typ)
+			}
+			if task.Effort != "high" {
+				t.Fatalf("类型护栏不应取消 high 的 effort 地板, got %q", task.Effort)
+			}
+		})
+	}
+
+	impl := &Task{Type: typeSequence}
+	if err := applyStakes(impl, cfg, stakesHigh, false); err != nil {
+		t.Fatalf("applyStakes sequence: %v", err)
+	}
+	if !impl.ReviewAfter || impl.MaxFixRounds != 1 {
+		t.Fatalf("高风险实现卡应保留一次自动复审/修复预算: %+v", impl)
 	}
 }
 

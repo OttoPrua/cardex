@@ -96,13 +96,15 @@ type copyGitStep struct {
 }
 
 // runCopyGit 跑一条建副本用的 git 子进程,把它同时挂到三条路径上:
-//   ① ctx —— exec.CommandContext,超时/取消即触发 Cancel;
-//   ② 进程组击杀 —— setupProcGroup 让 Cancel 走 killProcGroup(整组 SIGKILL),并设 WaitDelay(10s),
-//      使 git 派生的孙进程吊住管道时 Wait 仍能收尾(与 invokeClaude/invokeCodex/runReviewSync 同源);
-//   ③ 在册登记 —— runCmdRegisteredForTask 让 Ctrl-C/SIGTERM 处理器连坐击杀,并让巡逻在建副本期间
-//      看得见该卡的活进程(否则建副本这段时间任务进程组是"空的",是巡逻误判的素材)。
+//
+//	① ctx —— exec.CommandContext,超时/取消即触发 Cancel;
+//	② 进程组击杀 —— setupProcGroup 让 Cancel 走 killProcGroup(整组 SIGKILL),并设 WaitDelay(10s),
+//	   使 git 派生的孙进程吊住管道时 Wait 仍能收尾(与 invokeClaude/invokeCodex/runReviewSync 同源);
+//	③ 在册登记 —— runCmdRegisteredForTask 让 Ctrl-C/SIGTERM 处理器连坐击杀,并让巡逻在建副本期间
+//	   看得见该卡的活进程(否则建副本这段时间任务进程组是"空的",是巡逻误判的素材)。
+//
 // 裸 exec.Command 三条全无,这正是 CG-R3b 修 2 要闭掉的洞。
-func runCopyGit(ctx context.Context, taskID string, s copyGitStep) (stdout, stderr []byte, err error) {
+func runCopyGit(ctx context.Context, taskID, workspaceDir string, s copyGitStep) (stdout, stderr []byte, err error) {
 	cmd := exec.CommandContext(ctx, "git", s.args...)
 	setupProcGroup(cmd)
 	if s.stdin != "" {
@@ -111,7 +113,7 @@ func runCopyGit(ctx context.Context, taskID string, s copyGitStep) (stdout, stde
 	var out, errBuf bytes.Buffer
 	cmd.Stdout = &out
 	cmd.Stderr = &errBuf
-	runErr := runCmdRegisteredForTask(cmd, taskID)
+	runErr := runCmdRegisteredForTaskWorkspace(cmd, taskID, workspaceDir)
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		// ctx 到期/被取消 → 进程已被 Cancel 整组收掉,runErr 只是"signal: killed"这类下游噪声。
 		// 统一改报 ctx 错并 %w 包装:上层 errors.Is(err, context.DeadlineExceeded) 才能把"卡死被击杀"
@@ -152,9 +154,11 @@ type codexWorkMarker struct {
 
 // codexReviewNeedsWorktree 判断本次 codex 调用是否应该走一次性副本沙箱。
 // 条件:
-//   ① 归一后的 CodexReviewSandbox == worktree-write(默认;显式 readonly 就直接回退旧行为);
-//   ② 任务非 sequence——sequence 卡本就要落码到原仓(commit 等),不建副本;
-//   ③ 目标 dir 是 git 工作树(clone --local 依赖 .git)。
+//
+//	① 归一后的 CodexReviewSandbox == worktree-write(默认;显式 readonly 就直接回退旧行为);
+//	② 任务非 sequence——sequence 卡本就要落码到原仓(commit 等),不建副本;
+//	③ 目标 dir 是 git 工作树(clone --local 依赖 .git)。
+//
 // 三条件缺一即 false;后续调用侧就走 read-only 老路(硬语义:原仓永不受写污染的兜底)。
 // ctx 一路透传到 ③ 的 git 探测:该探测同样会因仓库/文件系统异常挂住,不能是无约束的裸子进程。
 func codexReviewNeedsWorktree(ctx context.Context, cfg *Config, t *Task) bool {
@@ -164,7 +168,7 @@ func codexReviewNeedsWorktree(ctx context.Context, cfg *Config, t *Task) bool {
 	// 探测挂建副本的同一条子预算:探测卡死等价于建副本卡死,不该按 step 的 60min 量级去等。
 	probeCtx, cancel := context.WithTimeout(ctx, codexPrepareTimeout(cfg))
 	defer cancel()
-	return isGitWorkTree(probeCtx, t.Dir)
+	return isGitWorkTree(probeCtx, t.ID, t.Dir)
 }
 
 // codexReviewWantsWorktree 是上面判据里**不起子进程**的前两条(策略 + 卡类型)。
@@ -176,13 +180,16 @@ func codexReviewWantsWorktree(cfg *Config, t *Task) bool {
 	if resolvedCodexReviewSandbox(cfg) != codexReviewSandboxWorktreeWrite {
 		return false
 	}
-	return t != nil && t.Type != typeSequence
+	// Cross A/B/C are independent answer/merge lanes. They may emit only their textual result and must
+	// never gain a writable repository copy; this keeps Fable A/B mechanically read-only and also avoids
+	// making the merger's final answer depend on unreported scratch mutations.
+	return t != nil && t.Type != typeSequence && t.Type != typeCrossCheck
 }
 
 // isGitWorkTree 用 `git -C <dir> rev-parse --show-toplevel` 侦测 dir 是否在 git 工作树里。
 // 非零退出/非目录/ctx 到期都视作 false(clone --local 会直接失败,提前判掉更清晰;探测都挂住的
 // 目录更不可能 clone 成功,判 false 回落 read-only 正是保守侧)。
-func isGitWorkTree(ctx context.Context, dir string) bool {
+func isGitWorkTree(ctx context.Context, taskID, dir string) bool {
 	if dir == "" {
 		return false
 	}
@@ -191,7 +198,7 @@ func isGitWorkTree(ctx context.Context, dir string) bool {
 	}
 	// taskID 传空:探测不属于任何一次 invoke 的执行期,不该进 taskPG 影响巡逻的"活/死"判断;
 	// runCopyGit 内的 procGroups 登记仍在,Ctrl-C 连坐击杀不漏。
-	_, _, err := runCopyGit(ctx, "", copyGitStep{
+	_, _, err := runCopyGit(ctx, taskID, dir, copyGitStep{
 		label: "rev-parse --show-toplevel",
 		args:  []string{"-C", dir, "rev-parse", "--show-toplevel"},
 	})
@@ -203,7 +210,7 @@ func isGitWorkTree(ctx context.Context, dir string) bool {
 //   - workDir: 副本绝对路径(codex --sandbox workspace-write 将 cd 到此)。失败时回落 t.Dir。
 //   - cleanup: 收工必调,幂等(多次调用无害)。删除副本目录 + marker。
 //   - err:     建副本过程的错误(git clone/apply/cp)。调用侧据此决定回落 read-only 还是报错;
-//               当前策略是"建失败即回落 read-only,原仓保护语义不破,只是失去 workspace-write 收益"。
+//     当前策略是"建失败即回落 read-only,原仓保护语义不破,只是失去 workspace-write 收益"。
 //
 // 【为什么 clone --local --no-hardlinks】--local 用文件系统副本(不走 git 协议解析),避开 file://
 // 的一些边角;--no-hardlinks 让 objects 完全独立,避免副本 gc/commit 反噬父仓 pack。--quiet 抑制
@@ -274,7 +281,7 @@ func prepareCodexReviewWorkspace(ctx context.Context, root string, cfg *Config, 
 
 	// 三段 git 全部走 runCopyGit(ctx + 进程组击杀 + 在册登记);%w 包装保住 ctx 错的类型,
 	// 让调用侧能按 errors.Is(context.DeadlineExceeded) 区分"卡死被击杀"与"git 真失败"。
-	if _, errOut, err := runCopyGit(ctx, t.ID, copyGitStep{
+	if _, errOut, err := runCopyGit(ctx, t.ID, src, copyGitStep{
 		label: "clone --local",
 		args:  []string{"clone", "--local", "--no-hardlinks", "--quiet", src, copyDir},
 	}); err != nil {
@@ -311,7 +318,7 @@ func prepareCodexReviewWorkspace(ctx context.Context, root string, cfg *Config, 
 // applyUncommittedTracked 把源仓当前的 `git diff --binary --no-renames HEAD`(tracked 未提交面)
 // 灌进副本的 `git apply --binary`。diff 为空(工作树干净)则跳过,不当错误。
 func applyUncommittedTracked(ctx context.Context, taskID, src, copyDir string) error {
-	patch, _, err := runCopyGit(ctx, taskID, copyGitStep{
+	patch, _, err := runCopyGit(ctx, taskID, src, copyGitStep{
 		label: "diff HEAD",
 		args: []string{"-c", "core.quotepath=false", "-C", src,
 			"diff", "--binary", "--no-renames", "HEAD"},
@@ -322,7 +329,7 @@ func applyUncommittedTracked(ctx context.Context, taskID, src, copyDir string) e
 	if len(patch) == 0 {
 		return nil
 	}
-	_, errOut, err := runCopyGit(ctx, taskID, copyGitStep{
+	_, errOut, err := runCopyGit(ctx, taskID, src, copyGitStep{
 		label: "apply",
 		stdin: string(patch),
 		args:  []string{"-C", copyDir, "apply", "--binary", "--whitespace=nowarn"},
@@ -337,7 +344,7 @@ func applyUncommittedTracked(ctx context.Context, taskID, src, copyDir string) e
 // 后逐一 cp 到副本。空目录不特殊处理:git 不追踪空目录,复审用不到。
 // -c core.quotepath=false 让中文文件名以真实 UTF-8 传出(否则 git 默认 8 进制引号化,后续 stat 找不到)。
 func copyUntracked(ctx context.Context, taskID, src, copyDir string) error {
-	out, _, err := runCopyGit(ctx, taskID, copyGitStep{
+	out, _, err := runCopyGit(ctx, taskID, src, copyGitStep{
 		label: "ls-files --others",
 		args: []string{"-c", "core.quotepath=false", "-C", src,
 			"ls-files", "--others", "--exclude-standard", "-z"},
@@ -361,6 +368,7 @@ func copyUntracked(ctx context.Context, taskID, src, copyDir string) error {
 //   - 超大 untracked 面(未忽略的 node_modules 之流)会让 min(step_timeout,10min) 子预算**静默失效**
 //     ——循环照跑到底,谁也不喊停,README 承诺的"拷贝跑在子预算内"当场作废;
 //   - NFS 停顿等慢 IO 场景同理:父 ctx 早死透了,拷贝腿还在一条一条搬。
+//
 // 查在**迭代前**而非迭代后:ctx 已死时一条都不该再搬(多搬一条就是多一份无谓 IO 与磁盘占用)。
 // 【粒度的诚实边界】Go 的文件 IO 不接 ctx,故中止粒度是**单文件边界**:正在 io.Copy 的那一条会
 // 读完才停。真正会永久挂住的非常规文件已在 copyUntrackedPath 里被挡在 open 之外,剩下的普通文件
@@ -503,8 +511,10 @@ func readCodexWorkMarker(copyDir string) (*codexWorkMarker, bool) {
 
 // cleanupCodexReviewOrphans 扫 <root>/tmp/codex-review-work/,把崩溃残留副本清掉。
 // 判据("孤儿"的双条件):
-//   ① marker 缺失/损坏 → 半成品,直接清(建到一半就崩,活任务不会用它);
-//   ② marker 存在但 pid 已死透 且 taskID 不在当前 activeIDs → 崩溃残留,清。
+//
+//	① marker 缺失/损坏 → 半成品,直接清(建到一半就崩,活任务不会用它);
+//	② marker 存在但 pid 已死透 且 taskID 不在当前 activeIDs → 崩溃残留,清。
+//
 // pid 活着或 taskID 在 activeIDs 里就跳过——那可能是活任务的副本,清了就毁执行数据。
 // 事件账本落 reason=codex_review_orphan_cleanup 留痕,失败仅 stderr 告警不阻断 tick。
 func cleanupCodexReviewOrphans(root string, activeIDs map[string]bool) {

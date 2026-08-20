@@ -112,17 +112,24 @@ type TaskBrief struct {
 	// 直接渲染 step/steps_total 会得到 0/1，与自家活动流的「第 1/1 步」对不上。
 	Step int `json:"step"`
 	// StepsTotal 恒等于 prompts 数（与 TaskDetail.prompts_count 同源）。
-	StepsTotal  int      `json:"steps_total"`
-	Model       string   `json:"model"`
-	ModelTier   string   `json:"model_tier"`
-	ModelSource string   `json:"model_source"`
-	Runner      string   `json:"runner"`
-	Effort      string   `json:"effort"`
-	ETA         BoardETA `json:"eta"`
-	CreatedAt   string   `json:"created_at"`
-	UpdatedAt   string   `json:"updated_at"`
-	LastSummary string   `json:"last_summary"`
-	LastError   string   `json:"last_error"`
+	StepsTotal  int    `json:"steps_total"`
+	Model       string `json:"model"`
+	ModelTier   string `json:"model_tier"`
+	ModelSource string `json:"model_source"`
+	// ModelRoute 是当前卡所属的完整模型路线；Model 仍只表示当前实际生效的一跳，
+	// 两者分开避免把尚未执行的回退模型伪装成已执行模型。
+	ModelRoute   string   `json:"model_route,omitempty"`
+	Runner       string   `json:"runner"`
+	RunnerSource string   `json:"runner_source"`
+	RouteReason  string   `json:"route_reason,omitempty"`
+	RouteClass   string   `json:"route_class,omitempty"`
+	Effort       string   `json:"effort"`
+	EffortSource string   `json:"effort_source"`
+	ETA          BoardETA `json:"eta"`
+	CreatedAt    string   `json:"created_at"`
+	UpdatedAt    string   `json:"updated_at"`
+	LastSummary  string   `json:"last_summary"`
+	LastError    string   `json:"last_error"`
 	// ElapsedMinutes 只对 running 卡有意义（自最近一次状态变更起算），其余卡为 0。
 	ElapsedMinutes float64 `json:"elapsed_minutes"`
 	Attempts       int     `json:"attempts"`
@@ -195,6 +202,10 @@ type Project struct {
 	// Weighted 是第三口径「工时进度」（boardweight.go）：按每张卡的工作量（turns 代理）
 	// 加权算完成占比，并给出预估完成时刻。Available=false 时前端回落卡数口径并显示 basis。
 	Weighted *ProjectWeighted `json:"weighted,omitempty"`
+	// Maturity 是版本化能力切片合同给出的结构成熟度。预估/工时视图以它为主口径；
+	// 卡片 Estimate/Weighted 继续保留为兼容与活动诊断，但绝不能触发成熟度晋级。
+	// 未配置时 omitempty；配置错误/超龄时返回 available=false + 原因，前端不得回退 done 率。
+	Maturity *ProjectMaturity `json:"maturity,omitempty"`
 	// KindRuleError 是 board.json kind_rules 里被跳过的规则的披露串（无问题时 omitempty 消失）。
 	// 坏规则逐条跳过而非整块拒，但被跳过的必须说出来——静默失效即造读数。
 	KindRuleError string `json:"kind_rule_error,omitempty"`
@@ -693,7 +704,7 @@ func modelTierKeyword(cfg *Config, model string) string {
 		}
 	}
 	switch {
-	case strings.Contains(m, "fable"), strings.Contains(m, "sol"):
+	case strings.Contains(m, "fable"), strings.Contains(m, "sol"), strings.Contains(m, "grok-4.6"):
 		return "fable"
 	case strings.Contains(m, "opus"), strings.Contains(m, "terra"), strings.Contains(m, "k3"):
 		return "opus"
@@ -728,16 +739,134 @@ func modelTier(cfg *Config, model string) string {
 	return "未知"
 }
 
+// effectiveBoardRunner 解析看板应该展示的执行器与证据来源。
+//
+// Runner 非空时是已派发/最近一次真实执行器，优先于 runner_pref；但 K3 命中限额后，
+// 卡会先以 Runner=opencode 回到 queued，再由 Codex 接力。这个短暂状态若继续展示 OpenCode，
+// 用户会把“上一次撞限额的执行器”误读成“下一次要跑的执行器”，因此回退原因在非 running
+// 状态下显式压成 codex。尚未派发的显式 OpenCode/Codex/Gemini 卡则展示 runner_pref，
+// 不能一律把空 Runner 猜成 Claude。
+func effectiveBoardRunner(t *Task) (runner, source string) {
+	if t == nil {
+		return "claude", "default"
+	}
+	if t.Status != statusRunning && (t.Runner == "" || t.Runner == "opencode") &&
+		(t.RouteReason == routeReasonOpenCodeLimitFallbackPending || t.RouteReason == routeReasonOpenCodeLimitFallback) {
+		return "codex", "route_reason"
+	}
+	if t.Status != statusRunning && (t.Runner == "" || t.Runner == kimiCLIRunnerName) &&
+		(t.RouteReason == routeReasonKimiCLILimitFallbackPending || t.RouteReason == routeReasonKimiCLILimitFallback) {
+		return "codex", "route_reason"
+	}
+	if t.Status != statusRunning &&
+		(t.RouteReason == routeReasonKimiToGrokPending || t.RouteReason == routeReasonKimiToGrok ||
+			t.RouteReason == routeReasonFableToGrokPending || t.RouteReason == routeReasonFableToGrok ||
+			t.RouteReason == routeReasonGrokOpusGeneral || t.RouteReason == routeReasonGrokOpusBackend || t.RouteReason == routeReasonGrokSonnet ||
+			t.RouteReason == routeReasonGrokHaiku) {
+		return grokBuildRunnerName, "route_reason"
+	}
+	if t.Status != statusRunning &&
+		(t.RouteReason == routeReasonGrokToKimiPending || t.RouteReason == routeReasonGrokToKimi) {
+		return kimiCLIRunnerName, "route_reason"
+	}
+	if t.Status != statusRunning &&
+		(t.RouteReason == routeReasonGrokToSolPending || t.RouteReason == routeReasonGrokToSol ||
+			t.RouteReason == routeReasonKimiToSolPending || t.RouteReason == routeReasonKimiToSol ||
+			t.RouteReason == routeReasonFableToSolPending || t.RouteReason == routeReasonFableToSol ||
+			t.RouteReason == routeReasonGrokSonnetToLunaPending || t.RouteReason == routeReasonGrokSonnetToLuna ||
+			t.RouteReason == routeReasonGrokHaikuToLunaPending || t.RouteReason == routeReasonGrokHaikuToLuna) {
+		return "codex", "route_reason"
+	}
+	if t.Runner != "" {
+		return t.Runner, "actual"
+	}
+	if t.RemoteHost != "" {
+		return "remote:" + t.RemoteHost, "remote_host"
+	}
+	if t.PreferRunner != "" {
+		return t.PreferRunner, "runner_pref"
+	}
+	return "claude", "default"
+}
+
 // effectiveModel 还原一张卡**实际生效**的模型与来源。
 // 四条路径：codex 系走 resolveCodexModel（含交叉冻结/卡级钉定/降级专用/全局回落），
 // 引擎系走 resolveEngineModel（档位映射后的供应商模型——卡面 Model 是 sonnet 这类别名时，
 // 真跑的是映射结果，看板必须显示真跑的那个），claude 系用卡上的 Model，
 // 卡上为空则回填 type_defaults。
+func taskUsesCodex(cfg *Config, t *Task) bool {
+	if t == nil {
+		return false
+	}
+	runner, _ := effectiveBoardRunner(t)
+	if runner == "codex" {
+		return true
+	}
+	if t.RemoteHost != "" || strings.HasPrefix(runner, "remote:") {
+		if cfg != nil {
+			if rh, ok := cfg.RemoteHosts[t.RemoteHost]; ok && rh.CodexOnly {
+				return true
+			}
+		}
+		return !remoteUsesClaude(t)
+	}
+	return false
+}
+
+func taskUsesOpenCode(t *Task) bool {
+	if t == nil {
+		return false
+	}
+	runner, _ := effectiveBoardRunner(t)
+	return runner == "opencode"
+}
+
+func taskUsesKimiCLI(t *Task) bool {
+	if t == nil {
+		return false
+	}
+	runner, _ := effectiveBoardRunner(t)
+	return runner == kimiCLIRunnerName
+}
+
+func taskUsesGrokBuild(t *Task) bool {
+	if t == nil {
+		return false
+	}
+	runner, _ := effectiveBoardRunner(t)
+	return runner == grokBuildRunnerName
+}
+
+func taskUsesCursor(t *Task) bool {
+	if t == nil {
+		return false
+	}
+	runner, _ := effectiveBoardRunner(t)
+	return runner == cursorRunnerName
+}
+
 func effectiveModel(cfg *Config, t *Task) (model, source string) {
-	codexSide := t.Runner == "codex" || t.PreferRunner == "codex" ||
-		(strings.HasPrefix(t.Runner, "remote:") && t.Model == "") ||
-		(t.RemoteHost != "" && t.Model == "")
-	if codexSide {
+	if taskUsesOpenCode(t) {
+		if m := resolveOpenCodeRunModel(cfg, t); m != "" {
+			return m, "opencode_model"
+		}
+	}
+	if taskUsesKimiCLI(t) {
+		if m := resolveKimiCLIModel(cfg, t); m != "" {
+			return m, "kimi_model"
+		}
+	}
+	if taskUsesGrokBuild(t) {
+		if m := resolveGrokBuildModel(cfg, t); m != "" {
+			return m, "grok_model"
+		}
+	}
+	if taskUsesCursor(t) {
+		if m := resolveCursorModel(cfg, t); m != "" {
+			return m, "cursor_model"
+		}
+	}
+	if taskUsesCodex(cfg, t) {
 		if m := resolveCodexModel(cfg, t); m != "" {
 			return m, "codex_model"
 		}
@@ -766,6 +895,281 @@ func effectiveModel(cfg *Config, t *Task) (model, source string) {
 		return td.Model, "type_default"
 	}
 	return "", "task"
+}
+
+// effectiveEffort 与 effectiveModel 同源：Codex 卡展示最终 resolve 后的推理档，而不是卡面
+// 为 Claude 来源档位烘焙的 high。否则 Opus 卡实际跑 Sol/xhigh、看板却长期显示 high，
+// 正是配置已经生效但生产看起来仍像旧策略的误导。
+func effectiveEffort(cfg *Config, t *Task) (effort, source string) {
+	if taskUsesOpenCode(t) {
+		if resolved := resolveOpenCodeRunVariant(cfg, t); resolved != "" {
+			return resolved, "opencode_variant"
+		}
+	}
+	if taskUsesKimiCLI(t) {
+		if resolved := resolveKimiCLIEffort(cfg, t); resolved != "" {
+			return resolved, "kimi_effort"
+		}
+	}
+	if taskUsesGrokBuild(t) {
+		if resolved := resolveGrokBuildEffort(cfg, t); resolved != "" {
+			return resolved, "grok_effort"
+		}
+	}
+	if taskUsesCursor(t) {
+		if resolved := cursorEffortFromModel(resolveCursorModel(cfg, t)); resolved != "" {
+			return resolved, "cursor_model"
+		}
+	}
+	if taskUsesCodex(cfg, t) {
+		resolved := resolveCodexReasoning(cfg, t)
+		if t != nil && (t.RemoteHost != "" || strings.HasPrefix(t.Runner, "remote:")) {
+			resolved = resolveRemoteCodexReasoning(cfg, t)
+		}
+		if resolved != "" {
+			return resolved, "codex_reasoning"
+		}
+	}
+	if t != nil && t.Effort != "" {
+		return t.Effort, "task"
+	}
+	if t != nil {
+		if td, ok := typeDefaultsFor(cfg, t.Type); ok && td.Effort != "" {
+			return td.Effort, "type_default"
+		}
+	}
+	return "", "task"
+}
+
+func boardRouteModelName(model string) string {
+	raw := strings.TrimSpace(model)
+	switch strings.ToLower(raw) {
+	case "claude-fable-5-thinking-max":
+		return "Fable 5 Thinking Max"
+	case "cursor-grok-4.6-xhigh":
+		return "Grok 4.6"
+	case "grok-4.6":
+		return "4.6"
+	case "gpt-5.6-sol":
+		return "GPT-5.6 Sol"
+	case "gpt-5.6-luna":
+		return "GPT-5.6 Luna"
+	case "kimi-code/k3", "kimi-k3":
+		return "K3"
+	default:
+		return raw
+	}
+}
+
+func boardRouteLeg(runner, model, effort string) string {
+	effort = strings.ToLower(strings.TrimSpace(effort))
+	effortAlreadyNamed := effort != "" && strings.Contains(strings.ToLower(model), "thinking-"+effort)
+	switch runner {
+	case kimiCLIRunnerName:
+		runner = "Kimi CLI"
+	case grokBuildRunnerName:
+		runner = "Grok Build"
+	case cursorRunnerName:
+		runner = "Cursor"
+	case "codex":
+		runner = "Codex"
+	}
+	label := boardRouteModelName(model)
+	if label == "" {
+		label = "账号默认"
+	}
+	if effort != "" && !effortAlreadyNamed {
+		label += "/" + effort
+	}
+	return runner + " " + label
+}
+
+func ownerModelRoute(route ownerRoute) string {
+	if len(route.Legs) == 0 {
+		return ""
+	}
+	if route.Name == "fable_explicit" && len(route.Legs) == 3 && route.Merge != nil {
+		return boardRouteLeg(route.Legs[0].Runner, route.Legs[0].Model, route.Legs[0].Effort) +
+			" → [仅确认 eligible quota-limit 后: " +
+			boardRouteLeg(route.Legs[1].Runner, route.Legs[1].Model, route.Legs[1].Effort) + " 独立作答 → " +
+			boardRouteLeg(route.Legs[2].Runner, route.Legs[2].Model, route.Legs[2].Effort) + " 独立作答] → " +
+			boardRouteLeg(route.Merge.Runner, route.Merge.Model, route.Merge.Effort) + " 第一性合并（不预设原方案正确）"
+	}
+	parts := make([]string, 0, len(route.Legs))
+	for _, leg := range route.Legs {
+		parts = append(parts, boardRouteLeg(leg.Runner, leg.Model, leg.Effort))
+	}
+	result := strings.Join(parts, " →（仅安全失败）")
+	if route.Review != nil {
+		prefix := "；实现完成后另派 "
+		if route.Name == "opus_general" {
+			prefix = "；进入 Grok 路径且完成实现后另派 "
+		}
+		result += prefix + boardRouteLeg(route.Review.Runner, route.Review.Model, route.Review.Effort) + " 独立对抗复审"
+	}
+	return result
+}
+
+// effectiveModelRoute 只披露 Cardex 已确定的完整路线，不把普通卡的单一模型重复一遍。
+// Cursor Fable 主路由和 A/B/C 回退链共用同一文案；进入回退后优先读取冻结的 B/C 规格，
+// 让热更新 profile 不会改变仍在途链的模型显示。
+func cursorFableModelRoute(cfg *Config, t *Task) string {
+	if t == nil {
+		return ""
+	}
+	if t.RouteReason == routeReasonCursorFablePolicyWait {
+		return "Cursor Fable 5 Thinking Max（政策等待：需 fresh 单 prompt 与完整路由配置；未落到通用 Codex）"
+	}
+	if cfg == nil || cfg.CursorFable == nil {
+		return ""
+	}
+	fallbackProfile := strings.TrimSpace(cfg.CursorFable.FallbackProfile)
+	visible := cursorFablePolicyApplies(cfg, t) ||
+		(t.XRole != "" && fallbackProfile != "" && t.XProfile == fallbackProfile)
+	switch t.RouteReason {
+	case routeReasonCursorFable, routeReasonCursorFableFallbackPending, routeReasonCursorFableFallback:
+		visible = true
+	}
+	if !visible {
+		return ""
+	}
+
+	primary := "Cursor " + boardRouteModelName(cfg.CursorFable.Model)
+	prof, ok := cfg.CrossProfiles[fallbackProfile]
+	if !ok || prof.Merge == nil {
+		return primary
+	}
+
+	aModel, aEffort := strings.TrimSpace(prof.A.Model), strings.TrimSpace(prof.A.Effort)
+	if aModel == "" && cfg.GrokBuild != nil {
+		aModel = strings.TrimSpace(cfg.GrokBuild.Model)
+	}
+	if aEffort == "" && cfg.GrokBuild != nil {
+		aEffort = strings.TrimSpace(cfg.GrokBuild.Effort)
+	}
+	if t.XRole == "A" {
+		if t.GrokModel != "" {
+			aModel = t.GrokModel
+		}
+		if t.GrokEffort != "" {
+			aEffort = t.GrokEffort
+		}
+	}
+
+	bModel, bEffort := strings.TrimSpace(cfg.CodexModel), strings.TrimSpace(prof.B.Effort)
+	if t.XEngineB != nil {
+		if t.XEngineB.CodexModel != "" {
+			bModel = t.XEngineB.CodexModel
+		}
+		if t.XEngineB.Effort != "" {
+			bEffort = t.XEngineB.Effort
+		}
+	}
+	if bEffort == "" {
+		bEffort = strings.TrimSpace(cfg.CodexReasoning)
+	}
+
+	cLeg := crossPolicyLeg(cfg, *prof.Merge)
+	if t.XEngineC != nil {
+		cLeg.Runner = t.XEngineC.PreferRunner
+		switch t.XEngineC.PreferRunner {
+		case "codex":
+			cLeg.Model = t.XEngineC.CodexModel
+		case cursorRunnerName:
+			cLeg.Model = t.XEngineC.CursorModel
+		case grokBuildRunnerName:
+			cLeg.Model = t.XEngineC.GrokModel
+		default:
+			if t.XEngineC.Model != "" {
+				cLeg.Model = t.XEngineC.Model
+			}
+		}
+		cLeg.Effort = t.XEngineC.Effort
+	}
+
+	return primary + " → [仅确认 eligible quota-limit 后: " +
+		boardRouteLeg("Grok Build", aModel, aEffort) + " 独立作答 → " +
+		boardRouteLeg("Codex", bModel, bEffort) + " 独立作答] → " +
+		boardRouteLeg(cLeg.Runner, cLeg.Model, cLeg.Effort) + " 第一性合并（不预设原方案正确）"
+}
+
+func effectiveModelRoute(cfg *Config, t *Task) string {
+	if reason := ownerRoutingPolicyWaitReason(cfg, t); reason != "" {
+		return "政策等待：" + reason
+	}
+	if t != nil && t.RouteReason == routeReasonCursorFablePolicyWait {
+		return cursorFableModelRoute(cfg, t)
+	}
+	if route, ok := resolveOwnerRouteReadback(cfg, t); ok {
+		return ownerModelRoute(route)
+	}
+	if cfg != nil && cfg.OwnerRoutingEnforced {
+		// Cross A/B/C carries independently frozen identities and keeps its dedicated readback. Every
+		// other non-owner card is displayed only from an explicit/persisted runner identity, never from
+		// the legacy automatic heuristics below.
+		if t != nil && t.XRole != "" {
+			return cursorFableModelRoute(cfg, t)
+		}
+		if leg, ok := resolvePinnedTaskLeg(cfg, t); ok {
+			return boardRouteLeg(leg.Runner, leg.Model, leg.Effort)
+		}
+		return ""
+	}
+	// Cross A/B/C cards carry XRole and are intentionally outside fresh owner auto-routing; their
+	// frozen leg identities still use the existing cross-chain readback.
+	if route := cursorFableModelRoute(cfg, t); route != "" {
+		return route
+	}
+	if cfg == nil || cfg.GrokBuild == nil || t == nil {
+		return ""
+	}
+
+	// 通用模式兼容路径：Owner 强制模式已在上方由统一 resolver 返回，不进入这些旧推导。
+	opusGeneral := modelTierKeyword(cfg, t.Model) == "opus" && !backendDevelopmentTask(t)
+	if opusGeneral && cfg.KimiCLIOpus != nil && cfg.KimiCLIOpus.Enabled {
+		visible := kimiCLIOpusPolicyApplies(cfg, t)
+		switch t.RouteReason {
+		case routeReasonKimiCLIOpus, routeReasonGrokOpusGeneral,
+			routeReasonGrokToKimiPending, routeReasonGrokToKimi,
+			routeReasonKimiToSolPending, routeReasonKimiToSol,
+			routeReasonKimiToGrokPending, routeReasonKimiToGrok,
+			routeReasonGrokToSolPending, routeReasonGrokToSol:
+			visible = true
+		}
+		if visible {
+			chain := boardRouteLeg("Grok Build", cfg.GrokBuild.Model, cfg.GrokBuild.Effort) + " →（仅安全失败）" +
+				boardRouteLeg("Kimi CLI", cfg.KimiCLIOpus.Model, cfg.KimiCLIOpus.Effort) + " →（仅安全失败）" +
+				boardRouteLeg("Codex", cfg.GrokBuild.CodexFallbackModel, cfg.GrokBuild.CodexFallbackEffort)
+			if cfg.GrokBuild.OpusAdversarialReview {
+				chain += "；实现完成后另派 " +
+					boardRouteLeg("Codex", cfg.GrokBuild.ReviewCodexModel, cfg.GrokBuild.ReviewCodexEffort) + " 对抗复审"
+			}
+			return chain
+		}
+	}
+
+	key, route, ok := grokBuildTierRoute(cfg, t)
+	if !ok {
+		return ""
+	}
+	visible := grokBuildAutoRouteApplies(cfg, t)
+	switch t.RouteReason {
+	case routeReasonGrokOpusBackend, routeReasonGrokSonnet, routeReasonGrokHaiku,
+		routeReasonGrokSonnetToLunaPending, routeReasonGrokSonnetToLuna,
+		routeReasonGrokHaikuToLunaPending, routeReasonGrokHaikuToLuna,
+		routeReasonGrokToSolPending, routeReasonGrokToSol:
+		visible = true
+	}
+	if !visible {
+		return ""
+	}
+	primary := boardRouteLeg("Grok Build", cfg.GrokBuild.Model, route.Effort)
+	fallback := boardRouteLeg("Codex", route.CodexFallbackModel, route.CodexFallbackEffort)
+	if key == "opus_backend" && cfg.GrokBuild.OpusAdversarialReview {
+		return primary + " →（仅安全失败）" + fallback + "；实现完成后另派 " +
+			boardRouteLeg("Codex", cfg.GrokBuild.ReviewCodexModel, cfg.GrokBuild.ReviewCodexEffort) + " 对抗复审"
+	}
+	return primary + " →（仅安全失败）" + fallback
 }
 
 // ---- 任务摘要 ----
@@ -839,7 +1243,85 @@ func parseRFC3339(s string) (time.Time, bool) {
 
 // toBrief 把原始卡转成看板摘要。eta 由调用方补（需要项目级节奏样本）。
 func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
-	model, source := effectiveModel(cfg, t)
+	displayTask := t
+	routeInferred := false
+	legacyAutoInference := cfg == nil || !cfg.OwnerRoutingEnforced
+	if t != nil && t.Status != statusRunning {
+		if route, ok := resolveOwnerRoute(cfg, t); ok && len(route.Legs) > 0 {
+			copyTask := *t
+			leg := route.Legs[0]
+			copyTask.OwnerRouteName = route.Name
+			copyTask.OwnerRouteLeg = 1
+			copyTask.Runner = leg.Runner
+			switch leg.Runner {
+			case cursorRunnerName:
+				copyTask.CursorModel = leg.Model
+				copyTask.RouteReason = routeReasonCursorFable
+			case kimiCLIRunnerName:
+				copyTask.KimiModel = leg.Model
+				copyTask.RouteReason = routeReasonKimiCLIOpus
+			case grokBuildRunnerName:
+				copyTask.PreferRunner = grokBuildRunnerName
+				copyTask.GrokModel = leg.Model
+				copyTask.GrokEffort = leg.Effort
+				switch route.Name {
+				case "opus_general":
+					copyTask.RouteReason = routeReasonGrokOpusGeneral
+				case "opus_backend":
+					copyTask.RouteReason = routeReasonGrokOpusBackend
+				case "sonnet":
+					copyTask.RouteReason = routeReasonGrokSonnet
+				case "haiku":
+					copyTask.RouteReason = routeReasonGrokHaiku
+				}
+			}
+			displayTask = &copyTask
+			routeInferred = true
+		}
+	}
+	if legacyAutoInference && !routeInferred && t != nil && t.Status != statusRunning && cursorFablePolicyApplies(cfg, t) {
+		copyTask := *t
+		copyTask.Runner = cursorRunnerName
+		copyTask.RouteReason = routeReasonCursorFable
+		displayTask = &copyTask
+		routeInferred = true
+	} else if !routeInferred && t != nil && t.Status != statusRunning && cursorFableOwnerRouteRequired(cfg, t) {
+		copyTask := *t
+		copyTask.Runner = cursorRunnerName
+		copyTask.CursorModel = "claude-fable-5-thinking-max"
+		copyTask.RouteReason = routeReasonCursorFablePolicyWait
+		displayTask = &copyTask
+		routeInferred = true
+	} else if legacyAutoInference && !routeInferred && t != nil && t.Status != statusRunning && grokBuildAutoRouteApplies(cfg, t) {
+		copyTask := *t
+		if pinGrokBuildAutoRoute(cfg, &copyTask) {
+			copyTask.Runner = grokBuildRunnerName
+			displayTask = &copyTask
+			routeInferred = true
+		}
+	} else if legacyAutoInference && !routeInferred && t != nil && t.Status != statusRunning && kimiCLIOpusPolicyApplies(cfg, t) {
+		copyTask := *t
+		if t.RouteReason == routeReasonKimiCLICooldownFallback {
+			copyTask.Runner = "codex"
+		} else {
+			copyTask.Runner = kimiCLIRunnerName
+			copyTask.RouteReason = routeReasonKimiCLIOpus
+		}
+		displayTask = &copyTask
+		routeInferred = true
+	}
+	model, source := effectiveModel(cfg, displayTask)
+	effort, effortSource := effectiveEffort(cfg, displayTask)
+	runner, runnerSource := effectiveBoardRunner(displayTask)
+	if routeInferred {
+		runnerSource = "route_policy"
+	}
+	routeReason := t.RouteReason
+	if routeInferred {
+		routeReason = displayTask.RouteReason
+	} else if routeReason == "" && kimiCLIBackendExcluded(cfg, t) {
+		routeReason = routeReasonCodexBackendExcluded
+	}
 	b := TaskBrief{
 		ID:            t.ID,
 		Title:         t.Title,
@@ -852,8 +1334,13 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 		Model:         model,
 		ModelTier:     modelTier(cfg, model),
 		ModelSource:   source,
-		Runner:        t.Runner,
-		Effort:        t.Effort,
+		ModelRoute:    effectiveModelRoute(cfg, displayTask),
+		Runner:        runner,
+		RunnerSource:  runnerSource,
+		RouteReason:   routeReason,
+		RouteClass:    t.RouteClass,
+		Effort:        effort,
+		EffortSource:  effortSource,
 		CreatedAt:     t.CreatedAt,
 		UpdatedAt:     t.UpdatedAt,
 		LastSummary:   t.LastSummary,
@@ -864,9 +1351,6 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 		XRole:         t.XRole,
 		RemoteHost:    t.RemoteHost,
 		BlockedReason: blockedReason(t),
-	}
-	if b.Runner == "" {
-		b.Runner = "claude" // 空 runner = 本机 claude，前端不该猜
 	}
 	if t.Status == statusRunning {
 		if ts, ok := parseRFC3339(t.UpdatedAt); ok {
@@ -917,6 +1401,8 @@ type boardOverrideProject struct {
 	Desc   string             `json:"desc"`
 	Phases map[string]string  `json:"phases"`
 	Goal   *boardOverrideGoal `json:"goal,omitempty"`
+	// Maturity 指向稳定、版本化的能力切片合同。看板只读并逐项重算，不解析 Codex JSONL。
+	Maturity *boardMaturitySource `json:"maturity,omitempty"`
 	// KindRules 是人工分类规则（见 boardkind.go）。标题关键词启发式再怎么调都会判错几张卡，
 	// 给一个精确出口比继续往 kindDesignHints 里堆词更诚实——堆词会让别的项目跟着遭殃。
 	KindRules []boardOverrideKindRule `json:"kind_rules,omitempty"`
@@ -1282,6 +1768,7 @@ func buildProject(cfg *Config, ov *boardOverride, id, name string, dirs []string
 		// Project.Goal 的 omitempty 保证 JSON 里不出现该键——前端"不显示"契约成立。
 		// root 是 board.json 所在目录，evidence.path 相对路径按它解析（不用进程 CWD）。
 		p.Goal = buildProjectGoal(o.Goal, ov.root, now)
+		p.Maturity = buildProjectMaturity(o.Maturity, name, now)
 	}
 
 	// 注意：这里**不**截断 phases[].tasks——/api/project 契约要求完整清单。

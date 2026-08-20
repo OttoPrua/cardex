@@ -32,6 +32,14 @@ type claudeResult struct {
 	TotalCostUSD float64    `json:"total_cost_usd"`
 	DurationMS   int64      `json:"duration_ms"`
 	Usage        *usageInfo `json:"usage"`
+	// Policy fallback observations are populated by streaming parsers. They are internal proof
+	// signals, not provider wire fields: a serial next leg is legal only when the parser completely
+	// observed the stream and saw zero semantic/model and zero tool events.
+	SemanticEvents      int  `json:"-"`
+	ModelEvents         int  `json:"-"`
+	ToolEvents          int  `json:"-"`
+	ObservationComplete bool `json:"-"`
+	TerminalEvents      int  `json:"-"`
 	// ResultFromTranscript 标记 Result 是否源自 combined(stdout+stderr transcript)。
 	// 【P1 教训 · CG-3 Round-3】codex 本机/远端与远端 claude 的失败路径会把 codexErrorLine
 	// 挑走的行或 firstLine(combined) 直接写进 Result，经 errorSummary 拼进 msg 后参与
@@ -142,7 +150,7 @@ func invokeClaudeCLI(ctx context.Context, cfg *Config, t *Task, prompt, model st
 
 	// runCmdRegisteredForTask 额外把 pid 登记到 taskPG,让 CG-5 巡逻能查该任务进程组存活;
 	// 反例注入依赖此登记(登记 + processAlive 双查排除伪心跳)。
-	runErr := runCmdRegisteredForTask(cmd, t.ID)
+	runErr := runCmdRegisteredForTaskWorkspace(cmd, t.ID, t.Dir)
 	// 本地 claude exit 0 但派生子进程（MCP server/hook/探针）吊住 stdout 管道触发 WaitDelay 时，
 	// 结果 JSON 已在 stdout 却被 ErrWaitDelay 误判失败、白白重试。远端两支已有"有结果即成功"救援。
 	runErr = rescueWaitDelay(runErr, cmd)
@@ -189,12 +197,54 @@ func codexCopyPathPreamble(workDir, origDir string) string {
 		"────────────────────────────────────────\n\n"
 }
 
+// isOpusTask 判断一张卡是否属于 Opus 档。
+// modelTierKeyword 同时覆盖裸档位（opus）和完整模型名（claude-opus-5），并尊重
+// config.model_tiers 的自定义分级。
+func isOpusTask(cfg *Config, t *Task) bool {
+	return cfg != nil && t != nil && modelTierKeyword(cfg, t.Model) == "opus"
+}
+
+// isOpusFallbackTask 判断一张卡是否属于本机 Claude → Codex 降级径的 Opus 卡。
+func isOpusFallbackTask(cfg *Config, t *Task) bool {
+	return isOpusTask(cfg, t) && t.PreferRunner != "codex" && t.RemoteHost == ""
+}
+
+// isLowInvestmentOpusTask 只把明确的低投入卡视为可降档任务。
+// 不根据标题/提示词长度猜复杂度，避免把短但高风险的任务误派到 Luna。
+func isLowInvestmentOpusTask(t *Task) bool {
+	return t != nil && t.Stakes == stakesLow
+}
+
+func codexTierModel(cfg *Config, t *Task) string {
+	if cfg == nil || t == nil {
+		return ""
+	}
+	tier := modelTierKeyword(cfg, t.Model)
+	if tier == "" {
+		return ""
+	}
+	return cfg.CodexTierModels[tier]
+}
+
+func codexTierReasoning(cfg *Config, t *Task) string {
+	if cfg == nil || t == nil {
+		return ""
+	}
+	tier := modelTierKeyword(cfg, t.Model)
+	if tier == "" {
+		return ""
+	}
+	return cfg.CodexTierReasoning[tier]
+}
+
 // resolveCodexModel 决定一次 codex 执行用哪个模型。优先序：
 //  1. XCodexModel——交叉链入队冻结的引擎身份，恒最高（防入队后改配置静默换引擎）；
 //  2. 卡级 CodexModel（-codex-model 钉定）——用户显式意图，主跑/降级两径都尊重；
-//  3. 降级径的 config.codex_fallback_model——仅当卡不是 codex 主跑（runner_pref≠codex）
-//     且非远端（远端无降级径）：即 claude 卡被 codex_fallback 改道时（档位对等：opus→terra）；
-//  4. 全局 codex_model。
+//  3. 明确低投入的 Opus → Codex 简单档；
+//  4. Opus 降级径的 config.codex_fallback_opus_model；
+//  5. Codex 按档位槽位；
+//  6. 通用降级径的 config.codex_fallback_model；
+//  7. 全局 codex_model。
 func resolveCodexModel(cfg *Config, t *Task) string {
 	if t.XCodexModel != "" {
 		return t.XCodexModel
@@ -202,10 +252,86 @@ func resolveCodexModel(cfg *Config, t *Task) string {
 	if t.CodexModel != "" {
 		return t.CodexModel
 	}
+	if isOpusTask(cfg, t) && isLowInvestmentOpusTask(t) && cfg.CodexOpusSimpleModel != "" {
+		return cfg.CodexOpusSimpleModel
+	}
+	if isOpusFallbackTask(cfg, t) && cfg.CodexFallbackOpusModel != "" {
+		return cfg.CodexFallbackOpusModel
+	}
+	if model := codexTierModel(cfg, t); model != "" {
+		return model
+	}
 	if t.PreferRunner != "codex" && t.RemoteHost == "" && cfg.CodexFallbackModel != "" {
 		return cfg.CodexFallbackModel
 	}
 	return cfg.CodexModel
+}
+
+// validateExplicitCodexRoute 校验“来源档位 + Codex 模型”同时显式给出时是否自洽。
+// 调用方只在两字段都确为外部显式输入时使用；单独 -codex-model 仍是高级钉模入口。
+func validateExplicitCodexRoute(cfg *Config, t *Task) error {
+	if cfg == nil || t == nil || t.PreferRunner != "codex" || t.Model == "" || t.CodexModel == "" {
+		return nil
+	}
+	tier := modelTierKeyword(cfg, t.Model)
+	if tier == "" {
+		return nil
+	}
+	probe := *t
+	probe.CodexModel = ""
+	probe.XCodexModel = ""
+	expected := resolveCodexModel(cfg, &probe)
+	if expected == "" || t.CodexModel == expected {
+		return nil
+	}
+	return fmt.Errorf("Codex 路由冲突: -model %s 按当前生产策略应使用 %s，不能同时钉为 %s；请删除 codex_model，或把 model 改成与目标模型一致的档位",
+		tier, expected, t.CodexModel)
+}
+
+// resolveCodexReasoningWithRunnerFallback 决定一次 codex 执行的思考档。
+// runnerFallback 给远端主机保留自己的最后一级 reasoning；本机传空。来源档位映射必须
+// 先于远端兜底，否则一张 Opus/high 卡会在本机解析为 Sol/xhigh、到远端却实际跑 high，
+// 看板和派发账本也就失去真实性。
+func resolveCodexReasoningWithRunnerFallback(cfg *Config, t *Task, runnerFallback string) string {
+	if t != nil && t.Effort != "" && t.EffortExplicit {
+		return t.Effort
+	}
+	if isOpusTask(cfg, t) && isLowInvestmentOpusTask(t) && cfg.CodexOpusSimpleReasoning != "" {
+		return cfg.CodexOpusSimpleReasoning
+	}
+	if isOpusFallbackTask(cfg, t) && cfg.CodexFallbackOpusReasoning != "" {
+		return cfg.CodexFallbackOpusReasoning
+	}
+	if reasoning := codexTierReasoning(cfg, t); reasoning != "" {
+		return reasoning
+	}
+	if t != nil && t.Effort != "" {
+		return t.Effort
+	}
+	if runnerFallback != "" {
+		return runnerFallback
+	}
+	if cfg != nil {
+		return cfg.CodexReasoning
+	}
+	return ""
+}
+
+// resolveCodexReasoning 是本机 Codex 路由；远端必须调用
+// resolveRemoteCodexReasoning，保证执行参数与观测字段共用同一解析结果。
+func resolveCodexReasoning(cfg *Config, t *Task) string {
+	return resolveCodexReasoningWithRunnerFallback(cfg, t, "")
+}
+
+func resolveRemoteCodexReasoning(cfg *Config, t *Task) string {
+	if cfg == nil || t == nil {
+		return resolveCodexReasoning(cfg, t)
+	}
+	rh, ok := cfg.RemoteHosts[t.RemoteHost]
+	if !ok {
+		return resolveCodexReasoning(cfg, t)
+	}
+	return resolveCodexReasoningWithRunnerFallback(cfg, t, rh.Reasoning)
 }
 
 func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
@@ -267,12 +393,9 @@ func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt 
 	if codexModel := resolveCodexModel(cfg, t); codexModel != "" {
 		args = append(args, "-m", codexModel)
 	}
-	// 思考等级：任务级 Effort 优先（交叉验证的 codex 卡据此跑指定档，如 max），空则回落全局 codex_reasoning。
-	// codex 与 claude 的档位同名同序，故 Task.Effort 直接复用为 model_reasoning_effort。
-	if reasoning := t.Effort; reasoning != "" {
+	// 思考等级：显式任务 effort > Opus 降级专用 effort > 任务默认 effort > 全局值。
+	if reasoning := resolveCodexReasoning(cfg, t); reasoning != "" {
 		args = append(args, "-c", "model_reasoning_effort="+reasoning)
-	} else if cfg.CodexReasoning != "" {
-		args = append(args, "-c", "model_reasoning_effort="+cfg.CodexReasoning)
 	}
 
 	// ctx 已在函数头部按 StepTimeoutMin 限时(建副本与 codex 执行共用同一条步预算,见上方注释)。
@@ -292,7 +415,7 @@ func invokeCodex(ctx context.Context, root string, cfg *Config, t *Task, prompt 
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	// CG-5 巡逻登记:pid 落 taskPG,drain 内 patrolOnce 可查该任务进程组存活(见 patrol.go)。
-	runErr := runCmdRegisteredForTask(cmd, t.ID)
+	runErr := runCmdRegisteredForTaskWorkspace(cmd, t.ID, t.Dir)
 	// codex exit 0 但派生子进程吊住 stdout 管道触发 WaitDelay 时，-o 结果文件已写好却因 ErrWaitDelay
 	// 被下方 `runErr != nil` 判定标 IsError、白白重试。同 runReviewSync/invokeClaude 的同类救援。
 	runErr = rescueWaitDelay(runErr, cmd)
@@ -457,11 +580,10 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 	// codex -C / -o 用正斜杠（codex 自会规范化写盘）；结果打印用 shell 对应的路径分隔符。
 	remoteCmd := fmt.Sprintf(`%s exec -C "%s" --sandbox %s --skip-git-repo-check --color never -o "%s"`,
 		codexBin, t.Dir, sandbox, outFile)
-	// 思考等级：任务级 Effort 优先（交叉验证远端 codex 卡据此跑指定档），空则回落该主机 reasoning 配置。
-	if reasoning := t.Effort; reasoning != "" {
+	// 与本机、看板和派发账本共用解析器：交叉卡显式 effort 仍优先；普通 Opus 卡
+	// 则按来源档位稳定解析为 xhigh，而不是误用卡面类型默认 high。
+	if reasoning := resolveRemoteCodexReasoning(cfg, t); reasoning != "" {
 		remoteCmd += " -c model_reasoning_effort=" + reasoning
-	} else if rh.Reasoning != "" {
-		remoteCmd += " -c model_reasoning_effort=" + rh.Reasoning
 	}
 	codexModel := resolveCodexModel(cfg, t)
 	if codexModel != "" {
@@ -513,9 +635,9 @@ func invokeRemoteCodex(ctx context.Context, cfg *Config, t *Task, prompt string)
 }
 
 // remoteUsesClaude 判定远端任务走远端 claude(true)还是远端 codex(false)：
-// runner_pref=codex 是用户的显式执行器钉定，优先级最高；否则带 claude 模型或只读审核卡
-// (typeReview)默认走远端 claude，以保留审核分流的既有额度平衡策略。这样显式 Codex 复审会
-// 真正消耗 GPT 额度，而未指定执行器的审核卡仍使用远端 Claude/Fable。
+// runner_pref=codex（含 default_runner 烘焙值）优先级最高；否则带 claude 模型或只读审核卡
+// (typeReview)沿用远端 Claude 的历史路由。生产要全量走 Codex 时，同时使用
+// default_runner=codex 与 remote_hosts.<name>.codex_only=true。
 func remoteUsesClaude(t *Task) bool {
 	if t.PreferRunner == "codex" {
 		return false
@@ -534,9 +656,10 @@ func enforceRemoteHostPolicy(cfg *Config, t *Task) {
 		return
 	}
 	t.PreferRunner = "codex"
-	t.Model = ""
 	if t.CodexModel == "" {
-		t.CodexModel = cfg.CodexModel
+		// 保留 Model 作为来源档位标签，并把当下映射冻结到卡面：Opus/Fable→Sol，
+		// Sonnet/Haiku→Luna。清 Model 或直接写全局模型都会让远端 codex_only 绕过档位表。
+		t.CodexModel = resolveCodexModel(cfg, t)
 	}
 }
 
@@ -942,6 +1065,147 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 	return runTaskVia(ctx, root, cfg, t, via)
 }
 
+func routeAttemptIdentity(cfg *Config, t *Task, remote bool) (provider, model, effort string) {
+	if t == nil {
+		return "", "", ""
+	}
+	provider = t.Runner
+	if provider == "" {
+		provider = "claude"
+	}
+	switch {
+	case remote && !remoteUsesClaude(t):
+		model = resolveCodexModel(cfg, t)
+		effort = resolveRemoteCodexReasoning(cfg, t)
+	case remote:
+		model, effort = t.Model, t.Effort
+	case provider == "codex":
+		model, effort = resolveCodexModel(cfg, t), resolveCodexReasoning(cfg, t)
+	case provider == kimiCLIRunnerName:
+		model, effort = resolveKimiCLIModel(cfg, t), resolveKimiCLIEffort(cfg, t)
+	case provider == grokBuildRunnerName:
+		model, effort = resolveGrokBuildModel(cfg, t), resolveGrokBuildEffort(cfg, t)
+	case provider == cursorRunnerName:
+		model = resolveCursorModel(cfg, t)
+		effort = cursorEffortFromModel(model)
+	case provider == "opencode":
+		model, effort = resolveOpenCodeRunModel(cfg, t), resolveOpenCodeRunVariant(cfg, t)
+	case provider == "gemini":
+		model, _ = resolveGeminiModel(cfg, t)
+	default:
+		model, effort = t.Model, t.Effort
+	}
+	return strings.TrimSpace(provider), strings.TrimSpace(model), strings.ToLower(strings.TrimSpace(effort))
+}
+
+func beginRouteAttemptReadback(cfg *Config, t *Task, remote bool) {
+	provider, model, effort := routeAttemptIdentity(cfg, t, remote)
+	t.LastRouteAttempt = &RouteAttemptReadback{
+		RequestedProvider: provider, RequestedModel: model, RequestedEffort: effort,
+		ActualProvider: provider, ActualModel: model, ActualEffort: effort,
+		OwnerRouteName: t.OwnerRouteName, OwnerRouteLeg: t.OwnerRouteLeg, Attempt: t.Attempts,
+	}
+}
+
+func recordRouteAttemptObservation(t *Task, res *claudeResult) {
+	if t == nil || t.LastRouteAttempt == nil {
+		return
+	}
+	r := t.LastRouteAttempt
+	r.ObservationSeen = true
+	if res == nil {
+		return
+	}
+	r.ObservationOK = res.ObservationComplete
+	r.SemanticEvents = res.SemanticEvents
+	if res.NumTurns > r.SemanticEvents {
+		r.SemanticEvents = res.NumTurns
+	}
+	r.ModelEvents = res.ModelEvents
+	r.ToolEvents = res.ToolEvents
+}
+
+func withRouteAttempt(detail map[string]any, t *Task) map[string]any {
+	if detail == nil {
+		detail = map[string]any{}
+	}
+	if t == nil || t.LastRouteAttempt == nil {
+		return detail
+	}
+	r := t.LastRouteAttempt
+	detail["requested_provider"] = r.RequestedProvider
+	detail["requested_model"] = r.RequestedModel
+	detail["requested_effort"] = r.RequestedEffort
+	detail["actual_provider"] = r.ActualProvider
+	detail["actual_model"] = r.ActualModel
+	detail["actual_effort"] = r.ActualEffort
+	detail["owner_route_name"] = r.OwnerRouteName
+	detail["owner_route_leg"] = r.OwnerRouteLeg
+	detail["attempt"] = r.Attempt
+	if r.FailureClass != "" {
+		detail["failure_class"] = r.FailureClass
+	}
+	if r.FailureKind != "" {
+		detail["failure_kind"] = r.FailureKind
+	}
+	if r.ObservationSeen {
+		detail["observation_complete"] = r.ObservationOK
+		detail["semantic_events"] = r.SemanticEvents
+		detail["model_events"] = r.ModelEvents
+		detail["tool_events"] = r.ToolEvents
+	}
+	if r.WorkspaceBefore != "" {
+		detail["workspace_fingerprint_before"] = r.WorkspaceBefore
+	}
+	if r.WorkspaceAfter != "" {
+		detail["workspace_fingerprint_after"] = r.WorkspaceAfter
+	}
+	detail["process_residue"] = r.ProcessResidue
+	return detail
+}
+
+// dispatchEventDetail 把“真正执行了什么”钉进派发事件。任务卡的 Model/Effort 是来源档位，
+// 不能代替最终解析出的 Codex 模型与推理档；缺这两项就无法按真实组合比较完成率、耗时、
+// 修复轮次与成本，也无法识别配置已改但生产仍跑旧路由的漂移。
+func dispatchEventDetail(cfg *Config, t *Task, useCodex, remote bool) map[string]any {
+	if t != nil && t.LastRouteAttempt == nil {
+		beginRouteAttemptReadback(cfg, t, remote)
+	}
+	detail := map[string]any{
+		"runner": t.Runner, "mid_step": t.MidStep, "use_codex": useCodex,
+		"source_model": t.Model, "source_tier": modelTierKeyword(cfg, t.Model),
+		"source_effort": t.Effort, "effort_explicit": t.EffortExplicit, "stakes": t.Stakes,
+	}
+	if useCodex || (remote && !remoteUsesClaude(t)) {
+		detail["codex_model"] = resolveCodexModel(cfg, t)
+		if remote {
+			detail["codex_reasoning"] = resolveRemoteCodexReasoning(cfg, t)
+		} else {
+			detail["codex_reasoning"] = resolveCodexReasoning(cfg, t)
+		}
+	}
+	if t.Runner == "opencode" {
+		detail["opencode_model"] = resolveOpenCodeRunModel(cfg, t)
+		detail["opencode_variant"] = resolveOpenCodeRunVariant(cfg, t)
+	}
+	if t.Runner == kimiCLIRunnerName {
+		detail["kimi_model"] = resolveKimiCLIModel(cfg, t)
+		detail["kimi_effort"] = resolveKimiCLIEffort(cfg, t)
+	}
+	if t.Runner == grokBuildRunnerName {
+		detail["grok_model"] = resolveGrokBuildModel(cfg, t)
+		detail["grok_effort"] = resolveGrokBuildEffort(cfg, t)
+	}
+	if t.Runner == cursorRunnerName {
+		detail["cursor_model"] = resolveCursorModel(cfg, t)
+		detail["cursor_effort"] = cursorEffortFromModel(resolveCursorModel(cfg, t))
+	}
+	if t.RouteReason != "" {
+		detail["route_reason"] = t.RouteReason
+	}
+	return withRouteAttempt(detail, t)
+}
+
 // runTaskVia 在一次派发内循环执行任务的各个步骤，直到完成、失败、撞上限额或被取消。
 // 同一任务的多个步骤通过 --resume 复用同一会话，保持上下文连续。
 // via 是执行路由：""=本机 claude；"codex"=备用执行器 codex exec（限单步任务）；
@@ -950,6 +1214,10 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via string) error {
 	useCodex := via == "codex"
 	useGemini := geminiVia(via)
+	useOpenCode := via == "opencode"
+	useKimiCLI := kimiCLIVia(via)
+	useGrokBuild := grokBuildVia(via)
+	useCursor := cursorVia(via)
 	engineName := ""
 	if engineVia(via) {
 		engineName = via
@@ -976,6 +1244,17 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 	if t.Status != statusRunning {
 		_ = resetTombstoneKind(root, t.ID, resumeKind(t.Step))
 	}
+	if useGrokBuild {
+		// 人工显式 Grok 与自动路由走同一冻结纪律：实际开跑前把模型/档位写回卡面，
+		// Opus 实现同时固化对抗复审义务，避免“配置说会复审、卡面却没有”的漂移。
+		if t.GrokModel == "" {
+			t.GrokModel = resolveGrokBuildModel(cfg, t)
+		}
+		if t.GrokEffort == "" {
+			t.GrokEffort = resolveGrokBuildEffort(cfg, t)
+		}
+		ensureGrokOpusAdversarialReview(cfg, t)
+	}
 	t.Status = statusRunning
 	// 交叉 C 重跑（如 cardex retry）先撤下旧的终局报告：否则若这次在执行器层就失败（未进 postComplete），
 	// 上一轮的旧报告仍会被 progress -show 当成当前终局。首跑时无报告可删，无害。
@@ -987,24 +1266,84 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 	switch {
 	case remote:
 		t.Runner = "remote:" + t.RemoteHost
+		t.RouteReason = ""
 	case useCodex:
 		t.Runner = "codex"
+		if t.RouteReason == routeReasonOpenCodeLimitFallbackPending || t.RouteReason == routeReasonOpenCodeLimitFallback {
+			t.RouteReason = routeReasonOpenCodeLimitFallback
+		} else if t.RouteReason == routeReasonKimiCLILimitFallbackPending || t.RouteReason == routeReasonKimiCLILimitFallback {
+			t.RouteReason = routeReasonKimiCLILimitFallback
+		} else if t.RouteReason == routeReasonGrokToSolPending || t.RouteReason == routeReasonGrokToSol {
+			t.RouteReason = routeReasonGrokToSol
+		} else if t.RouteReason == routeReasonKimiToSolPending || t.RouteReason == routeReasonKimiToSol {
+			t.RouteReason = routeReasonKimiToSol
+		} else if t.RouteReason == routeReasonGrokSonnetToLunaPending || t.RouteReason == routeReasonGrokSonnetToLuna {
+			t.RouteReason = routeReasonGrokSonnetToLuna
+		} else if t.RouteReason == routeReasonGrokHaikuToLunaPending || t.RouteReason == routeReasonGrokHaikuToLuna {
+			t.RouteReason = routeReasonGrokHaikuToLuna
+		} else if t.RouteReason == routeReasonFableToSolPending || t.RouteReason == routeReasonFableToSol {
+			t.RouteReason = routeReasonFableToSol
+		} else if t.RouteReason != routeReasonCodexBackendExcluded && t.RouteReason != routeReasonKimiCLICooldownFallback {
+			t.RouteReason = ""
+		}
 	case useGemini:
 		t.Runner = "gemini"
+		t.RouteReason = ""
+	case useOpenCode:
+		t.Runner = "opencode"
+		if t.PreferRunner == "opencode" {
+			t.RouteReason = routeReasonOpenCodeExplicit
+		} else {
+			t.RouteReason = routeReasonOpenCodeNightOpus
+		}
+	case useKimiCLI:
+		t.Runner = kimiCLIRunnerName
+		if t.RouteReason == routeReasonGrokToKimiPending || t.RouteReason == routeReasonGrokToKimi {
+			t.RouteReason = routeReasonGrokToKimi
+		} else if t.PreferRunner == kimiCLIRunnerName {
+			t.RouteReason = routeReasonKimiCLIExplicit
+		} else {
+			t.RouteReason = routeReasonKimiCLIOpus
+		}
+	case useGrokBuild:
+		t.Runner = grokBuildRunnerName
+		switch t.RouteReason {
+		case routeReasonKimiToGrokPending, routeReasonKimiToGrok:
+			t.RouteReason = routeReasonKimiToGrok
+		case routeReasonFableToGrokPending, routeReasonFableToGrok:
+			t.RouteReason = routeReasonFableToGrok
+		case routeReasonGrokOpusGeneral, routeReasonGrokOpusBackend, routeReasonGrokSonnet, routeReasonGrokHaiku:
+			// 自动主路由原因已经是稳定终态值，保留供看板与按组合复盘。
+		default:
+			if t.PreferRunner == grokBuildRunnerName {
+				t.RouteReason = routeReasonGrokExplicit
+			}
+		}
+	case useCursor:
+		t.Runner = cursorRunnerName
+		if t.RouteReason == routeReasonCursorFableFallbackPending || t.RouteReason == routeReasonCursorFableFallback {
+			t.RouteReason = routeReasonCursorFableFallback
+		} else if t.PreferRunner == cursorRunnerName {
+			t.RouteReason = routeReasonCursorExplicit
+		} else {
+			t.RouteReason = routeReasonCursorFable
+		}
 	case engineName != "":
 		t.Runner = engineName // 引擎名即执行器标签（看板/账本/审计三处同源）
+		t.RouteReason = ""
 	default:
 		t.Runner = "" // 清除历史执行器标签（如降级失败后的重试回到 claude）
+		t.RouteReason = ""
 	}
+	beginRouteAttemptReadback(cfg, t, remote)
 	t.touch()
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
 	// 派发事件:tick 已把卡从 queued/limit_paused 拉进 running。actor=runner,detail 记录执行器身份
 	// (远端/codex/引擎/claude)与当前步序号——恢复限额后续跑与首次派发在这条事件上会有 step/mid_step 差异。
-	emitTaskEvent(root, t.ID, evDispatched, "runner", statusRunning, t.Step, map[string]any{
-		"runner": t.Runner, "mid_step": t.MidStep, "use_codex": useCodex,
-	})
+	emitTaskEvent(root, t.ID, evDispatched, "runner", statusRunning, t.Step,
+		dispatchEventDetail(cfg, t, useCodex, remote))
 	lg, err := openTaskLog(root, t.ID)
 	if err != nil {
 		return err
@@ -1056,6 +1395,14 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			runnerTag = "  runner=codex"
 		} else if useGemini {
 			runnerTag = "  runner=gemini"
+		} else if useOpenCode {
+			runnerTag = "  runner=opencode"
+		} else if useKimiCLI {
+			runnerTag = "  runner=" + kimiCLIRunnerName
+		} else if useGrokBuild {
+			runnerTag = "  runner=" + grokBuildRunnerName
+		} else if useCursor {
+			runnerTag = "  runner=" + cursorRunnerName
 		} else if engineName != "" {
 			runnerTag = "  runner=" + engineName
 		}
@@ -1066,7 +1413,28 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		var res *claudeResult
 		var combined string
 		var runErr error
+		var fallbackBefore *policyWorkspaceFingerprint
+		var fallbackBeforeErr error
+		preexistingPolicyResidue := false
+		if policyFallbackCandidate(cfg, t, via) {
+			// The fingerprint must precede the writer invocation. Residue pruning at this boundary removes
+			// only process groups the OS proves dead; live residue from older attempts remains a blocker.
+			resetTaskProcessResidue(t.ID)
+			preexistingPolicyResidue = taskProcessResidue(t.ID) || anyTaskProcAlive(t.ID) || workspaceProcessResidue(t.Dir)
+			if preexistingPolicyResidue {
+				fallbackBeforeErr = fmt.Errorf("pre-invocation writer/process residue is still alive")
+			} else {
+				fallbackBefore, fallbackBeforeErr = capturePolicyWorkspaceFingerprint(t.Dir)
+			}
+		}
 		invoke := func() error {
+			if preexistingPolicyResidue {
+				res = &claudeResult{Type: "result", IsError: true, Subtype: "policy_process_residue",
+					Result: "检测到上一执行腿仍有 writer/process residue；本轮未启动新执行器"}
+				combined = res.Result
+				runErr = errors.New(res.Result)
+				return nil
+			}
 			switch {
 			case remote:
 				// 远端执行：runner_pref=codex 显式钉定优先；否则带 claude 模型(如 fable/opus)
@@ -1090,6 +1458,38 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					logBlock(lg, "GEMINI", "模型解析: "+note)
 				}
 				if t.PreferRunner == "gemini" && res != nil && res.SessionID != "" {
+					t.SessionID = res.SessionID
+				}
+				if res != nil {
+					appendUsage(root, cfg, t, res.Usage)
+				}
+			case useOpenCode:
+				res, combined, runErr = invokeOpenCode(ctx, cfg, t, prompt)
+				if t.PreferRunner == "opencode" && res != nil && res.SessionID != "" {
+					t.SessionID = res.SessionID
+				}
+				if res != nil {
+					appendUsage(root, cfg, t, res.Usage)
+				}
+			case useKimiCLI:
+				res, combined, runErr = invokeKimiCLI(ctx, root, cfg, t, prompt)
+				if t.PreferRunner == kimiCLIRunnerName && res != nil && res.SessionID != "" {
+					t.SessionID = res.SessionID
+				}
+				if res != nil {
+					appendUsage(root, cfg, t, res.Usage)
+				}
+			case useGrokBuild:
+				res, combined, runErr = invokeGrokBuild(ctx, root, cfg, t, prompt)
+				if t.PreferRunner == grokBuildRunnerName && res != nil && res.SessionID != "" {
+					t.SessionID = res.SessionID
+				}
+				if res != nil {
+					appendUsage(root, cfg, t, res.Usage)
+				}
+			case useCursor:
+				res, combined, runErr = invokeCursor(ctx, cfg, t, prompt)
+				if t.PreferRunner == cursorRunnerName && res != nil && res.SessionID != "" {
 					t.SessionID = res.SessionID
 				}
 				if res != nil {
@@ -1172,6 +1572,123 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		if ctx.Err() != nil || diskCanceled(root, t.ID) {
 			return finalizeCanceled(root, t, lg)
 		}
+		recordRouteAttemptObservation(t, res)
+
+		// Owner serial fallback gate. Classification happens only after invoke returned; the post-state
+		// fingerprint and process-group residue probe happen after that. queuePolicyFallback refuses a
+		// zero/forged authorization, so no next writer can be queued before all three proof axes pass.
+		if kind, candidateFailure := classifyPolicyFallbackFailure(via, res, combined, runErr); candidateFailure &&
+			policyFallbackCandidate(cfg, t, via) {
+			if via == cursorRunnerName && kind != fallbackQuota {
+				// Explicit Fable has exactly one automatic trigger: a confirmed eligible quota-limit.
+				// Every other runner terminal is held on the same card; it never creates answer or merge legs.
+				semanticEvents, modelEvents, toolEvents, observationComplete := 0, 0, 0, false
+				if res != nil {
+					semanticEvents, modelEvents, toolEvents = res.SemanticEvents, res.ModelEvents, res.ToolEvents
+					observationComplete = res.ObservationComplete
+				}
+				residue := taskProcessResidue(t.ID) || anyTaskProcAlive(t.ID) || workspaceProcessResidue(t.Dir)
+				if t.LastRouteAttempt != nil {
+					t.LastRouteAttempt.FailureKind = string(kind)
+					t.LastRouteAttempt.ProcessResidue = residue
+				}
+				t.Status = statusHeld
+				t.LastError = fmt.Sprintf("Cursor Fable 非 quota 终态保持 held（未启动 fallback）: %s", kind)
+				t.touch()
+				emitTaskEvent(root, t.ID, evHeld, "runner:policy-fallback", statusHeld, t.Step, withCostTelemetry(withRouteAttempt(map[string]any{
+					"reason": "fable_non_quota_held", "failure_kind": string(kind),
+					"observation_complete": observationComplete, "semantic_events": semanticEvents,
+					"model_events": modelEvents, "tool_events": toolEvents,
+					"process_residue": residue,
+				}, t), t))
+				return saveTask(root, t)
+			}
+			var fallbackAfter *policyWorkspaceFingerprint
+			fallbackAfterErr := fallbackBeforeErr
+			if fallbackAfterErr == nil {
+				fallbackAfter, fallbackAfterErr = capturePolicyWorkspaceFingerprint(t.Dir)
+			}
+			semanticEvents, modelEvents, toolEvents, observationComplete := 0, 0, 0, false
+			if res != nil {
+				semanticEvents = res.SemanticEvents
+				if res.NumTurns > semanticEvents {
+					semanticEvents = res.NumTurns
+				}
+				modelEvents = res.ModelEvents
+				toolEvents = res.ToolEvents
+				observationComplete = res.ObservationComplete
+			}
+			proof := policyFallbackProof{
+				Before: fallbackBefore, After: fallbackAfter,
+				SemanticEvents: semanticEvents, ModelEvents: modelEvents, ToolEvents: toolEvents,
+				ObservationComplete: observationComplete,
+				ProcessResidue: taskProcessResidue(t.ID) || anyTaskProcAlive(t.ID) ||
+					workspaceProcessResidue(t.Dir),
+			}
+			if t.LastRouteAttempt != nil {
+				t.LastRouteAttempt.FailureKind = string(kind)
+				t.LastRouteAttempt.ProcessResidue = proof.ProcessResidue
+				if proof.Before != nil {
+					t.LastRouteAttempt.WorkspaceBefore = proof.Before.Digest
+				}
+				if proof.After != nil {
+					t.LastRouteAttempt.WorkspaceAfter = proof.After.Digest
+				}
+			}
+			auth, proofErr := authorizePolicyFallback(proof)
+			if fallbackAfterErr != nil {
+				proofErr = fmt.Errorf("fallback proof unavailable: %w", fallbackAfterErr)
+			}
+			if proofErr == nil {
+				reason := firstLine(strings.TrimSpace(errorSummary(res, combined, runErr)))
+				if reason == "" {
+					reason = string(kind)
+				}
+				if kind == fallbackQuota {
+					switch via {
+					case kimiCLIRunnerName:
+						setEngineCooldown(root, kimiCLICooldownName, kimiCLIResetEpoch(cfg, res, combined, now), reason)
+					case grokBuildRunnerName:
+						setEngineCooldown(root, grokBuildCooldownName, grokBuildResetEpoch(cfg, res, combined, now), reason)
+					case cursorRunnerName:
+						setEngineCooldown(root, cursorCooldownName, cursorResetEpoch(cfg, res, combined, now), reason)
+					}
+				}
+				if via == cursorRunnerName {
+					if err := prepareCursorFableFallback(root, cfg, t, reason, kind, auth); err != nil {
+						return err
+					}
+					logBlock(lg, "SAFE_FALLBACK", fmt.Sprintf(
+						"%s proof passed (fingerprint=%s, semantic=0, model=0, tools=0, residue=false); serial Grok→Sol→Sol merge chain queued",
+						kind, auth.beforeDigest))
+					return nil
+				}
+				previousRunner := via
+				if err := queuePolicyFallback(cfg, t, kind, auth); err != nil {
+					return err
+				}
+				if err := saveTask(root, t); err != nil {
+					return err
+				}
+				emitTaskEvent(root, t.ID, evRetry, "runner:"+previousRunner, statusQueued, t.Step, withRouteAttempt(map[string]any{
+					"reason": string(kind), "previous_runner": previousRunner, "next_runner": t.PreferRunner,
+					"fallback_runner": t.PreferRunner, "fallback_model": policyFallbackResolvedModel(cfg, t),
+					"fallback_reasoning":           policyFallbackResolvedEffort(cfg, t),
+					"workspace_fingerprint_before": auth.beforeDigest, "workspace_fingerprint_after": auth.afterDigest,
+					"semantic_events": 0, "model_events": 0, "tool_events": 0, "process_residue": false,
+				}, t))
+				logBlock(lg, "SAFE_FALLBACK", fmt.Sprintf(
+					"%s proof passed (fingerprint=%s, semantic=0, model=0, tools=0, residue=false); queued runner=%s",
+					kind, auth.beforeDigest, t.PreferRunner))
+				return nil
+			}
+			logBlock(lg, "FALLBACK_BLOCKED", fmt.Sprintf("%s: %v", kind, proofErr))
+			emitTaskEvent(root, t.ID, evStalled, "runner:policy-fallback", statusRunning, t.Step, withRouteAttempt(map[string]any{
+				"reason": "fallback_proof_failed", "failure_kind": string(kind), "detail": proofErr.Error(),
+				"semantic_events": semanticEvents, "model_events": modelEvents, "tool_events": toolEvents,
+				"process_residue": proof.ProcessResidue,
+			}, t))
+		}
 
 		// 1d) gemini 车道挂起（当日配额耗尽 / 认证资格错误）：只写 cooldown-gemini.json，
 		// **绝不写 claude 全局冷却**。Google 配额是账号级每日请求数——挂车道（而非像 codex
@@ -1205,6 +1722,133 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			return saveTask(root, t)
 		}
 
+		// 1e) 原生 Kimi CLI 车道限额。策略卡的安全接力已由上方统一证明闸处理；走到这里
+		// 就表示证明缺失/不匹配或这是一张人工钉定卡，因此只能沿既有车道暂停，绝不改写执行器。
+		if useKimiCLI && !remote && limitHitForRunner(via, remote, t, res, combined) {
+			scan := kimiCLILimitScanText(res, combined)
+			until := kimiCLIResetEpoch(cfg, res, combined, now)
+			reason := firstLine(strings.TrimSpace(scan))
+			if reason == "" {
+				reason = "Kimi CLI 用量限额"
+			}
+			setEngineCooldown(root, kimiCLICooldownName, until, reason)
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = t.SessionID != ""
+			if t.FreshSteps {
+				t.SessionID = ""
+				t.MidStep = false
+			}
+			t.LastError = "Kimi CLI 车道用量限额: " + reason
+			t.touch()
+			logBlock(lg, "LIMIT", fmt.Sprintf("Kimi CLI 车道命中限额，%s 后恢复（%s）\n%s",
+				fmtIn(until, now), fmtClock(until), reason))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner:kimi-cli", statusLimitPaused, t.Step, map[string]any{
+				"engine": kimiCLIRunnerName, "resume_at": until, "mid_step": t.MidStep,
+			})
+			return saveTask(root, t)
+		}
+
+		// 1g) Grok Build 车道限额。策略卡的下一腿同样只能从统一证明闸进入；证明未通过
+		// 或人工钉定的 Grok 卡均留在本车道等待，避免任何无凭证重放。
+		if useGrokBuild && !remote && limitHitForRunner(via, remote, t, res, combined) {
+			scan := grokBuildLimitScanText(res, combined)
+			until := grokBuildResetEpoch(cfg, res, combined, now)
+			reason := firstLine(strings.TrimSpace(scan))
+			if reason == "" {
+				reason = "Grok Build 用量限额"
+			}
+			setEngineCooldown(root, grokBuildCooldownName, until, reason)
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = t.SessionID != ""
+			if t.FreshSteps {
+				t.SessionID = ""
+				t.MidStep = false
+			}
+			t.LastError = "Grok Build 车道用量限额: " + reason
+			t.touch()
+			logBlock(lg, "LIMIT", fmt.Sprintf("Grok Build 车道命中限额，%s 后恢复（%s）\n%s",
+				fmtIn(until, now), fmtClock(until), reason))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner:grok-build", statusLimitPaused, t.Step, map[string]any{
+				"engine": grokBuildRunnerName, "resume_at": until, "mid_step": t.MidStep,
+			})
+			return saveTask(root, t)
+		}
+
+		// 1i) Cursor Fable 车道：安全三腿链只能由统一证明闸创建。到这里说明证明失败
+		// 或是人工 Cursor 卡；政策门禁挂 held，额度则暂停，均不偷换执行器。
+		cursorQuota := useCursor && !remote && isLimitHitCursor(res, combined)
+		cursorPolicyGate := useCursor && !remote && isCursorDataPolicyGate(res, combined)
+		if cursorQuota || cursorPolicyGate {
+			scan := cursorErrorScanText(res, combined)
+			reason := firstLine(strings.TrimSpace(scan))
+			if reason == "" {
+				reason = "Cursor Fable 不可用"
+			}
+			if cursorPolicyGate {
+				t.Status = statusHeld
+				t.LastError = "Cursor Fable 需要用户在 Cursor 中确认数据保留政策: " + reason
+				t.touch()
+				emitTaskEvent(root, t.ID, evHeld, "runner:cursor", statusHeld, t.Step, withCostTelemetry(map[string]any{
+					"reason": "cursor_data_policy_gate", "detail": reason,
+				}, t))
+				return saveTask(root, t)
+			}
+			until := cursorResetEpoch(cfg, res, combined, now)
+			setEngineCooldown(root, cursorCooldownName, until, reason)
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = t.SessionID != ""
+			t.LastError = "Cursor 车道用量限额: " + reason
+			t.touch()
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner:cursor", statusLimitPaused, t.Step, map[string]any{
+				"engine": cursorRunnerName, "resume_at": until, "mid_step": t.MidStep,
+			})
+			return saveTask(root, t)
+		}
+
+		// 1f) OpenCode 车道限额。显式 provider 钉定永不改写；Owner 六行强制模式下旧夜间
+		// OpenCode 路由也不得绕过零工作/零变更/零残留证明。仅在未启用 Owner 契约时，保留
+		// 历史“自动夜间卡转 Codex”兼容行为。各径只写 OpenCode 独立冷却。
+		if useOpenCode && !remote && limitHitForRunner(via, remote, t, res, combined) {
+			scan := openCodeLimitScanText(res, combined)
+			until := openCodeResetEpoch(cfg, res, combined, now)
+			reason := firstLine(strings.TrimSpace(scan))
+			setEngineCooldown(root, openCodeCooldownName, until, reason)
+			t.SessionID = ""
+			t.MidStep = false
+			t.ResumeAtEpoch = 0
+			legacyAutoFallback := t.PreferRunner != "opencode" && cfg != nil && !cfg.OwnerRoutingEnforced
+			if legacyAutoFallback {
+				t.Status = statusQueued
+				t.NotBeforeEpoch = 0
+				t.RouteReason = routeReasonOpenCodeLimitFallbackPending
+				t.LastError = "OpenCode 额度命中，转 Codex Sol/xhigh: " + reason
+				t.touch()
+				logBlock(lg, "LIMIT_FALLBACK", fmt.Sprintf(
+					"OpenCode 命中限额，车道冷却至 %s；本卡立即转 Codex Sol/xhigh\n%s",
+					fmtClock(until), reason))
+				emitTaskEvent(root, t.ID, evRetry, "runner:opencode", statusQueued, t.Step, map[string]any{
+					"engine": "opencode", "reason": "limit_fallback", "fallback_runner": "codex",
+					"fallback_model":     resolveCodexModel(cfg, t),
+					"fallback_reasoning": resolveCodexReasoning(cfg, t), "cooldown_until": until,
+				})
+				return saveTask(root, t)
+			}
+			t.Status = statusLimitPaused
+			t.ResumeAtEpoch = until
+			t.MidStep = t.SessionID != ""
+			t.LastError = "OpenCode 车道用量限额: " + reason
+			t.touch()
+			logBlock(lg, "LIMIT", fmt.Sprintf("OpenCode 车道命中限额，%s 后恢复（%s）\n%s",
+				fmtIn(until, now), fmtClock(until), reason))
+			emitTaskEvent(root, t.ID, evLimitPaused, "runner:opencode", statusLimitPaused, t.Step, map[string]any{
+				"engine": "opencode", "resume_at": until,
+			})
+			return saveTask(root, t)
+		}
+
 		// 1c) 引擎限额：只写该引擎自己的 cooldown-<name>.json，**绝不写 claude 全局冷却**
 		// （Kimi 撞限额挂住 claude 队列＝把独立额度池焊死在一根保险丝上，本分支存在的全部意义
 		// 就是拆开它）。会话语义与 claude 分支同构：有会话→MidStep 续跑提示；fresh→重发本步。
@@ -1233,13 +1877,16 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			return saveTask(root, t)
 		}
 
+		claudeLimit := engineName == "" && !useCodex && !useGemini && !useOpenCode &&
+			!useKimiCLI && !useGrokBuild && !useCursor && !remote && limitHitForEngine(false, false, t, res, combined)
+
 		// 1) 限额：记录恢复时间，全局冷却，等 tick 到点自动续跑
 		// 【CG-R1 修复】用 isLimitHitClaude 收敛扫描面到 stderr 尾段 + res.Result(非 transcript),
 		// 挡"自审本仓 transcript 含 usage limit 字面量 + 超时→误挂 limit_paused/写全局冷却"回归。
 		// 【CG-R1 R3 P2-3】三处 call site 全走 limitHitForEngine 单口路由, 让 (useCodex, remote)
 		// 到 wrapper 的映射被 TestLimitHitForEngineRoutesByFlags 钉住; 错改条件顺序会立即测试红。
 		// 引擎路由（engineName != ""）已被上方 1c 分支独占承接，gemini 被 1d 承接，此处仅本机 claude。
-		if engineName == "" && !useCodex && !useGemini && !remote && limitHitForEngine(useCodex, remote, t, res, combined) {
+		if engineName == "" && !useCodex && !useGemini && !useOpenCode && !useKimiCLI && !useGrokBuild && !useCursor && !remote && claudeLimit {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			setCooldown(root, until, firstLine(combined))
 			t.Status = statusLimitPaused
@@ -1299,6 +1946,30 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			return saveTask(root, t)
 		}
 
+		// Grok 认证熔断在首张卡已经留下 held 根因。并发派发中已经进入 runTask 的跟随卡只退回
+		// 原 Grok 队列等待，不再重复探针、不烧 attempts、更不能串行回退到另一 writer。
+		if useGrokBuild && res != nil && res.IsError && res.Subtype == "grok_build_auth_circuit_open" {
+			if t.LastRouteAttempt != nil {
+				t.LastRouteAttempt.FailureClass = string(failureAuth)
+			}
+			t.Status = statusQueued
+			t.SessionID = ""
+			t.MidStep = false
+			t.ResumeAtEpoch = 0
+			t.NotBeforeEpoch = 0
+			t.LastError = "[auth] " + res.Result
+			t.touch()
+			cd := loadEngineCooldown(root, grokBuildCooldownName)
+			detail := map[string]any{"engine": grokBuildRunnerName, "reason": "auth_circuit_open",
+				"failure_class": string(failureAuth)}
+			if cd != nil {
+				detail["cooldown_until"] = cd.UntilEpoch
+			}
+			emitTaskEvent(root, t.ID, evRetry, "runner:grok-build", statusQueued, t.Step, withRouteAttempt(detail, t))
+			logBlock(lg, "AUTH_CIRCUIT", res.Result)
+			return saveTask(root, t)
+		}
+
 		// 2) 其他失败：CG-3 分类分流决定策略——认证/权限直接 held 升级人工；输入超长直接 failed
 		// 不重试；超时/执行器崩溃/未知类沿用现行 retry_backoff（回归基线：未知类的 last_error/事件
 		// 字段与旧版逐字节一致，只多一个 detail.failure_class 供审计聚合）。
@@ -1308,7 +1979,14 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		if runErr != nil || res == nil || res.IsError {
 			msg := errorSummary(res, combined, runErr)
 			cls := classifyFailure(msg, combined, res, runErr)
+			if t.LastRouteAttempt != nil {
+				t.LastRouteAttempt.FailureClass = string(cls)
+			}
 			policy := policyFor(cls)
+			transcriptDerived := classificationFromTranscript(res, runErr)
+			if useGrokBuild && cls == failureAuth && !transcriptDerived && grokBuildExactAuthResult(res) {
+				setGrokBuildAuthCooldown(root, canonicalGrokBuildAuthReason(msg), now)
+			}
 			// 【P1 教训 · Round-3 复审】classifyFailure 只吃 msg 是第一道防线,但 msg 可能是
 			// invokeCodex/invokeRemoteCodex/invokeRemoteClaude 从 combined 挑走的 transcript 行,
 			// 或 errorSummary fallback 分支拼进的 firstLine(combined)——transcript 天然含分类正则
@@ -1317,7 +1995,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			// 一律降级 retry_backoff,failure_class 事件仍写供审计,与 classifyFailure 归类分层。
 			// 详见 failure_class.go 顶部 P1 · Round-3 教训与 classificationFromTranscript 判据说明。
 			softenedFromTranscript := false
-			if policy.Terminal != "" && classificationFromTranscript(res, runErr) {
+			if policy.Terminal != "" && transcriptDerived {
 				logBlock(lg, "CLASS_SOFTENED", fmt.Sprintf(
 					"[%s→retry_backoff] transcript 来源判据不落终态(would-be %s),降级现行 retry_backoff: %s",
 					cls, policy.Terminal, msg))
@@ -1333,9 +2011,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.LastError = annotatedError(cls, msg)
 				logBlock(lg, "CLASS_HELD", fmt.Sprintf("[%s] 不烧 attempts 直接挂 held(升级人工): %s", cls, msg))
 				emitTaskEvent(root, t.ID, evHeld, "runner:classifier", statusHeld, t.Step,
-					withCostTelemetry(map[string]any{
+					withCostTelemetry(withRouteAttempt(map[string]any{
 						"err": msg, "failure_class": string(cls), "reason": policy.Reason,
-					}, t))
+					}, t), t))
 			case statusFailed:
 				// 输入超长：同样 prompt 再送必然再超长，直接 failed 不烧 attempts；人工按 retry 时
 				// 可裁剪 prompt 或换更大窗口的模型。
@@ -1343,9 +2021,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.LastError = annotatedError(cls, msg)
 				logBlock(lg, "CLASS_FAILED", fmt.Sprintf("[%s] 不可重试类直接 failed: %s", cls, msg))
 				emitTaskEvent(root, t.ID, evFailed, "runner:classifier", statusFailed, t.Step,
-					withCostTelemetry(map[string]any{
+					withCostTelemetry(withRouteAttempt(map[string]any{
 						"err": msg, "failure_class": string(cls), "reason": policy.Reason,
-					}, t))
+					}, t), t))
 			default:
 				// 现行 retry_backoff：超时/执行器崩溃/未知类。回归基线纪律——未知类的 LastError 与
 				// 事件字段结构与旧版逐字节一致（annotatedError 对 unknown 返回原 msg，不加前缀）；
@@ -1369,7 +2047,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 						detail["softened_from_terminal"] = true
 						detail["reason"] = "softened_transcript_derived"
 					}
-					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, withCostTelemetry(detail, t))
+					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, withCostTelemetry(withRouteAttempt(detail, t), t))
 				} else {
 					t.Status = statusQueued
 					backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
@@ -1387,7 +2065,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 						detail["softened_from_terminal"] = true
 						detail["reason"] = "softened_transcript_derived"
 					}
-					emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, detail)
+					emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, withRouteAttempt(detail, t))
 				}
 			}
 			t.touch()
@@ -1400,6 +2078,14 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			switch {
 			case useGemini:
 				clearEngineCooldown(root, "gemini")
+			case useOpenCode:
+				clearEngineCooldown(root, openCodeCooldownName)
+			case useKimiCLI:
+				clearEngineCooldown(root, kimiCLICooldownName)
+			case useGrokBuild:
+				clearEngineCooldown(root, grokBuildCooldownName)
+			case useCursor:
+				clearEngineCooldown(root, cursorCooldownName)
 			case engineName != "":
 				clearEngineCooldown(root, engineName)
 			default:
@@ -1430,6 +2116,37 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		logSection(lg, fmt.Sprintf("步骤完成  turns=%d cost=$%.4f duration=%.0fs", res.NumTurns, res.TotalCostUSD, float64(res.DurationMS)/1000))
 
 		if t.Step >= len(t.Prompts) {
+			if t.ReviewAfter && t.SolMaxAdversarialReview && reviewAfterEligibleType(t) {
+				// Persist the completed implementation as held/pending before the reviewer child. A crash
+				// anywhere after this write cannot expose a done Opus implementation without its review
+				// obligation, and tick can reconcile by ReviewOf without rerunning the model step.
+				t.Status = statusHeld
+				t.ReviewObligationPending = true
+				t.LastError = "实现已完成，等待独立 Sol/max 对抗复审义务落盘"
+				t.touch()
+				if err := saveTask(root, t); err != nil {
+					return err
+				}
+				childCfg := configForGeneratedChildren(root, cfg, lg)
+				rv, err := ensureReviewAfterTask(root, childCfg, t, lg)
+				if err != nil || rv == nil {
+					if err == nil {
+						err = fmt.Errorf("review helper returned no child")
+					}
+					t.LastError = "独立 Sol/max 对抗复审义务未落盘: " + err.Error()
+					t.touch()
+					if saveErr := saveTask(root, t); saveErr != nil {
+						return errors.Join(err, saveErr)
+					}
+					emitTaskEvent(root, t.ID, evHeld, "runner:review-obligation", statusHeld, t.Step,
+						withCostTelemetry(map[string]any{"reason": "mandatory_review_persist_failed", "err": err.Error()}, t))
+					logBlock(lg, "REVIEW", t.LastError)
+					return nil
+				}
+				t.ReviewTaskID = rv.ID
+				t.ReviewObligationPending = false
+				t.LastError = ""
+			}
 			t.Status = statusDone
 			// 交叉 C 终局：标 done 前先定合并契约（不合规直接 failed），让**首次落盘即是终态**——
 			// 避免"done 先落盘、校验在后、failed 靠第二次保存"的崩溃窗口（reconcile 不覆盖 C）。
@@ -1663,8 +2380,166 @@ func applyDefaultReviewDivert(t *Task, cfg *Config) {
 	}
 }
 
+// configForGeneratedChildren 只在“父任务已完成、即将生成新卡”这一边界重读配置。
+// 在途执行仍使用派发时冻结的 cfg，避免模型/权限中途漂移；但新审核、修复、emit 子卡必须
+// 立即采用已经确认落盘的生产策略，不能被一个跑了数小时的父任务继续复制旧默认值。
+func configForGeneratedChildren(root string, fallback *Config, lg *os.File) *Config {
+	if _, err := os.Stat(configPath(root)); err != nil {
+		return fallback
+	}
+	latest, err := loadConfig(root)
+	if err != nil {
+		if lg != nil {
+			logBlock(lg, "CONFIG", "子卡配置热重载失败，沿用父任务已冻结配置: "+err.Error())
+		}
+		return fallback
+	}
+	return latest
+}
+
+func existingReviewAfterChild(root, parentID string) (*Task, error) {
+	var matches []*Task
+	for _, dir := range []string{tasksDir(root), archiveDir(root)} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, err
+			}
+			var candidate Task
+			if err := json.Unmarshal(data, &candidate); err != nil {
+				return nil, err
+			}
+			if candidate.ReviewOf == parentID {
+				matches = append(matches, &candidate)
+			}
+		}
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("review_after obligation %s has %d children", parentID, len(matches))
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	return nil, nil
+}
+
+// ensureReviewAfterTask is idempotent on ReviewOf. Mandatory Opus callers invoke it while the parent
+// is durably held/pending; ordinary review_after callers retain the historical post-complete timing.
+func ensureReviewAfterTask(root string, cfg *Config, t *Task, lg *os.File) (*Task, error) {
+	if t == nil || !t.ReviewAfter || !reviewAfterEligibleType(t) {
+		return nil, nil
+	}
+	if existing, err := existingReviewAfterChild(root, t.ID); err != nil {
+		return nil, err
+	} else if existing != nil {
+		if t.SolMaxAdversarialReview && (existing.PreferRunner != "codex" || existing.CodexModel != "gpt-5.6-sol" ||
+			existing.Effort != "max" || existing.SessionID != "" || existing.ReviewAfter) {
+			return nil, fmt.Errorf("existing mandatory reviewer %s is not a clean Sol/max identity", existing.ID)
+		}
+		return existing, nil
+	}
+	tpl, err := loadTemplate(root, typeReview)
+	if err != nil {
+		return nil, fmt.Errorf("load review template: %w", err)
+	}
+	applyDefaultReviewDivert(t, cfg)
+	reviewDir := t.Dir
+	reviewHost := t.RemoteHost
+	divert := t.ReviewHost != ""
+	if t.ReviewSync != "" {
+		if err := runReviewSync(t, lg); err != nil {
+			logBlock(lg, "REVIEW", "审核同步失败，回退本地审核: "+err.Error())
+			divert = false
+		}
+	}
+	if divert {
+		reviewDir = t.ReviewDir
+		reviewHost = t.ReviewHost
+	}
+	focus := fmt.Sprintf("审查任务「%s」刚刚在该目录产生的改动（可结合 git diff/log）", t.Title)
+	prompt := renderTemplate(tpl, map[string]string{"DIR": reviewDir, "FOCUS": focus})
+	rv := newTask(root, cfg, typeReview, "审核: "+t.Title, reviewDir, []string{prompt}, t.Priority)
+	rv.ReviewOf = t.ID
+	rv.Project = t.Project
+	rv.FixRound = t.FixRound
+	rv.MaxFixRounds = t.MaxFixRounds
+	rv.RemoteHost = reviewHost
+	if reviewHost != "" && rv.Model == "" {
+		rv.Model = t.Model
+	}
+	pinGrokOpusAdversarialReview(cfg, t, rv)
+	if err := saveTask(root, rv); err != nil {
+		return nil, fmt.Errorf("persist review task: %w", err)
+	}
+	emitTaskEvent(root, t.ID, evCloseout, "runner:review", t.Status, t.Step, map[string]any{
+		"kind": "review_after", "child": rv.ID,
+	})
+	emitTaskEvent(root, rv.ID, evQueued, "runner:review", statusQueued, 0, map[string]any{
+		"parent": t.ID, "review_of": t.ID,
+	})
+	logBlock(lg, "REVIEW", "已入队审核任务: "+rv.ID)
+	return rv, nil
+}
+
+func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task, activeIDs map[string]bool) {
+	for _, t := range tasks {
+		if t == nil || activeIDs[t.ID] || t.Status != statusHeld || !t.ReviewObligationPending ||
+			!t.SolMaxAdversarialReview || !t.ReviewAfter || !reviewAfterEligibleType(t) {
+			continue
+		}
+		lg, _ := openTaskLog(root, t.ID)
+		rv, err := ensureReviewAfterTask(root, cfg, t, lg)
+		if err != nil || rv == nil {
+			if err == nil {
+				err = fmt.Errorf("review helper returned no child")
+			}
+			t.LastError = "独立 Sol/max 对抗复审义务仍未落盘: " + err.Error()
+			t.touch()
+			_ = saveTask(root, t)
+			if lg != nil {
+				logBlock(lg, "REVIEW", t.LastError)
+				_ = lg.Close()
+			}
+			continue
+		}
+		t.ReviewTaskID = rv.ID
+		t.ReviewObligationPending = false
+		t.Status = statusDone
+		t.LastError = ""
+		t.touch()
+		if err := saveTask(root, t); err != nil {
+			t.Status = statusHeld
+			t.ReviewObligationPending = true
+			t.LastError = "复审卡已落盘，但父卡完成状态回写失败: " + err.Error()
+			t.touch()
+			_ = saveTask(root, t)
+			if lg != nil {
+				_ = lg.Close()
+			}
+			continue
+		}
+		emitTaskEvent(root, t.ID, evDone, "runner:review-obligation", statusDone, t.Step,
+			withCostTelemetry(map[string]any{"review_child": rv.ID, "reconciled": true}, t))
+		if lg != nil {
+			noteTaskDoneLogged(root, cfg, t, lg)
+			_ = lg.Close()
+		}
+	}
+}
+
 // postComplete 处理任务链：进度报告落盘；装配/协调任务产出的新任务入队；review_after 自动入队设计审核。
 func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
+	cfg = configForGeneratedChildren(root, cfg, lg)
 	// C 存在即意味 B→C 已成，甲结论侧车使命完成——清理（兜住 B→C 在删侧车前崩溃的残留）。
 	if t.XRole == "C" {
 		_ = os.Remove(crossPeerPath(root, t.XKey))
@@ -1713,61 +2588,22 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 			logBlock(lg, "EMIT", "已入队: "+strings.Join(created, ", "))
 		}
 	}
-	if t.ReviewAfter {
-		tpl, err := loadTemplate(root, typeReview)
-		if err == nil {
-			// 审核默认在被审卡所在处执行（远程卡在远程审）；声明 ReviewHost/ReviewSync 时把只读审核
-			// 负载分流到第二台机器。分流前若有 ReviewSync 先本地同步改动，失败则只收掉 divert——
-			// reviewHost/reviewDir 回到初值 t.RemoteHost/t.Dir（远程实现卡仍在远程审，绝不抹主机把审核
-			// 错拉回本机以远端路径当本地目录），闭环不断。
-			applyDefaultReviewDivert(t, cfg) // 全局默认复审分流（config 配了 default_review_host 时自动压到第二台机器）
-			reviewDir := t.Dir
-			reviewHost := t.RemoteHost
-			divert := t.ReviewHost != ""
-			if t.ReviewSync != "" {
-				if err := runReviewSync(t, lg); err != nil {
-					logBlock(lg, "REVIEW", "审核同步失败，回退本地审核: "+err.Error())
-					divert = false
-				}
-			}
-			if divert {
-				reviewDir = t.ReviewDir
-				reviewHost = t.ReviewHost
-			}
-			focus := fmt.Sprintf("审查任务「%s」刚刚在该目录产生的改动（可结合 git diff/log）", t.Title)
-			prompt := renderTemplate(tpl, map[string]string{"DIR": reviewDir, "FOCUS": focus})
-			rv := newTask(root, cfg, typeReview, "审核: "+t.Title, reviewDir, []string{prompt}, t.Priority)
-			// 修复闭环谱系：审核卡记住被审卡，并继承其循环轮次与（分流后的）执行位置。
-			rv.ReviewOf = t.ID
-			// 显式项目归属随派生卡继承：审核卡的 dir 常是**审核主机上的镜像目录**，
-			// 不继承的话，一张钉了 -project 的实现卡派出的审核卡会掉进「未分类」。
-			rv.Project = t.Project
-			rv.FixRound = t.FixRound
-			rv.MaxFixRounds = t.MaxFixRounds // 轮限随审核卡继承（卡面自洽；判据仍取被审卡）
-			rv.RemoteHost = reviewHost
-			// 远程审核（分流或远程实现卡回退）的模型选取：非空烘焙值恒优先，空才继承实现卡模型。
-			// newTask 已从 type_defaults.review.model 烘焙 rv.Model；仅当它为空（typeDefaults 未配审核模型）
-			// 才继承实现卡 Model，保证远端命中 claude 而非烧 GPT 额度的 codex。绝不用实现卡 Model 覆写非空烘焙值——
-			// 否则 type_defaults.review.model=opus + 实现卡 -model haiku 时审核会被静默降级成 haiku（本地审核却仍用
-			// opus），配置的审核模型被践踏。runTask 对 typeReview 亦兜底走远端 claude，空 Model 不会被路由到远端 codex。
-			if reviewHost != "" && rv.Model == "" {
-				rv.Model = t.Model
-			}
-			if saveTask(root, rv) == nil {
-				// review_after 派生的审核卡是实现卡完成后的下一环，父账本记 closeout 留指针。
-				emitTaskEvent(root, t.ID, evCloseout, "runner:review", statusDone, t.Step, map[string]any{
-					"kind": "review_after", "child": rv.ID,
-				})
-				emitTaskEvent(root, rv.ID, evQueued, "runner:review", statusQueued, 0, map[string]any{
-					"parent": t.ID, "review_of": t.ID,
-				})
-				logBlock(lg, "REVIEW", "已入队审核任务: "+rv.ID)
-			}
+	// Fable 5 限额后的异构接力不把候选方案当成既定方向：无论候选最终由 Grok 还是
+	// 最终 Sol 产出，都追加且只追加一张本地 Sol/max 第一性顾问审查卡。
+	ensureFableFirstPrinciplesReview(root, cfg, t, res.Result, lg)
+	// 运行期再守一次，覆盖升级前已入队的旧卡或人工直接改 JSON 的旁路；非实现卡即使盘上
+	// 残留 review_after=true，也不得生成“审核: 审核…”任务。
+	if t.ReviewAfter && reviewAfterEligibleType(t) {
+		if rv, err := ensureReviewAfterTask(root, cfg, t, lg); err != nil {
+			t.LastError = "自动复审义务未落盘: " + err.Error()
+			logBlock(lg, "REVIEW", t.LastError)
+		} else if rv != nil {
+			t.ReviewTaskID = rv.ID
 		}
 	}
 	// 修复闭环：对抗审核完成后消费 verdict——pass 收口；concerns/block 自动派下一轮修复卡；
 	// 超轮限挂 held 升级卡交人工。这是"实现→审核→修复→再审"循环的自动闭合点。
-	if t.Type == typeReview {
+	if t.Type == typeReview && !t.AdvisoryReview {
 		handleReviewVerdict(root, cfg, t, res.Result, lg)
 	}
 	// 交叉验证链：A 完成 → 派独立引擎乙的 B 卡（不注入 A）；B 完成 → 派引擎乙交叉查漏的 C 卡（注入 A+B）。
@@ -1808,6 +2644,8 @@ type emitTask struct {
 	ReviewAfter bool   `json:"review_after"`
 	FreshSteps  bool   `json:"fresh_steps"`
 	Runner      string `json:"runner"`
+	// RouteClass 让协调器显式标注后端开发例外；空值由调度器对存量卡做确定性判定。
+	RouteClass string `json:"route_class"`
 	// CodexModel 卡级钉定 codex 模型（runner=codex 时随卡生效，档位对等制下协调器可按档发 terra/luna）。
 	CodexModel string `json:"codex_model"`
 	// GeminiModel 卡级钉定 gemini 模型（runner=gemini 时随卡生效；推荐官方别名 pro/flash/flash-lite）。
@@ -2016,6 +2854,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 			if orig, err := findTaskAnywhere(root, t.ReviewOf); err == nil && strings.TrimSpace(orig.Closeout) != "" {
 				co := newTask(root, cfg, typeSequence, "收口: "+baseFixTitle(orig.Title), orig.Dir, []string{orig.Closeout}, orig.Priority)
 				co.Model = "haiku"
+				co.RouteClass = orig.RouteClass
 				co.Project = orig.Project // 显式归属随派生卡继承（收口卡属于被收口卡的项目）
 				co.EmittedBy = t.ID       // 谱系标：系统派生卡，进度预估的派生耦合系数依赖（boardestimate.go）
 				co.SkipPermissions = orig.SkipPermissions
@@ -2089,6 +2928,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		// 会在 release 后被派到本机、cd 直接失败（实测远端 R4 卡两张踩中）。
 		esc.RemoteHost = orig.RemoteHost
 		esc.Project = orig.Project // 显式归属随派生卡继承（升级卡属于原卡的项目）
+		esc.RouteClass = orig.RouteClass
 		esc.FixRound = round
 		esc.MaxFixRounds = orig.MaxFixRounds // 轮限随谱系留档：人裁后 release 续跑不该换上限
 		// 链账随谱系留档：人裁后若从升级卡续出新一轮审核，链账不该从 0 重新起算。
@@ -2137,13 +2977,14 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	nt.FixRound = round
 	nt.Project = orig.Project // 显式归属随修复链继承
 	// 轮限随修复链继承：下一轮的 handleReviewVerdict 读的是**下一张卡**的卡面，不继承就会在
-	// R2 静默掉回全局值——一张 -stakes high 的卡只有第一轮享受 4 轮上限，后面又按 3 轮截断。
+	// R2 静默掉回全局值。生产 high 当前钉 1；历史卡或显式配置仍可能有其它绝对值。
 	nt.MaxFixRounds = orig.MaxFixRounds
 	// 链账随修复链继承：不继承的话每张修复卡的链账都从 0 起算，撞墙时落盘的 chain_cost_total
 	// 就退化成"最后一轮那张卡的账"——正是本键此前口径撒谎的成因。
 	nt.ChainCostUSD = chainCost
 	nt.ChainTurnsUsed = chainTurns
 	nt.Stakes = orig.Stakes // 审计留档随链传递（非运行期判据，见 stakes.go 文件头）
+	nt.RouteClass = orig.RouteClass
 	nt.Model = orig.Model
 	nt.SkipPermissions = orig.SkipPermissions
 	nt.PermissionMode = orig.PermissionMode
@@ -2154,9 +2995,10 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	nt.ReviewDir = orig.ReviewDir
 	nt.ReviewSync = orig.ReviewSync
 	nt.Closeout = orig.Closeout // 收口指令随修复链继承，pass 时才由末轮触发
-	// 修复是最该多想的环节：未显式指定时抬到 high（质量优先）。不继承 PreferRunner——
-	// 修复吃上下文推理，钉 codex 的填充类偏好不适用。
+	// 修复是最该多想的环节：未显式指定时抬到 high（质量优先）。不继承父卡的单卡
+	// PreferRunner；newTask 已烘焙全局 default_runner，避免自动修复重新掉回旧执行器。
 	nt.Effort = orig.Effort
+	nt.EffortExplicit = orig.EffortExplicit
 	if nt.Effort == "" {
 		nt.Effort = "high"
 	}
@@ -2215,6 +3057,10 @@ func crossEngineIdentity(eng CrossEngine, cfg *Config) string {
 		return "codex|" + cfg.CodexModel
 	case "gemini":
 		return "gemini|" + cfg.GeminiModel
+	case grokBuildRunnerName:
+		return grokBuildRunnerName + "|" + eng.Model + "|" + eng.Effort
+	case cursorRunnerName:
+		return cursorRunnerName + "|" + eng.Model
 	case "remote-claude":
 		return "remote-claude|" + eng.Host + "|" + eng.Model
 	case "remote-codex":
@@ -2229,7 +3075,11 @@ func freezeCrossEngine(eng CrossEngine, cfg *Config) (*XFrozenEngine, error) {
 	if err := applyCrossEngine(tmp, eng, cfg); err != nil {
 		return nil, err
 	}
-	f := &XFrozenEngine{Model: tmp.Model, Effort: tmp.Effort, PreferRunner: tmp.PreferRunner, RemoteHost: tmp.RemoteHost, Label: crossEngineLabel(eng)}
+	f := &XFrozenEngine{
+		Model: tmp.Model, Effort: tmp.Effort, PreferRunner: tmp.PreferRunner, RemoteHost: tmp.RemoteHost,
+		GrokModel: tmp.GrokModel, GrokEffort: tmp.GrokEffort, CursorModel: tmp.CursorModel,
+		Label: crossEngineLabel(eng),
+	}
 	// 冻结空 effort 的 reasoning 回落——但必须冻结**执行时真正会用的那个源**：本机 codex 回落全局
 	// codex_reasoning，远端 codex 回落该主机的 reasoning。冻错源会在正常路径就跑错档位。
 	switch eng.Kind {
@@ -2256,6 +3106,7 @@ func applyFrozenEngine(t *Task, f *XFrozenEngine) {
 	t.Model, t.Effort, t.PreferRunner, t.RemoteHost = f.Model, f.Effort, f.PreferRunner, f.RemoteHost
 	t.XCodexModel = f.CodexModel
 	t.XGeminiModel = f.GeminiModel
+	t.GrokModel, t.GrokEffort, t.CursorModel = f.GrokModel, f.GrokEffort, f.CursorModel
 }
 
 func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
@@ -2263,6 +3114,7 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 		return fmt.Errorf("交叉引擎 effort %q 非法（minimal/low/medium/high/xhigh/max/ultra）", eng.Effort)
 	}
 	t.Model, t.Effort, t.PreferRunner, t.RemoteHost = "", "", "", ""
+	t.GrokModel, t.GrokEffort, t.CursorModel = "", "", ""
 	switch eng.Kind {
 	case "claude":
 		// 本机 claude：默认执行器，走本机 claude 账号额度（如 opus-4.8 max）。
@@ -2307,6 +3159,34 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 			return fmt.Errorf("gemini 交叉引擎不支持 effort（gemini CLI 无思考等级参数），请从 profile 删掉 effort 字段")
 		}
 		t.PreferRunner = "gemini"
+	case grokBuildRunnerName:
+		if !grokBuildEnabled(cfg) {
+			return fmt.Errorf("grok-build 交叉引擎需启用 config.grok_build")
+		}
+		if strings.TrimSpace(eng.Model) == "" {
+			return fmt.Errorf("grok-build 交叉引擎必须显式指定 model")
+		}
+		effort := strings.ToLower(strings.TrimSpace(eng.Effort))
+		switch effort {
+		case "low", "medium", "high", "xhigh":
+		default:
+			return fmt.Errorf("grok-build 交叉引擎 effort %q 非法（Grok 4.6 最高 xhigh）", eng.Effort)
+		}
+		t.PreferRunner = grokBuildRunnerName
+		t.GrokModel = strings.TrimSpace(eng.Model)
+		t.GrokEffort = effort
+	case cursorRunnerName:
+		if !cursorEnabled(cfg) {
+			return fmt.Errorf("cursor 交叉引擎需配置 cursor_bin")
+		}
+		if strings.TrimSpace(eng.Model) == "" {
+			return fmt.Errorf("cursor 交叉引擎必须显式指定账号模型 ID")
+		}
+		if strings.TrimSpace(eng.Effort) != "" {
+			return fmt.Errorf("cursor 交叉引擎的思考档已编码在 model ID，effort 必须留空")
+		}
+		t.PreferRunner = cursorRunnerName
+		t.CursorModel = strings.TrimSpace(eng.Model)
 	case "remote-claude":
 		// SSH 远端 claude：Model 必填，否则 remoteUsesClaude 判 false 会被路由到远端 codex。
 		rh, ok := cfg.RemoteHosts[eng.Host]
@@ -2337,11 +3217,12 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 		t.RemoteHost = eng.Host
 		t.Effort = eng.Effort
 	default:
-		return fmt.Errorf("未知交叉引擎 kind %q（可选 claude/codex/gemini/remote-claude/remote-codex）", eng.Kind)
+		return fmt.Errorf("未知交叉引擎 kind %q（可选 claude/codex/gemini/grok-build/cursor/remote-claude/remote-codex）", eng.Kind)
 	}
 	// codex/远端引擎要求 codexEligible（单步无会话）——交叉卡都是单步，正常满足；防御性兜底。
 	// gemini 不在此列：有会话（--session-id/--resume），无此形状约束。
-	if (t.PreferRunner == "codex" || t.RemoteHost != "") && !codexEligible(t) {
+	if (t.PreferRunner == "codex" || t.PreferRunner == grokBuildRunnerName ||
+		t.PreferRunner == cursorRunnerName || t.RemoteHost != "") && !codexEligible(t) {
 		return fmt.Errorf("codex/远端引擎要求单步无会话")
 	}
 	return nil
@@ -2394,6 +3275,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		b.XProfile = t.XProfile
 		b.XTask = t.XTask
 		b.XEngineB = t.XEngineB // 冻结规格随链传递
+		b.XEngineC = t.XEngineC // 可选的独立合并引擎同样冻结并随链传递
 		applyFrozenEngine(b, t.XEngineB)
 		if err := saveTask(root, b); err != nil {
 			breakChain("B 卡落盘失败: " + err.Error())
@@ -2430,9 +3312,14 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		c.XKey = t.XKey
 		c.XProfile = t.XProfile
 		c.XEngineB = t.XEngineB
+		c.XEngineC = t.XEngineC
 		c.EmitProgress = true // C 的 json 最终结论落进度报告，键=XKey，供 progress -show 取回
 		c.ProgressKey = t.XKey
-		applyFrozenEngine(c, t.XEngineB)
+		mergeEngine := t.XEngineB // 旧卡兼容：未冻结独立 C 时仍由乙引擎合并。
+		if t.XEngineC != nil {
+			mergeEngine = t.XEngineC
+		}
+		applyFrozenEngine(c, mergeEngine)
 		if err := saveTask(root, c); err != nil {
 			breakChain("C 卡落盘失败: " + err.Error())
 			return
@@ -2445,7 +3332,11 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		emitTaskEvent(root, c.ID, evQueued, "runner:cross-C", statusQueued, 0, map[string]any{
 			"parent": t.ID, "xkey": t.XKey, "profile": t.XProfile, "role": "C",
 		})
-		logBlock(lg, "CROSS", fmt.Sprintf("引擎乙完成 → 已派交叉查漏 C 卡 %s（%s，注入甲+乙完整结论）", c.ID, label))
+		mergeLabel := mergeEngine.Label
+		if mergeLabel == "" {
+			mergeLabel = "合并引擎"
+		}
+		logBlock(lg, "CROSS", fmt.Sprintf("引擎乙完成 → 已派交叉查漏 C 卡 %s（%s，注入甲+乙完整结论）", c.ID, mergeLabel))
 	}
 }
 
@@ -2623,6 +3514,8 @@ func crossEngineLabel(eng CrossEngine) string {
 		return "codex"
 	case "gemini":
 		return "gemini"
+	case grokBuildRunnerName, cursorRunnerName:
+		return eng.Kind + "·" + orDash(eng.Model)
 	case "remote-claude", "remote-codex":
 		return eng.Kind + "@" + eng.Host
 	}
@@ -2676,15 +3569,24 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		// 进度预估的派生耦合系数靠它区分系统派生与人工立项（boardestimate.go）。
 		nt.EmittedBy = parent.ID
 		nt.ReviewAfter = s.ReviewAfter
+		enforceReviewAfterEligibility(nt)
 		// 协调链：产出的 coordinate 任务同样具备 emit 能力（自愈式续排——每批收尾排下一批）。
 		// 递归有界：每次 emit ≤10 张、每张协调都消耗额度且受红线节流，模板负责终止条款。
 		if typ == typeCoordinate {
 			nt.EmitTasks = true
 		}
 		nt.FreshSteps = s.FreshSteps
+		nt.RouteClass = strings.ToLower(strings.TrimSpace(s.RouteClass))
+		if nt.RouteClass != "" && nt.RouteClass != routeClassGeneral && nt.RouteClass != routeClassBackend {
+			return ids, fmt.Errorf("产出任务 %q: 未知 route_class %q（可选 general/backend）", title, s.RouteClass)
+		}
+		if err := validateNewTaskRouteClass(cfg, nt); err != nil {
+			return ids, fmt.Errorf("产出任务 %q: %w", title, err)
+		}
 		// 协调可把填充类任务钉在 codex 上（独立 GPT 额度）；形状不合规则忽略指定。
 		if s.Runner == "codex" {
 			nt.PreferRunner = "codex"
+			nt.RunnerExplicit = true
 			if !codexEligible(nt) {
 				nt.PreferRunner = ""
 			}
@@ -2704,8 +3606,17 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		}
 		if validEfforts[s.Effort] {
 			nt.Effort = s.Effort
+			nt.EffortExplicit = true
+		}
+		if s.Model != "" && s.CodexModel != "" {
+			if err := validateExplicitCodexRoute(cfg, nt); err != nil {
+				return ids, fmt.Errorf("产出任务 %q: %w", title, err)
+			}
 		}
 		nt.SessionID = s.SessionID
+		if s.Runner == "" {
+			preserveSessionRunner(nt)
+		}
 		if parent.EmitHold {
 			nt.Status = statusHeld
 		}
@@ -2714,7 +3625,7 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		}
 		// emit 出的每张子卡都记 queued 起点，parent 指针留在 detail 里。
 		emitTaskEvent(root, nt.ID, evQueued, "runner:emit", statusQueued, 0, map[string]any{
-			"parent": parent.ID, "type": typ, "emit_hold": parent.EmitHold,
+			"parent": parent.ID, "type": typ, "emit_hold": parent.EmitHold, "route_class": nt.RouteClass,
 		})
 		if parent.EmitHold {
 			// EmitHold 意味着新卡立即置 held——先 queued 后 held 忠实反映状态起点与人工待放行的实际语义。

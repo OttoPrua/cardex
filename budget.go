@@ -82,6 +82,9 @@ func appendUsage(root string, cfg *Config, t *Task, u *usageInfo) {
 	if t.Runner == "gemini" {
 		engine = "gemini" // gemini 执行器同引擎待遇：走 Google 订阅额度，不占 claude 红线预算
 	}
+	if t.Runner == "opencode" {
+		engine = "opencode" // OpenCode Go 订阅独立记账，不占 Claude 红线预算
+	}
 	now := time.Now()
 	keep := now.Add(-(windowHours + 1) * time.Hour).Unix()
 	var recs []usageRec
@@ -404,11 +407,11 @@ func fetchOAuthUsage(cfg *Config, now time.Time) (*oauthUsageSample, error) {
 
 // parseOAuthUsageBody 从 body 里挖 5h 窗口的百分比。
 // 端点未文档化 → 用宽松+防御式解析：
-//  - 尝试几种已观察到的字段路径（five_hour / fiveHour / windows[]）；
-//  - 兼容 utilization / used_percent / percent 命名；
-//  - 数值域按字段名硬分派、绝不自动归一（CG-1b）：utilization 认 0-100 域原样取整，
-//    (0,1] 区间刻度歧义拒判；used_percent/usedPercent/percent 铁定 0-100 域原样取，详见 readPercentFields；
-//  - **拿不到就返回 PercentOK=false**（"端点已变更/字段缺失/值歧义"=数据不足，不猜、不用 header 兜底）。
+//   - 尝试几种已观察到的字段路径（five_hour / fiveHour / windows[]）；
+//   - 兼容 utilization / used_percent / percent 命名；
+//   - 数值域按字段名硬分派、绝不自动归一（CG-1b）：utilization 认 0-100 域原样取整，
+//     (0,1] 区间刻度歧义拒判；used_percent/usedPercent/percent 铁定 0-100 域原样取，详见 readPercentFields；
+//   - **拿不到就返回 PercentOK=false**（"端点已变更/字段缺失/值歧义"=数据不足，不猜、不用 header 兜底）。
 func parseOAuthUsageBody(body []byte, now time.Time) (*oauthUsageSample, error) {
 	if !json.Valid(body) {
 		return nil, fmt.Errorf("响应不是有效 JSON")
@@ -491,9 +494,12 @@ func isFiveHourWindow(name, kind string, mins int) bool {
 // 上层应按"数据不足"披露 ambig 拒响应;ok=false 且 ambig 为空:字段全缺失(不构成异常,继续尝试兄弟节点)。
 //
 // 教训1(CG-1):老版做"0-1 视为分数×100、>1 视为百分比原样"的自动归一——在整数刻度崩塌:
-//   * used_percent:0.8 真实语义 0.8%,老版判为分数×100→80% 假触线。
+//   - used_percent:0.8 真实语义 0.8%,老版判为分数×100→80% 假触线。
+//
 // 教训2(CG-1b):端点实测 utilization 是 0-100 百分比域（返回如 54），非 0-1 分数域；
-//   (0,1] 区间存在刻度歧义（旧分数写法 vs 新百分写法），拒判为数据不足。
+//
+//	(0,1] 区间存在刻度歧义（旧分数写法 vs 新百分写法），拒判为数据不足。
+//
 // 新语义：按字段名硬分派、拒绝任何自动归一，任一歧义值一律"数据不足"拒响应（fail-open）。
 func readPercentFields(node map[string]any) (int, bool, string) {
 	for _, key := range []string{"utilization", "used_percent", "usedPercent", "percent"} {
@@ -602,6 +608,7 @@ func readUsageFeedPercent(cfg *Config, now time.Time) percentRead {
 // oauthUsageCache 是进程级样本缓存:
 //  1. 拒 tick 15s 循环每次都打端点(macOS 无凭据文件会每次落 keychain 弹窗,quota 命令并行调用同理);
 //  2. 让 SampledAt/oauth_usage_max_age_min 真正有语义(过去 SampledAt=now→age 恒 0→配置形同虚设=P1-3 死配置)。
+//
 // 复用窗口=oauth_usage_max_age_min(0 用默认 15 分钟,与 quota 展示层的"新鲜度"感知一致)。
 // 重抓失败时保留旧样本:让上层能披露"上一样本过期+重抓失败"而不是骤然回退到"完全无数据"。
 type oauthUsageCacheState struct {

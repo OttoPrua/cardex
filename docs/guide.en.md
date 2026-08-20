@@ -32,9 +32,18 @@ cardex progress                   # progress overview (a "status" column shows w
 
 **The board doubles as progress**: `cardex list`'s title column shows each task's "title ▸ latest progress" (preferring the status from a pulled progress report, otherwise falling back to an auto-captured summary of the last step's output); `cardex progress` has a dedicated "status" column, and `progress -show <KEY>` is a human-readable render (goal / in-progress / done / remaining / blockers / key files, with the multi-thousand-word handoff prompt folded by default, `-full` to expand) — so you read *where things stand*, not a static title.
 
-**Model routing**: a task carrying a `model` field runs with `--model` (subscription limits are weighted per model, so routing routine work to sonnet/haiku noticeably stretches the 5-hour window). Every add-style command accepts `-model`; a coordinate task's division output auto-suggests a model per task along "mechanical → haiku / routine implementation → sonnet / high-risk → strongest default", and you can set defaults in `type_defaults.*.model`. Leverage inversion: expensive models do only the small-token orchestration and arbitration (coordinate defaults to `opus`); cheap models burn the large-token execution.
+**Model routing**: with `default_runner=codex`, a task's `model` is its source tier and the scheduler resolves
+the current production execution chain: explicit Fable uses Cursor Fable 5; non-backend Opus uses
+Grok→Kimi→Sol; backend Opus uses Grok→Sol; and Sonnet/Haiku use Grok with tier-specific Luna fallbacks.
+The coordinator emits explicit tiers along “hardest adjudication→Fable / ambiguous, long-horizon,
+cross-repository, or high-risk→Opus / complex implementation→Sonnet+xhigh / routine
+implementation→Sonnet+xhigh / mechanical→Haiku+medium.” Source tier and concrete model are recorded
+separately; only cards explicitly resuming an old Claude session keep the Claude runner.
 
-**Design-phase profile (fable designs, codex/opus builds)**: when design quality is the top priority, switch the design trio to the strongest model — set `coordinate` / `design-review` / `prompt-assembly`'s model to `"claude-fable-5"` in `type_defaults`. The coordinate template then assigns a model to each emitted task along "design → `claude-fable-5`, implementation → prefer `runner:"codex"` (GPT-5.5, high-reasoning, its own independent quota, `model` left empty), mechanical → `sonnet`, trivial → `haiku`", reserving `opus` only for cards that genuinely need the Claude ecosystem (sub-agents, MCP tools, or resuming a Claude session). `model_weights` already ships `claude-fable-5` and `fable` at weight 10 by default. Once you enter heavy development, you can dial `design-review` back to `opus` to control spend.
+**Production profile**: assembly, coordination, and routine review retain Opus as their source tier,
+while ordinary `sequence` work defaults to Sonnet. Choose Fable explicitly only for the hardest
+adjudication. The actual model comes from the card's Kimi/Grok/Codex fields and dispatch event;
+`model_weights` still serves Claude/third-party quota accounting.
 
 **In-session sub-layering (sub-agents)**: `sequence` tasks whitelist the Task tool by default, so paired with user-level sub-agents (`~/.claude/agents/deep-reasoner.md` bound to opus, `fast-worker.md` bound to sonnet) an executing session can hand hard reasoning up and push mechanical labor down — routing by task across sessions and by stage within a session, two layers stacked.
 
@@ -430,9 +439,153 @@ The scheduler itself is pure Go and spends no quota — a limit only makes tasks
 - The board and logs label `[codex]` / `runner=codex`, and the emit/progress-parsing pipeline works as usual (coordinate can keep enqueuing splits even during a cooldown);
 - Reasoning effort is tunable via `codex_reasoning` (minimal/low/medium/high/xhigh), passed as `-c model_reasoning_effort=…`.
 
-**Downgrade-specific model and tier-parity rule (`codex_fallback_model`)**: when `codex_fallback` is active and a claude card is rerouted to codex, `codex_fallback_model` takes priority over the global `codex_model`. Tier-parity mapping: **opus-tier cards downgrade to the same-tier terra (o3), not the design-tier sol (GPT-5)** — design-tier doesn't go fill implementation-tier roles. Empty falls back to `codex_model`; this key only applies to the downgrade path (task `runner_pref≠codex` and not remote) — codex-primary cards and remote codex are unaffected.
+**Downgrade-specific model and tier rule**: when `codex_fallback` is active, Opus-tier Claude cards
+first use `codex_fallback_opus_model` / `codex_fallback_opus_reasoning` (default
+`gpt-5.6-sol` + `xhigh`, with no automatic downgrade for `stakes=low`), then the
+generic `codex_fallback_model`, and finally the global
+`codex_model`. Explicit card-level `-codex-model` / `-effort` settings still win. These keys apply
+only to the downgrade path (task `runner_pref≠codex` and not remote); codex-primary cards and remote
+codex are unaffected.
 
-**Pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
+`codex_opus_simple_model` / `codex_opus_simple_reasoning` remain available as an explicit opt-in.
+They are empty by default and in production; structured `stakes=low` Opus cards only downgrade if
+both fields are deliberately configured later.
+
+The Owner table has exactly six rows: explicit Fable→Cursor Fable 5/thinking-max; only after a confirmed
+eligible Fable quota-limit do read-only Grok 4.6/xhigh and Sol/ultra produce independent answers serially
+before a fresh Sol/max run merges from first principles; non-backend Opus→Grok 4.6/xhigh→Kimi K3/max→Sol/xhigh;
+backend Opus→Grok 4.6/xhigh→Sol/max; Sonnet→Grok 4.6/high→Luna/max; and Haiku→Grok 4.6/high→Luna/xhigh.
+Implementation cards do not automatically append a review. Standalone `design-review` cards go directly
+to a fresh Sol/max session and reviews do not recurse.
+Ambiguous, long-horizon, cross-repository, or high-risk work is promoted to Opus;
+both routine and well-bounded complex implementation use Sonnet/xhigh; only the hardest adjudication
+sets `effort=max`. Every Codex `dispatched` event records the resolved `codex_model` and
+`codex_reasoning`, so later comparisons group by the model combination that actually ran rather than
+the card's source-tier alias.
+
+**All-day Kimi Code CLI/K3 second leg**: with `kimi_cli_opus.enabled=true`, an eligible non-backend
+default-Codex Opus card starts on Grok 4.6/xhigh and advances to the locally authenticated Kimi Code CLI
+only after an eligible non-auth Grok failure passes the complete proof gate. Production pins
+`kimi-code/k3`; max is injected only into that child process through the CLI's official
+`KIMI_MODEL_THINKING_EFFORT` variable. Backend work bypasses Kimi and runs directly on Grok 4.6/xhigh.
+The owner definition of backend covers service, persistence, protocol, database, network execution,
+identity/credential, manifest/launchd, Control/authority, and live cutover. With
+`owner_routing_enforced=true`, every new `sequence` card must declare `route_class=backend|general`
+(`-route-class` on the CLI, `route_class` in emitted JSON); omission fails before enqueue. Explicit values
+are authoritative; text inference is only a compatibility path for eligible implementation/sequence
+cards whose value is empty.
+
+Except for normal successful A→B→merge stage progression inside an already-created Fable chain,
+every fallback next leg is queued only for quota, transport failure, stream-incomplete, semantic stall/timeout,
+invalid terminal result, or a presemantic execution-environment error that explicitly identifies the
+`.grok`/`GROK_HOME`/Grok session store, and only after Cardex proves all three conditions: zero semantic/model/tool
+events; an identical pre/post product-worktree fingerprint including exact Git index bytes, pre-existing
+dirty/untracked bytes, modes, empty directories, symbolic HEAD, and linked-worktree Git identity; and no surviving writer/process residue. Missing or mismatched proof follows the existing
+retry/held policy and never falls back. Legs are serial. A cooldown makes the current leg wait; it is not
+provider-availability evidence and cannot skip a leg. Remote cards, cross profiles, established sessions,
+and manual runner/model pins remain outside auto-routing. Only tasks carrying a frozen
+`owner_route_name` + `owner_route_leg` whose provider fields still match continue through the same proof
+gate; `route_reason` alone never revives an old chain or overrides a later explicit pin/session/remote identity.
+Managed launchd units should also set `CARDEX_REQUIRE_OWNER_ROUTING=1`, making removal of the config flag
+fail startup rather than silently restoring legacy policy.
+A card carrying Kimi session state waits for its own lane because that context cannot
+be transferred safely across CLIs. The compatible `opencode_night_opus` route remains available for
+other nighttime OpenCode models only in generic mode; Owner-enforced mode disables that legacy automatic
+branch while preserving explicit `-runner opencode` pins.
+
+Provider legs, serial fallback, zero-residue proof, and the standalone Sol/max review identity are mechanically enforced.
+Fable's first-principles/no-presumed-direction method is enforced by prompts, sidecar exposure discipline,
+and merge contract rather than separate OS identities; it is a management-method constraint, not hard
+information isolation.
+
+```json
+"kimi_cli_bin": "/Users/ottoprua/.kimi-code/bin/kimi",
+"kimi_cli_model": "kimi-code/k3",
+"kimi_cli_effort": "max",
+"kimi_cli_opus": {
+  "enabled": true,
+  "exclude_backend": true,
+  "model": "kimi-code/k3",
+  "effort": "max",
+  "limit_fallback_min": 180
+},
+"grok_build_bin": "/Users/ottoprua/.local/bin/grok",
+"grok_build": {
+  "enabled": true,
+  "model": "grok-4.6",
+  "effort": "xhigh",
+  "limit_fallback_min": 180,
+  "kimi_opus_fallback": true,
+  "opus_adversarial_review": false,
+  "codex_fallback_model": "gpt-5.6-sol",
+  "codex_fallback_effort": "xhigh",
+  "review_codex_model": "gpt-5.6-sol",
+  "review_codex_effort": "max",
+  "tier_routes": {
+    "opus_backend": {
+      "effort": "xhigh",
+      "codex_fallback_model": "gpt-5.6-sol",
+      "codex_fallback_effort": "max"
+    },
+    "sonnet": {
+      "effort": "high",
+      "codex_fallback_model": "gpt-5.6-luna",
+      "codex_fallback_effort": "max"
+    },
+    "haiku": {
+      "effort": "high",
+      "codex_fallback_model": "gpt-5.6-luna",
+      "codex_fallback_effort": "xhigh"
+    }
+  }
+}
+```
+
+Grok Build reuses its authenticated `~/.grok` state; Cardex never reads credential values. Sequence cards
+run under the `workspace` OS sandbox with `auto` permissions, while non-implementation cards are forced
+to `read-only` + `plan`. The currently installed Grok 4.6 menu tops out at `xhigh`; `max` is rejected at
+configuration load. Manual probes can use
+`-runner grok-build -grok-model grok-4.6 -grok-effort xhigh`.
+Before every Grok job, Cardex runs `grok --no-auto-update models`. This validates the live login and required
+model list without opening a model session or sending the task prompt. The first trusted 401 holds the root
+card without consuming attempts and opens a 24-hour engine-wide auth circuit. Concurrent followers return
+to the same Grok queue without another probe or an auth-triggered writer fallback. After login, run
+`cardex doctor`; only a successful live probe clears the auth circuit, and an existing quota cooldown is
+preserved. Production should point `grok_build_bin` at an explicit versioned binary. Both the preflight and
+product invocation pass `--no-auto-update`, preventing an unattended dispatch from changing CLI versions.
+The enforced Owner configuration leaves `opus_adversarial_review` disabled. When review is needed, a
+standalone `design-review` card is pinned directly to a fresh Sol/max session; the recursion guard remains.
+
+**Fable 5 exception**: Fable is source-tier opt-in only and its owner primary is Cursor Fable
+5/thinking-max. The older Claude Fable→Grok→advisory proposal is not an owner auto-route. Existing Claude
+sessions and explicit Claude pins keep their identity. Only the unified safety proof may create the
+serial A→B→C chain below.
+
+### Cursor Fable 5 primary route and three-model fallback
+
+The account-specific Cursor model list is authoritative for Fable. The local Codex 0.145.0 model capability
+cache explicitly exposes both `ultra` (maximum reasoning with automatic delegation) and `max` for GPT-5.6 Sol.
+The Fable primary remains `claude-fable-5-thinking-max`; answer B uses Sol/ultra while merge C deliberately
+uses a fresh Sol/max session.
+
+With `cursor_fable.enabled=true`, explicit fresh single-step Fable cards on the default Codex route
+prefer Cursor Fable 5/thinking-max. An explicit multi-step Fable card, or one whose route configuration
+is incomplete, waits in place and never falls through to generic Codex; dispatchers must express a Fable
+adjudication as one fresh prompt. One of the five safe failure kinds plus a complete three-axis proof
+atomically converts the same card into read-only serial Grok Build `grok-4.6/xhigh` then Codex
+`gpt-5.6-sol/ultra` independent answers, followed by a separate fresh Codex `gpt-5.6-sol/max` merger.
+The merger reconstructs goals and constraints from
+first principles and presumes neither answer nor the existing direction is correct. This chain does
+not spawn another ordinary review loop. Cursor auto-review, force, and yolo remain disabled.
+The existing cross-profile freeze contract supplies the Codex identity: B is
+B is `{kind:"codex", effort:"ultra"}` and C is `{kind:"codex", effort:"max"}`; both freeze global
+`codex_model="gpt-5.6-sol"`. A profile-level `model` is a no-op impostor and is rejected at load.
+
+Fable 5 may require the account owner to acknowledge its data-retention policy on first use. Cardex
+does not accept account policy on the owner's behalf; a pre-semantic policy gate can fall back safely,
+but Fable itself is not considered proven until that acknowledgement is completed.
+
+**All other pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
 
 ## Gemini CLI fallback executor (second heterogeneous executor)
 
@@ -620,11 +773,11 @@ lets you tier by the hand you actually hold; **custom entries always beat the st
 
 Where it applies: model tier labels on the board / `cardex list`, engine tiers in
 `cardex engines` / `cardex quota` / the board quota strip (derived from the highest mapped model
-when `tier` isn't set explicitly), and the spend page's top-model tier. **Dispatch routing never
-consumes tiers** — what actually decides which card runs which model is the engine profile's
-`models` slot map plus `fallback_order`; `model_tiers` only aligns display and derivation with
-your fleet's reality. The standard-line table stays (unlisted models fall back to it), and the
-two scales never need to fight: entries you list are your call.
+when `tier` isn't set explicitly), the spend page's top-model tier, and the six-row Owner auto-route.
+That route selects the concrete execution chain from the resolved fable/opus/sonnet/haiku tier, so a
+mapping change changes dispatch for new unpinned cards; existing sessions, remote/cross identities,
+and explicit runner/model pins remain untouched. The standard-line table stays for unlisted models,
+while entries you list are authoritative for this fleet.
 
 ## Per-card stakes tiering (`-stakes` → review-depth lookup table)
 
@@ -643,20 +796,19 @@ The table lives in `config.json`, with defaults for all three tiers:
   "low":    {"review": "off"},                            // never attach a review
   "normal": {"review": "follow"},                          // follow the explicit -review-after (default tier)
   "high":   {"review": "on", "default_effort": "high",     // force a review + thinking-tier floor
-             "max_fix_rounds": 4}                          // one extra fix round (the global default is 3)
+             "max_fix_rounds": 1}                          // one auto-fix; then escalate for human judgment
 }
 ```
 
 - `review` takes `on` / `off` / `follow` (`follow` = don't interfere; keep whatever `-review-after` said);
 - `default_effort` is a **floor, not an override**: it only applies when `-effort` was not given explicitly, and it only raises — a card whose type default is already `max` is never pulled down to `high`;
 - `max_fix_rounds` overrides the global key of the same name for that tier (the round cap on the
-  implement → adversarial-review → auto-fix loop; the global default is 3). The built-in table raises it to
-  **4** for `high` only; `low` and `normal` carry `0`, meaning "follow the global value".
-  **Why only the top tier**: in the `retro-77` sample, 9 of 10 high-effort spec-alignment cards hit the cap of 3
-  and were escalated into a human-adjudication shell — and every one of those shells was later judged empty,
-  with the work simply continuing on a fresh chain. At that tier the cap was not a guardrail but a noise source:
-  it stopped no spinning, it merely made the same work restart on another chain, burning one dispatch and one
-  round of human triage for nothing. Low-value cards should still stop after three rounds, so they are unchanged;
+  implement → adversarial-review → auto-fix loop; the global default is 3). The built-in `high` tier is fixed at
+  **1**: if the review after the first repair still fails, Cardex creates a held human-adjudication card instead of
+  expanding another model loop. `low` and `normal` carry `0`, meaning "follow the global value";
+- automatic review is only eligible for `sequence` implementation cards. Even at high stakes, `design-review`,
+  coordination, assembly, and progress-pull cards have `review_after` cleared at enqueue time, preventing
+  “review the review” chains;
 - an explicit `-effort` always wins over the floor (`-stakes high -effort low` really is `low`): the command line has the final say, otherwise the command line stops being trustworthy;
 - you may specify only some tiers — the rest keep the built-in defaults (keys are merged, the table is not replaced wholesale);
 - **fields you omit inside a tier also fall back to the built-in value for that tier** — JSON merges at key

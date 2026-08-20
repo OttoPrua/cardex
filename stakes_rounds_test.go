@@ -1,12 +1,12 @@
 package main
 
-// stakes 分档修复轮限（retro-77 建议一，2026-08-02 监控 session 终裁采纳）的回归测试。
+// stakes 分档修复轮限的回归测试。
 //
-// 【场景来源】retro-77 样本：10 张高 effort 规格对齐类卡有 9 张撞在全局上限 3 上进人裁壳，
-// 事后均判"壳清、工作在新链继续"——上限对该类卡偏紧。high 档因此放宽到 4，low/normal 不动。
+// 【当前策略】high 实现卡配一次独立复审；若首轮修复后的再审仍不通过，立即转 held 人裁。
+// 多轮自动扩张会把规格歧义误当实现缺陷，并持续消耗高档模型额度。low/normal 仍跟随全局值。
 //
 // 【突变致死设计】本文件的断言全部钉**具体轮数**而非"比全局大"：把 defaultStakesPolicy 里
-// high 档的 4 改成 3 或 5，或把 low/normal 从 0（跟随全局）改成任何非 0 值，都必须报红。
+// high 档的 1 改成其它值，或把 low/normal 从 0（跟随全局）改成任何非 0 值，都必须报红。
 
 import (
 	"os"
@@ -16,12 +16,12 @@ import (
 )
 
 // TestStakesDefaultMaxFixRoundsPinned 钉死内置表的分档轮限取值本身。
-// 【突变致死】defaultStakesPolicy 的 high 档 MaxFixRounds 改成 3/5 → 红；
+// 【突变致死】defaultStakesPolicy 的 high 档 MaxFixRounds 改成其它值 → 红；
 // low/normal 补上任何非 0 值 → 红（它们必须留 0 = 跟随全局，否则改全局配置对低档位失效）。
 func TestStakesDefaultMaxFixRoundsPinned(t *testing.T) {
 	p := defaultStakesPolicy()
-	if got := p[stakesHigh].MaxFixRounds; got != 4 {
-		t.Errorf("high 档内置 max_fix_rounds = %d, 应为 4（retro-77 终裁：高档位放宽一轮）", got)
+	if got := p[stakesHigh].MaxFixRounds; got != 1 {
+		t.Errorf("high 档内置 max_fix_rounds = %d, 应为 1（一次自动修复后转人裁）", got)
 	}
 	for _, tier := range []string{stakesLow, stakesNormal} {
 		if got := p[tier].MaxFixRounds; got != 0 {
@@ -40,11 +40,11 @@ func TestApplyStakesPinsMaxFixRounds(t *testing.T) {
 		stakes    string
 		want      int
 	}{
-		{"high 档取分档值 4（不是全局 3）", 0, stakesHigh, 4},
+		{"high 档取分档值 1（不是全局 3）", 0, stakesHigh, 1},
 		{"normal 档跟随全局默认 3", 0, stakesNormal, 3},
 		{"low 档跟随全局默认 3", 0, stakesLow, 3},
 		{"normal 档跟随显式全局值", 7, stakesNormal, 7},
-		{"high 档的分档值压过全局值", 7, stakesHigh, 4},
+		{"high 档的一轮上限压过全局值", 7, stakesHigh, 1},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -87,15 +87,15 @@ func TestStakesRuleMaxFixRoundsFieldLevelFallback(t *testing.T) {
 		}
 	})
 
-	t.Run("只写 default_effort: max_fix_rounds 回落内置 4 而非缩回全局 3", func(t *testing.T) {
+	t.Run("只写 default_effort: max_fix_rounds 回落内置 1 而非全局 3", func(t *testing.T) {
 		cfg := defaultConfig("claude")
 		cfg.StakesPolicy = map[string]StakesRule{stakesHigh: {DefaultEffort: "xhigh"}}
 		task := &Task{}
 		if err := applyStakes(task, cfg, stakesHigh, false); err != nil {
 			t.Fatalf("applyStakes: %v", err)
 		}
-		if task.MaxFixRounds != 4 {
-			t.Errorf("分档轮限被部分覆写打掉: %d, 应回落内置 high 档的 4", task.MaxFixRounds)
+		if task.MaxFixRounds != 1 {
+			t.Errorf("分档轮限被部分覆写打掉: %d, 应回落内置 high 档的 1", task.MaxFixRounds)
 		}
 	})
 
@@ -106,8 +106,8 @@ func TestStakesRuleMaxFixRoundsFieldLevelFallback(t *testing.T) {
 		if err := applyStakes(task, cfg, stakesHigh, false); err != nil {
 			t.Fatalf("applyStakes: %v", err)
 		}
-		if task.MaxFixRounds != 4 {
-			t.Errorf("stakes_policy=null 时分档轮限应回落内置 4, got %d", task.MaxFixRounds)
+		if task.MaxFixRounds != 1 {
+			t.Errorf("stakes_policy=null 时分档轮限应回落内置 1, got %d", task.MaxFixRounds)
 		}
 	})
 }
@@ -141,19 +141,18 @@ func TestLoadConfigPartialHighTierKeepsWidenedRounds(t *testing.T) {
 	if err := applyStakes(task, cfg, stakesHigh, false); err != nil {
 		t.Fatalf("applyStakes: %v", err)
 	}
-	if task.MaxFixRounds != 4 {
-		t.Errorf("部分覆写 high 档后分档轮限失效: %d, 应为 4", task.MaxFixRounds)
+	if task.MaxFixRounds != 1 {
+		t.Errorf("部分覆写 high 档后分档轮限失效: %d, 应为 1", task.MaxFixRounds)
 	}
 }
 
 // ---- 端到端：修复闭环真的按卡面轮限截断 ----
 
-// TestFixLoopHonorsPinnedRoundLimit 是本功能的承重测试：R4 这一轮，钉了 4 轮的高档卡必须继续派
-// 修复卡，钉了 3 轮的普通卡必须挂升级卡。两个分支同时断言才能锁死"分档确实生效且只对高档生效"。
+// TestFixLoopHonorsPinnedRoundLimit 是卡面轮限优先级的承重测试：即使生产默认是一轮，历史卡或
+// 显式配置仍可能钉成其它值；执行期必须严格尊重卡面，而不是偷偷回查当前全局配置。
 //
-// 【突变致死】把 defaultStakesPolicy 的 high 档 MaxFixRounds 改成 3 → high 子例挂升级卡，报红；
-// 改成 5 → normal 子例不受影响但 high 子例的 R5 边界（下一个子测试）报红；
-// 把 runner 的 taskMaxFixRounds(orig,…) 换回 cfg.MaxFixRounds → high 子例报红。
+// 【突变致死】把 runner 的 taskMaxFixRounds(orig,…) 换回 cfg.MaxFixRounds，会让所有自定义钉值
+// 子例报红。
 func TestFixLoopHonorsPinnedRoundLimit(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -161,10 +160,10 @@ func TestFixLoopHonorsPinnedRoundLimit(t *testing.T) {
 		round        int // 被审卡已完成的轮次；本次判定为 round+1
 		wantEscalate bool
 	}{
-		{"高档卡钉 4 轮: R4 仍派修复卡", 4, 3, false},
-		{"高档卡钉 4 轮: R5 才挂升级卡", 4, 4, true},
-		{"普通卡钉 3 轮: R4 挂升级卡", 3, 3, true},
-		{"普通卡钉 3 轮: R3 仍派修复卡", 3, 2, false},
+		{"卡面钉 4 轮: R4 仍派修复卡", 4, 3, false},
+		{"卡面钉 4 轮: R5 才挂升级卡", 4, 4, true},
+		{"卡面钉 3 轮: R4 挂升级卡", 3, 3, true},
+		{"卡面钉 3 轮: R3 仍派修复卡", 3, 2, false},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

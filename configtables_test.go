@@ -26,12 +26,15 @@ func TestConfigMapTablesRegistered(t *testing.T) {
 		"stakes_policy": "命中: 档内留空字段由 stakesRule 回落内置表(TestStakesRuleFieldLevelFallback)",
 		"type_defaults": "命中: 条目内留空字段由 typeDefaultsFor 回落内置表(TestTypeDefaultsFieldLevelFallback)",
 		// 判定为不命中，各自的判据在下方测试里钉住：
-		"cross_profiles": "不命中: 零值引擎 kind 为空 → applyCrossEngine 报错(TestCrossProfilePartialOverrideFailsLoudly)",
-		"remote_hosts":   "不命中: 内置表不预置任何主机, 无内置值可被截断(TestDefaultConfigShipsNoBuiltinRemoteHosts)",
-		"model_weights":  "不命中: 值是标量无档内字段; 键缺失有 default 与硬兜底(TestModelWeightSurvivesTruncatedTable)",
-		"engines":        "不命中: 内置表不预置任何引擎条目, 无内置值可被截断(TestDefaultConfigShipsNoBuiltinEngines); 档内缺字段全落保守默认或载入即拒(TestValidateEnginesRejectsBadConfigs/TestEngineProfileZeroFieldsFailClosed)",
-		"model_tiers":    "不命中: 值是标量档位关键字无档内字段; 内置表不预置条目, 缺键回落内置标准线, 坏值载入即拒(TestModelTiersCustomOverride/TestModelTiersValidation)",
-		"gemini_models":  "不命中: 值是标量模型串无档内字段; 非空即整表生效(空表才用内置槽默认), 缺槽向下档回落并披露, 终兜底 gemini_model/内置 pro 永不落空(TestResolveGeminiModelSlotFallback); 坏键载入即拒(TestValidateGeminiRejectsBadConfigs)",
+		"cross_profiles":       "不命中: 零值引擎 kind 为空 → applyCrossEngine 报错(TestCrossProfilePartialOverrideFailsLoudly)",
+		"remote_hosts":         "不命中: 内置表不预置任何主机, 无内置值可被截断(TestDefaultConfigShipsNoBuiltinRemoteHosts)",
+		"model_weights":        "不命中: 值是标量无档内字段; 键缺失有 default 与硬兜底(TestModelWeightSurvivesTruncatedTable)",
+		"engines":              "不命中: 内置表不预置任何引擎条目, 无内置值可被截断(TestDefaultConfigShipsNoBuiltinEngines); 档内缺字段全落保守默认或载入即拒(TestValidateEnginesRejectsBadConfigs/TestEngineProfileZeroFieldsFailClosed)",
+		"model_tiers":          "不命中: 值是标量档位关键字无档内字段; 内置表不预置条目, 缺键回落内置标准线, 坏值载入即拒(TestModelTiersCustomOverride/TestModelTiersValidation)",
+		"gemini_models":        "不命中: 值是标量模型串无档内字段; 非空即整表生效(空表才用内置槽默认), 缺槽向下档回落并披露, 终兜底 gemini_model/内置 pro 永不落空(TestResolveGeminiModelSlotFallback); 坏键载入即拒(TestValidateGeminiRejectsBadConfigs)",
+		"opencode_models":      "不命中: 值是标量 provider/model 串无档内字段; 缺槽回落 opencode_model，任务级钉定优先(TestResolveOpenCodeModel)",
+		"codex_tier_models":    "不命中: 值是标量模型串无档内字段; loadConfig 从内置槽位 map 起手按键合并, 缺键保留内置映射, 空/坏值由解析回落旧单值字段(TestResolveCodexModel)",
+		"codex_tier_reasoning": "不命中: 值是标量 effort 串无档内字段; loadConfig 按键合并缺键保留内置映射, 缺档由 resolveCodexReasoning 回落任务/全局 effort(TestResolveCodexReasoning)",
 	}
 
 	found := map[string]bool{}

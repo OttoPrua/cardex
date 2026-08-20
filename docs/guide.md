@@ -33,15 +33,16 @@ cardex progress             # 进度一览（“现状”列看进展）；-show
 
 **看板即进度**：`cardex list` 的标题列显示每个任务的「标题 ▸ 最新进度」（优先取已回收进度报告的现状，没有则回落到最近一步输出的自动摘要）；`cardex progress` 列表带独立的「现状」列，`progress -show <KEY>` 改为人读渲染（目标/进行中/完成/剩余/阻塞/关键文件，几千字接力 prompt 默认折叠、`-full` 展开）——一眼读出进展，不再是静态标题。
 
-**模型路由**：任务带 `model` 字段则以 `--model` 执行（订阅限额按模型加权，例行工作路由到
-sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-model`，协调任务的分工输出里
-按"机械→haiku / 常规实现→sonnet / 高风险→默认最强"自动建议，也可在 `type_defaults.*.model` 配默认值。
-杠杆倒置原则：贵模型只做小 token 量的编排与仲裁（coordinate 默认 opus），便宜模型烧大 token 量的执行。
+**模型路由**：在 `default_runner=codex` 下，任务的 `model` 是来源档位，调度器再按当前生产策略解析
+实际执行链：显式 Fable 走 Cursor Fable 5；非后端 Opus 走 Grok→Kimi→Sol；后端 Opus 走
+Grok→Sol；Sonnet/Haiku 走 Grok→对应 Luna 回退。
+协调模板按"最难裁决→Fable / 模糊长程跨仓高风险→Opus / 复杂落地→Sonnet+xhigh /
+常规落地→Sonnet+xhigh / 机械→Haiku+medium"显式发卡。来源档位和实际模型分开记录；只有明确续接
+旧 Claude session 的卡保留 Claude 执行器。
 
-**设计期 profile（fable 出设计、opus 落地）**：设计质量为第一优先级的阶段，把设计三件套切到最强模型——
-`type_defaults` 里 coordinate / design-review / prompt-assembly 的 model 设为 `"claude-fable-5"`，
-协调模板会按"设计→fable、落地→opus、机械→sonnet、琐碎→haiku"给产出任务指派模型；
-`model_weights` 默认已带 `"claude-fable-5": 10`（`fable` 同权重）。进入密集开发期后可把 design-review 回调到 opus 控制消耗。
+**生产 profile**：装配、协调和例行审核仍以 Opus 作为来源档位，普通 `sequence` 默认 Sonnet；只有
+最难裁决才显式选择 Fable。实际模型以卡面的 Kimi/Grok/Codex 字段及派发事件为准，
+`model_weights` 仍用于 Claude/第三方引擎的额度账本。
 
 **会话内再分层（子 agent）**：`sequence` 任务默认放行 Task 工具，配合用户级子 agent
 （`~/.claude/agents/deep-reasoner.md` 绑 opus、`fast-worker.md` 绑 sonnet），执行会话可以把
@@ -431,9 +432,140 @@ progress-pull 2——相差 28 倍**，多步卡（112）又是单步卡（41）
 - 沙箱按类型收窄：`sequence` 落码卡走 `--sandbox workspace-write`；只读类任务(design-review/crosscheck/coordinate/progress-pull)默认建**一次性隔离副本 + `--sandbox workspace-write`**(CG-R3 承 BD-36 工具链③终裁 b, BD-39 附记 2026-07-24)——副本落 `<root>/tmp/codex-review-work/<taskID>-<pid>-<nano>/`,承载 dirty+untracked 面,复审可跑测试/写夹具做动态验证;卡结束即删,崩溃残留由 tick 对账清(pid 死透 + taskID 不在 activeIDs 双条件);原仓永不受写污染(硬语义)。建副本阶段(探测/clone/apply/拷贝)跑在 `min(step_timeout, 10min)` 的独立子预算内(CG-R3b):git 子进程超时即整组击杀,拷贝腿**每个文件边界**查一次子预算、到期即止,且**从不打开非常规文件**(FIFO/socket/设备跳过;symlink 按链接本体复制、不跟随——否则一条指向无写端管道的 untracked 链接就能让 `open` 永久阻塞,把整条泳道占死且任何取消都解不开)。任一腿卡住都回落 `read-only` 继续跑,事件账本落 `codex_review_prepare_timeout` 留痕——降级而非把整条泳道堵死。`config.json` 加 `"codex_review_sandbox": "readonly"` 可回落旧的只读行为(退失去动态验证力)。远端复审同治:远端镜像本身已是影本,默认也放宽到 `workspace-write`。
 - 看板与日志标注 `[codex]` / `runner=codex`，emit/进度解析管线照常工作（协调分工在冷却期也能继续入队）。
 
-**降级专用模型与档位对等规则（`codex_fallback_model`）**：`codex_fallback` 生效时若 claude 卡被改道 codex，优先用 `codex_fallback_model`，而非全局 `codex_model`。档位对等映射：**opus 档降级首选同档的 terra（o3），不降设计档的 sol（GPT-5）**——设计档不去干实现档的活。空值回退 `codex_model`；此键仅对降级径（任务 `runner_pref≠codex` 且非远端）生效，codex 主跑卡与远端 codex 不受影响。
+**降级专用模型与档位规则**：`codex_fallback` 生效时，Opus 档 claude 卡优先使用
+`codex_fallback_opus_model` / `codex_fallback_opus_reasoning`（默认 `gpt-5.6-sol` + `xhigh`，不因
+`stakes=low` 自动降档），再回落按档位槽位与通用
+`codex_fallback_model`，最后才是全局 `codex_model`。卡级显式
+`-codex-model` / `-effort` 仍优先；这些键仅对降级径（任务 `runner_pref≠codex` 且非远端）生效，
+codex 主跑卡与远端 codex 不受影响。
 
-**钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
+`codex_opus_simple_model` / `codex_opus_simple_reasoning` 是保留的显式可选开关，默认与当前生产均为空；
+只有以后主动填写时，结构化 `stakes=low` 的 Opus 才会降档。
+
+生产路由严格为六行：显式 Fable→Cursor Fable 5/thinking-max；仅在确认的 eligible Fable quota-limit 失败后串行取得
+只读 Grok 4.6/xhigh 与 Sol/ultra 两份独立答案，再由全新 Sol/max 第一性合并；Opus 非 backend
+→Grok 4.6/xhigh→Kimi K3/max→Sol/xhigh；Opus backend→Grok 4.6/xhigh→Sol/max；
+Sonnet→Grok 4.6/high→Luna/max；Haiku→Grok 4.6/high→Luna/xhigh。实现卡不自动追加复审；
+单独 `design-review` 卡直达新的 Sol/max 会话，复审卡本身不再递归复审。
+模糊、长程、跨仓或高风险任务升到 Opus；边界明确的复杂与常规实现都用 Sonnet/xhigh；只有最难
+裁决才显式写 `effort=max`。每次 Codex 派发还会在 `dispatched` 事件里记录最终解析出的
+`codex_model` / `codex_reasoning`，因此后续比较按真实执行组合而不是卡面别名统计。
+
+**全时段 Kimi Code CLI/K3 第二腿**：配置 `kimi_cli_opus.enabled=true` 后，调度器先把默认 Codex 且
+可无损回退的非后端 Opus 单步/`fresh_steps` 卡派给 Grok 4.6/xhigh；只有 Grok 的合格非鉴权失败通过完整证明闸后，同一张卡才推进到本地已登录的 Kimi Code CLI。生产模型显式钉
+`kimi-code/k3`；`max` 通过 CLI 官方 `KIMI_MODEL_THINKING_EFFORT` 只注入该子进程，不改用户全局配置。
+backend 卡不进入 Kimi，而由 Grok 4.6/xhigh 直接承接。Fable 的 transport/stream/stall 等非配额失败保持 held；除已由确认配额触发的 Fable 链内 A 成功→B 成功→merge
+的正常串行阶段推进外，所有 fallback 下一腿都只在 quota、transport、
+stream-incomplete、semantic stall/timeout、invalid terminal result，或明确指向 `.grok`/`GROK_HOME`/Grok session
+存储的 presemantic execution-environment 失败后进入，而且必须由 Cardex 同时证明：
+零语义/模型/工具事件；调用前后 product/worktree 指纹完全相同（包括 Git index 原始字节、调用前已经
+dirty 的 tracked/untracked 字节、权限位、空目录、symbolic HEAD 与 linked-worktree Git 身份）；没有存活 writer/process residue。证明缺失或不一致就沿既有 retry/held 策略
+fail closed，绝不 fallback。各腿严格串行；已有 cooldown 只让本腿等待，不能被当成“provider 不可用”
+而跳腿。Sonnet 和 Haiku 分别直派 Grok 4.6/high，安全失败后回退 Luna/max 与 Luna/xhigh；远端卡、
+交叉链、显式 runner/model pin 与已有会话都不自动改道。
+
+开启 `owner_routing_enforced=true` 后，新 `sequence` 卡必须显式写 `route_class=backend|general`
+（命令行为 `-route-class`，协调 emit JSON 用 `route_class`）；缺失会在入队前失败。backend 的 Owner 定义是 service、persistence、protocol、database、network execution、
+identity/credential、manifest/launchd、Control/authority 与 live cutover（服务、持久化、协议、数据库、
+网络执行、身份/凭据、清单/launchd、Control/权限、在线切换）。显式值恒权威；空值只为存量卡保留，
+且调度器仅对 eligible implementation/sequence 卡做确定性文本兼容判定；误命中可显式标成 `general`。人工测试可在任意时段显式使用
+`-runner kimi-cli -kimi-model kimi-code/k3 -effort max`；人工显式 pin 保持原身份；只有 Cardex 已用
+`owner_route_name` + `owner_route_leg` 快照且当前 provider 字段仍精确匹配的在途腿才继续受同一证明闸控制；
+`route_reason` 单独不能恢复旧链，后加的显式 pin/session/remote 身份优先。受管 launchd 还应设置
+`CARDEX_REQUIRE_OWNER_ROUTING=1`；这样删除/关闭配置键会让 board/tick 启动失败，而不是静默退回旧策略。
+认证、权限、输入等不在安全失败白名单中的错误继续按原分类规则挂起/失败；
+带 Kimi 会话且不能无损跨 CLI 的卡仍等待本车道恢复。兼容的
+`opencode_night_opus` 仅在通用模式可用于其它 OpenCode 夜间模型；Owner 强制模式完全禁用这条旧自动分支，
+显式 `-runner opencode` 仍保持人工 pin。
+
+路由腿、串行回退、零残留证明和独立审核卡 Sol/max 身份是机械强制；Fable 的“第一性、不预设原方案
+正确”由独立 prompt/侧车暴露纪律与合并契约执行，并不是独立 OS 身份提供的硬信息隔离，审计时必须按
+管理方法约束表述，不能宣称为物理隔离。
+
+```json
+"kimi_cli_bin": "/Users/ottoprua/.kimi-code/bin/kimi",
+"kimi_cli_model": "kimi-code/k3",
+"kimi_cli_effort": "max",
+"kimi_cli_opus": {
+  "enabled": true,
+  "exclude_backend": true,
+  "model": "kimi-code/k3",
+  "effort": "max",
+  "limit_fallback_min": 180
+},
+"grok_build_bin": "/Users/ottoprua/.local/bin/grok",
+"grok_build": {
+  "enabled": true,
+  "model": "grok-4.6",
+  "effort": "xhigh",
+  "limit_fallback_min": 180,
+  "kimi_opus_fallback": true,
+  "opus_adversarial_review": false,
+  "codex_fallback_model": "gpt-5.6-sol",
+  "codex_fallback_effort": "xhigh",
+  "review_codex_model": "gpt-5.6-sol",
+  "review_codex_effort": "max",
+  "tier_routes": {
+    "opus_backend": {
+      "effort": "xhigh",
+      "codex_fallback_model": "gpt-5.6-sol",
+      "codex_fallback_effort": "max"
+    },
+    "sonnet": {
+      "effort": "high",
+      "codex_fallback_model": "gpt-5.6-luna",
+      "codex_fallback_effort": "max"
+    },
+    "haiku": {
+      "effort": "high",
+      "codex_fallback_model": "gpt-5.6-luna",
+      "codex_fallback_effort": "xhigh"
+    }
+  }
+}
+```
+
+Grok Build 使用自身已登录的 `~/.grok`，Cardex 不读取认证值。`sequence` 卡以 `workspace` OS 沙箱和
+`auto` 权限运行；审核/协调等非落码卡强制 `read-only` + `plan`。当前本机 Grok 4.6 的最高菜单档是
+`xhigh`，配置 `max` 会在加载时直接拒绝。显式人工测试可用
+`-runner grok-build -grok-model grok-4.6 -grok-effort xhigh`。
+Cardex 在每次 Grok 任务前先执行 `grok --no-auto-update models`：它只验证实时登录态和所需模型清单，
+不创建模型会话、不发送任务 prompt。首个可信 401 会不烧 attempts 地挂起根因卡，并打开 24 小时
+引擎级认证熔断；同一批并发跟随卡只回到原 Grok 队列，不重复探针，也不因认证问题切换 writer。
+重新登录后运行 `cardex doctor`；只有实时预检成功才解除认证熔断，已有额度冷却不会被误清。生产配置
+建议让 `grok_build_bin` 指向明确的版本化二进制；Cardex 的预检和产品调用都传 `--no-auto-update`，
+避免无人值守任务在派发途中换版本。
+当前 Owner 强制配置关闭 `opus_adversarial_review`；需要复审时使用单独 `design-review` 卡，resolver
+将它直接钉到新的 Sol/max 会话，并沿用防递归门禁。
+
+**Fable 5 特例**：Fable 只接受显式来源档位，并由 Cursor Fable 5/thinking-max 主跑；旧的
+Claude Fable→Grok→补盲提案不属于 Owner 自动路由。已有 Claude 会话或人工 Claude pin 保持原身份，
+不能借 Fable 标签切到新链。Cursor 主腿只有在统一安全证明闸通过后才创建下述 A→B→C 串行链。
+
+### Cursor Fable 5 主路由与三模型回退
+
+本机 Cursor Agent CLI 的账号模型清单是 Fable 能力真源；本机 Codex 0.145.0 模型能力缓存则明确
+列出 GPT-5.6 Sol 的 `ultra`（最大推理并自动任务委派）与 `max`。Fable 主腿固定
+`claude-fable-5-thinking-max`；独立答案 B 使用 Sol/ultra，合并 C 刻意使用新的 Sol/max 会话。
+
+`cursor_fable.enabled=true` 后，默认 Codex 路由中显式 Fable、无会话、首步且单步的卡优先走
+Cursor Fable 5/thinking-max。fresh 多步或配置不完整的显式 Fable 卡会原地等待，绝不落到通用 Codex
+偷换主腿；dispatcher 必须把 Fable 裁决做成只有一个 prompt 的 fresh 卡。若遇到五类安全失败之一且
+三轴证明全部通过，同一母卡原子转换为：
+
+1. Grok Build `grok-4.6/xhigh` 独立作答；
+2. Codex `gpt-5.6-sol/ultra` 在看不到 A 结论的情况下只读独立作答；
+3. 全新的 Codex `gpt-5.6-sol/max` 会话作为第三方，从零重建目标和约束，对两份答案同时证伪并合并。
+
+第三腿不会默认 A、B 或既有方向正确，也不会再生成普通 `review_after` 或旧的第一性补盲卡，避免
+复审重复。Cursor 调用保持 `--auto-review`、`--force`、`--yolo` 全关闭；A/B 均为只读分析卡。
+交叉 profile 的 Codex 腿沿用既有冻结契约：B 写 `{kind:"codex", effort:"ultra"}`，C 写
+`{kind:"codex", effort:"max"}`，二者都从全局 `codex_model="gpt-5.6-sol"` 冻结；profile 的
+`model` 是无效伪覆盖，配置加载会直接拒绝。
+Fable 5 首次调用可能要求账号所有者在 Cursor 中确认该模型的数据保留政策；Cardex 不代签。门禁发生在
+语义事件前时，本卡可无损进入上述三腿链，但直到所有者确认前，不能声称 Fable 主模型已实际跑通。
+
+**其余钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
 
 ## Gemini CLI 备用执行器（第二异构执行器）
 
@@ -593,10 +725,10 @@ gemini-3.5-flash-lite = 36 / gemini-2.5-pro = 26（haiku 档）。
 ```
 
 生效面：看板/`cardex list` 的模型档位标签、`cardex engines`/`cardex quota`/看板额度条的
-引擎档位（未显式写 `tier` 时从最高档映射模型自动推导）、消耗页的主力模型档位。
-**派发路由不吃档位**——真正决定"哪张卡跑哪个模型"的是引擎档案里的 `models` 槽位映射与
-`fallback_order`，`model_tiers` 只管把展示与推导对齐到你的机队现实；统一标准线表仍在
-（未列条目回落它），两套口径孰是孰非不需要争：你列的条目就是你的口径。
+引擎档位（未显式写 `tier` 时从最高档映射模型自动推导）、消耗页的主力模型档位，以及 Owner
+六行自动路由。后者按解析出的 fable/opus/sonnet/haiku 选择真实执行链，所以修改映射会改变未显式
+pin 新卡的派发；已有 session、remote、cross profile 与显式 runner/model pin 仍保持原身份。
+统一标准线表仍在（未列条目回落它），你列出的条目就是本机队的权威口径。
 
 ## 卡级投入产出分档（`-stakes` → 复核深度查表）
 
@@ -617,17 +749,17 @@ cardex add -dir ~/proj "常规改动"                                  # 缺省 
   "low":    {"review": "off"},                            // 强制不配复审
   "normal": {"review": "follow"},                         // 跟随 -review-after 的显式指定（缺省档）
   "high":   {"review": "on", "default_effort": "high",    // 强制配复审 + 思考档地板
-             "max_fix_rounds": 4}                         // 修复轮限放宽一轮（全局是 3）
+             "max_fix_rounds": 1}                         // 自动修一次；再审不通过转人工
 }
 ```
 
 - `review` 取值 `on` / `off` / `follow`（`follow` = 不干预，保留 `-review-after` 的原值）；
 - `default_effort` 是**地板不是覆盖**：只在没显式给 `-effort` 时生效，且只抬不降——类型默认已经是 `max` 的卡不会被拉低到 `high`；
 - `max_fix_rounds` 按档覆盖全局的同名配置（"实现→对抗审核→自动修复"闭环的轮次上限，全局缺省 3）。
-  内置默认只在 `high` 档抬到 **4**，`low` / `normal` 写 `0`（= 跟随全局）。
-  **为什么只放宽高档**：`retro-77` 复盘样本里，10 张高 effort 规格对齐类卡有 9 张撞在上限 3 上进了人裁壳，
-  事后复核一律判"壳清、工作在新链继续"——上限对这类卡不是护栏而是噪声源，它没拦住任何打转，
-  只是把同一件事换条链重跑，白烧一次派卡和一次人工翻看。低价值卡在实现层打转三轮就该停，不动；
+  内置 `high` 档固定为 **1**：首轮修复后的再审仍不通过就转 held 人裁，避免把规格歧义误当实现缺陷继续扩链；
+  `low` / `normal` 写 `0`（= 跟随全局）；
+- 自动复审只允许挂在 `sequence` 实现卡上；`design-review`、协调、装配和进度回收即便是 high 档也会被
+  入队护栏强制清掉 `review_after`，避免生成“审核: 审核…”；
 - `-effort` 显式指定恒优先于地板（`-stakes high -effort low` 就是 `low`）：命令行说了算，否则命令行不再可信；
 - 只写部分档位也可以，没写的档位沿用内置默认（按键合并，不是整表顶掉）；
 - **档内没写的字段也沿用内置同档位的值**——JSON 的合并粒度只到键，`{"high": {"default_effort": "xhigh"}}`

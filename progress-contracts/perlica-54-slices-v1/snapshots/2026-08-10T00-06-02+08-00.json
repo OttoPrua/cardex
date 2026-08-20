@@ -1,0 +1,1232 @@
+{
+  "schema_version": "cardex-maturity-progress/v2",
+  "snapshot_at": "2026-08-10T00:06:02+08:00",
+  "denominator": {
+    "version": "perlica-54-slices-v1",
+    "capability_slices": 54,
+    "max_points": 216,
+    "weighted_by_effort": false
+  },
+  "state_scores": {
+    "设计/待开发": 0,
+    "遗留待迁移": 1,
+    "开发/复审中": 1,
+    "隔离候选": 2,
+    "主线/集成已有": 3,
+    "Live/有界 Canary": 4
+  },
+  "reference_snapshot": {
+    "at": "2026-08-09T23:02:58+08:00",
+    "points": 96,
+    "max_points": 216,
+    "projects": [
+      {
+        "project": "PerlicaHermes",
+        "points": 31,
+        "max_points": 44
+      },
+      {
+        "project": "PerlicaOptimize",
+        "points": 10,
+        "max_points": 44
+      },
+      {
+        "project": "PerlicaAnywhere",
+        "points": 19,
+        "max_points": 72
+      },
+      {
+        "project": "PerlicaAnything",
+        "points": 36,
+        "max_points": 56
+      }
+    ]
+  },
+  "previous_sync": {
+    "at": "2026-08-09T23:02:58+08:00",
+    "points": 96,
+    "max_points": 216,
+    "projects": [
+      {
+        "project": "PerlicaHermes",
+        "points": 31,
+        "max_points": 44
+      },
+      {
+        "project": "PerlicaOptimize",
+        "points": 10,
+        "max_points": 44
+      },
+      {
+        "project": "PerlicaAnywhere",
+        "points": 19,
+        "max_points": 72
+      },
+      {
+        "project": "PerlicaAnything",
+        "points": 36,
+        "max_points": 56
+      }
+    ]
+  },
+  "projects": [
+    {
+      "project": "PerlicaHermes",
+      "project_id": "perlica-hermes",
+      "eta": {
+        "target": "全 profile E5/E6",
+        "min_days": 35,
+        "max_days": 70,
+        "open_ended": true,
+        "confidence": "中低",
+        "basis": "历史短窗速度只反映合同转化，不采信机械外推；使用风险修正 5–10+ 周。",
+        "acceptance_gate": "当前全门绿色、fresh exact review、真实用户路径 canary、rollback 与 soak"
+      },
+      "slices": [
+        {
+          "id": "H-01",
+          "kind": "review",
+          "order": 1,
+          "phase": "R0 基线与证据对账",
+          "goal": "冻结真实运行基线、配置指纹、回滚与验收口径",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1–E2；当前 pinned 60/60，full make test 3759 中 1 个旧事实文档断言失败",
+              "summary": "registry、contracts、离线证据与 readiness/receipt 工具已进入 managed activation branch；当前工作树另有 3 份未跟踪设计/证据文档"
+            },
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-10T00:06:02+08:00",
+              "source": "/Users/ottoprua/Projects/PerlicaHermes",
+              "ref": "HEAD da9fc84831f4ed03361e7a0696df03b4233001f3; make test 3772/6 fail/25 skip",
+              "summary": "fresh 全量门发现 manifest 漂移文档计数、现役 seal registry digest 与 shipped TestReady baseline/pin 共 6 条红；工作树含 registry 与测试相关未提交改动。代码仍在集成面，故不凭失败数量机械降级，但 acceptance gate 明确未满足。"
+            }
+          ],
+          "acceptance_gate": "消除 manifest/registry authority digest drift 与 shipped baseline/pin 的 6 条 fresh 门禁红；形成 clean、exact-SHA、fresh independent review 可接受基线后才可继续晋级或验收",
+          "user_accepted": false
+        },
+        {
+          "id": "H-02",
+          "kind": "impl",
+          "order": 2,
+          "phase": "R1 Control 基础",
+          "goal": "建立唯一任务/会话/效果/超时/恢复权威",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "最高局部 E4；本轮没有 provider/model 请求或用户回复探针",
+              "summary": "Control、executor、dispatcher 与 8 个 managed gateway 在 fresh 只读快照中 running；R1.1 已进入 managed activation branch"
+            }
+          ],
+          "acceptance_gate": "按 profile 做真实输入→决策→回执→回复 canary，并继续 E5 soak / E6 验收",
+          "user_accepted": false
+        },
+        {
+          "id": "H-03",
+          "kind": "fix",
+          "order": 3,
+          "phase": "R1.1 Control Correctness",
+          "goal": "闭合终局、obligation、effect、reconcile、restore、deadline 真值",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E2 managed integration；激活前 full 3759/3759 与 pinned 60/60；当前 pinned 60/60，full 仅 1 个已过时文档断言红",
+              "summary": "R1.1 clean 候选 20d907a4b 已经由 8a3c47183 集成到 managed activation branch；当前激活源 54173f9d1。literal refs/heads/main 仍不是该激活分支"
+            }
+          ],
+          "acceptance_gate": "修复 stale drift 文档门并在当前 clean SHA 复审；再做 Control 真实用户路径 canary，不能把 integration 当 USER_ACCEPTED",
+          "user_accepted": false
+        },
+        {
+          "id": "H-04",
+          "kind": "design",
+          "order": 4,
+          "phase": "R1.2 授权/时间/预算",
+          "goal": "把 grant、时钟、预算、取消与升级政策闭成权威契约",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 合同实现；exact-SHA review=RUNSPEC_CANDIDATE_BLOCKED",
+              "summary": "RunSpecV1 / RunConsumptionReceiptV1 P2→P3 合同形成 clean commit e973adf：2 个 schema、ADR、fixture 与 489 行测试；共 +1512 行。独立复审发现 P1=3/P2=2，候选被阻断。"
+            }
+          ],
+          "acceptance_gate": "修同 ref 冲突 digest、event sequence/time、每 RunSpec 唯一 receipt；恢复 full gate；再冻结 pinned Hermes 接口与真实 adapter",
+          "user_accepted": false
+        },
+        {
+          "id": "H-05",
+          "kind": "review",
+          "order": 5,
+          "phase": "R2 测试身份与容量",
+          "goal": "建立 managed test identity、并发与隔离 release gate",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "局部 E4；整体未形成全 profile E4",
+              "summary": "身份/容量/离线门已有；历史有界 canary 证据"
+            }
+          ],
+          "acceptance_gate": "补上游摄取、运行边界和每单位签名验收",
+          "user_accepted": false
+        },
+        {
+          "id": "H-06",
+          "kind": "impl",
+          "order": 6,
+          "phase": "R3 Personal Core",
+          "goal": "Perlica Telegram、Estella digest、TangTang Feishu news、Shu logging",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "Perlica E4；其余多为 E1–E3",
+              "summary": "Perlica Telegram 曾通过五门有界 canary；其余 profile 有代码/进程/工作流但证据不齐"
+            }
+          ],
+          "acceptance_gate": "逐 profile 补完整输入→决策→动作→回执→回复证据",
+          "user_accepted": false
+        },
+        {
+          "id": "H-07",
+          "kind": "impl",
+          "order": 7,
+          "phase": "R4 其余领域 Profile",
+          "goal": "研究、开发观察、dry-run trading、财务、callback 等",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1–E3，按 profile 不均匀",
+              "summary": "配置、工作流、假件/局部集成与部分历史验证存在"
+            }
+          ],
+          "acceptance_gate": "领域 owner 签名、真实 consumer、负向边界、独立 canary 与 soak",
+          "user_accepted": false
+        },
+        {
+          "id": "H-08",
+          "kind": "coord",
+          "order": 8,
+          "phase": "R5 单元化生产发布",
+          "goal": "每个 profile 独立签名、canary、soak、回滚",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E4 受限 startup/runtime landing；两位独立 reviewer P0=0/P1=0/P2=1。未发 provider/model 请求、主动消息或端到端 inference",
+              "summary": "8 个 managed manifest 已 8/8 重签，8 个 profile 串行重启并保留精确回滚闭环；两次 fleet 快照相隔 118 秒。fresh 只读检查显示相同 PID/run 身份持续稳定超过 2 天"
+            }
+          ],
+          "acceptance_gate": "修复 controlled-SIGTERM child_exit_nonzero P2；补真实回复、失败回滚演练与长时 soak 后才能扩大 live 声明",
+          "user_accepted": false
+        },
+        {
+          "id": "H-09",
+          "kind": "impl",
+          "order": 9,
+          "phase": "R6 Memory / Retrieval",
+          "goal": "安全记忆、检索、生命周期、删除传播",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1；候选层",
+              "summary": "R6.0 负向安全套件在干净隔离分支；59/59 定向绿；尚未并入 Optimize main/Hermes 生产"
+            }
+          ],
+          "acceptance_gate": "处理 full gate 漂移，合并 R6.0；实现 R6.1 purge/de-reference 与生产 consumer",
+          "user_accepted": false
+        },
+        {
+          "id": "H-10",
+          "kind": "impl",
+          "order": 10,
+          "phase": "R7 Optimize 闭环",
+          "goal": "评测、归因、提案、试验、晋升、回滚",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1；NOT_RELEASED",
+              "summary": "evaluation manifest v0 在 Optimize 干净隔离分支，228/228；只有第一切片"
+            }
+          ],
+          "acceptance_gate": "assignment/run/query ledger、runner、asset dependency、Cardex bridge、proposal/trial/promotion/backtest",
+          "user_accepted": false
+        },
+        {
+          "id": "H-11",
+          "kind": "coord",
+          "order": 11,
+          "phase": "R8 OpenClaw 退休",
+          "goal": "去除旧 bridge/命名/数据工具链，保留可回退迁移",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 静态守卫；非运行退休证据",
+              "summary": "静态前向引用守卫仍为隔离候选；fresh runtime 中 OpenClaw bridge 仍在运行"
+            }
+          ],
+          "acceptance_gate": "真实 consumer 迁移、数据边界、停用/回滚验收；bridge 停止前不能记退休完成",
+          "user_accepted": false
+        }
+      ]
+    },
+    {
+      "project": "PerlicaOptimize",
+      "project_id": "perlica-optimize",
+      "eta": {
+        "target": "受控 Optimize 闭环",
+        "min_days": 63,
+        "max_days": 119,
+        "open_ended": true,
+        "confidence": "低",
+        "basis": "R6/R7 依赖与复审回退使短窗速度不可用；使用风险修正 9–17+ 周。",
+        "acceptance_gate": "R6.0 整包 P0/P1=0、R6.1、真实 ledgers/runner/bridge、proposal→trial→rollback"
+      },
+      "slices": [
+        {
+          "id": "O-01",
+          "kind": "design",
+          "order": 1,
+          "phase": "Blueprint / CORE-00",
+          "goal": "定义 Optimize 是设计、实验、评测和 conformance oracle，不直接夺取生产权威",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0–E1",
+              "summary": "路线图、外审处置、CORE-00 文档修正已在隔离分支/本地文档形成"
+            }
+          ],
+          "acceptance_gate": "把被采纳文档合并为单一现行版本，去掉过期矩阵",
+          "user_accepted": false
+        },
+        {
+          "id": "O-02",
+          "kind": "impl",
+          "order": 2,
+          "phase": "L5.1 Trajectory Assembly",
+          "goal": "统一轨迹、证据和评测输入",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1–E2；不是 live 改进服务",
+              "summary": "Node/fixture conformance oracle 已实现；Hermes 有生产前置对象"
+            }
+          ],
+          "acceptance_gate": "补真实 assignment/run/query ledger 与 Hermes 生产消费绑定",
+          "user_accepted": false
+        },
+        {
+          "id": "O-03",
+          "kind": "fix",
+          "order": 3,
+          "phase": "R6.0 Memory 负向安全",
+          "goal": "阻止敏感、撤回、跨域、无 lineage 内容进入记忆/检索",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 实质实现；SCOPED_EXACT_REVIEW_FAIL_ROOT_HELD，P0=0/P1=1/P2=0",
+              "summary": "R6.0 handoff 20ed3bf 的 59/59 与大规模负例仍保留；fresh exact review t0809-2227-01ff 曾发现合法 stable ref v1→v2 被误拒的 P1。修复 c418822 已独立 PASS（P0/P1/P2=0）；health mixed-leaf 366b7df 也 PASS。root-fixture 1b02e31 虽消除当前 fixture red，却因漏拦 Node test/**/*.mjs 自动发现面再获 P1。"
+            },
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-10T00:06:02+08:00",
+              "source": "/Users/ottoprua/.cardex/logs/t0809-2337-86b0.log",
+              "ref": "candidate 4f5ac24f5b84af5f5ac001e809880721780e23fa; P0/P1/P2=0/0/0",
+              "summary": "R6 composite exact review 通过，但 verdict 明确为 R6_OFFLINE_ORACLE_COMPOSITE_EXACT_REVIEW_PASS_ROOT_GATE_PENDING；R6 root、R6.0、R6.1、product/live 继续 held，不能从开发/复审中晋级。"
+            }
+          ],
+          "acceptance_gate": "由 manager 关闭 R6 root gate 并形成可接受 exact-SHA 集成；随后完成 R6.1、Optimize main 与真实 Hermes consumer，当前 composite PASS 仍不等于候选/主线/live",
+          "user_accepted": false
+        },
+        {
+          "id": "O-04",
+          "kind": "impl",
+          "order": 4,
+          "phase": "R6.1 生命周期/解引用",
+          "goal": "TTL、撤回、删除传播、内容解引用、恢复验证",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "有设计与 held 卡，未形成可验收实现"
+            }
+          ],
+          "acceptance_gate": "schema、purge ledger、restore drill、下游缓存失效和负例",
+          "user_accepted": false
+        },
+        {
+          "id": "O-05",
+          "kind": "review",
+          "order": 5,
+          "phase": "R7.0-A Evaluation Manifest v0",
+          "goal": "冻结评测资产、输入摘要、版本和资源上限",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 clean reviewed candidate；明确 NOT_RELEASED",
+              "summary": "干净隔离分支 da96214；fresh exact review t0809-2215-50b0 为 P0/P1/P2=0，228/228 加额外 62/62 通过；结论仍是 EXACT_MANIFEST_CONTRACT_REVIEW_PASS_R7_PARENT_HELD。"
+            },
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-10T00:06:02+08:00",
+              "source": "/Users/ottoprua/.cardex/logs/t0809-2333-48e2.log",
+              "ref": "eval-isolation 4ae7122 review P0/P1/P2=2/1/1; F2 review t0809-2358-7ee1 concerns P0/P1/P2=0/1/1",
+              "summary": "既有 da96214 Evaluation Manifest clean candidate 仍有效；后续 eval-isolation 扩展先后 fresh review 失败，F2 仍有 replay 记录增删绕过摘要重算的 P1。它没有让既有 manifest 候选晋级，也不释放 R7 parent。"
+            }
+          ],
+          "acceptance_gate": "F2 取得 P0/P1=0 的 fresh exact review 后仍须 owner 接受、R7 parent 释放、真实 runner/资产/ledger 集成；既有 manifest 保持隔离候选，不因后续活动量晋级",
+          "user_accepted": false
+        },
+        {
+          "id": "O-06",
+          "kind": "design",
+          "order": 6,
+          "phase": "Attribution / Assignment / Query Ledgers",
+          "goal": "说明哪个变化、哪次运行、哪些查询导致结果",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "设计清单存在，未形成完整实现"
+            }
+          ],
+          "acceptance_gate": "冻结 schema、identity、digest、join 与退役策略",
+          "user_accepted": false
+        },
+        {
+          "id": "O-07",
+          "kind": "impl",
+          "order": 7,
+          "phase": "L5.2 Distillation / Proposal",
+          "goal": "从轨迹提炼候选规则、提示词或技能变更",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "设计目标存在，无生产级 proposal pipeline"
+            }
+          ],
+          "acceptance_gate": "候选生成、去敏、归因、预算、重复检测和人工可读 diff",
+          "user_accepted": false
+        },
+        {
+          "id": "O-08",
+          "kind": "review",
+          "order": 8,
+          "phase": "L5.3 Review / Trial / Promotion / Rollback",
+          "goal": "在 shadow/canary 中验证改进并安全晋升",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0–E1 零散",
+              "summary": "审批/回滚概念分散存在，闭环未组装"
+            }
+          ],
+          "acceptance_gate": "trial registry、对照组、promotion gate、owner approval、rollback receipt",
+          "user_accepted": false
+        },
+        {
+          "id": "O-09",
+          "kind": "review",
+          "order": 9,
+          "phase": "L5.4 Backtest / Counterfactual",
+          "goal": "离线回放历史任务，估算副作用和退化",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "状态报告明确为零/未实现"
+            }
+          ],
+          "acceptance_gate": "回放语料、污染隔离、基线、统计判据、失败样本保留",
+          "user_accepted": false
+        },
+        {
+          "id": "O-10",
+          "kind": "coord",
+          "order": 10,
+          "phase": "R7.1 Cardex development_job Bridge",
+          "goal": "把获批改进转成可审计开发任务",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 fake-only；FAKE_ONLY_CANDIDATE_BLOCKED",
+              "summary": "fake-only DevelopmentJob/Receipt v2、validator、FakeCardexPort 与 60/60 定向测试形成 clean commit 801b8a5（+2323 行）；独立复审 P1=3/P2=2。"
+            }
+          ],
+          "acceptance_gate": "补 reconcile target、通配路径重叠、receipt before/after 转移；fresh review 后才可进入真实 Cardex consumer",
+          "user_accepted": false
+        },
+        {
+          "id": "O-11",
+          "kind": "coord",
+          "order": 11,
+          "phase": "Production Assembly Boundary",
+          "goal": "由 Hermes/Control 承担生产执行，Optimize 只产出受审候选",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "设计约束，不是缺失的进程",
+              "summary": "这是已批准的架构边界；Optimize 仓本身没有 live 服务"
+            }
+          ],
+          "acceptance_gate": "需要 Hermes consumer、owner approval 和 E3→E6 证据链才能形成实际闭环",
+          "user_accepted": false
+        }
+      ]
+    },
+    {
+      "project": "PerlicaAnywhere",
+      "project_id": "perlica-anywhere",
+      "eta": {
+        "target": "S4–S6 长期 Agent 闭环",
+        "min_days": 90,
+        "observation_floor_days": 90,
+        "open_ended": true,
+        "confidence": "低",
+        "basis": "S4–S5 历史风险修正 9–16 周；S6 另有至少 90 天真实观测下限，故整体不早于观测门。",
+        "acceptance_gate": "EVT 接受、PRV fresh review、Timeline/ContextBuilder、双主机/日审/删除传播与 90 天误报治理"
+      },
+      "slices": [
+        {
+          "id": "AW-01",
+          "kind": "impl",
+          "order": 1,
+          "phase": "既有 Voice / Device / Notification 链",
+          "goal": "让本地长期 Agent 可听、说、通知并连接设备",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "局部 E4；尚无广泛 E5 soak",
+              "summary": "xiaozhi、BLE/WebSocket、TTS/LLM、通知与 PM1 证据链已有；关键进程本次快照在运行；历史端到端演示通过"
+            }
+          ],
+          "acceptance_gate": "重复场景、长时稳定性、远端 LLM 首包抖动、权限拒绝/恢复和固件窗口",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-02",
+          "kind": "impl",
+          "order": 2,
+          "phase": "既有 Timeline Scaffold",
+          "goal": "保存行为、结果、回复与来源，为上下文提供时间线",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E2 进程/集成迹象；本轮未查 DB/health/query",
+              "summary": "timeline 服务和存储/MCP 骨架已存在，进程本次快照运行"
+            }
+          ],
+          "acceptance_gate": "不能由进程推断可用；需 fresh query、source health、只读投影与真实事件接入",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-03",
+          "kind": "coord",
+          "order": 3,
+          "phase": "S0 CTX-00 Authority Freeze",
+          "goal": "冻结 Context/Memory/Suggestion/Control 权威与负边界",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0 设计/契约候选",
+              "summary": "干净隔离分支 2696073；4 对象、10 来源、14 ADR、9 negative invariants 的 validator 通过"
+            }
+          ],
+          "acceptance_gate": "合并权威文档；实现 runtime adapter/collector/purge/ContextBuilder",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-04",
+          "kind": "fix",
+          "order": 4,
+          "phase": "S0 AUD-01 Ambient/Conversation 分流",
+          "goal": "物理隔离环境采集与对话激活，保留 provenance",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1；Python 路径局部独立复审通过；Java Maven/全树终审未完成",
+              "summary": "ambient/conversation、ASR generation、MQTT generation 等大面积实现已在脏工作树；MQTT 专项独立复审 PASS，Python 全量在该复审中 99/99"
+            }
+          ],
+          "acceptance_gate": "补 manager-api Maven 门与全树复审，冻结规格歧义，干净提交后再决定并主线",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-05",
+          "kind": "design",
+          "order": 5,
+          "phase": "S1 EVT-01 EventEnvelope v2",
+          "goal": "统一可版本、可去重、可纠错、可追踪事件",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 clean reviewed candidate；RECOMMEND_EVT_ACCEPTANCE_PENDING_YVONNE_POST_WAVE",
+              "summary": "EventEnvelope v2 / SourceRegistry v2 经多轮身份、lineage、purge-invalidation 修复，clean handoff bf9b543；exact-SHA 独立复审 P0=0/P1=0/P2=0。"
+            }
+          ],
+          "acceptance_gate": "Yvonne/Owner 接受与目标分支集成；接受后才释放 PRV/TL/SEN，不等于 live",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-06",
+          "kind": "fix",
+          "order": 6,
+          "phase": "S1 PRV-01 Capture/Purge/Restore",
+          "goal": "按来源暂停采集、删除、传播撤回并验证恢复",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 实质实现；BLOCKED — PRV_FIX_R3_EXACT_CANDIDATE_NOT_RECOMMENDED",
+              "summary": "Privacy capture/purge/restore 从 fcca466 经 dbb7c45/e09b061 修到 ff93b62，含服务代码、fixture、测试与 handoff；R3 exact review t0809-2238-fe5a 为 P0=0/P1=1/P2=2。"
+            },
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-10T00:06:02+08:00",
+              "source": "/Users/ottoprua/.cardex/logs/t0809-2350-6c0d.log",
+              "ref": "candidate 66d9687eedba362a9feaf2657d16e3a72e9bbf2f; verdict HELD",
+              "summary": "replacement fresh review 因准备好的 entity-local 依赖预检失败而 HELD；仅完成 3/13 步、2 pass、1 error、10 skip，attacks=0、mutations=0。没有代码缺陷 verdict，也没有接受依据。"
+            }
+          ],
+          "acceptance_gate": "在合规的 entity-local 依赖环境完成 66d9687 fresh review、非零 attacks/mutations 与 P0/P1=0；再由 manager/Yvonne 接受并释放 TL/SEN/R6.1，当前仍为开发/复审中",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-07",
+          "kind": "impl",
+          "order": 7,
+          "phase": "S1 SEN-03R screenpipe Adapter",
+          "goal": "把屏幕事件按 cursor/session/idempotency 接入新事件合同",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 遗留候选",
+              "summary": "旧 feat/sen-03 分支有 69 测试与适配器实现"
+            }
+          ],
+          "acceptance_gate": "不能直接合并旧分支；需重基线到 EVT v2、隐私/删除与 source health",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-08",
+          "kind": "impl",
+          "order": 8,
+          "phase": "S2 TL-01 Read-only Timeline Projection",
+          "goal": "按来源、时间、健康度读取可解释事件",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0–E2 混合",
+              "summary": "现有服务是骨架，目标投影尚未验收"
+            }
+          ],
+          "acceptance_gate": "实现真实只读 query、watermark/gap、分页、source health 和 UI/MCP 结果",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-09",
+          "kind": "impl",
+          "order": 9,
+          "phase": "S2 TL-02 Task/Action Projection",
+          "goal": "把任务、动作、效果、回执投影到 Timeline",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "设计目标已写入阶段文档"
+            }
+          ],
+          "acceptance_gate": "绑定 Hermes TaskSpec/PolicyDecision/ActionResult/Receipt 与纠错语义",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-10",
+          "kind": "impl",
+          "order": 10,
+          "phase": "S2 CTX-01 ContextBundle / Builder",
+          "goal": "生成 source/budget/gap-aware Current Context",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "对象和目标已设计，没有可用 builder/runtime"
+            }
+          ],
+          "acceptance_gate": "预算算法、来源优先级、过期/未知、摘要 provenance、缓存与查询 API",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-11",
+          "kind": "review",
+          "order": 11,
+          "phase": "S3 ACT-01 Manifest / Evidence",
+          "goal": "声明能力、目标、效果、验证方法与尝试证据",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 clean independently reviewed candidate；这是跨项目依赖，不在 Anywhere main",
+              "summary": "共享的 ACT-01 实现在 PerlicaAnything 隔离工作树形成 clean commit 3cfdf237；独立审核 P0=0/P1=0，fresh common_runtime 250/250"
+            }
+          ],
+          "acceptance_gate": "ACT-02 Frozen Task/Action/Receipt 仍 held；需 Hermes authority、Anywhere consumer 集成与目标仓全门",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-12",
+          "kind": "impl",
+          "order": 12,
+          "phase": "S3 ACT-02 Frozen Task/Action/Receipt",
+          "goal": "把 Context、授权、动作和回执装成不可漂移执行包",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "设计目标存在，尚未组装"
+            }
+          ],
+          "acceptance_gate": "依赖 R1.1/R1.2/W2/ACT-01；实现冻结摘要、Control grant、receipt 与补偿",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-13",
+          "kind": "impl",
+          "order": 13,
+          "phase": "S4 COL-01 Mac Collector",
+          "goal": "建立 macOS 连续采集、暂停、隐私与健康契约",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "进程存在，不足以提升到 E2",
+              "summary": "本次快照看到 screenpipe agent 进程；但没有 accepted 的 Perlica collector 合同/adapter/privacy/soak"
+            }
+          ],
+          "acceptance_gate": "需补设计权威、Mac 权限、source identity、暂停/删除、failure/soak 计划",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-14",
+          "kind": "review",
+          "order": 14,
+          "phase": "S4 COL-02 Dual-host Equivalence",
+          "goal": "Mac/Windows 同合同、同幂等、同水位与故障语义",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "设计目标存在；Windows SEN 路径较早，等价性未实现"
+            }
+          ],
+          "acceptance_gate": "双端 fixture、乱序/断网/恢复、clock skew、cursor 和 side-by-side soak",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-15",
+          "kind": "impl",
+          "order": 15,
+          "phase": "S5 UX-01 Daily Review / Correction",
+          "goal": "每天查看、纠正、撤回、标记重要事件",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "设计阶段"
+            }
+          ],
+          "acceptance_gate": "审阅界面/摘要、correction event、provenance、批量撤回、可访问性",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-16",
+          "kind": "review",
+          "order": 16,
+          "phase": "S5 MEM-01 Promotion Gateway",
+          "goal": "把经复核的事件晋升为可删记忆",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 contract-only；KDEP_CANDIDATE_BLOCKED",
+              "summary": "KnowledgeDepositIntent/Receipt、content reference、promotion/provenance 合同 clean commit fffde70（+1923 行，focused 31/31）；独立复审 P1=2。"
+            }
+          ],
+          "acceptance_gate": "闭合 outcome-specific 转移与 lost-receipt/terminal-replay 状态序列；PRV/R6.1/registry/writer/live 均未释放",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-17",
+          "kind": "impl",
+          "order": 17,
+          "phase": "S6 Suggestions / Digest",
+          "goal": "在足够历史证据后提供低风险建议与摘要",
+          "state": "开发/复审中",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 contract-only；review REJECT，P0=2/P1=3/P2=2",
+              "summary": "Personal Intelligence v1 五路径合同包 a677dc3（goal/commitment/proposal/reflection/encouragement 与 digest-only policy，+1566 行）已实现并独立复审。"
+            }
+          ],
+          "acceptance_gate": "修 exact 五路径合同后 fresh review；仍需稳定 Context/Memory、shadow 指标与至少 90 天用户校正观测",
+          "user_accepted": false
+        },
+        {
+          "id": "AW-18",
+          "kind": "design",
+          "order": 18,
+          "phase": "S6 Cloud / Optional Sensors",
+          "goal": "可选云同步和更多传感器，不破坏 local-first",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0",
+              "summary": "方向性设计，边界未补全"
+            }
+          ],
+          "acceptance_gate": "威胁模型、加密/身份、冲突、离线、删除传播、费用与 opt-in",
+          "user_accepted": false
+        }
+      ]
+    },
+    {
+      "project": "PerlicaAnything",
+      "project_id": "perlica-anything",
+      "eta": {
+        "target": "更广平台 parity",
+        "min_days": 56,
+        "max_days": 105,
+        "confidence": "中低",
+        "basis": "Control-grade 动作 MVP 3–7 周；更广 parity 使用风险修正 8–15 周。",
+        "acceptance_gate": "ManifestV2/ACT-01 集成、ACT-02+Hermes authority、Windows parity、真实动作 canary"
+      },
+      "slices": [
+        {
+          "id": "AT-01",
+          "kind": "design",
+          "order": 1,
+          "phase": "Phase 0 Contract Freeze",
+          "goal": "统一 CLI、ResultEnvelope、error taxonomy、metadata 与 approval 钩子",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1",
+              "summary": "Docs/contracts 与 common_runtime 主线实现较完整"
+            }
+          ],
+          "acceptance_gate": "把旧合同升级到 ACT v2/Control 权威，不让 schema 绿灯替代语义验证",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-02",
+          "kind": "impl",
+          "order": 2,
+          "phase": "Phase 1 common_runtime",
+          "goal": "提供注册、运行、日志、artifact、approval、离线 guard",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1–E2",
+              "summary": "CLI/registry/runner/validators/tests 已实现并被多个包使用"
+            }
+          ],
+          "acceptance_gate": "吸收 ACT 语义对、value-free、安全时间与补偿规则",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-03",
+          "kind": "impl",
+          "order": 3,
+          "phase": "Phase 2 web_ops",
+          "goal": "fixture-first 网页读取/会话/诊断，受控 live adapter",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1–E2",
+              "summary": "fixture client、Crawlee、session、diagnostics 和 dry-run MVP 已有"
+            }
+          ],
+          "acceptance_gate": "真实 Amap send adapter 仍 NOT_IMPLEMENTED；需 live boundary、approval、receipt、回滚",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-04",
+          "kind": "impl",
+          "order": 4,
+          "phase": "Phase 3 mac_semantic_ops",
+          "goal": "优先 AX/语义定位，视觉只作受控 fallback",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "局部 E4；不是全应用兼容",
+              "summary": "应用/菜单/AX 路由、Swift helper 与历史真机验证存在"
+            }
+          ],
+          "acceptance_gate": "权限矩阵、更多应用、错误恢复、Control receipt 与长时评测",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-05",
+          "kind": "impl",
+          "order": 5,
+          "phase": "Phase 4 ios_bridge",
+          "goal": "把 iOS/设备操作接入统一合同",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0–E1",
+              "summary": "以设计/原型/桥接思路为主，未见完整生产链"
+            }
+          ],
+          "acceptance_gate": "设备身份、权限、离线/重试、用户确认、证据与回滚",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-06",
+          "kind": "coord",
+          "order": 6,
+          "phase": "Phase 5 openclaw_adapter",
+          "goal": "给旧 OpenClaw 提供薄适配",
+          "state": "遗留待迁移",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1–E2 遗留集成",
+              "summary": "包、fixture、skills 和测试已实现"
+            }
+          ],
+          "acceptance_gate": "迁移到 Hermes/Control，避免双权威；随后随 R8 退休",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-07",
+          "kind": "fix",
+          "order": 7,
+          "phase": "Phase 6 Fallback / Lab",
+          "goal": "在语义路径失败时用视觉/实验工具降级",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1；真实视觉规划未证实",
+              "summary": "mac_ui_fallback、mock/semantic 测试和 no-op/dry-run 路径存在"
+            }
+          ],
+          "acceptance_gate": "SCREEN_RECORDING_NOT_ALLOWED、LOCAL_VISION_MODEL_NOT_CONFIGURED 等边界未解除；不得称真视觉可用",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-08",
+          "kind": "impl",
+          "order": 8,
+          "phase": "Desktop Actuation Drivers",
+          "goal": "统一 CUA/输入动作与 deny policy",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "局部 E4",
+              "summary": "CUA driver 双端有历史 live 验证，watchdog 本次进程运行"
+            }
+          ],
+          "acceptance_gate": "与 Control grant/receipt 对齐，多应用负例、异常恢复、headless 边界",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-09",
+          "kind": "impl",
+          "order": 9,
+          "phase": "AX-first Observation / Action",
+          "goal": "先读语义树，必要时再视觉",
+          "state": "Live/有界 Canary",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "Mac 局部 E4；Windows E2",
+              "summary": "Mac live、Windows read 路径已有；Windows write 不完整"
+            }
+          ],
+          "acceptance_gate": "Windows 写入、跨 DPI/语言、权限/焦点、失败回滚",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-10",
+          "kind": "impl",
+          "order": 10,
+          "phase": "Vision Provider / Model Swap",
+          "goal": "可换本地视觉模型并限制显存/权限",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1–E2",
+              "summary": "provider/swap/config/mocks 与部分下载/运行脚本存在"
+            }
+          ],
+          "acceptance_gate": "真实截图权限、模型可用性、质量/延迟基线、隐私与真实 eval",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-11",
+          "kind": "impl",
+          "order": 11,
+          "phase": "Plan–Act–Observe Controller",
+          "goal": "观察、规划、动作、复核循环",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E2 MVP",
+              "summary": "Mac MVP controller 和 demo grounding loop 存在"
+            }
+          ],
+          "acceptance_gate": "Windows、多任务、blackboard、取消/重试、Control 状态与持久回执",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-12",
+          "kind": "review",
+          "order": 12,
+          "phase": "Evaluation Harness",
+          "goal": "对 AX、视觉、控制器做可重复任务评测",
+          "state": "主线/集成已有",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E2；历史局部结果",
+              "summary": "desktop-eval、tasks.yaml 与历史 AX 12/13 记录存在"
+            }
+          ],
+          "acceptance_gate": "vision 真评测、样本扩充、污染控制、失败保留与 Optimize manifest 接入",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-13",
+          "kind": "design",
+          "order": 13,
+          "phase": "Governance / Browser / Headless",
+          "goal": "把审批、浏览器子代理、headless 代理纳入同一权威",
+          "state": "设计/待开发",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E0–E1",
+              "summary": "approval 插件/设计材料和部分代码存在"
+            }
+          ],
+          "acceptance_gate": "approval 实际装载、headless proxy、browser 子代理、凭据与下载目录边界",
+          "user_accepted": false
+        },
+        {
+          "id": "AT-14",
+          "kind": "coord",
+          "order": 14,
+          "phase": "ACT-01 / ACT-02 Control-grade Assembly",
+          "goal": "用 Manifest v2、ActionAttemptEvidence 和 Frozen Task/Receipt 约束所有动作",
+          "state": "隔离候选",
+          "evidence": [
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-09T23:02:58+08:00",
+              "source": "reference_thread:019fd7f3-7ca1-7af0-a4e9-7a0dea475049#019fe6eb-4469-7583-bc40-b32040924c08",
+              "ref": "E1 clean candidate；no-effect 合同通过，observe-window 边界仍阻断；未进入 main/release/live",
+              "summary": "ACT-01 clean commit 3cfdf237 与独立审核仍有效；fresh readiness 337 total / 336 pass / 1 skip、P0=0/P1=0。新增 no-effect manifest baa9323 的 fresh review PASS（P0/P1/P2=0，303/303），observe-window cd5d534 fresh review FAIL（P1=1）。"
+            },
+            {
+              "layer": "git_test",
+              "observed_at": "2026-08-10T00:06:02+08:00",
+              "source": "/Users/ottoprua/.cardex/logs/t0809-2314-0c79.log",
+              "ref": "candidate 40f96113dd329e17860a87950635369d072c414f; P0/P1/P2=0/0/0",
+              "summary": "observe-window machine-boundary 离线合同 fresh review PASS：focused 7/7、package 22/22、common 250/250；但公共 runtime 仍 nonconforming_held，capture/EVT/TL/SEN/ACT-02/UI/product/live 全部 held。"
+            }
+          ],
+          "acceptance_gate": "把已复审的 observe-window/ManifestV2 合同集成到目标分支与真实 runtime；完成 ACT-02、Hermes grant/receipt、Windows P2、用户确认和有界 canary 后才能晋级",
+          "user_accepted": false
+        }
+      ]
+    }
+  ],
+  "migration_ledger": [],
+  "evidence_layers": [
+    {
+      "layer": "design",
+      "observed_at": "2026-08-10T00:06:02+08:00",
+      "source": "/Users/ottoprua/Projects/PerlicaHermes/docs/design/perlica-six-plane-four-loop-architecture-authority-2026-08-09.md",
+      "ref": "sha256:3ca92cb6e88fdab970f89f82b35909d12e247f740e9655726d3e14a75addd9ed",
+      "summary": "按原始设计目标重新核对 54 个能力切片；同时复核 Optimize roadmap、Anywhere 架构全景与 Anything roadmap 指针，分母仍为 perlica-54-slices-v1。"
+    },
+    {
+      "layer": "cardex",
+      "observed_at": "2026-08-10T00:06:02+08:00",
+      "source": "/Users/ottoprua/.cardex/tasks",
+      "ref": "t0809-2337-86b0,t0809-2350-6c0d,t0809-2314-0c79,t0809-2358-7ee1",
+      "summary": "561 张活动卡；done 528、failed 2、held 27、running 4。这些只作活动/诊断，不能晋级成熟度。"
+    },
+    {
+      "layer": "git_test",
+      "observed_at": "2026-08-10T00:06:02+08:00",
+      "source": "four-repository fresh read-only reconciliation",
+      "ref": "Hermes=da9fc84831f4ed03361e7a0696df03b4233001f3;Optimize=86ee70ede8c96647cc356a47cf6a91b8250cf890;Anywhere=e0a53e15ab00553828e987c7442af550aa7cc43b;Anything=4b46969bd46c5efb2f156a0d90eaec0fd883aa41",
+      "summary": "Cardex go test ./... 通过；Hermes make test 为 3772 total / 6 fail / 25 skip，网络和外部动作均 0。R6 composite fresh review P0/P1/P2=0 但 ROOT_GATE_PENDING；PRV R4 replacement 因依赖预检 HELD；observe-window 仅离线合同 PASS；R7 F2 fresh review 为 concerns（P0/P1/P2=0/1/1）。"
+    },
+    {
+      "layer": "runtime",
+      "observed_at": "2026-08-10T00:06:02+08:00",
+      "source": "launchctl + Cardex /api/health read-only snapshot",
+      "ref": "com.cardex.board pid=37419 listen=*:8788; xiaozhi/openclaw-bridge/timeline/dispatcher=running",
+      "summary": "Cardex health 200；相关本地服务进程存在，但未执行 provider 调用、真实回复、用户路径 canary 或验收，因此不据此晋级。"
+    }
+  ],
+  "activity": {
+    "cardex_total": 561,
+    "cardex_done": 528,
+    "cardex_failed": 2,
+    "cardex_held": 27,
+    "cardex_running": 4
+  }
+}

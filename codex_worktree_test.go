@@ -696,6 +696,14 @@ func TestRemoteCodexReviewSandbox(t *testing.T) {
 	}
 }
 
+func TestLocalCrossCheckNeverRequestsWritableCopy(t *testing.T) {
+	cfg := defaultConfig("")
+	cfg.CodexReviewSandbox = codexReviewSandboxWorktreeWrite
+	if codexReviewWantsWorktree(cfg, &Task{Type: typeCrossCheck, Dir: t.TempDir()}) {
+		t.Fatal("cross A/B/C must remain read-only even when ordinary review cards use writable copies")
+	}
+}
+
 // ---- CG-R3b 修 1:codex_review_sandbox 未知值必须 fail-closed(回落最小权限) ----
 
 // TestResolvedCodexReviewSandboxUnknownFailsClosed 是修 1 的可证伪核心。

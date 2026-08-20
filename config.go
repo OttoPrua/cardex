@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // TypeDefaults 是某一任务类型的默认执行参数，在 add/emit 时烘焙进任务。
@@ -29,6 +30,70 @@ type TypeDefaults struct {
 	Effort string `json:"effort,omitempty"`
 }
 
+// OpenCodeNightRoute 是“夜间借用 OpenCode 订阅、白天仍走 Codex”的窄自动路由策略。
+// 当前只用于默认 Codex 路由的 Opus 卡；显式 runner=opencode 是独立的人工钉定语义，
+// 不受此时间窗限制，同一目标模型仅在真实额度命中时接力到 Codex。
+// 时间窗采用 [start_hour, end_hour) 半开区间，并在 timezone 指定的时区内判断。
+type OpenCodeNightRoute struct {
+	Enabled          bool   `json:"enabled"`
+	StartHour        int    `json:"start_hour"`
+	EndHour          int    `json:"end_hour"`
+	Timezone         string `json:"timezone,omitempty"`
+	Model            string `json:"model"`
+	Variant          string `json:"variant"`
+	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
+}
+
+// KimiCLIOpusRoute 是 Owner 非 backend Opus 路由的 Kimi K3/max 第二腿。Grok 第一腿只有在
+// eligible non-auth 失败且零语义/模型/工具、指纹不变、无进程残留三证齐全后才串行排 Kimi；
+// Kimi 同样通过三证后才可进入 Sol/xhigh。
+type KimiCLIOpusRoute struct {
+	Enabled          bool   `json:"enabled"`
+	ExcludeBackend   bool   `json:"exclude_backend,omitempty"`
+	Model            string `json:"model"`
+	Effort           string `json:"effort"`
+	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
+}
+
+// GrokTierRoute 把一个来源档位钉到 Grok 推理档，并冻结安全失败白名单三证通过后的 Codex 末腿。
+// 当前键域由 validateGrokBuild 收口为 opus_backend / sonnet / haiku。
+type GrokTierRoute struct {
+	Effort              string `json:"effort"`
+	CodexFallbackModel  string `json:"codex_fallback_model"`
+	CodexFallbackEffort string `json:"codex_fallback_effort"`
+}
+
+// GrokBuildRoute 是 Owner 的 Grok 主腿与受控串行接力。TierRoutes 的 exact identities 在加载
+// 时校验；Grok 发生白名单安全失败且三证齐全才排逐档 Codex 末腿。独立审核卡使用
+// ReviewCodexModel/ReviewCodexEffort；OpusAdversarialReview 仅保留为通用模式兼容开关。
+type GrokBuildRoute struct {
+	Enabled          bool   `json:"enabled"`
+	Model            string `json:"model"`
+	Effort           string `json:"effort"`
+	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
+	KimiOpusFallback bool   `json:"kimi_opus_fallback,omitempty"`
+	// FableClaudeFallback/FableFirstPrinciples 仅用于读取并收口已经进入旧链的卡；Owner 路由
+	// 不再从这两个兼容字段创建新链，新 Fable 卡只走 CursorFableRoute。
+	FableClaudeFallback   bool                     `json:"fable_claude_fallback,omitempty"`
+	FableFirstPrinciples  bool                     `json:"fable_first_principles_review,omitempty"`
+	CodexFallbackModel    string                   `json:"codex_fallback_model,omitempty"`
+	CodexFallbackEffort   string                   `json:"codex_fallback_effort,omitempty"`
+	ReviewCodexModel      string                   `json:"review_codex_model,omitempty"`
+	ReviewCodexEffort     string                   `json:"review_codex_effort,omitempty"`
+	OpusAdversarialReview bool                     `json:"opus_adversarial_review,omitempty"`
+	TierRoutes            map[string]GrokTierRoute `json:"tier_routes,omitempty"`
+}
+
+// CursorFableRoute 把显式 Fable 档交给已登录的 Cursor CLI。模型固定 thinking-max；只有确认
+// eligible quota-limit 且三证齐全时，FallbackProfile 才启动 Grok 与 Sol 独立只读答案，再由 fresh
+// Sol/max 第一性合并。transport/stream/stall/invalid/environment/auth 均不得触发该链。
+type CursorFableRoute struct {
+	Enabled          bool   `json:"enabled"`
+	Model            string `json:"model"`
+	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
+	FallbackProfile  string `json:"fallback_profile"`
+}
+
 type Config struct {
 	ClaudeBin         string `json:"claude_bin"`
 	PollIntervalSec   int    `json:"poll_interval_sec"`
@@ -46,6 +111,14 @@ type Config struct {
 	TypeOrder      []string                `json:"type_order"`
 	ResumePrompt   string                  `json:"resume_prompt"`
 	TypeDefaults   map[string]TypeDefaults `json:"type_defaults"`
+	// DefaultRunner 决定未显式钉执行器的新卡默认走哪条主路由。空或 claude 保持历史行为；
+	// codex/gemini 分别把手工卡与 newTask 派生的审核、修复、收口、复盘、emit 卡钉到对应执行器。
+	// 显式会话续跑与 cross profile 仍尊重其已声明的执行器身份。
+	DefaultRunner string `json:"default_runner,omitempty"`
+	// OwnerRoutingEnforced 把本机确认的六行 Owner 路由提升为配置加载期硬契约。关闭时 Cardex
+	// 仍可作为通用调度器使用；开启时，Kimi/Grok/Cursor、全部六行、独立 Sol/max 审核位与 Fable
+	// 交叉 profile 任一缺失或漂移都拒绝加载，避免“配置仍合法但生产悄悄退回旧路线”。
+	OwnerRoutingEnforced bool `json:"owner_routing_enforced,omitempty"`
 
 	// ---- 5 小时额度红线（保底额度，给交互/突发任务留余量）----
 	// QueueBudgetTokens: 滑动 5 小时窗口内，队列最多消耗的加权 token 数；0 关闭。
@@ -80,11 +153,23 @@ type Config struct {
 	// 带会话的多步任务仍等 claude 重置（跨 CLI 无法延续上下文）。
 	CodexBin      string `json:"codex_bin"`
 	CodexFallback bool   `json:"codex_fallback"`
-	// CodexFallbackModel 降级专用模型：claude 卡经 codex_fallback 改道 codex 时用它。
+	// CodexFallbackModel 未命中档位槽位时的通用降级模型：claude 卡经 codex_fallback 改道 codex 时用它。
 	// 生产配置应选择已授权且适合落地实现的模型；不要把未授权/禁用模型当隐式回退。
 	// 空 = 沿用全局 codex_model。仅降级径生效；runner_pref=codex 主跑与远端 codex 不受影响。
 	CodexFallbackModel string `json:"codex_fallback_model,omitempty"`
-	CodexModel         string `json:"codex_model,omitempty"`
+	// CodexFallbackOpusModel / CodexFallbackOpusReasoning：Opus 档 Claude 卡改道 codex 时的
+	// 专用模型与思考档。空表示不覆盖按档位映射；默认是 gpt-5.6-sol + xhigh。
+	CodexFallbackOpusModel     string `json:"codex_fallback_opus_model,omitempty"`
+	CodexFallbackOpusReasoning string `json:"codex_fallback_opus_reasoning,omitempty"`
+	// CodexOpusSimpleModel / CodexOpusSimpleReasoning：可选的 Opus 低投入(stakes=low)
+	// 显式降档。默认关闭；只有配置非空才生效，且只认结构化 stakes，不从 prompt 猜复杂度。
+	CodexOpusSimpleModel     string `json:"codex_opus_simple_model,omitempty"`
+	CodexOpusSimpleReasoning string `json:"codex_opus_simple_reasoning,omitempty"`
+	// CodexTierModels / CodexTierReasoning：Codex 主跑及可回退卡的档位槽位映射。
+	// 键为 fable/opus/sonnet/haiku；缺键时回落到旧的单值字段。
+	CodexTierModels    map[string]string `json:"codex_tier_models,omitempty"`
+	CodexTierReasoning map[string]string `json:"codex_tier_reasoning,omitempty"`
+	CodexModel         string            `json:"codex_model,omitempty"`
 	// CodexReasoning 透传 -c model_reasoning_effort，空则用 codex 默认。合法档位（实测 codex 0.144.1，
 	// 由低到高）：minimal < low < medium < high < xhigh < max < ultra（ultra 是多代理委派特档）。
 	// 与 claude --effort 的 low<medium<high<xhigh<max 完全同序、同名——所以 Task.Effort 是二者共用的
@@ -123,6 +208,34 @@ type Config struct {
 	// （IneligibleTierError），需 API key 或 Google AI Pro/Ultra 订阅 OAuth。
 	GeminiAuthEnv string `json:"gemini_auth_env,omitempty"`
 
+	// OpenCode CLI 原生执行器：复用 OpenCode 自己的登录凭据。显式 runner=opencode 可钉定；
+	// OpenCodeNightOpus 非空且 enabled 时，还可在指定夜间窗口把默认 Codex 的 Opus 卡临时改道。
+	OpenCodeBin       string              `json:"opencode_bin,omitempty"`
+	OpenCodeModel     string              `json:"opencode_model,omitempty"`
+	OpenCodeModels    map[string]string   `json:"opencode_models,omitempty"`
+	OpenCodeNightOpus *OpenCodeNightRoute `json:"opencode_night_opus,omitempty"`
+
+	// Kimi Code CLI 原生执行器：复用 ~/.kimi-code 的 OAuth 登录，不复制 token。
+	// kimi_cli_opus 是独立于 OpenCode Go 的全时段 K3 自动路由与冷却车道。
+	KimiCLIBin string `json:"kimi_cli_bin,omitempty"`
+	// KimiCLIHome 指向已登录的 Kimi Code 数据目录；空时默认 ~/.kimi-code。
+	// Cardex 会在自身 root 下建立隔离运行目录，并只把 credentials 软链接回这里。
+	KimiCLIHome   string            `json:"kimi_cli_home,omitempty"`
+	KimiCLIModel  string            `json:"kimi_cli_model,omitempty"`
+	KimiCLIEffort string            `json:"kimi_cli_effort,omitempty"`
+	KimiCLIOpus   *KimiCLIOpusRoute `json:"kimi_cli_opus,omitempty"`
+
+	// Grok Build 原生执行器：复用 ~/.grok 的本机登录态，不读取或复制认证值。
+	// grok_build 为空/disabled 时完全保留旧 Kimi→Codex 与 Claude 限额行为。
+	GrokBuildBin string          `json:"grok_build_bin,omitempty"`
+	GrokBuild    *GrokBuildRoute `json:"grok_build,omitempty"`
+
+	// Cursor Agent CLI 原生执行器：复用 ~/.cursor 的本机登录态，不读取或复制 token。
+	// cursor_fable 只接管默认 Codex 路由中显式标成 Fable 的 fresh 单步卡。
+	CursorBin   string            `json:"cursor_bin,omitempty"`
+	CursorModel string            `json:"cursor_model,omitempty"`
+	CursorFable *CursorFableRoute `json:"cursor_fable,omitempty"`
+
 	// ---- 多订阅引擎档案（Kimi Code / GLM Coding Plan / MiniMax / MiMo / OpenCode Go / Ollama Cloud…）----
 	// Engines 键 = 引擎名（进 Runner 标签与 cooldown-<名>.json，限小写字母数字连字符；
 	// claude/codex/remote 是保留字）。执行复用 claude CLI + 按档案注入环境变量（base_url/
@@ -136,7 +249,7 @@ type Config struct {
 	// ModelTiers 自定义分级表：模型 ID（小写；精确或前缀匹配，"glm-4.7" 盖住 "glm-4.7:cloud"）
 	// → 档位关键字（fable/opus/sonnet/haiku）。优先于内置统一标准线——给"机队里没有更强模型"
 	// 的用户按牌面定档：手里最强的模型就是自己的 fable 档，看板/引擎档位展示随之。
-	// 只影响档位**展示与推导**；派发路由不吃档位（模型槽位由 engines.<名>.models 显式填）。
+	// Owner 六行自动路由也读取该解析结果；修改映射会改变未显式 pin 新卡的实际派发。
 	// 值写错载入即拒（fail fast），键必须全小写。见 docs/guide.md「自定义分级」。
 	ModelTiers map[string]string `json:"model_tiers,omitempty"`
 
@@ -205,7 +318,7 @@ type StakesRule struct {
 	// 不写 = 继承内置表同档位的地板。
 	DefaultEffort string `json:"default_effort,omitempty"`
 	// MaxFixRounds 是该档位的"实现→对抗审核→自动修复"轮次上限，覆盖全局 config.max_fix_rounds。
-	// 0/不写 = 继承内置表同档位的值；内置表里 low/normal 为 0（跟随全局），high 为 4。
+	// 0/不写 = 继承内置表同档位的值；内置表里 low/normal 为 0（跟随全局），high 为 1。
 	//
 	// 【为什么高档要多给一轮】retro-77（2026-08-02）样本：10 张高 effort 规格对齐类卡有 9 张撞在
 	// 全局上限 3 上进人裁壳，事后复核均判"壳清、工作在新链继续"——上限对这类卡偏紧，人裁壳只是
@@ -232,10 +345,12 @@ type CrossEngine struct {
 	Label string `json:"label,omitempty"`
 }
 
-// CrossProfile 是一对交叉验证引擎：A 先独立作答，B 独立作答后再拿 A 的结论对抗式交叉查漏。
+// CrossProfile 是一条交叉验证链：A 与 B 分别独立作答；Merge 非空时由第三个冻结引擎
+// 合并复审，空时保留历史行为（B 自己承担 C 合并）。
 type CrossProfile struct {
-	A CrossEngine `json:"a"`
-	B CrossEngine `json:"b"`
+	A     CrossEngine  `json:"a"`
+	B     CrossEngine  `json:"b"`
+	Merge *CrossEngine `json:"merge,omitempty"`
 }
 
 // XFrozenEngine 是入队时钉死的引擎执行规格——把从 config 解析出的执行参数快照进卡，B/C 直接套用，
@@ -247,6 +362,9 @@ type XFrozenEngine struct {
 	RemoteHost   string `json:"remote_host,omitempty"`
 	CodexModel   string `json:"codex_model,omitempty"`  // codex/远端 codex 引擎冻结的具体模型
 	GeminiModel  string `json:"gemini_model,omitempty"` // gemini 引擎冻结的具体模型（kind=gemini）
+	GrokModel    string `json:"grok_model,omitempty"`
+	GrokEffort   string `json:"grok_effort,omitempty"`
+	CursorModel  string `json:"cursor_model,omitempty"`
 	Label        string `json:"label,omitempty"`
 }
 
@@ -442,17 +560,31 @@ func typeDefaultsFor(cfg *Config, typ string) (TypeDefaults, bool) {
 
 func defaultConfig(claudeBin string) *Config {
 	return &Config{
-		ClaudeBin:          claudeBin,
-		PollIntervalSec:    300,
-		LimitFallbackMin:   30,
-		CooldownMarginSec:  90,
-		StepTimeoutMin:     60,
-		MaxAttempts:        3,
-		RetryBackoffMin:    5,
-		MaxParallel:        1,
-		ResumeFirst:        true,
-		DrainRescanSec:     15,
-		CodexReviewSandbox: codexReviewSandboxWorktreeWrite,
+		ClaudeBin:                  claudeBin,
+		PollIntervalSec:            300,
+		LimitFallbackMin:           30,
+		CooldownMarginSec:          90,
+		StepTimeoutMin:             60,
+		MaxAttempts:                3,
+		RetryBackoffMin:            5,
+		MaxParallel:                1,
+		ResumeFirst:                true,
+		DrainRescanSec:             15,
+		CodexReviewSandbox:         codexReviewSandboxWorktreeWrite,
+		CodexFallbackOpusModel:     "gpt-5.6-sol",
+		CodexFallbackOpusReasoning: "xhigh",
+		CodexTierModels: map[string]string{
+			"fable":  "gpt-5.6-sol",
+			"opus":   "gpt-5.6-sol",
+			"sonnet": "gpt-5.6-luna",
+			"haiku":  "gpt-5.6-luna",
+		},
+		CodexTierReasoning: map[string]string{
+			"fable":  "max",
+			"opus":   "xhigh",
+			"sonnet": "max",
+			"haiku":  "xhigh",
+		},
 		TypeOrder:          []string{typeProgressPull, typeCoordinate, typeReview, typeSequence, typeAssembly},
 		QueueBudgetTokens:  0,
 		RedlinePercent:     0,
@@ -478,8 +610,8 @@ func defaultConfig(claudeBin string) *Config {
 		TypeDefaults: map[string]TypeDefaults{
 			typeReview: {
 				PermissionMode: "default",
-				Model:          "claude-fable-5",
-				Effort:         "high",
+				Model:          "claude-opus-5",
+				Effort:         "max",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob",
 					"Bash(git log:*)", "Bash(git diff:*)", "Bash(git show:*)", "Bash(git status:*)", "Bash(ls:*)",
@@ -487,19 +619,20 @@ func defaultConfig(claudeBin string) *Config {
 			},
 			typeAssembly: {
 				PermissionMode: "default",
-				Model:          "claude-fable-5",
-				Effort:         "high",
+				Model:          "claude-opus-5",
+				Effort:         "xhigh",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob",
 					"Bash(git log:*)", "Bash(git status:*)", "Bash(ls:*)",
 				},
 			},
-			// 协调需要较强规划能力，但默认使用 Fable 高档即可；只有明确的复杂仲裁才单卡升 Opus。
+			// 装配/协调/例行审核默认使用 Opus 来源档，按 Owner 的 backend/general 路由解析；
+			// Fable 不作为任何普通卡型默认值，只允许最难裁决显式选择。
 			// 进度回收是机械总结，haiku 即可。
 			typeCoordinate: {
 				PermissionMode: "default",
-				Model:          "claude-fable-5",
-				Effort:         "high",
+				Model:          "claude-opus-5",
+				Effort:         "xhigh",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob",
 					"Bash(git log:*)", "Bash(git status:*)", "Bash(ls:*)",
@@ -523,8 +656,10 @@ func defaultConfig(claudeBin string) *Config {
 			},
 			typeSequence: {
 				PermissionMode: "acceptEdits",
-				Model:          "claude-fable-5",
-				Effort:         "high",
+				// 普通落地默认用 Sonnet 来源档（Grok/high→Luna/max）；模糊、长程、跨仓
+				// 或高风险由派卡方显式升为 Opus，最难裁决才显式使用 Fable/max。
+				Model:  "sonnet",
+				Effort: "xhigh",
 				AllowedTools: []string{
 					"Read", "Grep", "Glob", "Edit", "Write", "MultiEdit", "Task",
 					"Bash(git add:*)", "Bash(git commit:*)", "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)",
@@ -630,7 +765,234 @@ func loadConfig(root string) (*Config, error) {
 	if err := validateGemini(cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath(root), err)
 	}
+	if err := validateOpenCode(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
+	if err := validateKimiCLI(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
+	if err := validateGrokBuild(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
+	if err := validateCursor(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
+	if err := validateDefaultRunner(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
+	if err := validateOwnerRoutingPolicy(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
+	if ownerRoutingRequiredByProcess() && !cfg.OwnerRoutingEnforced {
+		return nil, fmt.Errorf("%s: CARDEX_REQUIRE_OWNER_ROUTING=1，但 owner_routing_enforced 未启用", configPath(root))
+	}
 	return cfg, nil
+}
+
+const ownerRoutingRequireEnv = "CARDEX_REQUIRE_OWNER_ROUTING"
+
+func ownerRoutingRequiredByProcess() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(ownerRoutingRequireEnv))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func validateOpenCode(cfg *Config) error {
+	if cfg == nil || cfg.OpenCodeNightOpus == nil || !cfg.OpenCodeNightOpus.Enabled {
+		return nil
+	}
+	r := cfg.OpenCodeNightOpus
+	if strings.TrimSpace(cfg.OpenCodeBin) == "" {
+		return fmt.Errorf("opencode_night_opus.enabled=true 需要配置 opencode_bin")
+	}
+	if r.StartHour < 0 || r.StartHour > 23 || r.EndHour < 0 || r.EndHour > 23 || r.StartHour == r.EndHour {
+		return fmt.Errorf("opencode_night_opus 时间窗非法: start_hour/end_hour 必须为 0..23 且不能相同")
+	}
+	r.Timezone = strings.TrimSpace(r.Timezone)
+	if r.Timezone == "" {
+		r.Timezone = "Local"
+	}
+	if _, err := time.LoadLocation(r.Timezone); err != nil {
+		return fmt.Errorf("opencode_night_opus.timezone %q 非法: %w", r.Timezone, err)
+	}
+	r.Model = strings.TrimSpace(r.Model)
+	if r.Model == "" {
+		return fmt.Errorf("opencode_night_opus.model 不能为空")
+	}
+	r.Variant = strings.TrimSpace(r.Variant)
+	if r.Variant == "" {
+		return fmt.Errorf("opencode_night_opus.variant 不能为空")
+	}
+	if r.LimitFallbackMin < 0 {
+		return fmt.Errorf("opencode_night_opus.limit_fallback_min 不能为负数")
+	}
+	return nil
+}
+
+func validateKimiCLI(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	cfg.KimiCLIModel = strings.TrimSpace(cfg.KimiCLIModel)
+	cfg.KimiCLIEffort = strings.ToLower(strings.TrimSpace(cfg.KimiCLIEffort))
+	if cfg.KimiCLIEffort != "" && !validEfforts[cfg.KimiCLIEffort] {
+		return fmt.Errorf("kimi_cli_effort %q 非法（可选 low/medium/high/xhigh/max）", cfg.KimiCLIEffort)
+	}
+	r := cfg.KimiCLIOpus
+	if r == nil || !r.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(cfg.KimiCLIBin) == "" {
+		return fmt.Errorf("kimi_cli_opus.enabled=true 需要配置 kimi_cli_bin")
+	}
+	r.Model = strings.TrimSpace(r.Model)
+	if r.Model == "" {
+		return fmt.Errorf("kimi_cli_opus.model 不能为空")
+	}
+	r.Effort = strings.ToLower(strings.TrimSpace(r.Effort))
+	if r.Effort == "" || !validEfforts[r.Effort] {
+		return fmt.Errorf("kimi_cli_opus.effort %q 非法（可选 low/medium/high/xhigh/max）", r.Effort)
+	}
+	if r.LimitFallbackMin < 0 {
+		return fmt.Errorf("kimi_cli_opus.limit_fallback_min 不能为负数")
+	}
+	if cfg.GrokBuild == nil || !cfg.GrokBuild.Enabled || !cfg.GrokBuild.KimiOpusFallback {
+		return fmt.Errorf("kimi_cli_opus.enabled=true 需要完整启用 Grok 主腿与 Kimi 第二腿（grok_build.enabled=true 且 kimi_opus_fallback=true）")
+	}
+	return nil
+}
+
+func validateGrokBuild(cfg *Config) error {
+	if cfg == nil || cfg.GrokBuild == nil || !cfg.GrokBuild.Enabled {
+		return nil
+	}
+	r := cfg.GrokBuild
+	cfg.GrokBuildBin = strings.TrimSpace(cfg.GrokBuildBin)
+	if cfg.GrokBuildBin == "" {
+		return fmt.Errorf("grok_build.enabled=true 需要配置 grok_build_bin")
+	}
+	r.Model = strings.TrimSpace(r.Model)
+	if r.Model == "" {
+		return fmt.Errorf("grok_build.model 不能为空")
+	}
+	r.Effort = strings.ToLower(strings.TrimSpace(r.Effort))
+	// Grok Build 1.0.4 的 grok-4.6 菜单最高只接受 xhigh；max 会在模型调用前退出。
+	if r.Effort == "max" {
+		return fmt.Errorf("grok_build.effort=max 不受当前 Grok 4.6 支持；请使用最高可用档 xhigh")
+	}
+	switch r.Effort {
+	case "low", "medium", "high", "xhigh":
+	default:
+		return fmt.Errorf("grok_build.effort %q 非法（当前 Grok 4.6 可选 low/medium/high/xhigh）", r.Effort)
+	}
+	if r.LimitFallbackMin < 0 {
+		return fmt.Errorf("grok_build.limit_fallback_min 不能为负数")
+	}
+	r.CodexFallbackModel = strings.TrimSpace(r.CodexFallbackModel)
+	r.CodexFallbackEffort = strings.ToLower(strings.TrimSpace(r.CodexFallbackEffort))
+	r.ReviewCodexModel = strings.TrimSpace(r.ReviewCodexModel)
+	r.ReviewCodexEffort = strings.ToLower(strings.TrimSpace(r.ReviewCodexEffort))
+	for name, effort := range map[string]string{
+		"codex_fallback_effort": r.CodexFallbackEffort,
+		"review_codex_effort":   r.ReviewCodexEffort,
+	} {
+		if effort != "" && !validEfforts[effort] {
+			return fmt.Errorf("grok_build.%s %q 非法（可选 low/medium/high/xhigh/max）", name, effort)
+		}
+	}
+	allowedTierRoutes := map[string]bool{"opus_backend": true, "sonnet": true, "haiku": true}
+	for key, route := range r.TierRoutes {
+		if !allowedTierRoutes[key] {
+			return fmt.Errorf("grok_build.tier_routes.%s 未知（可选 opus_backend/sonnet/haiku）", key)
+		}
+		route.Effort = strings.ToLower(strings.TrimSpace(route.Effort))
+		route.CodexFallbackModel = strings.TrimSpace(route.CodexFallbackModel)
+		route.CodexFallbackEffort = strings.ToLower(strings.TrimSpace(route.CodexFallbackEffort))
+		switch route.Effort {
+		case "low", "medium", "high", "xhigh":
+		default:
+			return fmt.Errorf("grok_build.tier_routes.%s.effort %q 非法（当前 Grok 4.6 可选 low/medium/high/xhigh）", key, route.Effort)
+		}
+		if route.CodexFallbackModel == "" {
+			return fmt.Errorf("grok_build.tier_routes.%s.codex_fallback_model 不能为空", key)
+		}
+		if !validEfforts[route.CodexFallbackEffort] {
+			return fmt.Errorf("grok_build.tier_routes.%s.codex_fallback_effort %q 非法（可选 low/medium/high/xhigh/max）", key, route.CodexFallbackEffort)
+		}
+		r.TierRoutes[key] = route
+	}
+	// Owner routing table is an enforcement contract, not a suggestion that per-host config may
+	// silently weaken. Optional rows may be omitted, but any enabled row must match the exact identity.
+	expectedTierRoutes := map[string]GrokTierRoute{
+		"opus_backend": {Effort: "xhigh", CodexFallbackModel: "gpt-5.6-sol", CodexFallbackEffort: "max"},
+		"sonnet":       {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "max"},
+		"haiku":        {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "xhigh"},
+	}
+	for key, expected := range expectedTierRoutes {
+		if route, ok := r.TierRoutes[key]; ok && route != expected {
+			return fmt.Errorf("grok_build.tier_routes.%s 必须严格为 Grok/%s → %s/%s",
+				key, expected.Effort, expected.CodexFallbackModel, expected.CodexFallbackEffort)
+		}
+	}
+	if len(r.TierRoutes) > 0 && r.Model != "grok-4.6" {
+		return fmt.Errorf("Owner tier routes must strictly use grok_build.model=grok-4.6")
+	}
+	if r.OpusAdversarialReview && (r.ReviewCodexModel == "" || r.ReviewCodexEffort == "") {
+		return fmt.Errorf("grok_build.opus_adversarial_review=true 需要 review_codex_model/review_codex_effort")
+	}
+	if r.OpusAdversarialReview && (r.ReviewCodexModel != "gpt-5.6-sol" || r.ReviewCodexEffort != "max") {
+		return fmt.Errorf("grok_build Opus 对抗复审必须严格使用 gpt-5.6-sol/max")
+	}
+	if r.KimiOpusFallback {
+		if r.Model != "grok-4.6" || r.Effort != "xhigh" || r.CodexFallbackModel != "gpt-5.6-sol" || r.CodexFallbackEffort != "xhigh" {
+			return fmt.Errorf("Grok→Kimi→Sol 策略必须严格使用 grok-4.6/xhigh → kimi-code/k3/max → gpt-5.6-sol/xhigh")
+		}
+		if cfg.KimiCLIOpus == nil || strings.TrimSpace(cfg.KimiCLIOpus.Model) != "kimi-code/k3" ||
+			strings.ToLower(strings.TrimSpace(cfg.KimiCLIOpus.Effort)) != "max" {
+			return fmt.Errorf("Grok→Kimi→Sol 策略需要 kimi_cli_opus.model=kimi-code/k3 且 effort=max")
+		}
+		for _, key := range []string{"opus_backend", "sonnet", "haiku"} {
+			if _, ok := r.TierRoutes[key]; !ok {
+				return fmt.Errorf("Owner 六行路由启用 Kimi 腿时缺 grok_build.tier_routes.%s", key)
+			}
+		}
+	}
+	if (r.KimiOpusFallback || r.FableClaudeFallback || r.FableFirstPrinciples || r.OpusAdversarialReview || len(r.TierRoutes) > 0) && strings.TrimSpace(cfg.CodexBin) == "" {
+		return fmt.Errorf("grok_build 接力/复审策略需要配置 codex_bin")
+	}
+	if r.KimiOpusFallback && (cfg.KimiCLIOpus == nil || !cfg.KimiCLIOpus.Enabled) {
+		return fmt.Errorf("grok_build.kimi_opus_fallback=true 需要启用 kimi_cli_opus")
+	}
+	if r.FableFirstPrinciples && !r.FableClaudeFallback {
+		return fmt.Errorf("grok_build.fable_first_principles_review=true 需要启用 fable_claude_fallback")
+	}
+	return nil
+}
+
+func validateDefaultRunner(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	cfg.DefaultRunner = strings.TrimSpace(strings.ToLower(cfg.DefaultRunner))
+	switch cfg.DefaultRunner {
+	case "", "claude":
+		return nil
+	case "codex":
+		if strings.TrimSpace(cfg.CodexBin) == "" {
+			return fmt.Errorf("default_runner=codex 需要配置 codex_bin")
+		}
+		return nil
+	case "gemini":
+		if strings.TrimSpace(cfg.GeminiBin) == "" {
+			return fmt.Errorf("default_runner=gemini 需要配置 gemini_bin")
+		}
+		return nil
+	default:
+		return fmt.Errorf("default_runner %q 非法（可选: claude, codex, gemini）", cfg.DefaultRunner)
+	}
 }
 
 func saveConfig(root string, cfg *Config) error {

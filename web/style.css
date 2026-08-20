@@ -387,6 +387,27 @@ button { font: inherit; color: inherit; }
   white-space: nowrap; max-width: 100%; overflow: hidden; text-overflow: ellipsis;
 }
 .meta-chip.is-mono { font-family: var(--mono); font-size: 10.5px; }
+.meta-chip.is-opencode {
+  color: color-mix(in oklab, var(--s7) 82%, var(--ink));
+  border-color: color-mix(in oklab, var(--s7) 38%, transparent);
+  background: color-mix(in oklab, var(--s7) 10%, var(--surface));
+}
+.meta-chip.is-codex {
+  color: color-mix(in oklab, var(--s2) 78%, var(--ink));
+  border-color: color-mix(in oklab, var(--s2) 34%, transparent);
+  background: color-mix(in oklab, var(--s2) 9%, var(--surface));
+}
+.meta-chip.is-route {
+  color: color-mix(in oklab, var(--s1) 76%, var(--ink));
+  border-style: dashed;
+  border-color: color-mix(in oklab, var(--s1) 38%, transparent);
+  background: color-mix(in oklab, var(--s1) 8%, var(--surface));
+}
+.meta-chip.is-model-route {
+  color: color-mix(in oklab, var(--s3) 76%, var(--ink));
+  border-color: color-mix(in oklab, var(--s3) 36%, transparent);
+  background: color-mix(in oklab, var(--s3) 8%, var(--surface));
+}
 
 /* ---------- 6. 卡片 ---------- */
 .card {
@@ -550,6 +571,56 @@ button { font: inherit; color: inherit; }
   margin: 3px 0 0; font-size: 10.5px; color: var(--ink-mute);
   line-height: 1.5; overflow-wrap: anywhere;
 }
+
+/* 成熟度进度：阶段名比「设计/落地」长，单独给更宽的首列；条只表达 0–4 得分，
+   不复用任务状态色，避免把「卡正在 running」误读成「能力已晋级」。 */
+.maturity-group .prog-row {
+  grid-template-columns: minmax(86px, 1.35fr) minmax(66px, auto) minmax(110px, 2fr);
+}
+.maturity-group .prog-key { white-space: normal; line-height: 1.25; }
+.maturity-bar-wrap { min-width: 0; }
+.prog-seg.is-maturity-earned {
+  background: linear-gradient(90deg,
+    color-mix(in oklab, var(--s1) 68%, var(--surface-2)),
+    color-mix(in oklab, var(--s1) 88%, var(--ink)));
+}
+/* 五类颜色同时服务于总条分段、分类行和阶段条；文字标签/悬停/aria 是第二重编码，
+   因而不会把颜色本身当作唯一信息。 */
+.mk-design { --maturity-kind-color: var(--s1); }
+.mk-impl   { --maturity-kind-color: var(--s2); }
+.mk-fix    { --maturity-kind-color: var(--s6); }
+.mk-review { --maturity-kind-color: var(--s7); }
+.mk-coord  { --maturity-kind-color: var(--s4); }
+.prog-seg.is-maturity-kind {
+  background: var(--maturity-kind-color);
+}
+.maturity-kind-key {
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.maturity-kind-dot {
+  width: 7px; height: 7px; border-radius: 2px; flex: 0 0 auto;
+  background: var(--maturity-kind-color);
+}
+.maturity-kind-basis {
+  padding-bottom: 3px; margin-bottom: 2px;
+  border-bottom: 1px dotted var(--border);
+}
+.prog-seg.is-maturity-gap {
+  background: repeating-linear-gradient(45deg, transparent, transparent 3px,
+    color-mix(in oklab, var(--line) 75%, transparent) 3px,
+    color-mix(in oklab, var(--line) 75%, transparent) 6px);
+}
+.maturity-state {
+  margin: -1px 0 3px; padding-left: 4px;
+  border-left: 2px solid color-mix(in oklab, var(--s1) 28%, transparent);
+}
+.maturity-na-text {
+  min-height: 8px; padding: 2px 7px; border: 1px dashed var(--border-2);
+  border-radius: var(--r-sm); color: var(--ink-mute); font-size: 11px;
+}
+.maturity-delta { color: var(--ink-2); }
+.maturity-ledger { color: var(--st-warning, #9a6500); }
+.maturity-source { border-top: 1px dotted var(--border); padding-top: 4px; }
 
 /* 落地进度（CG-8）：与卡片进度**并列**呈现，视觉上要能一眼分清"活干完了多少"
    与"离目标多远"。用略深的字重与独立分隔线避免与 .prog-wrap 混淆。 */

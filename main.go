@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,7 +16,7 @@ import (
 	"time"
 )
 
-const version = "0.10.0"
+const version = "0.10.11"
 
 func main() {
 	if len(os.Args) < 2 {
@@ -99,8 +100,11 @@ func printUsage() {
 用法: cardex <命令> [选项]
 
 添加任务
-  add       [-type sequence|design-review|prompt-assembly|coordinate|progress-pull]
-            [-title T] [-dir D] [-priority N] [-model haiku|sonnet|opus] [-file steps.md]
+	add       [-type sequence|design-review|prompt-assembly|coordinate|progress-pull]
+	          [-title T] [-dir D] [-priority N] [-model haiku|sonnet|opus] [-file steps.md]
+	          [-runner claude|codex|gemini|opencode|kimi-cli|grok-build|cursor] [-opencode-model provider/model]
+	          [-kimi-model kimi-code/k3] [-grok-model grok-4.6] [-grok-effort xhigh] [-cursor-model MODEL]
+	          [-route-class general|backend]
             [-stakes low|normal|high] [-review-after] [-emit] [-hold] [-skip-permissions]
             [-tools "A,B"] "prompt..."
             -file 中用单独一行 --- 分隔多个步骤（预设 prompt 序列）
@@ -226,9 +230,15 @@ func cmdAdd(args []string) error {
 	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
 	stakes := fs.String("stakes", "", "投入产出档位（low|normal|high，缺省 normal）：按 config.stakes_policy 查表决定是否配对抗复审/抬思考档，入队即固化到卡面")
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
-	runner := fs.String("runner", "", "钉定执行器：codex = 走独立 GPT 额度（要求单步或 -fresh）；gemini = 走 Google 订阅额度（有会话，多步可用）")
+	runner := fs.String("runner", "", "钉定执行器：claude / codex / gemini / opencode / kimi-cli / grok-build / cursor")
 	codexModel := fs.String("codex-model", "", "钉定经 codex 执行时的模型（如 gpt-5.6-terra）：配 -runner codex 主跑生效；不配 runner 时作为本卡 codex_fallback 降级模型")
 	geminiModel := fs.String("gemini-model", "", "钉定经 gemini 执行时的模型（推荐官方别名 pro/flash/flash-lite）：主跑与降级改道两径生效；空按档位槽映射")
+	openCodeModel := fs.String("opencode-model", "", "钉定原生 OpenCode provider/model（如 opencode-go/gpt-5.6-luna）")
+	kimiModel := fs.String("kimi-model", "", "钉定原生 Kimi Code CLI 模型（如 kimi-code/k3）")
+	grokModel := fs.String("grok-model", "", "钉定原生 Grok Build 模型（如 grok-4.6）")
+	grokEffort := fs.String("grok-effort", "", "钉定 Grok Build 推理档（当前 grok-4.6 最高 xhigh）")
+	cursorModel := fs.String("cursor-model", "", "钉定 Cursor 账号模型 ID（思考档已编码在 ID 内）")
+	routeClass := fs.String("route-class", "", "工作负载路由分类：backend=服务/持久化/协议/数据库/网络执行/身份凭据/manifest-launchd/Control权限/live cutover，general=明确非后端；Owner 强制模式下新 sequence 卡必填，空值仅供存量卡兼容判定")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
 	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
@@ -240,9 +250,10 @@ func cmdAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *runner != "" && *runner != "codex" && *runner != "gemini" {
+	if *runner != "" && *runner != "claude" && *runner != "codex" && *runner != "gemini" &&
+		*runner != "opencode" && *runner != "kimi-cli" && *runner != grokBuildRunnerName && *runner != cursorRunnerName {
 		if _, ok := cfg.Engines[*runner]; !ok {
-			return fmt.Errorf("未知 runner %q（可选: codex, gemini%s；引擎预设用 cardex engines add <名> 并入）",
+			return fmt.Errorf("未知 runner %q（可选: claude, codex, gemini, opencode, kimi-cli, grok-build, cursor%s；引擎预设用 cardex engines add <名> 并入）",
 				*runner, engineNamesHint(cfg))
 		}
 	}
@@ -290,6 +301,9 @@ func cmdAdd(args []string) error {
 	t.ReviewAfter = *reviewAfter
 	t.EmitTasks = *emit || *typ == typeAssembly || *typ == typeCoordinate
 	t.SessionID = *session
+	if *runner == "" {
+		preserveSessionRunner(t)
+	}
 	if *hold {
 		t.Status = statusHeld
 	}
@@ -310,6 +324,7 @@ func cmdAdd(args []string) error {
 			return fmt.Errorf("未知 effort %q（可选: low/medium/high/xhigh/max）", *effort)
 		}
 		t.Effort = *effort
+		t.EffortExplicit = true
 	}
 	// stakes 查表：入队即钉，把"这卡多重要"翻译成复核深度固化到卡面（见 stakes.go 文件头）。
 	// 必须排在 -review-after / -effort 赋值之后——查表是在显式意图之上做的决定。
@@ -318,7 +333,12 @@ func cmdAdd(args []string) error {
 	}
 	t.Closeout = *closeout
 	t.FreshSteps = *fresh
-	if *runner == "codex" {
+	if *runner == "claude" {
+		t.PreferRunner = "claude"
+		if strings.TrimSpace(cfg.ClaudeBin) == "" {
+			return fmt.Errorf("config.json 未配置 claude_bin，无法钉定 Claude 执行器")
+		}
+	} else if *runner == "codex" {
 		t.PreferRunner = "codex"
 		if !codexEligible(t) {
 			return fmt.Errorf("-runner codex 要求任务单步无会话，或加 -fresh（状态在文件里，步骤间不续会话）")
@@ -339,6 +359,26 @@ func cmdAdd(args []string) error {
 		if cfg.GeminiBin == "" {
 			return fmt.Errorf("config.json 未配置 gemini_bin，无法钉定 gemini 执行器")
 		}
+	} else if *runner == "opencode" {
+		t.PreferRunner = "opencode"
+		if strings.TrimSpace(cfg.OpenCodeBin) == "" {
+			return fmt.Errorf("config.json 未配置 opencode_bin，无法钉定 opencode 执行器")
+		}
+	} else if *runner == "kimi-cli" {
+		t.PreferRunner = "kimi-cli"
+		if strings.TrimSpace(cfg.KimiCLIBin) == "" {
+			return fmt.Errorf("config.json 未配置 kimi_cli_bin，无法钉定 Kimi CLI 执行器")
+		}
+	} else if *runner == grokBuildRunnerName {
+		t.PreferRunner = grokBuildRunnerName
+		if !grokBuildEnabled(cfg) {
+			return fmt.Errorf("config.json 未启用 grok_build/grok_build_bin，无法钉定 Grok Build 执行器")
+		}
+	} else if *runner == cursorRunnerName {
+		t.PreferRunner = cursorRunnerName
+		if !cursorEnabled(cfg) {
+			return fmt.Errorf("config.json 未配置 cursor_bin，无法钉定 Cursor 执行器")
+		}
 	} else if *runner != "" {
 		// 订阅引擎钉定（config.engines 的键，上面已校验存在）。与 codex 钉定的两点差异：
 		//   - 不要求 codexEligible：引擎跑的是 claude CLI，有会话、多步/续跑全可用；
@@ -346,8 +386,54 @@ func cmdAdd(args []string) error {
 		//     供应商原生模型 ID 直通（如 -model k3 / -model glm-5.2）。
 		t.PreferRunner = *runner
 	}
+	if strings.TrimSpace(*runner) != "" {
+		t.RunnerExplicit = true
+	}
 	t.CodexModel = strings.TrimSpace(*codexModel)
 	t.GeminiModel = strings.TrimSpace(*geminiModel)
+	t.OpenCodeModel = strings.TrimSpace(*openCodeModel)
+	t.KimiModel = strings.TrimSpace(*kimiModel)
+	t.GrokModel = strings.TrimSpace(*grokModel)
+	t.GrokEffort = strings.ToLower(strings.TrimSpace(*grokEffort))
+	t.CursorModel = strings.TrimSpace(*cursorModel)
+	t.RouteClass = strings.ToLower(strings.TrimSpace(*routeClass))
+	if t.RouteClass != "" && t.RouteClass != routeClassGeneral && t.RouteClass != routeClassBackend {
+		return fmt.Errorf("未知 route-class %q（可选: general/backend）", *routeClass)
+	}
+	if err := validateNewTaskRouteClass(cfg, t); err != nil {
+		return err
+	}
+	if t.PreferRunner == "opencode" && resolveOpenCodeModel(cfg, t) == "" {
+		return fmt.Errorf("-runner opencode 需要 -opencode-model，或配置 opencode_model/opencode_models")
+	}
+	if t.PreferRunner == "kimi-cli" && resolveKimiCLIModel(cfg, t) == "" {
+		return fmt.Errorf("-runner kimi-cli 需要 -kimi-model，或配置 kimi_cli_model/kimi_cli_opus.model")
+	}
+	if t.GrokEffort != "" {
+		if t.GrokEffort == "max" {
+			return fmt.Errorf("-grok-effort=max 不受当前 Grok 4.6 支持；请使用最高可用档 xhigh")
+		}
+		switch t.GrokEffort {
+		case "low", "medium", "high", "xhigh":
+		default:
+			return fmt.Errorf("未知 grok-effort %q（当前可选 low/medium/high/xhigh）", t.GrokEffort)
+		}
+	}
+	if t.PreferRunner == grokBuildRunnerName && resolveGrokBuildModel(cfg, t) == "" {
+		return fmt.Errorf("-runner grok-build 需要 -grok-model，或配置 grok_build.model")
+	}
+	if t.PreferRunner == cursorRunnerName && resolveCursorModel(cfg, t) == "" {
+		return fmt.Errorf("-runner cursor 需要 -cursor-model，或配置 cursor_model/cursor_fable.model")
+	}
+	// 生产分层防漂移：default_runner=codex 时，旧 session 可能继续同时传
+	// `-model sonnet -codex-model gpt-5.6-sol`。后者优先级更高，会让卡面声称 Sonnet/Luna、
+	// 实际却跑 Sol，直接绕过刚确认的路由。只有“两边都显式给出”时做一致性校验；单独
+	// -codex-model 仍保留为高级钉模入口，-runner codex 的既有用法也不受影响。
+	if t.PreferRunner == "codex" && *model != "" && t.CodexModel != "" {
+		if err := validateExplicitCodexRoute(cfg, t); err != nil {
+			return err
+		}
+	}
 	if *host != "" {
 		t.RemoteHost = *host
 		if !codexEligible(t) {
@@ -378,7 +464,7 @@ func cmdAdd(args []string) error {
 	emitTaskEvent(root, t.ID, evQueued, "cli:add", statusQueued, t.Step, map[string]any{
 		"type": t.Type, "priority": t.Priority, "prompts": len(t.Prompts),
 		"stakes": t.Stakes, "review_after": t.ReviewAfter, "effort": t.Effort,
-		"max_fix_rounds": t.MaxFixRounds,
+		"max_fix_rounds": t.MaxFixRounds, "route_class": t.RouteClass,
 	})
 	if *hold {
 		// 新生卡零用量是真实的，但仍落显式 cost_unavailable 标记：终态事件二选一没有第三种。
@@ -451,6 +537,11 @@ func cmdCross(args []string) error {
 	if la, lb := crossEngineLoc(prof.A), crossEngineLoc(prof.B); la != lb {
 		return fmt.Errorf("profile %q 的甲乙引擎执行位置不同（%s vs %s）：交叉链共用一个工作目录，一对引擎须同在本机或同一远端主机", name, la, lb)
 	}
+	if prof.Merge != nil {
+		if la, lc := crossEngineLoc(prof.A), crossEngineLoc(*prof.Merge); la != lc {
+			return fmt.Errorf("profile %q 的合并引擎执行位置不同（%s vs %s）：A/B/C 必须共享同一执行位置", name, la, lc)
+		}
+	}
 	// 甲乙必须是**不同引擎**：同 kind+同模型（codex 同 codex_model / claude 同 model / 远端同 host+model）=
 	// 单引擎自审，交叉验证形同虚设。
 	if ia, ib := crossEngineIdentity(prof.A, cfg), crossEngineIdentity(prof.B, cfg); ia == ib {
@@ -514,21 +605,32 @@ func cmdCross(args []string) error {
 		return fmt.Errorf("引擎乙(%s): %w", crossEngineLabel(prof.B), err)
 	}
 	a.XEngineB = frozenB
+	if prof.Merge != nil {
+		frozenC, err := freezeCrossEngine(*prof.Merge, cfg)
+		if err != nil {
+			return fmt.Errorf("合并引擎(%s): %w", crossEngineLabel(*prof.Merge), err)
+		}
+		a.XEngineC = frozenC
+	}
 	if err := saveTask(root, a); err != nil {
 		return err
 	}
 	emitTaskEvent(root, a.ID, evQueued, "cli:cross", statusQueued, 0, map[string]any{
 		"profile": name, "x_role": "A", "x_key": a.XKey,
 	})
-	fmt.Printf(`已入队交叉验证链 [%s]  甲=%s  乙=%s
+	mergeLabel := crossEngineLabel(prof.B)
+	if prof.Merge != nil {
+		mergeLabel = crossEngineLabel(*prof.Merge)
+	}
+	fmt.Printf(`已入队交叉验证链 [%s]  甲=%s  乙=%s  合并=%s
   A %s  引擎甲独立作答（第一性原理+对抗式自审）
   ↓ 完成后自动派：
   B      引擎乙独立作答（不见甲结论、无 A 指针）
   ↓ 完成后自动派：
-  C      引擎乙拿甲结论对抗式交叉查漏 → 结论落进度报告
+  C      独立合并引擎拿甲乙结论做第一性复审 → 结论落进度报告
 链 ID: %s   最终结论: cardex progress -show %s   A 卡日志: cardex log %s
 工作目录: %s
-`, name, crossEngineLabel(prof.A), crossEngineLabel(prof.B), a.ID, a.XKey, a.XKey, a.ID, wd)
+`, name, crossEngineLabel(prof.A), crossEngineLabel(prof.B), mergeLabel, a.ID, a.XKey, a.XKey, a.ID, wd)
 	return nil
 }
 
@@ -576,7 +678,11 @@ func listCrossProfiles(cfg *Config) error {
 		if n == cfg.DefaultCrossProfile {
 			def = "  (默认)"
 		}
-		fmt.Printf("  %-14s 甲=%s  乙=%s%s\n", n, crossEngineLabel(p.A), crossEngineLabel(p.B), def)
+		merge := crossEngineLabel(p.B)
+		if p.Merge != nil {
+			merge = crossEngineLabel(*p.Merge)
+		}
+		fmt.Printf("  %-14s 甲=%s  乙=%s  合并=%s%s\n", n, crossEngineLabel(p.A), crossEngineLabel(p.B), merge, def)
 	}
 	return nil
 }
@@ -614,6 +720,7 @@ func cmdAssemble(args []string) error {
 	t.EmitTasks = true
 	t.EmitHold = *holdOut
 	t.SessionID = *session
+	preserveSessionRunner(t)
 	if *model != "" {
 		t.Model = *model
 	}
@@ -657,6 +764,7 @@ func cmdReview(args []string) error {
 	prompt := renderTemplate(tpl, map[string]string{"DIR": wd, "FOCUS": focus})
 	t := newTask(root, cfg, typeReview, orDefaultTitle(*title, "审核: "+focus), wd, []string{prompt}, *priority)
 	t.SessionID = *session
+	preserveSessionRunner(t)
 	if *model != "" {
 		t.Model = *model
 	}
@@ -702,6 +810,7 @@ func cmdAdopt(args []string) error {
 	}
 	t := newTask(root, cfg, typeSequence, "接管会话 "+short, wd, []string{prompt}, *priority)
 	t.SessionID = sessionID
+	preserveSessionRunner(t)
 	if *model != "" {
 		t.Model = *model
 	}
@@ -863,6 +972,7 @@ func cmdBrief(args []string) error {
 		}
 		t := newTask(root, cfg, typeProgressPull, "进度: "+ttl, wd, []string{tpl}, *priority)
 		t.SessionID = sess
+		preserveSessionRunner(t)
 		t.EmitProgress = true
 		t.ProgressKey = key
 		applyLegacyTypeFallback(cfg, t)
@@ -1138,7 +1248,167 @@ func shortTime(rfc string) string {
 	return rfc
 }
 
-// cmdCmd 打印手动接管某任务的 claude 命令与当前步骤 prompt（想自己在终端里跑时用）。
+func ownerManualRouteLeg(cfg *Config, t *Task) (ownerRoute, policyLeg, bool) {
+	if route, ok := resolveOwnerRoute(cfg, t); ok && len(route.Legs) > 0 {
+		return route, route.Legs[0], true
+	}
+	route, ok := resolveOwnerRouteReadback(cfg, t)
+	if !ok || len(route.Legs) == 0 {
+		return ownerRoute{}, policyLeg{}, false
+	}
+	runner, _ := effectiveBoardRunner(t)
+	for _, leg := range route.Legs {
+		if leg.Runner == runner {
+			return route, leg, true
+		}
+	}
+	return route, route.Legs[0], true
+}
+
+// ownerManualDispatchCommand consumes the same resolver as tick and board readback. It returns a
+// directly runnable zsh command for the currently selected leg without mutating the task or probing
+// provider availability; provider cooldowns therefore cannot silently make manual takeover skip a leg.
+func ownerManualDispatchCommand(cfg *Config, t *Task, prompt string) (ownerRoute, policyLeg, string, bool) {
+	route, leg, ok := ownerManualRouteLeg(cfg, t)
+	if !ok {
+		return ownerRoute{}, policyLeg{}, "", false
+	}
+	command, ok := manualDispatchCommandForLeg(cfg, t, prompt, leg)
+	return route, leg, command, ok
+}
+
+func manualDispatchCommandForLeg(cfg *Config, t *Task, prompt string, leg policyLeg) (string, bool) {
+	cd := "cd " + shellQuote(t.Dir) + " && "
+	switch leg.Runner {
+	case kimiCLIRunnerName:
+		bin := strings.TrimSpace(cfg.KimiCLIBin)
+		if bin == "" {
+			bin = "kimi"
+		}
+		cmd := "KIMI_MODEL_THINKING_EFFORT=" + shellQuote(leg.Effort) + " " + shellQuote(bin) +
+			" --model " + shellQuote(leg.Model) + " --prompt " + shellQuote(prompt) + " --output-format stream-json"
+		return cd + cmd, true
+	case grokBuildRunnerName:
+		bin := strings.TrimSpace(cfg.GrokBuildBin)
+		if bin == "" {
+			bin = "grok"
+		}
+		sandbox, permission := "read-only", "plan"
+		if t.Type == typeSequence || t.SkipPermissions {
+			sandbox, permission = "workspace", "auto"
+		}
+		cmd := shellQuote(bin) + " --no-auto-update --model " + shellQuote(leg.Model) +
+			" --reasoning-effort " + shellQuote(leg.Effort) + " --output-format streaming-json" +
+			" --sandbox " + sandbox + " --permission-mode " + permission +
+			" --no-memory --no-subagents --disable-web-search --verbatim" +
+			" --prompt-file <(printf %s " + shellQuote(prompt) + ")"
+		return cd + cmd, true
+	case cursorRunnerName:
+		bin := strings.TrimSpace(cfg.CursorBin)
+		if bin == "" {
+			bin = "cursor-agent"
+		}
+		cmd := shellQuote(bin) + " --print --trust --output-format stream-json --model " + shellQuote(leg.Model) +
+			" --workspace " + shellQuote(t.Dir) + " --sandbox enabled"
+		if t.Type != typeSequence {
+			cmd += " --mode ask"
+		}
+		cmd += " " + shellQuote(prompt)
+		return cd + cmd, true
+	case "opencode":
+		bin := strings.TrimSpace(cfg.OpenCodeBin)
+		if bin == "" {
+			bin = "opencode"
+		}
+		cmd := shellQuote(bin) + " run --pure --format json --model " + shellQuote(leg.Model) +
+			" --dir " + shellQuote(t.Dir)
+		if t.SessionID != "" {
+			cmd += " --session " + shellQuote(t.SessionID)
+		}
+		if leg.Effort != "" {
+			cmd += " --variant " + shellQuote(leg.Effort)
+		}
+		if t.Type == typeSequence || t.SkipPermissions {
+			cmd += " --auto"
+		}
+		cmd += " " + shellQuote(prompt)
+		return cd + cmd, true
+	case "codex":
+		bin := strings.TrimSpace(cfg.CodexBin)
+		if bin == "" {
+			bin = "codex"
+		}
+		sandbox := "read-only"
+		if t.Type == typeSequence {
+			sandbox = "workspace-write"
+		}
+		cmd := "printf %s " + shellQuote(prompt) + " | " + shellQuote(bin) + " exec -C " + shellQuote(t.Dir) +
+			" --sandbox " + sandbox + " --skip-git-repo-check --color never -m " + shellQuote(leg.Model) +
+			" -c " + shellQuote("model_reasoning_effort="+leg.Effort)
+		return cd + cmd, true
+	default:
+		return "", false
+	}
+}
+
+func remoteManualDispatchCommand(cfg *Config, t *Task, prompt string) (string, error) {
+	if cfg == nil || t == nil || t.RemoteHost == "" {
+		return "", fmt.Errorf("remote task identity missing")
+	}
+	rh, ok := cfg.RemoteHosts[t.RemoteHost]
+	if !ok {
+		return "", fmt.Errorf("未配置远程主机 %q", t.RemoteHost)
+	}
+	sshBin := strings.TrimSpace(cfg.SSHBin)
+	if sshBin == "" {
+		sshBin = "ssh"
+	}
+	remoteCmd := ""
+	if remoteUsesClaude(t) {
+		if rh.CodexOnly {
+			return "", fmt.Errorf("远程主机 %q 为 codex_only，拒绝生成 Claude 命令", t.RemoteHost)
+		}
+		bin := strings.TrimSpace(rh.ClaudeBin)
+		if bin == "" {
+			bin = "claude"
+		}
+		cdCmd, dir := "cd /d", strings.ReplaceAll(t.Dir, "/", `\`)
+		if rh.Shell == "posix" {
+			cdCmd, dir = "cd", t.Dir
+		}
+		remoteCmd = fmt.Sprintf(`%s "%s" && %s -p --output-format json`, cdCmd, dir, bin)
+		if t.Model != "" {
+			remoteCmd += " --model " + t.Model
+		}
+		if t.Effort != "" {
+			remoteCmd += " --effort " + t.Effort
+		}
+	} else {
+		bin := strings.TrimSpace(rh.CodexBin)
+		if bin == "" {
+			bin = "codex"
+		}
+		sandbox := strings.TrimSpace(rh.Sandbox)
+		if sandbox == "" {
+			sandbox = "workspace-write"
+		}
+		if t.Type != typeSequence {
+			sandbox = remoteCodexReviewSandbox(cfg, t)
+		}
+		remoteCmd = fmt.Sprintf(`%s exec -C "%s" --sandbox %s --skip-git-repo-check --color never`,
+			bin, t.Dir, sandbox)
+		if effort := resolveRemoteCodexReasoning(cfg, t); effort != "" {
+			remoteCmd += " -c model_reasoning_effort=" + effort
+		}
+		if model := resolveCodexModel(cfg, t); model != "" {
+			remoteCmd += " -m " + model
+		}
+	}
+	return "printf %s " + shellQuote(prompt) + " | " + shellQuote(sshBin) + " -o BatchMode=yes " +
+		shellQuote(t.RemoteHost) + " " + shellQuote(remoteCmd), nil
+}
+
+// cmdCmd 打印手动接管某任务的实际执行器命令与当前步骤 prompt（想自己在终端里跑时用）。
 func cmdCmd(args []string) error {
 	fs := flag.NewFlagSet("cmd", flag.ExitOnError)
 	rootFlag := fs.String("root", "", "数据目录")
@@ -1162,6 +1432,39 @@ func cmdCmd(args []string) error {
 	if step >= len(t.Prompts) {
 		step = len(t.Prompts) - 1
 	}
+	prompt := injectLiveContext(root, t.ID, t.Prompts[step])
+	if route, leg, command, ok := ownerManualDispatchCommand(cfg, t, prompt); ok {
+		fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
+			t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
+		fmt.Printf("# Owner 路由 %s；当前腿 %s\n", route.Name, boardRouteLeg(leg.Runner, leg.Model, leg.Effort))
+		fmt.Printf("%s\n", command)
+		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
+		return nil
+	}
+	if reason := ownerRoutingPolicyWaitReason(cfg, t); reason != "" {
+		return fmt.Errorf("%s 属于 Owner 路由政策等待：%s；不生成通用执行命令", t.ID, reason)
+	}
+	if t.RemoteHost != "" {
+		command, err := remoteManualDispatchCommand(cfg, t, prompt)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
+			t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
+		fmt.Printf("# 冻结远程执行腿 %s\n%s\n", t.RemoteHost, command)
+		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
+		return nil
+	}
+	if leg, ok := resolvePinnedTaskLeg(cfg, t); ok && leg.Runner != "gemini" {
+		if command, commandOK := manualDispatchCommandForLeg(cfg, t, prompt, leg); commandOK {
+			fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
+				t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
+			fmt.Printf("# 显式/冻结执行腿 %s\n", boardRouteLeg(leg.Runner, leg.Model, leg.Effort))
+			fmt.Printf("%s\n", command)
+			fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
+			return nil
+		}
+	}
 	parts := []string{"claude"}
 	cmdModel := t.Model
 	envPrefix := ""
@@ -1181,7 +1484,7 @@ func cmdCmd(args []string) error {
 		fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
 			t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
 		fmt.Printf("%s\n", strings.Join(parts, " "))
-		fmt.Printf("\n# codex exec 从 stdin 读 prompt，进入后粘贴当前步骤的 prompt：\n%s\n", injectLiveContext(root, t.ID, t.Prompts[step]))
+		fmt.Printf("\n# codex exec 从 stdin 读 prompt，进入后粘贴当前步骤的 prompt：\n%s\n", prompt)
 		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
 		return nil
 	case t.PreferRunner == "gemini":
@@ -1196,7 +1499,7 @@ func cmdCmd(args []string) error {
 		if t.MidStep && t.SessionID != "" {
 			fmt.Printf("\n# 该会话在步骤中途被打断，进入后先发续跑提示：\n%s\n", cfg.ResumePrompt)
 		} else {
-			fmt.Printf("\n# 进入后粘贴当前步骤的 prompt：\n%s\n", injectLiveContext(root, t.ID, t.Prompts[step]))
+			fmt.Printf("\n# 进入后粘贴当前步骤的 prompt：\n%s\n", prompt)
 		}
 		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
 		return nil
@@ -1235,7 +1538,7 @@ func cmdCmd(args []string) error {
 	if t.MidStep && t.SessionID != "" {
 		fmt.Printf("\n# 该会话在步骤中途被打断，进入后先发续跑提示：\n%s\n", cfg.ResumePrompt)
 	} else {
-		fmt.Printf("\n# 进入后粘贴当前步骤的 prompt：\n%s\n", injectLiveContext(root, t.ID, t.Prompts[step]))
+		fmt.Printf("\n# 进入后粘贴当前步骤的 prompt：\n%s\n", prompt)
 	}
 	fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
 	return nil
@@ -1757,6 +2060,103 @@ func cmdDoctor(args []string) error {
 		}
 		if cd := loadEngineCooldown(root, "gemini"); cd.active(time.Now()) {
 			fmt.Printf("  - gemini 车道冷却中（%s），%s 恢复\n", cd.Reason, fmtClock(cd.UntilEpoch))
+		}
+	}
+	if cfg != nil && cfg.OpenCodeBin != "" {
+		_, err = os.Stat(cfg.OpenCodeBin)
+		if err != nil {
+			_, err = exec.LookPath(cfg.OpenCodeBin)
+		}
+		check("opencode 可执行文件 ("+cfg.OpenCodeBin+")", err,
+			"确认 OpenCode CLI 已安装，或修改 config.json 的 opencode_bin")
+		home, _ := os.UserHomeDir()
+		authPath := filepath.Join(home, ".local", "share", "opencode", "auth.json")
+		var providers map[string]json.RawMessage
+		if data, readErr := os.ReadFile(authPath); readErr == nil {
+			_ = json.Unmarshal(data, &providers)
+		}
+		if _, found := providers["opencode-go"]; found {
+			fmt.Println("  ✔ opencode-go 登录凭据（OpenCode 本地凭据库，值不回显）")
+		} else {
+			check("opencode-go 登录凭据", fmt.Errorf("本地凭据库未发现 opencode-go"),
+				"运行 opencode，在 /connect 中登录 OpenCode Go")
+		}
+	}
+	if cfg != nil && cfg.KimiCLIBin != "" {
+		_, err = os.Stat(cfg.KimiCLIBin)
+		if err != nil {
+			_, err = exec.LookPath(cfg.KimiCLIBin)
+		}
+		check("Kimi CLI 可执行文件 ("+cfg.KimiCLIBin+")", err,
+			"确认 Kimi Code CLI 已安装，或修改 config.json 的 kimi_cli_bin")
+		home, _ := os.UserHomeDir()
+		kimiConfig := filepath.Join(home, ".kimi-code", "config.toml")
+		kimiCreds := filepath.Join(home, ".kimi-code", "credentials", "kimi-code.json")
+		configData, configErr := os.ReadFile(kimiConfig)
+		_, credsErr := os.Stat(kimiCreds)
+		if configErr == nil && credsErr == nil && strings.Contains(string(configData), `[providers."managed:kimi-code"]`) {
+			fmt.Println("  ✔ Kimi CLI OAuth 登录凭据（本地凭据库，值不回显）")
+		} else {
+			check("Kimi CLI OAuth 登录凭据", fmt.Errorf("未发现 managed:kimi-code OAuth 配置"),
+				"运行 kimi login 完成 Kimi Code CLI 登录")
+		}
+		if cd := loadEngineCooldown(root, kimiCLICooldownName); cd.active(time.Now()) {
+			fmt.Printf("  - Kimi CLI 车道冷却中（%s），%s 恢复\n", cd.Reason, fmtClock(cd.UntilEpoch))
+		}
+		limit, limitErr := installedLaunchdOpenFileLimit()
+		if limitErr == nil {
+			limitErr = validateKimiCLIOpenFileLimit(limit)
+		}
+		check(fmt.Sprintf("%s Kimi 文件描述符上限 (%d)", launchdLabel, cardexTickOpenFileLimit), limitErr,
+			"重新运行 cardex install-launchd，为 Kimi CLI 配置每任务文件描述符上限")
+	}
+	if cfg != nil && cfg.GrokBuildBin != "" {
+		_, err = os.Stat(cfg.GrokBuildBin)
+		if err != nil {
+			_, err = exec.LookPath(cfg.GrokBuildBin)
+		}
+		check("Grok Build 可执行文件 ("+cfg.GrokBuildBin+")", err,
+			"确认官方 Grok Build CLI 已安装，或修改 config.json 的 grok_build_bin")
+		hadAuthCircuit := grokBuildAuthCooldownActive(loadEngineCooldown(root, grokBuildCooldownName), time.Now())
+		authErr := refreshGrokBuildAuth(context.Background(), root, cfg, resolveGrokBuildModel(cfg, nil))
+		check("Grok Build 实时登录态与模型清单（无模型调用，凭据不回显）", authErr,
+			"运行 grok login 后再次执行 cardex doctor；成功会只解除 Grok 认证熔断")
+		if authErr == nil && hadAuthCircuit {
+			fmt.Println("  ✔ Grok Build 认证熔断已在实时预检成功后解除")
+		}
+		if cd := loadEngineCooldown(root, grokBuildCooldownName); cd.active(time.Now()) {
+			fmt.Printf("  - Grok Build 车道冷却中（%s），%s 恢复\n", cd.Reason, fmtClock(cd.UntilEpoch))
+		}
+	}
+	if cfg != nil && cfg.CursorBin != "" {
+		_, err = os.Stat(cfg.CursorBin)
+		if err != nil {
+			_, err = exec.LookPath(cfg.CursorBin)
+		}
+		check("Cursor CLI 可执行文件 ("+cfg.CursorBin+")", err,
+			"确认 Cursor Agent CLI 已安装，或修改 config.json 的 cursor_bin")
+		var status struct {
+			IsAuthenticated bool `json:"isAuthenticated"`
+		}
+		statusOut, statusErr := exec.Command(cfg.CursorBin, "status", "--format", "json").Output()
+		if statusErr == nil {
+			statusErr = json.Unmarshal(statusOut, &status)
+		}
+		if statusErr == nil && !status.IsAuthenticated {
+			statusErr = fmt.Errorf("Cursor CLI 未登录")
+		}
+		check("Cursor CLI 登录态（只读布尔状态，身份与 token 不回显）", statusErr,
+			"运行 cursor-agent login 完成登录")
+		if cfg.CursorFable != nil && cfg.CursorFable.Enabled {
+			modelsOut, modelsErr := exec.Command(cfg.CursorBin, "models").Output()
+			if modelsErr == nil && !strings.Contains(string(modelsOut), cfg.CursorFable.Model+" ") {
+				modelsErr = fmt.Errorf("账号模型清单缺 %s", cfg.CursorFable.Model)
+			}
+			check("Cursor Fable 5/max 模型清单", modelsErr,
+				"运行 cursor-agent models 核对账号模型；首次使用还需在 Cursor 中确认该模型的数据政策")
+		}
+		if cd := loadEngineCooldown(root, cursorCooldownName); cd.active(time.Now()) {
+			fmt.Printf("  - Cursor CLI 车道冷却中（%s），%s 恢复\n", cd.Reason, fmtClock(cd.UntilEpoch))
 		}
 	}
 	_, err = os.Stat(tasksDir(root))

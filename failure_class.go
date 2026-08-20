@@ -98,7 +98,7 @@ var (
 	// authClassRe 认证类：401 / invalid key / oauth 过期 / 需重新登录。
 	// 【为什么不认光"unauthorized"一词】现代 codex/claude 输出常把 "authorization error" 与
 	// permission 混用；只认带具体动词/状态码的措辞，避免把权限类误判为认证类导致 held 语义走偏。
-	authClassRe = regexp.MustCompile(`(?i)401 unauthorized|invalid api key|authentication failed|oauth token (?:has )?(?:expired|invalid|revoked)|please (?:re-?)?login|please log in again|请重新登录|token expired`)
+	authClassRe = regexp.MustCompile(`(?i)(?:\bhttp(?:/\d(?:\.\d)?)?\s+(?:status\s+)?401\b|\bhttp\s+status\s*[:=]\s*401\b|\bstatus(?:\s+code)?\s*[:=]\s*401\b|\b401\s*(?::|-)?\s*unauthorized\b|\bunauthorized\s*\(\s*401\s*\))|invalid api key|invalid or expired credentials|authentication failed|oauth token (?:has )?(?:expired|invalid|revoked)|please (?:re-?)?login|please log in again|reason\s*=\s*no auth context|请重新登录|token expired`)
 	// permissionClassRe 权限拒绝：403 / policy 拒绝 / 明确"未授权动作"。
 	permissionClassRe = regexp.MustCompile(`(?i)403 forbidden|permission denied|access denied by (?:policy|admin|organization)|not authorized to (?:perform|access)|operation not permitted by (?:policy|admin)|blocked by (?:policy|admin|organization)`)
 	// inputTooLongClassRe 输入超长：prompt/context 超限。
@@ -120,24 +120,25 @@ var (
 
 // classifyFailure 判定失败类别。
 // 参数：
-//   msg      errorSummary 拼好的一行摘要（含 res.Subtype/首行 result 或 runErr+首行 combined）
-//   combined stdout+stderr 合并串（长文本，含 codex 天然 transcript 噪声，**不作为分类依据**，
-//            仍保留在签名里是给未来可能"锚定错误行框架"式判据留手，不改上层调用点）
-//   res      claudeResult（可能为 nil，如 parseClaudeJSON 失败）
-//   runErr   进程层错误（可能为 nil，如 res.IsError=true 但进程正常退出）
+//
+//	msg      errorSummary 拼好的一行摘要（含 res.Subtype/首行 result 或 runErr+首行 combined）
+//	combined stdout+stderr 合并串（长文本，含 codex 天然 transcript 噪声，**不作为分类依据**，
+//	         仍保留在签名里是给未来可能"锚定错误行框架"式判据留手，不改上层调用点）
+//	res      claudeResult（可能为 nil，如 parseClaudeJSON 失败）
+//	runErr   进程层错误（可能为 nil，如 res.IsError=true 但进程正常退出）
 //
 // 【纪律】
-//   1. **限额类不属于本分类器**——limitRe 命中的路径在 runTask 前段的 isLimitHit 分支独占处理
-//      (写全局冷却/挂 limit_paused)，走到 classifyFailure 时 combined 已经证明不是限额；即便
-//      文本恰巧含 "limit-like" 词而无 limitRe 特征，也必须回落 unknown、绝不写全局冷却。
-//   2. 判据顺序：auth → permission → input_too_long → timeout → executor_crash → unknown。
-//      有交叉措辞（如 "401 unauthorized (forbidden)"）以更精确的 auth 优先，与 held 升级方向一致。
-//   3. **只扫 msg**——见文件顶部 P0 教训。combined 全量丢弃：分类信号本该在 msg（errorSummary 的
-//      产物），若不在则宁可 unknown 走 retry_backoff，也不能用裸短语正则去 transcript 尾窗里碰运气。
-//   4. **本函数只做归类，不做策略降级**——transcript 来源信号（msg 里的分类特征其实是从 combined
-//      挑行/取首行经 res.Result 或 fallback 分支旁路进来的）由上层 runTask 调 classificationFromTranscript
-//      判断后降级 retry_backoff（见文件顶部 P1 · Round-3 教训）。这里若擅自把 transcript 来源降级
-//      unknown，会丢失事件账本的原分类审计信号——分层清晰：本函数出 cls，上层出 policy。
+//  1. **限额类不属于本分类器**——limitRe 命中的路径在 runTask 前段的 isLimitHit 分支独占处理
+//     (写全局冷却/挂 limit_paused)，走到 classifyFailure 时 combined 已经证明不是限额；即便
+//     文本恰巧含 "limit-like" 词而无 limitRe 特征，也必须回落 unknown、绝不写全局冷却。
+//  2. 判据顺序：auth → permission → input_too_long → timeout → executor_crash → unknown。
+//     有交叉措辞（如 "401 unauthorized (forbidden)"）以更精确的 auth 优先，与 held 升级方向一致。
+//  3. **只扫 msg**——见文件顶部 P0 教训。combined 全量丢弃：分类信号本该在 msg（errorSummary 的
+//     产物），若不在则宁可 unknown 走 retry_backoff，也不能用裸短语正则去 transcript 尾窗里碰运气。
+//  4. **本函数只做归类，不做策略降级**——transcript 来源信号（msg 里的分类特征其实是从 combined
+//     挑行/取首行经 res.Result 或 fallback 分支旁路进来的）由上层 runTask 调 classificationFromTranscript
+//     判断后降级 retry_backoff（见文件顶部 P1 · Round-3 教训）。这里若擅自把 transcript 来源降级
+//     unknown，会丢失事件账本的原分类审计信号——分层清晰：本函数出 cls，上层出 policy。
 func classifyFailure(msg, combined string, res *claudeResult, runErr error) failureClass {
 	// combined/res/runErr 有意不看：msg 已经是 errorSummary 提炼的摘要（第一道防线，见文件顶部
 	// P0 教训）；transcript 挑行经 res.Result 旁路的第二道防线由 runTask 侧的 classificationFromTranscript

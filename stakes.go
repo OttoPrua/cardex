@@ -27,8 +27,8 @@ const (
 	// 跟随 -review-after 的显式指定。注意：**空串不再与它同义**——空串表示"该字段没写"，
 	// 由 stakesRule 回落成内置表同档位的值（见 stakesRule 的【为什么档内还要逐字段回落】）。
 	stakesReviewFollow = "follow"
-	stakesReviewOn     = "on"     // 强制配对抗复审
-	stakesReviewOff    = "off"    // 强制不配
+	stakesReviewOn     = "on"  // 强制配对抗复审
+	stakesReviewOff    = "off" // 强制不配
 )
 
 var validStakes = map[string]bool{stakesLow: true, stakesNormal: true, stakesHigh: true}
@@ -40,17 +40,31 @@ const defaultMaxFixRounds = 3
 //
 //	low    → 不配复审（改错别字/加注释一类，复审收益低于成本）
 //	normal → 跟随 -review-after 显式指定（保持既有默认行为，不改变任何存量派卡习惯）
-//	high   → 强制配复审 + 思考档地板抬到 high + 修复轮限放到 4
+//	high   → 实现卡强制配复审 + 思考档地板抬到 high + 自动修复最多 1 轮
 //
-// 【为什么只有 high 抬轮限】retro-77（2026-08-02，监控 session 终裁采纳）样本：10 张高 effort
-// 规格对齐类卡有 9 张撞在全局上限 3 上进人裁壳，事后均判"壳清、工作在新链继续"——对这类卡而言
-// 上限 3 不是护栏而是噪声源，它没拦住任何打转，只是把同一件事换条链重跑。低/普通档保持跟随
-// 全局（0 = 不覆盖）：低价值卡在实现层打转三轮就该停，多给一轮只是多烧一轮额度。
+// 【为什么统一只自动修 1 轮】复审本身已经是一张独立高质量卡；若首轮修复后的再次复审仍有
+// P0/P1，继续自动扩成多轮实现→复审链既放大额度，也容易把规格歧义误当实现缺陷。此时应停在
+// held 交人工裁决，而不是让模型继续自我繁殖。卡面仍钉死绝对轮限，避免运行中静默漂移。
 func defaultStakesPolicy() map[string]StakesRule {
 	return map[string]StakesRule{
 		stakesLow:    {Review: stakesReviewOff},
 		stakesNormal: {Review: stakesReviewFollow},
-		stakesHigh:   {Review: stakesReviewOn, DefaultEffort: "high", MaxFixRounds: 4},
+		stakesHigh:   {Review: stakesReviewOn, DefaultEffort: "high", MaxFixRounds: 1},
+	}
+}
+
+// reviewAfterEligibleType 把自动复审限定在实现卡。空类型只为旧测试/旧卡兼容，按 sequence 处理。
+// 审核、协调、装配和进度回收本身已经是判断/编排工作，再挂 review_after 只会生成“审核: 审核…”
+// 或审核协调报告，而不是新增独立实现证据。
+func reviewAfterEligibleType(t *Task) bool {
+	return t != nil && (t.Type == "" || t.Type == typeSequence)
+}
+
+// enforceReviewAfterEligibility 是所有入队入口共用的硬护栏。风险档仍可抬模型/effort，
+// 但不能把非实现卡变成递归复审源。
+func enforceReviewAfterEligibility(t *Task) {
+	if !reviewAfterEligibleType(t) {
+		t.ReviewAfter = false
 	}
 }
 
@@ -167,6 +181,8 @@ func applyStakes(t *Task, cfg *Config, stakes string, explicitEffort bool) error
 		return fmt.Errorf("config.stakes_policy.%s.review=%q 非法（可选: %s/%s/%s）",
 			stakes, r.Review, stakesReviewOn, stakesReviewOff, stakesReviewFollow)
 	}
+	// 类型护栏必须在 stakes 决策之后执行：否则 high.review=on 会把前面清掉的审核卡开关重新打开。
+	enforceReviewAfterEligibility(t)
 
 	if r.DefaultEffort != "" {
 		if !validEfforts[r.DefaultEffort] {

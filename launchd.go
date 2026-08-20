@@ -5,9 +5,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strconv"
 )
 
-const launchdLabel = "com.cardex.tick"
+const (
+	launchdLabel            = "com.cardex.tick"
+	cardexTickOpenFileLimit = uint64(65536)
+)
 
 // legacyLaunchdLabel 是 BD-44 改名前的 label。本文件**不自动卸载**它——launchd 的卸载属
 // cutover 操作员的动作(与 migrate 同一窗口),代码擅自 launchctl unload 会在人还没准备好时
@@ -30,15 +35,54 @@ const plistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
     </array>
     <key>StartInterval</key><integer>%d</integer>
     <key>RunAtLoad</key><true/>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key><integer>%d</integer>
+    </dict>
     <key>StandardOutPath</key><string>%s</string>
     <key>StandardErrorPath</key><string>%s</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<key>CARDEX_REQUIRE_OWNER_ROUTING</key><string>%s</string>
     </dict>
 </dict>
 </plist>
 `
+
+var launchdOpenFileLimitRE = regexp.MustCompile(`(?s)<key>\s*SoftResourceLimits\s*</key>\s*<dict>.*?<key>\s*NumberOfFiles\s*</key>\s*<integer>\s*([0-9]+)\s*</integer>`)
+
+func renderLaunchdPlist(exe, root string, intervalSec int, logOut string, requireOwner ...bool) string {
+	required := "0"
+	if len(requireOwner) > 0 && requireOwner[0] {
+		required = "1"
+	}
+	return fmt.Sprintf(plistTemplate, launchdLabel, exe, root, intervalSec, cardexTickOpenFileLimit, logOut, logOut, required)
+}
+
+func launchdOpenFileLimit(data []byte) (uint64, error) {
+	m := launchdOpenFileLimitRE.FindSubmatch(data)
+	if len(m) != 2 {
+		return 0, fmt.Errorf("%s 缺少 SoftResourceLimits.NumberOfFiles", launchdLabel)
+	}
+	limit, err := strconv.ParseUint(string(m[1]), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s 的 NumberOfFiles 非法: %w", launchdLabel, err)
+	}
+	return limit, nil
+}
+
+func installedLaunchdOpenFileLimit() (uint64, error) {
+	pp, err := plistPath()
+	if err != nil {
+		return 0, err
+	}
+	data, err := os.ReadFile(pp)
+	if err != nil {
+		return 0, err
+	}
+	return launchdOpenFileLimit(data)
+}
 
 func plistPath() (string, error) {
 	home, err := os.UserHomeDir()
@@ -76,8 +120,12 @@ func installLaunchd(root string, intervalSec int) error {
 		return err
 	}
 	logOut := filepath.Join(logsDir(root), "launchd.log")
-	content := fmt.Sprintf(plistTemplate, launchdLabel, exe, root, intervalSec, logOut, logOut)
-	if err := os.WriteFile(pp, []byte(content), 0o644); err != nil {
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	content := renderLaunchdPlist(exe, root, intervalSec, logOut, cfg.OwnerRoutingEnforced)
+	if err := atomicWrite(pp, []byte(content)); err != nil {
 		return err
 	}
 	_ = exec.Command("launchctl", "unload", pp).Run()

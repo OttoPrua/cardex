@@ -403,7 +403,8 @@ func (r *projectResolver) resolve(t *Task) (string, string) {
 	return unclassifiedProject, projSourceUnclassified
 }
 
-// lineageMaxDepth 是谱系上溯的深度上限。修复链最长受 max_fix_rounds（默认 3、high 档 4）约束，
+// lineageMaxDepth 是谱系上溯的深度上限。修复链受卡面 max_fix_rounds 约束（生产 high 默认 1，
+// 但历史卡/显式配置可能更高），
 // 每轮两跳（实现→审核→修复），再加 emit 链几层——8 层足够覆盖真实谱系，同时挡住数据异常
 // （父指针成环/指向自身）把快照重建吊死。
 const lineageMaxDepth = 8

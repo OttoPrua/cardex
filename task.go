@@ -43,19 +43,24 @@ type RouteAttemptReadback struct {
 	ActualRunner      string `json:"actual_runner"`
 	ActualModel       string `json:"actual_model"`
 	ActualEffort      string `json:"actual_effort"`
-	OwnerRouteName    string `json:"owner_route_name,omitempty"`
-	OwnerRouteLeg     int    `json:"owner_route_leg,omitempty"`
-	Attempt           int    `json:"attempt"`
-	FailureClass      string `json:"failure_class,omitempty"`
-	FailureKind       string `json:"failure_kind,omitempty"`
-	ObservationSeen   bool   `json:"observation_seen,omitempty"`
-	ObservationOK     bool   `json:"observation_complete,omitempty"`
-	SemanticEvents    int    `json:"semantic_events,omitempty"`
-	ModelEvents       int    `json:"model_events,omitempty"`
-	ToolEvents        int    `json:"tool_events,omitempty"`
-	ProcessResidue    bool   `json:"process_residue,omitempty"`
-	WorkspaceBefore   string `json:"workspace_fingerprint_before,omitempty"`
-	WorkspaceAfter    string `json:"workspace_fingerprint_after,omitempty"`
+	// RequestedEngine/ActualEngine record the symbolic engine selection for engine-split providers
+	// (Kimi 0.37.2 legacy agent-core vs v2). Symbolic names only — never environment or credential
+	// values. omitempty keeps pre-existing task bytes and non-Kimi attempts unchanged.
+	RequestedEngine string `json:"requested_engine,omitempty"`
+	ActualEngine    string `json:"actual_engine,omitempty"`
+	OwnerRouteName  string `json:"owner_route_name,omitempty"`
+	OwnerRouteLeg   int    `json:"owner_route_leg,omitempty"`
+	Attempt         int    `json:"attempt"`
+	FailureClass    string `json:"failure_class,omitempty"`
+	FailureKind     string `json:"failure_kind,omitempty"`
+	ObservationSeen bool   `json:"observation_seen,omitempty"`
+	ObservationOK   bool   `json:"observation_complete,omitempty"`
+	SemanticEvents  int    `json:"semantic_events,omitempty"`
+	ModelEvents     int    `json:"model_events,omitempty"`
+	ToolEvents      int    `json:"tool_events,omitempty"`
+	ProcessResidue  bool   `json:"process_residue,omitempty"`
+	WorkspaceBefore string `json:"workspace_fingerprint_before,omitempty"`
+	WorkspaceAfter  string `json:"workspace_fingerprint_after,omitempty"`
 }
 
 type Task struct {
@@ -337,6 +342,8 @@ func newTask(root string, cfg *Config, typ, title, dir string, prompts []string,
 
 // applyDefaultRunner 把全局默认主路由烘焙到新卡。只填空白偏好，不覆盖 cross profile、
 // -runner 或其他显式执行器选择；会话续跑由各入口在写入 SessionID 后清除此默认 Codex 偏好。
+// 它只在显式创建路径（newTask）运行：存量 queued/held/limit_paused/failed/done/archived 卡的
+// 字节绝不因新默认值被补写、替换或重解释（P1-6 冻结纪律）。
 func applyDefaultRunner(cfg *Config, t *Task) bool {
 	if cfg == nil || t == nil || t.PreferRunner != "" {
 		return false
@@ -346,21 +353,6 @@ func applyDefaultRunner(cfg *Config, t *Task) bool {
 		t.PreferRunner = cfg.DefaultRunner
 		t.RunnerExplicit = false
 		return true
-	default:
-		return false
-	}
-}
-
-// applyDefaultRunnerToPending 给配置切换前已存在、尚未派发的卡补烘焙默认路由。
-// cross 卡的显式引擎身份与 Claude 会话续跑不能改写；running 卡由启动它的配置快照负责，
-// 避免调度器和在途 goroutine 同时写同一卡面。
-func applyDefaultRunnerToPending(cfg *Config, t *Task) bool {
-	if t == nil || t.XRole != "" || t.SessionID != "" || t.MidStep {
-		return false
-	}
-	switch t.Status {
-	case statusQueued, statusHeld, statusLimitPaused, statusFailed:
-		return applyDefaultRunner(cfg, t)
 	default:
 		return false
 	}

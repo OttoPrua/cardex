@@ -127,25 +127,24 @@ const (
 	grokBuildExactQuotedAuthBody     = "Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/responses: Invalid or expired credentials (auth_kind=none, x_xai_token_auth=xai-grok-cli, upstream=Unauthenticated, reason=no auth context)"
 )
 
-// exactGrokBuildNoAuthDiagnostic accepts only the two process bodies observed and authorized for
-// the engine-wide circuit. Context still matters: grokBuildAuthDiagnosticLine admits the first only
-// as a bare one-line stderr and the second only inside the exact quoted wrapper and closed footer.
-func exactGrokBuildNoAuthDiagnostic(line string) bool {
-	line = strings.TrimSpace(line)
-	return line == grokBuildExactBareAuthDiagnostic || line == grokBuildExactQuotedAuthBody
-}
+// Only the two process bodies above were observed and authorized for the engine-wide circuit.
+// Context still matters: grokBuildAuthDiagnosticLine admits the first only as a bare one-line
+// stderr and the second only inside the exact quoted wrapper and closed footer.
 
 func grokBuildTrustedAuthDiagnosticLine(stderr string) string {
-	var diagnostic string
-	for _, raw := range strings.Split(stderr, "\n") {
-		line := strings.TrimSpace(raw)
-		if line == "" {
-			continue
-		}
-		if diagnostic != "" {
-			return ""
-		}
-		diagnostic = line
+	// The same closed physical-line discipline as the circuit-opening grammar: a process's single
+	// trailing newline is tolerated, but every further blank physical line is an extra line that
+	// keeps the observation from being promoted into authentication evidence.
+	lines := strings.Split(stderr, "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+	if len(lines) != 1 {
+		return ""
+	}
+	diagnostic := strings.TrimSpace(lines[0])
+	if diagnostic == "" {
+		return ""
 	}
 	if grokBuildTrustedAuthLineRe.MatchString(diagnostic) || grokBuildAuthEnvelopeRe.MatchString(diagnostic) {
 		return diagnostic
@@ -527,6 +526,22 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 			res.ToolEvents++
 		case "start", "system", "system.version", "metadata", "available_commands":
 			// Invocation metadata is not model/tool work.
+		case "usage":
+			// Grok 1.0.5 emits usage as a standalone stream event before the terminal end event.
+			// It is known accounting metadata: it never breaks the observation, and the same
+			// non-zero rule as the end-embedded usage decides whether it proves model work.
+			if ev.Usage != nil {
+				res.Usage = &usageInfo{
+					InputTokens:              ev.Usage.InputTokens,
+					CacheReadInputTokens:     ev.Usage.CacheReadInputTokens,
+					CacheCreationInputTokens: ev.Usage.CacheCreationInputTokens,
+					OutputTokens:             ev.Usage.OutputTokens,
+				}
+				if ev.Usage.InputTokens != 0 || ev.Usage.OutputTokens != 0 ||
+					ev.Usage.CacheReadInputTokens != 0 || ev.Usage.CacheCreationInputTokens != 0 {
+					res.ModelEvents++
+				}
+			}
 		case "error":
 			res.IsError = true
 			res.Subtype = "grok_build_error"
@@ -586,68 +601,72 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 }
 
 func grokBuildAuthDiagnosticLine(stderr string) string {
-	var lines []string
-	for _, raw := range strings.Split(stderr, "\n") {
-		if line := strings.TrimSpace(raw); line != "" {
-			lines = append(lines, line)
-		}
+	// Closed physical grammar: split into exact physical lines and tolerate only the process's
+	// single trailing newline. Empty lines are never skipped over — any extra physical blank line
+	// (leading, interleaved beyond the wrapper's own one, or trailing) rejects the observation.
+	lines := strings.Split(stderr, "\n")
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
 	}
 	if len(lines) == 0 {
 		return ""
 	}
 
 	// Grok 1.0.4 emitted the OIDC failure either as one bare diagnostic or in this exact quoted
-	// five-line wrapper. Strip only that closed wrapper; arbitrary wrapper/task prose is rejected.
+	// six-physical-line wrapper: quoted body, its one internal blank line, then the ordered unique
+	// Model/Auth/Version/Available footer closed by the trailing quote. Strip only that closed
+	// wrapper; arbitrary wrapper/task prose and every non-exact multiline form are rejected.
 	quotedWrapper := strings.HasPrefix(lines[0], `Internal error: "`)
 	if quotedWrapper {
-		if len(lines) != 5 || !strings.HasSuffix(lines[len(lines)-1], `"`) {
+		if len(lines) != 6 || strings.TrimSpace(lines[1]) != "" || !strings.HasSuffix(lines[5], `"`) {
 			return ""
 		}
-		lines[0] = strings.TrimSpace(strings.TrimPrefix(lines[0], `Internal error: "`))
-		lines[len(lines)-1] = strings.TrimSpace(strings.TrimSuffix(lines[len(lines)-1], `"`))
-		if lines[0] != grokBuildExactQuotedAuthBody {
-			return ""
-		}
-	} else if len(lines) != 1 {
-		// The only unquoted production form is the complete diagnostic on one physical line.
-		// A bare diagnostic followed by an otherwise-valid footer is still an unquoted multiline
-		// diagnostic and must not be promoted into authentication evidence.
-		return ""
-	} else if lines[0] != grokBuildExactBareAuthDiagnostic {
-		return ""
-	}
-	if !exactGrokBuildNoAuthDiagnostic(lines[0]) {
-		return ""
-	}
-	if len(lines) == 1 {
-		return lines[0]
-	}
-	if len(lines) != 5 {
-		return ""
-	}
-
-	// The incident's metadata footer is deliberately a closed grammar. Field order, cardinality,
-	// spelling and values are fixed; 1.0.4 is the observed incident and 1.0.5 is the pinned CLI.
-	expected := [4][2]string{
-		{"Model:", "grok-4.6"},
-		{"Auth:", "Oidc"},
-		{"Version:", ""},
-		{"Available:", "grok-4.6"},
-	}
-	for i, want := range expected {
-		fields := strings.Fields(lines[i+1])
-		if len(fields) != 2 || fields[0] != want[0] {
-			return ""
-		}
-		if want[0] == "Version:" {
-			if fields[1] != "1.0.4" && fields[1] != "1.0.5" {
+		for _, raw := range append([]string{lines[0]}, lines[2:]...) {
+			if strings.TrimSpace(raw) == "" {
 				return ""
 			}
-		} else if fields[1] != want[1] {
+		}
+		body := strings.TrimSpace(strings.TrimPrefix(lines[0], `Internal error: "`))
+		if body != grokBuildExactQuotedAuthBody {
 			return ""
 		}
+		// The incident's metadata footer is deliberately a closed grammar. Field order,
+		// cardinality, spelling and values are fixed; 1.0.4 is the observed incident and 1.0.5 is
+		// the pinned CLI. The wrapper's closing quote rides on the final footer line.
+		footer := []string{lines[2], lines[3], lines[4], strings.TrimSuffix(lines[5], `"`)}
+		expected := [4][2]string{
+			{"Model:", "grok-4.6"},
+			{"Auth:", "Oidc"},
+			{"Version:", ""},
+			{"Available:", "grok-4.6"},
+		}
+		for i, want := range expected {
+			fields := strings.Fields(footer[i])
+			if len(fields) != 2 || fields[0] != want[0] {
+				return ""
+			}
+			if want[0] == "Version:" {
+				if fields[1] != "1.0.4" && fields[1] != "1.0.5" {
+					return ""
+				}
+			} else if fields[1] != want[1] {
+				return ""
+			}
+		}
+		return body
 	}
-	return lines[0]
+
+	// The only unquoted production form is the complete diagnostic on one physical line. A bare
+	// diagnostic followed by an otherwise-valid footer, or accompanied by any blank line, is still
+	// an unquoted multiline diagnostic and must not be promoted into authentication evidence.
+	if len(lines) != 1 {
+		return ""
+	}
+	line := strings.TrimSpace(lines[0])
+	if line != grokBuildExactBareAuthDiagnostic {
+		return ""
+	}
+	return line
 }
 
 func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
@@ -742,8 +761,8 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 			res.Subtype = "grok_build_process_auth_exact"
 			res.Result = exactAuthLine
 		} else if authLine := grokBuildTrustedAuthDiagnosticLine(stderr.String()); authLine != "" {
-			// A strict whole-line ordinary auth diagnostic remains held, but only the complete five-part
-			// family above is allowed to open the engine-wide circuit.
+			// A strict whole-line ordinary auth diagnostic remains held, but only the complete closed
+			// family above (exact bare one-liner or exact quoted wrapper) may open the engine-wide circuit.
 			res.IsError = true
 			res.Subtype = "grok_build_process_auth"
 			res.Result = authLine

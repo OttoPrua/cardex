@@ -133,16 +133,6 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				viaRunner := map[string]string{} // 任务ID → ""(claude) / "codex" / 引擎名
 				var cands []*Task
 				for _, t := range tasks {
-					if applyDefaultRunnerToPending(cfg, t) {
-						// 补烘焙必须先持久化再参与候选选择：若写盘失败却只改内存，本轮看似走
-						// Codex，daemon 重启后又会掉回旧执行器，形成不可见漂移。
-						if err := saveTask(root, t); err != nil {
-							if !quiet {
-								fmt.Fprintf(os.Stderr, "警告: 任务 %s 默认路由落盘失败，本轮不派发: %v\n", t.ID, err)
-							}
-							continue
-						}
-					}
 					if t.Status == statusCanceled {
 						if !activeIDs[t.ID] {
 							_ = archiveTask(root, t) // cancel 时执行器已不在场（如 daemon 重启过）的收尾归档

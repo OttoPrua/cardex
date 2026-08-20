@@ -346,6 +346,41 @@ func replaceProcessEnv(base []string, key, value string) []string {
 	return append(out, prefix+value)
 }
 
+// Kimi 0.37.2 defaults to the v2 agent engine, whose recursive workspace watcher fails in this
+// environment (EMFILE on large trees). The official compatibility selector is the child-process
+// environment flag below; selecting the legacy agent-core engine restores the accepted 0.35/0.36
+// JSON stream contract. Cardex never mutates the global shell, provider config, user config,
+// credentials, or the third-party binary to achieve this — only the child process environment.
+const (
+	kimiLegacyEngineEnvFlag = "KIMI_CODE_LEGACY_FLAG"
+	kimiEngineLegacy        = "legacy_agent_core"
+	kimiEngineV2            = "agent_v2"
+	kimiEngineCallerOpaque  = "caller_override"
+)
+
+// kimiChildEngineEnv resolves the deterministic engine selection for one Kimi child invocation.
+// Cardex always requests the official legacy agent-core engine. An explicit caller-provided
+// KIMI_CODE_LEGACY_FLAG is preserved untouched and reported symbolically; the raw environment
+// value is never copied into task, route, event, or board readback.
+func kimiChildEngineEnv(env []string) (requested, actual string, childEnv []string) {
+	requested = kimiEngineLegacy
+	prefix := kimiLegacyEngineEnvFlag + "="
+	for _, item := range env {
+		if value, ok := strings.CutPrefix(item, prefix); ok {
+			switch strings.ToLower(strings.TrimSpace(value)) {
+			case "1", "true":
+				actual = kimiEngineLegacy
+			case "0", "false":
+				actual = kimiEngineV2
+			default:
+				actual = kimiEngineCallerOpaque
+			}
+			return requested, actual, env
+		}
+	}
+	return requested, kimiEngineLegacy, replaceProcessEnv(env, kimiLegacyEngineEnvFlag, "1")
+}
+
 func overrideKimiTopLevelConfig(raw string, values map[string]string) string {
 	lines := strings.Split(raw, "\n")
 	inTable := false
@@ -495,10 +530,15 @@ func invokeKimiCLI(ctx context.Context, root string, cfg *Config, t *Task, promp
 
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
 	defer cancel()
-	cmdEnv := replaceProcessEnv(os.Environ(), "KIMI_CODE_NO_AUTO_UPDATE", "1")
+	requestedEngine, actualEngine, cmdEnv := kimiChildEngineEnv(os.Environ())
+	cmdEnv = replaceProcessEnv(cmdEnv, "KIMI_CODE_NO_AUTO_UPDATE", "1")
 	cmdEnv = replaceProcessEnv(cmdEnv, "KIMI_CODE_HOME", runtimeHome)
 	if effort := resolveKimiCLIEffort(cfg, t); effort != "" {
 		cmdEnv = replaceProcessEnv(cmdEnv, "KIMI_MODEL_THINKING_EFFORT", effort)
+	}
+	if t.LastRouteAttempt != nil {
+		t.LastRouteAttempt.RequestedEngine = requestedEngine
+		t.LastRouteAttempt.ActualEngine = actualEngine
 	}
 	runOnce := func() (string, string, error) {
 		cmd := exec.CommandContext(runCtx, cfg.KimiCLIBin, args...)

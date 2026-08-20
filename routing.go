@@ -52,6 +52,65 @@ func validateNewTaskRouteClass(cfg *Config, t *Task) error {
 	return nil
 }
 
+// mandatoryHighRiskCategory reports the closed Owner high-risk category a sequence task's declared
+// work falls into, independent of its mutable risk_class metadata. Identity/credential,
+// DB/schema/migration, protocol/network execution, manifest/launchd, Control/authority, live
+// cutover, security, and funds can never be downgraded to ordinary by card metadata; the resolver
+// fails them closed into the high-risk route. Returns "" when no category matches.
+func mandatoryHighRiskCategory(t *Task) string {
+	if t == nil || t.Type != typeSequence {
+		return ""
+	}
+	haystack := strings.ToLower(t.Title + "\n" + strings.Join(t.Prompts, "\n"))
+	// Keep the markers grouped by the eight authority categories so docs/templates/tests can audit
+	// exact parity. Category hits never downgrade; absence never upgrades a backend card whose
+	// risk is already fail-closed high by omission.
+	groups := []struct {
+		category string
+		markers  []string
+	}{
+		{"identity/credential", []string{
+			"身份", "凭据", "认证", "证书", "密钥轮换", "令牌刷新",
+			"identity", "credential", "authentication", "certificate", "key rotation",
+			"oauth", "jwt", "token refresh", "refresh token", "access token",
+		}},
+		{"db/schema/migration", []string{
+			"数据库", "数据表", "数据库迁移", "模式迁移", "database", "schema", "migration",
+		}},
+		{"protocol/network execution", []string{
+			"协议", "握手", "网络执行", "网络调用", "网络请求", "接口开发", "接口实现", "网络重试",
+			"protocol", "wire format", "handshake", "network execution", "network request", "network retry",
+			"api endpoint", "rest api", "graphql api",
+		}},
+		{"manifest/launchd", []string{
+			"运行清单", "启动清单", "服务清单", "launchd", "manifest", "launch agent", "launch daemon",
+		}},
+		{"control/authority", []string{
+			"权限", "控制权限", "控制面", "授权边界", "权威边界",
+			"authority", "authority boundary", "control authority", "control plane",
+		}},
+		{"live cutover", []string{
+			"在线切换", "实时切换", "生产切换", "上线切换", "live cutover", "production cutover", "go-live cutover",
+		}},
+		{"security", []string{
+			"安全", "漏洞", "越权", "注入", "加密", "解密", "签名校验", "签名验证",
+			"security", "vulnerability", "exploit", "injection", "encryption", "decryption", "signature verification",
+		}},
+		{"funds", []string{
+			"资金", "支付", "扣款", "转账", "结算", "退款", "计费",
+			"funds", "payment", "transfer", "settlement", "refund", "billing", "charge",
+		}},
+	}
+	for _, group := range groups {
+		for _, marker := range group.markers {
+			if strings.Contains(haystack, marker) {
+				return group.category
+			}
+		}
+	}
+	return ""
+}
+
 // backendDevelopmentTask 先尊重任务卡的显式分类；存量卡为空时仅对 sequence 卡做确定性文本判定。
 // general 是人工消歧开关，可覆盖标题中诸如“后端对比”但实际不改后端的误命中。
 func backendDevelopmentTask(t *Task) bool {

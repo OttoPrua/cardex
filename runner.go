@@ -1112,6 +1112,13 @@ func beginRouteAttemptReadback(cfg *Config, t *Task, remote bool) {
 		ActualProvider: provider, ActualRunner: runner, ActualModel: model, ActualEffort: effort,
 		OwnerRouteName: t.OwnerRouteName, OwnerRouteLeg: t.OwnerRouteLeg, Attempt: t.Attempts,
 	}
+	if runner == kimiCLIRunnerName {
+		// The engine split is resolved deterministically from the caller environment before
+		// dispatch; invokeKimiCLI re-confirms the identical symbolic pair at child spawn.
+		requested, actual, _ := kimiChildEngineEnv(os.Environ())
+		t.LastRouteAttempt.RequestedEngine = requested
+		t.LastRouteAttempt.ActualEngine = actual
+	}
 }
 
 func recordRouteAttemptObservation(t *Task, res *claudeResult) {
@@ -1148,6 +1155,12 @@ func withRouteAttempt(detail map[string]any, t *Task) map[string]any {
 	detail["actual_runner"] = r.ActualRunner
 	detail["actual_model"] = r.ActualModel
 	detail["actual_effort"] = r.ActualEffort
+	if r.RequestedEngine != "" {
+		detail["requested_engine"] = r.RequestedEngine
+	}
+	if r.ActualEngine != "" {
+		detail["actual_engine"] = r.ActualEngine
+	}
 	detail["owner_route_name"] = r.OwnerRouteName
 	detail["owner_route_leg"] = r.OwnerRouteLeg
 	detail["attempt"] = r.Attempt
@@ -2548,6 +2561,49 @@ func pendingRequiredReviewStage(t *Task) string {
 	return ""
 }
 
+// existingCrossChainChild finds the durable successor card for one cross-chain lineage role,
+// scanning both tasks/ and archive/. More than one match is a lineage violation and fails closed.
+// The Fable A→C path uses it to make the one automatic Sol/ultra merger per XKey idempotent
+// across replay, crash, and reconcile re-entry.
+func existingCrossChainChild(root, xkey, role string) (*Task, error) {
+	if xkey == "" || role == "" {
+		return nil, nil
+	}
+	var matches []*Task
+	for _, dir := range []string{tasksDir(root), archiveDir(root)} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, err
+			}
+			var candidate Task
+			if err := json.Unmarshal(data, &candidate); err != nil {
+				return nil, err
+			}
+			if candidate.XKey == xkey && candidate.XRole == role {
+				matches = append(matches, &candidate)
+			}
+		}
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("cross chain %s role %s has %d successors", xkey, role, len(matches))
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	return nil, nil
+}
+
 func existingPlannedReviewChild(root, parentID, stage string) (*Task, error) {
 	var matches []*Task
 	for _, dir := range []string{tasksDir(root), archiveDir(root)} {
@@ -2828,6 +2884,55 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 			"reason": "kimi_acceptance_failed", "review_stage": stage, "verdict": verdict.Verdict,
 			"review_child": review.ID,
 		}, parent))
+		return
+	}
+	// The closed review contract accepts pass only with empty p0/p1. A pass that still carries
+	// blocking findings is the Kimi reviewer's durable disagreement with the Grok implementation it
+	// formally accepted — a reachable, durable producer for the configured disagreement escalation.
+	// The lineage holds and its single conditional Sol/xhigh gate adjudicates; the decision is bound
+	// to the exact lineage, the review child's workspace evidence digests, and the frozen route state.
+	if stage == reviewStageKimiAdversarial && verdict.Verdict == "pass" &&
+		(len(verdict.P0) != 0 || len(verdict.P1) != 0) {
+		parent.SolEscalationReason = solEscalationDisagreement
+		var appendErr error
+		parent.RequiredReviews, appendErr = appendClosedReview(parent.RequiredReviews, reviewStageSolXHigh)
+		parent.Status = statusHeld
+		parent.ReviewObligationPending = true
+		parent.LastError = "Kimi verdict pass still carries unresolved P0/P1 findings; Grok-Kimi disagreement held for the conditional Sol/xhigh gate"
+		if appendErr != nil {
+			parent.LastError = appendErr.Error()
+		}
+		parent.touch()
+		if err := saveTask(root, parent); err != nil {
+			logBlock(lg, "REVIEW", "failed to persist Grok-Kimi disagreement escalation: "+err.Error())
+			return
+		}
+		detail := map[string]any{
+			"reason": "grok_kimi_disagreement", "review_stage": stage, "verdict": verdict.Verdict,
+			"review_child": review.ID, "owner_route_name": parent.OwnerRouteName,
+			"owner_route_leg": parent.OwnerRouteLeg, "escalation_reason": solEscalationDisagreement,
+		}
+		if review.LastRouteAttempt != nil {
+			detail["workspace_fingerprint_before"] = review.LastRouteAttempt.WorkspaceBefore
+			detail["workspace_fingerprint_after"] = review.LastRouteAttempt.WorkspaceAfter
+		}
+		emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step,
+			withCostTelemetry(detail, parent))
+		gate, err := ensureReviewAfterTaskWithEvidence(root, cfg, parent, result, lg)
+		if err != nil || gate == nil {
+			if err == nil {
+				err = fmt.Errorf("review helper returned no child")
+			}
+			parent.LastError = "disagreement Sol/xhigh gate was not persisted: " + err.Error()
+			parent.touch()
+			_ = saveTask(root, parent)
+			return
+		}
+		parent.ReviewTaskID = gate.ID
+		parent.ReviewObligationPending = false
+		parent.LastError = "Grok-Kimi disagreement escalated to the conditional Sol/xhigh gate: " + gate.ID
+		parent.touch()
+		_ = saveTask(root, parent)
 		return
 	}
 	if stage == reviewStageSolXHigh || stage == reviewStageSolMax {
@@ -3696,6 +3801,30 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 			// independent answer and the one fresh Sol/ultra call both attacks and repairs it before
 			// emitting the terminal conclusion. Creating a blind Sol answer B or a later Sol/max C
 			// would violate both the one-Codex limit and the Owner-resolved role semantics.
+			//
+			// One automatic Sol per lineage, durable and idempotent: an existing merger child
+			// (replay, crash, or reconcile re-entry of the completed answer leg) makes this path a
+			// no-op, and the reservation is recorded on the answer card itself — never rewritten
+			// into unrelated task history.
+			existing, scanErr := existingCrossChainChild(root, t.XKey, "C")
+			if scanErr != nil {
+				breakChain("Fable merger lineage scan failed: " + scanErr.Error())
+				return
+			}
+			if existing != nil {
+				if t.AutomaticSolCalls == 0 {
+					// Crash window: the merger child was persisted but the answer card's
+					// post-completion save never landed. Backfill the reservation on this same
+					// card; a second automatic Sol/ultra child is never created.
+					t.AutomaticSolCalls = 1
+				}
+				logBlock(lg, "FABLE", "谱系已有唯一 Sol/ultra 终局合并卡 "+existing.ID+"（重放幂等，不再派生）")
+				return
+			}
+			if t.AutomaticSolCalls != 0 {
+				breakChain("Fable lineage automatic Sol reservation already consumed without a merger child")
+				return
+			}
 			tpl, err := loadTemplate(root, "fable-adversarial-merge")
 			if err != nil {
 				breakChain("fable-adversarial-merge 模板不可得: " + err.Error())
@@ -3723,7 +3852,6 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 			c.FableReviewerMerger = true
 			c.ReviewAfter = false
 			c.SolMaxAdversarialReview = false
-			c.AutomaticSolCalls = t.AutomaticSolCalls
 			if err := reserveAutomaticSolCall(c, routeStageFableMerge); err != nil {
 				breakChain("Fable single automatic Sol reservation failed: " + err.Error())
 				return
@@ -3738,6 +3866,9 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 				breakChain("Fable reviewer-merger card persist failed: " + err.Error())
 				return
 			}
+			// The reservation becomes durable on the answer card the moment the merger child is
+			// persisted; runTask's post-completion save makes it permanent.
+			t.AutomaticSolCalls = 1
 			emitTaskEvent(root, t.ID, evCloseout, "runner:fable-terminal-merge", statusDone, t.Step, map[string]any{
 				"kind": "fable_sol_ultra_adversarial_merge", "child": c.ID, "xkey": t.XKey,
 				"route_stage": routeStageFableMerge, "automatic_sol_calls": 1,

@@ -126,10 +126,14 @@ type TaskBrief struct {
 	// The actual identity is deliberately separate from the configured/current route.  A serial
 	// fallback may already have selected the next provider while LastRouteAttempt still records the
 	// provider that really ran.  Consumers must not reconstruct this evidence from display labels.
-	ActualProvider   string   `json:"actual_provider,omitempty"`
-	ActualRunner     string   `json:"actual_runner,omitempty"`
-	ActualModel      string   `json:"actual_model,omitempty"`
-	ActualEffort     string   `json:"actual_effort,omitempty"`
+	ActualProvider string `json:"actual_provider,omitempty"`
+	ActualRunner   string `json:"actual_runner,omitempty"`
+	ActualModel    string `json:"actual_model,omitempty"`
+	ActualEffort   string `json:"actual_effort,omitempty"`
+	// RequestedEngine/ActualEngine expose the symbolic engine split (Kimi legacy agent-core vs v2)
+	// when the provider has one. Empty for every other provider and for pre-existing task bytes.
+	RequestedEngine  string   `json:"requested_engine,omitempty"`
+	ActualEngine     string   `json:"actual_engine,omitempty"`
 	RouteStage       string   `json:"route_stage,omitempty"`
 	FallbackReason   string   `json:"fallback_reason,omitempty"`
 	RiskClass        string   `json:"risk_class,omitempty"`
@@ -1350,11 +1354,14 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 		routeReason = routeReasonCodexBackendExcluded
 	}
 	actualProvider, actualRunner, actualModel, actualEffort := "", "", "", ""
+	requestedEngine, actualEngine := "", ""
 	if t.LastRouteAttempt != nil {
 		actualProvider = t.LastRouteAttempt.ActualProvider
 		actualRunner = t.LastRouteAttempt.ActualRunner
 		actualModel = t.LastRouteAttempt.ActualModel
 		actualEffort = t.LastRouteAttempt.ActualEffort
+		requestedEngine = t.LastRouteAttempt.RequestedEngine
+		actualEngine = t.LastRouteAttempt.ActualEngine
 	} else if t.Runner != "" {
 		actualProvider, actualRunner, actualModel, actualEffort = routeAttemptIdentity(cfg, t, t.RemoteHost != "")
 	}
@@ -1383,6 +1390,8 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 		ActualRunner:              actualRunner,
 		ActualModel:               actualModel,
 		ActualEffort:              actualEffort,
+		RequestedEngine:           requestedEngine,
+		ActualEngine:              actualEngine,
 		RouteStage:                displayTask.OwnerRouteStage,
 		FallbackReason:            t.FallbackReason,
 		RiskClass:                 effectiveOwnerRiskClass(displayTask),

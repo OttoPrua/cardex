@@ -601,6 +601,13 @@ func readUsageFeedProviderPercent(cfg *Config, now time.Time, provider string) p
 		r.Reason = "样本时间无法解析"
 		return r
 	}
+	if at.After(now) {
+		// A future-dated sample is invalid evidence: the feed's clock is untrustworthy and the
+		// negative age would otherwise sail past the staleness check below. Fail closed — it can
+		// never satisfy the automatic Codex budget gate or any Owner-bypass evidence.
+		r.Reason = "样本时间在未来（采样时钟不可信）"
+		return r
+	}
 	age := now.Sub(at)
 	// 教训:老版 maxAge>0 时才 check,导致 usage_feed_max_age_min:0 语义反转成
 	// "任意陈旧样本永远采信"——CodexBar 死在 99% 样本后队列被永久封锁

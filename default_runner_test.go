@@ -3,6 +3,7 @@ package main
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 func codexPrimaryTestConfig() *Config {
@@ -158,30 +159,39 @@ func TestSessionResumeOverridesOnlyDefaultCodexRunner(t *testing.T) {
 	}
 }
 
-func TestDefaultRunnerBackfillsPendingButPreservesExplicitIdentity(t *testing.T) {
+func TestLegacyPendingCardsKeepRunnerIdentityThroughReadback(t *testing.T) {
+	// P1-6: new defaults reach task bytes only through the explicit creation path. Pre-existing
+	// cards — queued, held, limit-paused, failed, or cross/session identities — must pass through
+	// load, resolver, and board readback with their runner identity and bytes untouched.
 	cfg := codexPrimaryTestConfig()
 	cases := []struct {
 		name string
 		task *Task
-		want bool
 	}{
-		{"旧排队卡补 Codex", &Task{Status: statusQueued}, true},
-		{"旧挂起卡补 Codex", &Task{Status: statusHeld}, true},
-		{"在跑卡不改", &Task{Status: statusRunning}, false},
-		{"Claude 会话不改", &Task{Status: statusQueued, SessionID: "s"}, false},
-		{"交叉引擎不改", &Task{Status: statusQueued, XRole: "A", Model: "claude-opus-5"}, false},
-		{"显式 Gemini 不改", &Task{Status: statusQueued, PreferRunner: "gemini"}, false},
+		{"旧排队卡保持无 runner", &Task{Status: statusQueued}},
+		{"旧挂起卡保持无 runner", &Task{Status: statusHeld}},
+		{"旧限额暂停卡保持无 runner", &Task{Status: statusLimitPaused}},
+		{"旧失败卡保持无 runner", &Task{Status: statusFailed}},
+		{"在跑卡不改", &Task{Status: statusRunning}},
+		{"Claude 会话不改", &Task{Status: statusQueued, SessionID: "s"}},
+		{"交叉引擎不改", &Task{Status: statusQueued, XRole: "A", Model: "claude-opus-5"}},
+		{"显式 Gemini 不改", &Task{Status: statusQueued, PreferRunner: "gemini"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := applyDefaultRunnerToPending(cfg, tc.task)
-			if got != tc.want {
-				t.Fatalf("changed=%v, want %v: %+v", got, tc.want, tc.task)
-			}
-			if tc.want && tc.task.PreferRunner != "codex" {
-				t.Fatalf("待派卡应补 runner_pref=codex: %+v", tc.task)
+			before := tc.task.PreferRunner
+			_ = toBrief(cfg, tc.task, time.Now())
+			_, _ = resolveOwnerRoute(cfg, tc.task)
+			_, _ = resolveOwnerRouteReadback(cfg, tc.task)
+			if tc.task.PreferRunner != before {
+				t.Fatalf("readback must never rebake a default runner into a pre-existing card: %+v", tc.task)
 			}
 		})
+	}
+	// The creation path still stamps the current default on brand-new cards.
+	fresh := newTask(testRoot(t), cfg, typeSequence, "新卡", t.TempDir(), []string{"p"}, 1)
+	if fresh.PreferRunner != "codex" {
+		t.Fatalf("explicit creation path must still bake the current default: %+v", fresh)
 	}
 }
 

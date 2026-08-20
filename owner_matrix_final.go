@@ -188,6 +188,13 @@ func effectiveOwnerRiskClass(t *Task) string {
 			return riskClassCritical
 		}
 	}
+	// The eight mandatory high-risk categories are a property of the declared work itself, not of
+	// mutable card metadata: an explicit or defaulted risk_class=ordinary can never downgrade
+	// identity/credential, DB/schema/migration, protocol/network execution, manifest/launchd,
+	// Control/authority, live cutover, security, or funds work.
+	if mandatoryHighRiskCategory(t) != "" {
+		return riskClassHigh
+	}
 	if backendDevelopmentTask(t) {
 		if raw == riskClassOrdinary {
 			return riskClassOrdinary

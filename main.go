@@ -104,7 +104,8 @@ func printUsage() {
 	          [-title T] [-dir D] [-priority N] [-model haiku|sonnet|opus] [-file steps.md]
 	          [-runner claude|codex|gemini|opencode|kimi-cli|grok-build|cursor] [-opencode-model provider/model]
 	          [-kimi-model kimi-code/k3] [-grok-model grok-4.6] [-grok-effort xhigh] [-cursor-model MODEL]
-	          [-route-class general|backend]
+	          [-route-class general|backend] [-risk-class ordinary|high-risk|critical|production]
+	          [-quality-sensitive] [-specialized-frontend] [-owner-critical-bypass-reason REASON]
             [-stakes low|normal|high] [-review-after] [-emit] [-hold] [-skip-permissions]
             [-tools "A,B"] "prompt..."
             -file 中用单独一行 --- 分隔多个步骤（预设 prompt 序列）
@@ -239,6 +240,10 @@ func cmdAdd(args []string) error {
 	grokEffort := fs.String("grok-effort", "", "钉定 Grok Build 推理档（当前 grok-4.6 最高 xhigh）")
 	cursorModel := fs.String("cursor-model", "", "钉定 Cursor 账号模型 ID（思考档已编码在 ID 内）")
 	routeClass := fs.String("route-class", "", "工作负载路由分类：backend=服务/持久化/协议/数据库/网络执行/身份凭据/manifest-launchd/Control权限/live cutover，general=明确非后端；Owner 强制模式下新 sequence 卡必填，空值仅供存量卡兼容判定")
+	riskClass := fs.String("risk-class", "", "Owner 风险分类：ordinary|high-risk|critical|production；backend 缺失或不明确时按 high-risk fail closed")
+	qualitySensitive := fs.Bool("quality-sensitive", false, "显式质量敏感 Haiku：Grok primary 从 medium 提升为 high")
+	specializedFrontend := fs.Bool("specialized-frontend", false, "复杂 React/frontend refactor、accessibility 或 fixing：要求 fresh Sol 最终质量门")
+	ownerCriticalBypassReason := fs.String("owner-critical-bypass-reason", "", "Owner-pinned critical automatic Codex 预算旁路的持久、可见理由（仅 high/critical/production 有效）")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")
 	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
 	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
@@ -403,6 +408,21 @@ func cmdAdd(args []string) error {
 	if err := validateNewTaskRouteClass(cfg, t); err != nil {
 		return err
 	}
+	t.RiskClass = strings.ToLower(strings.TrimSpace(*riskClass))
+	switch t.RiskClass {
+	case "", riskClassOrdinary, riskClassHigh, riskClassCritical, riskClassProduction:
+	default:
+		return fmt.Errorf("未知 risk-class %q（可选: ordinary/high-risk/critical/production）", *riskClass)
+	}
+	t.QualitySensitive = *qualitySensitive
+	t.SpecializedFrontend = *specializedFrontend
+	t.OwnerCriticalBypassReason = strings.TrimSpace(*ownerCriticalBypassReason)
+	if *ownerCriticalBypassReason != "" && t.OwnerCriticalBypassReason == "" {
+		return fmt.Errorf("-owner-critical-bypass-reason 不能只有空白字符")
+	}
+	if t.OwnerCriticalBypassReason != "" && !ownerCriticalBudgetBypass(t) {
+		return fmt.Errorf("Owner-critical Codex budget bypass 只允许 high-risk/critical/production，并必须保留非空理由")
+	}
 	if t.PreferRunner == "opencode" && resolveOpenCodeModel(cfg, t) == "" {
 		return fmt.Errorf("-runner opencode 需要 -opencode-model，或配置 opencode_model/opencode_models")
 	}
@@ -464,7 +484,9 @@ func cmdAdd(args []string) error {
 	emitTaskEvent(root, t.ID, evQueued, "cli:add", statusQueued, t.Step, map[string]any{
 		"type": t.Type, "priority": t.Priority, "prompts": len(t.Prompts),
 		"stakes": t.Stakes, "review_after": t.ReviewAfter, "effort": t.Effort,
-		"max_fix_rounds": t.MaxFixRounds, "route_class": t.RouteClass,
+		"max_fix_rounds": t.MaxFixRounds, "route_class": t.RouteClass, "risk_class": t.RiskClass,
+		"quality_sensitive": t.QualitySensitive, "specialized_frontend": t.SpecializedFrontend,
+		"owner_critical_bypass_reason": t.OwnerCriticalBypassReason,
 	})
 	if *hold {
 		// 新生卡零用量是真实的，但仍落显式 cost_unavailable 标记：终态事件二选一没有第三种。

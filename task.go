@@ -23,6 +23,11 @@ const (
 
 	routeClassGeneral = "general"
 	routeClassBackend = "backend"
+
+	riskClassOrdinary   = "ordinary"
+	riskClassHigh       = "high-risk"
+	riskClassCritical   = "critical"
+	riskClassProduction = "production"
 )
 
 // RouteAttemptReadback is the secret-free, durable identity and proof record for the most recent
@@ -31,9 +36,11 @@ const (
 // is queued on the next leg. The same keys are copied into task events for append-only history.
 type RouteAttemptReadback struct {
 	RequestedProvider string `json:"requested_provider"`
+	RequestedRunner   string `json:"requested_runner"`
 	RequestedModel    string `json:"requested_model"`
 	RequestedEffort   string `json:"requested_effort"`
 	ActualProvider    string `json:"actual_provider"`
+	ActualRunner      string `json:"actual_runner"`
 	ActualModel       string `json:"actual_model"`
 	ActualEffort      string `json:"actual_effort"`
 	OwnerRouteName    string `json:"owner_route_name,omitempty"`
@@ -115,6 +122,45 @@ type Task struct {
 	// LastRouteAttempt preserves requested/actual identity and the latest observation/proof even
 	// after the task advances to another route leg. It contains no prompt, output, or credential data.
 	LastRouteAttempt *RouteAttemptReadback `json:"last_route_attempt,omitempty"`
+	// RiskClass is the closed Owner risk declaration. For backend work only ordinary is a low-risk
+	// assertion; missing, unknown, critical, and production values all resolve to high-risk. Standalone
+	// reviews use ordinary versus critical/production, with missing or unknown values failing closed.
+	RiskClass string `json:"risk_class,omitempty"`
+	// QualitySensitive raises the Haiku Grok primary from medium to high. SpecializedFrontend marks
+	// complex React/frontend refactor, accessibility, or fixing work that requires a fresh Sol final gate.
+	QualitySensitive    bool `json:"quality_sensitive,omitempty"`
+	SpecializedFrontend bool `json:"specialized_frontend,omitempty"`
+	// OwnerRouteStage is the exact closed stage currently selected by the deterministic resolver.
+	OwnerRouteStage string `json:"owner_route_stage,omitempty"`
+	// FallbackReason stores only the closed serial-fallback failure kind. RouteReason remains the
+	// historical provider-transition code; keeping the two separate avoids presenting policy as evidence.
+	FallbackReason string `json:"fallback_reason,omitempty"`
+	// RequiredReviews and CompletedReviews contain only the closed review-stage constants in routing.go.
+	// They are additive and omitempty so old task JSON remains byte-for-byte readable without migration.
+	RequiredReviews  []string `json:"required_reviews,omitempty"`
+	CompletedReviews []string `json:"completed_reviews,omitempty"`
+	// ReviewPlanStage identifies an automatically created review card's exact obligation. It is not a
+	// generic review-after switch and therefore cannot recursively create a review of review.
+	ReviewPlanStage string `json:"review_plan_stage,omitempty"`
+	// ReviewPlanRoot keeps every serial gate attached directly to the implementation lineage. A Sol
+	// release gate may be created after Kimi completes, but it is never a review-of-review child.
+	ReviewPlanRoot string `json:"review_plan_root,omitempty"`
+	// SolEscalationReason is closed to disagreement, failed acceptance, explicit high risk, deterministic
+	// sampling, or the specialized frontend gate. Unknown values never authorize a Codex call.
+	SolEscalationReason string `json:"sol_escalation_reason,omitempty"`
+	// AutomaticCodex distinguishes an explicit Owner route gate from a global Codex fallback. The lineage
+	// counter enforces one automatic Sol call, including Fable. A budget bypass is valid only when its
+	// durable OwnerCriticalBypassReason is non-empty and the effective risk is high/critical/production.
+	AutomaticCodex    bool `json:"automatic_codex,omitempty"`
+	AutomaticSolCalls int  `json:"automatic_sol_calls,omitempty"`
+	// AutomaticSolInvocations is incremented and persisted before the automatic Codex process starts.
+	// A value of one is terminal for automatic dispatch: retries/resumes hold instead of spending a
+	// second Sol call. Existing tasks decode as zero and are unchanged until an explicit Owner gate runs.
+	AutomaticSolInvocations   int    `json:"automatic_sol_invocations,omitempty"`
+	OwnerCriticalBypassReason string `json:"owner_critical_bypass_reason,omitempty"`
+	// FableReviewerMerger marks the one terminal Sol/ultra child that receives the original evidence plus
+	// Grok's answer. It remains read-only, review_after=false, and can never spawn a Sol/max child.
+	FableReviewerMerger bool `json:"fable_reviewer_merger,omitempty"`
 	// FableFirstPrinciplesReview 是旧版 Fable 限额异构接力卡的兼容标记，完成后必须且只需
 	// 派一张本地 Sol/max 第一性补盲卡。AdvisoryReview 标记那张补盲卡本身：其结论供人工
 	// 判断，不喂给实现→审核→自动修复闭环，避免审查意见自动改写原设计。

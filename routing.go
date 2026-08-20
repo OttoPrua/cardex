@@ -23,6 +23,9 @@ func ownerRoutingPolicyWaitReason(cfg *Config, t *Task) string {
 	if invalidExplicitRouteClass(t) {
 		return fmt.Sprintf("route_class=%q 无效；仅允许 backend|general", t.RouteClass)
 	}
+	if err := closedOwnerTaskStateError(t); err != nil {
+		return "Owner 闭合路由状态无效：" + err.Error()
+	}
 	if cursorFableOwnerRouteRequired(cfg, t) {
 		return "显式 Fable 当前形状/配置无法解析完整 Owner 路由"
 	}
@@ -36,6 +39,12 @@ func validateNewTaskRouteClass(cfg *Config, t *Task) error {
 	class := strings.ToLower(strings.TrimSpace(t.RouteClass))
 	if invalidExplicitRouteClass(t) {
 		return fmt.Errorf("route_class 只允许 backend|general，收到 %q", t.RouteClass)
+	}
+	if cfg != nil && cfg.OwnerRoutingEnforced && modelTierKeyword(cfg, t.Model) == "fable" {
+		// Fable is a read-only decision/synthesis lineage. Subject matter cannot classify the Fable
+		// card as backend; any later implementation is a separate card with its own classification.
+		t.RouteClass = routeClassGeneral
+		return nil
 	}
 	if cfg != nil && cfg.OwnerRoutingEnforced && class == "" {
 		return fmt.Errorf("owner_routing_enforced=true 时新 sequence 卡必须显式指定 route_class=backend|general")

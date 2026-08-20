@@ -67,9 +67,9 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 |---|---|---|
 | `design-review` | 设计审核 session：只读审查代码/架构，产出 P0/P1/P2 分级报告 | 只读工具；默认来源档位 Opus，按 Opus 实际链派发 |
 | `prompt-assembly` | prompt 装配 session：调研项目后把目标拆成 prompt 序列，**产出的任务自动入队** | 只读工具；默认来源档位 Opus，按 Opus 实际链派发 |
-| `sequence` | 预设 prompt 序列：多个步骤在同一个会话中依次执行（`--resume` 串联，上下文连续） | acceptEdits；默认 Sonnet→Grok 4.6/high，安全失败三证通过后 Luna/max |
+| `sequence` | 预设 prompt 序列：多个步骤在同一个会话中依次执行（`--resume` 串联，上下文连续） | acceptEdits；默认 Sonnet→Grok 4.6/high，eligible 串行接力 Kimi K3/max；复杂前端按风险追加 Sol 最终门 |
 | `coordinate` | 分工协调 session：读**实时**队列快照 + 各会话进度报告，把目标拆成分工任务（含模型建议）自动入队 | 只读工具；默认来源档位 Opus，按 Opus 实际链派发 |
-| `progress-pull` | 进度回收 session：`--resume` 某个会话，让它输出结构化进度报告并落盘 | 只读工具；默认 Haiku→Grok 4.6/high，安全失败三证通过后 Luna/xhigh |
+| `progress-pull` | 进度回收 session：`--resume` 某个会话，让它输出结构化进度报告并落盘 | 只读工具；默认 Haiku→Grok 4.6/medium，显式质量敏感时 high，eligible 接力仅 Kimi/既证 OpenCode Go 轻量车道 |
 
 任务可以链式衔接：`assemble`（装配）→ 产出 `sequence` 入队 → 执行完成 → `review_after` 自动入队一个 `design-review` 审查刚才的改动。
 
@@ -132,15 +132,16 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 | `type_defaults.*.model` | 装配/协调/审核 Opus；落地 Sonnet；回收 Haiku | 各类型默认来源档位；Codex 主路由再映射到实际 GPT-5.6 模型；Fable 仅供显式最难裁决 |
 | `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行，只读类型豁免） |
 | `default_runner` | ""（历史 Claude） | 未显式钉执行器的新卡默认主路由；设为 `codex` 后，手工卡及自动审核/修复/收口/复盘/emit 卡统一烘焙 `runner_pref=codex`。显式 Claude 会话续跑和 cross profile 保留其已声明身份 |
-| `owner_routing_enforced` | `false` | 当前 Owner 六行生产路由的加载期硬锁。设为 `true` 后，Kimi/Grok/Cursor、精确模型与 effort、Fable 配额唯一触发的双答案/合并和独立 Sol/max 审核位任一漂移都会拒绝加载；新 `sequence` 卡必须显式写 `route_class=backend|general`。受管 board/tick 配合 `CARDEX_REQUIRE_OWNER_ROUTING=1` 防止删键静默降级 |
+| `owner_routing_enforced` | `false` | Final Owner 矩阵的加载期硬锁。设为 `true` 后，全部风险/审核分支、精确 provider/runner/model/effort、Fable 单次 Sol/ultra 终局以及显式 Sol gate 任一漂移都会拒绝加载；新 `sequence` 卡必须写 `route_class=backend|general`，backend 还必须明确任务字段 risk_class，缺失/歧义按 high-risk fail closed。受管 board/tick 配合 `CARDEX_REQUIRE_OWNER_ROUTING=1` 防止删键静默降级 |
+| `automatic_codex_budget_stop_percent` / `owner_provider_targets` | `0` / 空 | Final Owner 模式严格要求自动 Codex 在 provider-specific 已用 65% 时停止，证据不可用同样 held；仅带可见持久原因的 Owner-pinned critical 卡可绕过。provider targets 固定为 Grok 70–80%、Kimi/OpenCode 15–25%、direct Sol 5–10%，只做政策读回，不改已有卡 |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见[进阶指南](docs/guide.md#5-小时额度红线保底额度) |
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见[进阶指南](docs/guide.md#codex-备用执行器限额空窗不断档) |
 | `codex_fallback_model` | "" | 非 Opus claude 卡降级到 codex 时的通用模型；空回退 `codex_model` |
 | `codex_fallback_opus_model` / `codex_fallback_opus_reasoning` | `gpt-5.6-sol` / `xhigh` | Opus 档 claude 卡降级到 codex 时的默认模型与思考档；默认不因 `stakes=low` 降档 |
-| `codex_tier_models` / `codex_tier_reasoning` | 见内置映射 | Codex 档位槽位仍负责显式 Codex 与末级回退；生产自动链由六行 Owner resolver 覆盖：Opus/general→Grok 4.6/xhigh→Kimi K3/max→Sol/xhigh，Opus/backend→Grok 4.6/xhigh→Sol/max，Sonnet/Haiku→Grok 4.6/high→各自 Luna 档 |
-| `grok_build_bin` / `grok_build` | 空 / 关闭 | Owner 路由的 Grok 第一腿：非 backend Opus 合格失败后才到 Kimi K3/max，再到 Sol/xhigh；backend Opus=xhigh→Sol/max；Sonnet=high→Luna/max；Haiku=high→Luna/xhigh。生产应把路径钉到版本化二进制，并在每次任务前执行 `--no-auto-update models` 无模型登录预检。只有受信诊断同时证明完整的 401/expired/auth_kind/upstream/reason 家族才开启引擎级认证熔断；首卡 held 且不烧 attempts，跟随卡留在原 Grok 腿，鉴权绝不推进到 Kimi/Sol。`cardex doctor` 的真实预检成功后只解除认证熔断。其他合格失败仍须零语义/模型/工具、worktree 指纹不变、无进程残留三证齐全；任务与事件保存 requested/actual provider/model/effort/腿/尝试/证明读回；独立审核卡直达 fresh Sol/max |
-| `cursor_bin` / `cursor_model` / `cursor_fable` | 空 / 关闭 | 显式 Fable 主跑 `claude-fable-5-thinking-max`。仅在确认的 eligible Fable quota-limit 失败后，才严格串行取得 Grok 4.6/xhigh 与 Sol/ultra 两份只读独立答案，再由全新 Sol/max 从第一性合并；transport/stream/stall 等非配额失败保持 held，不启动 fallback |
+| `codex_tier_models` / `codex_tier_reasoning` | 见内置映射 | 只负责人工显式 Codex 与旧通用兼容径。Final Owner 模式移除全局 Codex fallback；每个自动 Sol 都是解析器显式 route gate，同一 lineage 最多一次 |
+| `grok_build_bin` / `grok_build` | 空 / 关闭 | Final Owner 主腿：Fable answer 与 Opus 用 Grok 4.6/xhigh，Sonnet 用 high，Haiku 用 medium（显式质量敏感可 high）。非 backend Opus/Sonnet/Haiku 的 eligible 失败串行到 Kimi K3/max；backend ordinary 为 Grok 实现→fresh Kimi 对抗审查/修复，并在确定性 20% 抽样、分歧或验收失败时追加 Sol/xhigh；backend high-risk 为 Grok 实现→fresh Kimi 只读第二视角→fresh Sol/max 发布门。Grok 鉴权严格 fail closed：只有精确单行 bare 诊断或精确 quoted OIDC wrapper 可开熔断，完整 stderr 观察结束且 semantic/model/tool=0/0/0 才成立；鉴权永不授权 fallback |
+| `cursor_bin` / `cursor_model` / `cursor_fable` | 空 / 关闭 | 显式 Fable 主跑 `claude-fable-5-thinking-max`，始终是 general、只读决策/方案综合角色。仅确认 quota 或 eligible 已证明前语义失败后，串行一份只读 Grok 4.6/xhigh answer，再由唯一一次 fresh Sol/ultra 接收原问题/证据与 Grok 答案，从第一性重建、对抗并修复后直接终局；没有 blind Sol answer B、Sol/max 第三腿或 review-of-review，未决 P0/P1/uncertainty 转 Owner held |
 | `gemini_bin` / `gemini_model` | 空 / ""（内置 pro） | Gemini CLI 第二异构执行器（钉定/降级链/交叉验证），见[进阶指南](docs/guide.md#gemini-cli-备用执行器第二异构执行器) |
 | `gemini_models` | fable/opus→pro，sonnet→flash，haiku→flash-lite | 档位槽映射（官方稳定别名）；非 sequence 卡恒 `--approval-mode plan` 只读 |
 | `engines` | {}（空） | 多订阅引擎档案（Kimi/GLM/MiniMax/MiMo/OpenCode Go/Ollama Cloud），`cardex engines add <名>` 并入预设，见[进阶指南](docs/guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud) |

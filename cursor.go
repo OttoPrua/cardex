@@ -277,7 +277,9 @@ func invokeCursor(ctx context.Context, cfg *Config, t *Task, prompt string) (*cl
 		"--print", "--trust", "--output-format", "stream-json",
 		"--model", model, "--workspace", t.Dir, "--sandbox", "enabled",
 	}
-	if t.Type != typeSequence {
+	fableReadOnly := cfg.OwnerRoutingEnforced &&
+		(t.OwnerRouteName == "fable_explicit" || modelTierKeyword(cfg, t.Model) == "fable")
+	if t.Type != typeSequence || fableReadOnly {
 		args = append(args, "--mode", "ask")
 	}
 	if t.SessionID != "" {
@@ -374,8 +376,8 @@ func prepareCursorFableFallback(root string, cfg *Config, t *Task, reason string
 	if !auth.verified || auth.beforeDigest == "" || auth.beforeDigest != auth.afterDigest {
 		return fmt.Errorf("Cursor Fable fallback refused without verified serial authorization")
 	}
-	if kind != fallbackQuota {
-		return fmt.Errorf("Cursor Fable fallback is quota-only; %s must remain held", kind)
+	if !fableFallbackKindEligible(kind) {
+		return fmt.Errorf("Cursor Fable fallback accepts only confirmed quota or proven presemantic triggers; %s must remain held", kind)
 	}
 	if cfg == nil || cfg.CursorFable == nil || t == nil {
 		return fmt.Errorf("Cursor Fable 回退配置不完整")
@@ -416,7 +418,20 @@ func prepareCursorFableFallback(root string, cfg *Config, t *Task, reason string
 	next.EmitProgress = false
 	next.AdvisoryReview = false
 	next.FableFirstPrinciplesReview = false
-	next.LastError = "Cursor Fable 已确认 quota-limit，转 Grok/xhigh + Sol/ultra 独立只读作答，再由 fresh Sol/max 第一性合并: " + reason
+	next.FableReviewerMerger = false
+	next.RouteClass = routeClassGeneral
+	next.RiskClass = riskClassOrdinary
+	next.OwnerRouteName = "fable_explicit"
+	next.OwnerRouteLeg = 2
+	next.OwnerRouteStage = routeStageFableAnswer
+	next.RequiredReviews = nil
+	next.CompletedReviews = nil
+	var reviewErr error
+	next.RequiredReviews, reviewErr = appendClosedReview(next.RequiredReviews, reviewStageFableSolUltra)
+	if reviewErr != nil {
+		return reviewErr
+	}
+	next.LastError = "Cursor Fable 已确认 quota 或 eligible presemantic trigger，转 Grok/xhigh 独立只读答案，再由单次 fresh Sol/ultra 对抗合并并直接终局: " + reason
 	if err := applyCrossEngine(&next, prof.A, cfg); err != nil {
 		return fmt.Errorf("回退引擎甲(%s): %w", crossEngineLabel(prof.A), err)
 	}
@@ -428,14 +443,10 @@ func prepareCursorFableFallback(root string, cfg *Config, t *Task, reason string
 		return fmt.Errorf("回退引擎乙(%s): %w", crossEngineLabel(prof.B), err)
 	}
 	next.XEngineB = frozenB
-	if prof.Merge == nil {
-		return fmt.Errorf("Cursor Fable 回退 profile %q 缺独立 merge 引擎", name)
+	if prof.Merge != nil {
+		return fmt.Errorf("Cursor Fable 回退 profile %q 必须移除第三 Sol/max merge 腿", name)
 	}
-	frozenC, err := freezeCrossEngine(*prof.Merge, cfg)
-	if err != nil {
-		return fmt.Errorf("回退合并引擎(%s): %w", crossEngineLabel(*prof.Merge), err)
-	}
-	next.XEngineC = frozenC
+	next.XEngineC = nil
 	next.RouteReason = routeReasonCursorFableFallbackPending
 	next.touch()
 	if err := saveTask(root, &next); err != nil {
@@ -492,14 +503,8 @@ func validateCursor(cfg *Config) error {
 	if leg := crossPolicyLeg(cfg, prof.B); leg.Model != "gpt-5.6-sol" {
 		return fmt.Errorf("Cursor Fable 回退 profile 的 B 必须通过 codex_model 严格使用 gpt-5.6-sol/ultra")
 	}
-	if prof.Merge == nil || prof.Merge.Kind != "codex" || strings.ToLower(strings.TrimSpace(prof.Merge.Effort)) != "max" {
-		return fmt.Errorf("Cursor Fable 回退 profile 必须配置独立 codex Sol/max merge 引擎")
-	}
-	if strings.TrimSpace(prof.Merge.Model) != "" {
-		return fmt.Errorf("Cursor Fable 回退 profile 的 merge.model 必须留空；Codex 模型由 codex_model 冻结")
-	}
-	if leg := crossPolicyLeg(cfg, *prof.Merge); leg.Model != "gpt-5.6-sol" {
-		return fmt.Errorf("Cursor Fable 回退 profile 的 merge 必须通过 codex_model 严格使用 gpt-5.6-sol/max")
+	if prof.Merge != nil {
+		return fmt.Errorf("Cursor Fable 回退 profile 不得配置第三 Sol/max merge；Sol/ultra reviewer-merger 直接终局")
 	}
 	// Exact names are not enough: every frozen leg must be executable under the loaded config.
 	// Reject a broken chain before Cursor Fable can run, rather than discovering a missing Grok/Codex
@@ -509,8 +514,7 @@ func validateCursor(cfg *Config) error {
 		eng  CrossEngine
 	}{
 		{"A", prof.A},
-		{"B", prof.B},
-		{"merge", *prof.Merge},
+		{"reviewer-merger", prof.B},
 	} {
 		if _, err := freezeCrossEngine(leg.eng, cfg); err != nil {
 			return fmt.Errorf("Cursor Fable 回退 profile 的 %s 不可执行: %w", leg.name, err)

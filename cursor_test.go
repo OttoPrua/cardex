@@ -25,9 +25,8 @@ func cursorTestConfig() *Config {
 	}
 	cfg.CrossProfiles = map[string]CrossProfile{
 		"fable-dual": {
-			A:     CrossEngine{Kind: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh", Label: "grok-4.6/xhigh"},
-			B:     CrossEngine{Kind: "codex", Effort: "ultra", Label: "gpt-5.6-sol/ultra"},
-			Merge: &CrossEngine{Kind: "codex", Effort: "max", Label: "gpt-5.6-sol/max first-principles merge"},
+			A: CrossEngine{Kind: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh", Label: "grok-4.6/xhigh"},
+			B: CrossEngine{Kind: "codex", Effort: "ultra", Label: "gpt-5.6-sol/ultra adversarial merger"},
 		},
 	}
 	return cfg
@@ -138,6 +137,32 @@ func TestInvokeCursorUsesReadOnlyAskAndNeverAutoReview(t *testing.T) {
 	}
 }
 
+func TestInvokeCursorFinalOwnerFableSequenceIsReadOnlyAsk(t *testing.T) {
+	stream := strings.Join([]string{
+		`{"type":"assistant","message":{"content":[{"type":"text","text":"FABLE_OK"}]}}`,
+		`{"type":"result","subtype":"success","result":"FABLE_OK"}`,
+	}, "\n")
+	bin, argsPath := fakeCursorAgent(t, stream, "", 0)
+	cfg := policyTestConfig()
+	cfg.CursorBin = bin
+	task := &Task{
+		ID: "fable-read-only", Type: typeSequence, Dir: t.TempDir(), Model: "fable",
+		CursorModel: "claude-fable-5-thinking-max", OwnerRouteName: "fable_explicit",
+	}
+	res, _, err := invokeCursor(context.Background(), cfg, task, "decide without writing")
+	if err != nil || res == nil || res.IsError {
+		t.Fatalf("Fable Cursor invoke failed: res=%+v err=%v", res, err)
+	}
+	args, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := "\n" + string(args) + "\n"
+	if !strings.Contains(got, "\n--mode\nask\n") {
+		t.Fatalf("Final Owner Fable sequence was not forced read-only at invocation:\n%s", got)
+	}
+}
+
 func TestValidateCursorFableUsesOnlyProvenEfforts(t *testing.T) {
 	cfg := cursorTestConfig()
 	if err := validateCursor(cfg); err != nil {
@@ -149,12 +174,12 @@ func TestValidateCursorFableUsesOnlyProvenEfforts(t *testing.T) {
 		B:     bad.CrossProfiles["fable-dual"].B,
 		Merge: &CrossEngine{Kind: "codex", Effort: "xhigh"},
 	}
-	if err := validateCursor(bad); err == nil || !strings.Contains(err.Error(), "Sol/max") {
-		t.Fatalf("non-max Sol merger must fail fast, got %v", err)
+	if err := validateCursor(bad); err == nil || !strings.Contains(err.Error(), "第三 Sol/max") {
+		t.Fatalf("any third Sol/max merger must fail fast, got %v", err)
 	}
 }
 
-func TestCursorFableFallbackBuildsGrokSolAndIndependentMerge(t *testing.T) {
+func TestCursorFableFallbackBuildsGrokAnswerAndSingleSolTerminalMerge(t *testing.T) {
 	root := testRoot(t)
 	cfg := cursorTestConfig()
 	task := newTask(root, cfg, typeCoordinate, "hard decision", t.TempDir(), []string{"decide from first principles"}, 9)
@@ -170,47 +195,41 @@ func TestCursorFableFallbackBuildsGrokSolAndIndependentMerge(t *testing.T) {
 		t.Fatalf("A must be Grok/xhigh: %+v", task)
 	}
 	if task.XEngineB == nil || task.XEngineB.PreferRunner != "codex" || task.XEngineB.CodexModel != "gpt-5.6-sol" || task.XEngineB.Effort != "ultra" {
-		t.Fatalf("B must be independent Sol/ultra: %+v", task.XEngineB)
+		t.Fatalf("B must be the Sol/ultra adversarial reviewer-merger: %+v", task.XEngineB)
 	}
-	if task.XEngineC == nil || task.XEngineC.PreferRunner != "codex" || task.XEngineC.CodexModel != "gpt-5.6-sol" || task.XEngineC.Effort != "max" {
-		t.Fatalf("C must be a distinct Sol/max first-principles merger: %+v", task.XEngineC)
+	if task.XEngineC != nil {
+		t.Fatalf("Fable must have no third Sol/max engine: %+v", task.XEngineC)
 	}
 	if task.ReviewAfter || task.FableFirstPrinciplesReview {
 		t.Fatalf("fallback cross chain must not spawn a second review loop: %+v", task)
 	}
 
-	if err := writeCrossPeer(root, task.XKey, "A answer"); err != nil {
-		t.Fatal(err)
-	}
-	b := newTask(root, cfg, typeCrossCheck, "交叉B[fable-dual]: hard decision", task.Dir, []string{"solo"}, task.Priority)
-	b.XRole, b.XKey, b.XProfile, b.XTask = "B", task.XKey, task.XProfile, task.XTask
-	b.XEngineB, b.XEngineC = task.XEngineB, task.XEngineC
-	applyFrozenEngine(b, task.XEngineB)
-	handleCrossStage(root, cfg, b, &claudeResult{Result: "B answer"}, nil)
+	handleCrossStage(root, cfg, task, &claudeResult{Result: "Grok answer"}, nil)
 	tasks, err := loadTasks(root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var c *Task
 	for _, candidate := range tasks {
+		if candidate.XKey == task.XKey && candidate.XRole == "B" {
+			t.Fatalf("Fable must not create a blind independent Sol B: %+v", candidate)
+		}
 		if candidate.XKey == task.XKey && candidate.XRole == "C" {
 			c = candidate
 			break
 		}
 	}
-	if c == nil || c.PreferRunner != "codex" || c.XCodexModel != "gpt-5.6-sol" || c.Effort != "max" {
-		t.Fatalf("C must use the separately frozen merger: %+v", c)
+	if c == nil || c.PreferRunner != "codex" || c.XCodexModel != "gpt-5.6-sol" || c.Effort != "ultra" ||
+		!c.FableReviewerMerger || c.AutomaticSolCalls != 1 || c.ReviewAfter {
+		t.Fatalf("C must be the sole fresh Sol/ultra terminal reviewer-merger: %+v", c)
 	}
-	if !strings.Contains(c.Prompts[0], "A answer") || !strings.Contains(c.Prompts[0], "B answer") {
-		t.Fatalf("merge prompt must contain both independent answers: %q", c.Prompts[0])
+	if !strings.Contains(c.Prompts[0], "decide from first principles") || !strings.Contains(c.Prompts[0], "Grok answer") {
+		t.Fatalf("merge prompt must contain original problem and Grok answer: %q", c.Prompts[0])
 	}
 }
 
-func TestCursorFableFallbackAcceptsOnlyConfirmedQuota(t *testing.T) {
-	for _, kind := range []fallbackFailureKind{
-		fallbackTransport, fallbackStreamIncomplete, fallbackSemanticStall,
-		fallbackInvalidTerminal, fallbackExecutionEnv,
-	} {
+func TestCursorFableFallbackAcceptsOnlyQuotaOrEligiblePresemantic(t *testing.T) {
+	for _, kind := range []fallbackFailureKind{fallbackSemanticStall, fallbackInvalidTerminal} {
 		t.Run(string(kind), func(t *testing.T) {
 			root := testRoot(t)
 			cfg := cursorTestConfig()
@@ -218,18 +237,20 @@ func TestCursorFableFallbackAcceptsOnlyConfirmedQuota(t *testing.T) {
 			task.Model = "fable"
 			task.PreferRunner = "codex"
 			if err := prepareCursorFableFallback(root, cfg, task, string(kind), kind, verifiedCursorFallbackAuth(t)); err == nil ||
-				!strings.Contains(err.Error(), "quota-only") {
-				t.Fatalf("non-quota Fable terminal must remain held: %v", err)
+				!strings.Contains(err.Error(), "proven presemantic") {
+				t.Fatalf("semantic or acceptance failure must remain held: %v", err)
 			}
 		})
 	}
-	root := testRoot(t)
-	cfg := cursorTestConfig()
-	task := newTask(root, cfg, typeCoordinate, "hard decision", t.TempDir(), []string{"decide"}, 9)
-	task.Model = "fable"
-	task.PreferRunner = "codex"
-	if err := prepareCursorFableFallback(root, cfg, task, "confirmed quota", fallbackQuota, verifiedCursorFallbackAuth(t)); err != nil {
-		t.Fatalf("confirmed eligible quota must create the bounded answer/merge chain: %v", err)
+	for _, kind := range []fallbackFailureKind{fallbackQuota, fallbackTransport, fallbackStreamIncomplete, fallbackExecutionEnv} {
+		root := testRoot(t)
+		cfg := cursorTestConfig()
+		task := newTask(root, cfg, typeCoordinate, "hard decision", t.TempDir(), []string{"decide"}, 9)
+		task.Model = "fable"
+		task.PreferRunner = "codex"
+		if err := prepareCursorFableFallback(root, cfg, task, string(kind), kind, verifiedCursorFallbackAuth(t)); err != nil {
+			t.Fatalf("%s must create the bounded answer/terminal-merge chain: %v", kind, err)
+		}
 	}
 }
 
@@ -241,12 +262,12 @@ func TestBoardShowsCursorFablePrimaryAndCompleteFallbackRoute(t *testing.T) {
 	task.PreferRunner = "codex"
 
 	brief := toBrief(cfg, task, time.Now())
-	const wantRoute = "Cursor Fable 5 Thinking Max → [仅确认 eligible quota-limit 后: Grok Build 4.6/xhigh 独立作答 → Codex GPT-5.6 Sol/ultra 独立作答] → Codex GPT-5.6 Sol/max 第一性合并（不预设原方案正确）"
+	const wantChain = "Grok answer → Sol/ultra adversarial merge → terminal"
 	if brief.Runner != cursorRunnerName || brief.Model != "claude-fable-5-thinking-max" || brief.Effort != "max" {
 		t.Fatalf("queued Fable card must show its effective Cursor primary: %+v", brief)
 	}
-	if brief.ModelRoute != wantRoute {
-		t.Fatalf("queued Fable card route=%q, want %q", brief.ModelRoute, wantRoute)
+	if !strings.Contains(brief.ModelRoute, wantChain) || strings.Contains(brief.ModelRoute, "Sol/max") {
+		t.Fatalf("queued Fable card route=%q, want terminal single-Sol chain", brief.ModelRoute)
 	}
 
 	if err := prepareCursorFableFallback(root, cfg, task, "cursor quota exhausted", fallbackQuota, verifiedCursorFallbackAuth(t)); err != nil {
@@ -256,7 +277,7 @@ func TestBoardShowsCursorFablePrimaryAndCompleteFallbackRoute(t *testing.T) {
 	if brief.Model != "grok-4.6" || brief.Effort != "xhigh" {
 		t.Fatalf("fallback A card must continue showing the current effective leg: %+v", brief)
 	}
-	if brief.ModelRoute != wantRoute {
+	if !strings.Contains(brief.ModelRoute, wantChain) || strings.Contains(brief.ModelRoute, "Sol/max") {
 		t.Fatalf("fallback chain must retain the complete route, got %q", brief.ModelRoute)
 	}
 	app, err := boardWeb.ReadFile("web/app.js")
@@ -325,7 +346,7 @@ func TestRunTaskCursorFableQuotaAtomicallyEntersFallbackChain(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Status != statusQueued || got.XRole != "A" || got.PreferRunner != grokBuildRunnerName ||
-		got.XEngineB == nil || got.XEngineC == nil || got.Step != 0 || got.SessionID != "" {
+		got.XEngineB == nil || got.XEngineC != nil || got.Step != 0 || got.SessionID != "" {
 		t.Fatalf("quota fallback must persist one complete fresh cross chain: %+v", got)
 	}
 	if cd := loadEngineCooldown(root, cursorCooldownName); cd == nil || !cd.active(time.Now()) {
@@ -344,10 +365,10 @@ func TestRunTaskCursorFableQuotaAtomicallyEntersFallbackChain(t *testing.T) {
 	}
 }
 
-func TestRunTaskCursorFableNonQuotaStaysHeldWithoutFallback(t *testing.T) {
+func TestRunTaskCursorFableSemanticStallStaysHeldWithoutFallback(t *testing.T) {
 	bin, _ := fakeCursorAgent(t,
 		`{"type":"system","subtype":"init","session_id":"presemantic","model":"Claude Fable 5 300K Max"}`,
-		"connection reset by peer", 1)
+		"semantic timeout", 1)
 	root := testRoot(t)
 	cfg := cursorTestConfig()
 	cfg.CursorBin = bin
@@ -365,18 +386,18 @@ func TestRunTaskCursorFableNonQuotaStaysHeldWithoutFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got.Status != statusHeld || got.XRole != "" || got.Attempts != 0 || got.PreferRunner != "codex" {
-		t.Fatalf("non-quota Fable terminal must hold the original card without answer/merge legs: %+v", got)
+		t.Fatalf("semantic Fable failure must hold the original card without answer/merge legs: %+v", got)
 	}
 	if cd := loadEngineCooldown(root, cursorCooldownName); cd != nil {
-		t.Fatalf("non-quota Fable terminal must not create a quota cooldown: %+v", cd)
+		t.Fatalf("semantic Fable failure must not create a quota cooldown: %+v", cd)
 	}
 	events, _, err := loadTaskEvents(root, task.ID)
 	if err != nil || len(events) == 0 {
 		t.Fatalf("load hold receipt: events=%d err=%v", len(events), err)
 	}
 	last := events[len(events)-1]
-	if last.Type != evHeld || last.Detail["reason"] != "fable_non_quota_held" ||
-		last.Detail["failure_kind"] != string(fallbackTransport) {
-		t.Fatalf("non-quota hold receipt incomplete: %+v", last)
+	if last.Type != evHeld || last.Detail["reason"] != "fable_ineligible_failure_held" ||
+		last.Detail["failure_kind"] != string(fallbackSemanticStall) {
+		t.Fatalf("semantic hold receipt incomplete: %+v", last)
 	}
 }

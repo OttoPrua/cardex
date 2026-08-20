@@ -44,9 +44,9 @@ type OpenCodeNightRoute struct {
 	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
 }
 
-// KimiCLIOpusRoute 是 Owner 非 backend Opus 路由的 Kimi K3/max 第二腿。Grok 第一腿只有在
-// eligible non-auth 失败且零语义/模型/工具、指纹不变、无进程残留三证齐全后才串行排 Kimi；
-// Kimi 同样通过三证后才可进入 Sol/xhigh。
+// KimiCLIOpusRoute 是 Owner 矩阵共用的 Kimi K3/max 串行腿：非 backend Opus、Sonnet/Haiku
+// 的 eligible fallback，以及 backend 的对抗复审/只读第二视角。Kimi CLI 与 OpenCode Go Kimi K3
+// 只构成容量冗余，不构成独立模型意见；任何后续 Sol 都必须来自显式条件或发布门。
 type KimiCLIOpusRoute struct {
 	Enabled          bool   `json:"enabled"`
 	ExcludeBackend   bool   `json:"exclude_backend,omitempty"`
@@ -55,8 +55,8 @@ type KimiCLIOpusRoute struct {
 	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
 }
 
-// GrokTierRoute 把一个来源档位钉到 Grok 推理档，并冻结安全失败白名单三证通过后的 Codex 末腿。
-// 当前键域由 validateGrokBuild 收口为 opus_backend / sonnet / haiku。
+// GrokTierRoute 把一个来源档位钉到 Grok 推理档。CodexFallback* 是旧通用模式兼容字段；
+// final Owner resolver 只从闭合矩阵的显式 route gate 创建 Codex 腿。
 type GrokTierRoute struct {
 	Effort              string `json:"effort"`
 	CodexFallbackModel  string `json:"codex_fallback_model"`
@@ -64,8 +64,8 @@ type GrokTierRoute struct {
 }
 
 // GrokBuildRoute 是 Owner 的 Grok 主腿与受控串行接力。TierRoutes 的 exact identities 在加载
-// 时校验；Grok 发生白名单安全失败且三证齐全才排逐档 Codex 末腿。独立审核卡使用
-// ReviewCodexModel/ReviewCodexEffort；OpusAdversarialReview 仅保留为通用模式兼容开关。
+// 时校验；final Owner 模式下不存在全局 Codex fallback，每个 Sol 都由解析器显式命名。
+// ReviewCodex* 与 OpusAdversarialReview 仅保留为通用模式兼容字段。
 type GrokBuildRoute struct {
 	Enabled          bool   `json:"enabled"`
 	Model            string `json:"model"`
@@ -85,13 +85,24 @@ type GrokBuildRoute struct {
 }
 
 // CursorFableRoute 把显式 Fable 档交给已登录的 Cursor CLI。模型固定 thinking-max；只有确认
-// eligible quota-limit 且三证齐全时，FallbackProfile 才启动 Grok 与 Sol 独立只读答案，再由 fresh
-// Sol/max 第一性合并。transport/stream/stall/invalid/environment/auth 均不得触发该链。
+// quota 或 eligible、已证明的前语义失败且零工作/零变更/零残留时，FallbackProfile 才启动一份
+// Grok 只读答案，再由唯一一次 fresh Sol/ultra 对抗审查、修复并直接给出终局。语义或验收失败不触发。
 type CursorFableRoute struct {
 	Enabled          bool   `json:"enabled"`
 	Model            string `json:"model"`
 	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
 	FallbackProfile  string `json:"fallback_profile"`
+}
+
+// OwnerProviderTargets are reporting bounds only. They never select a provider or mutate existing
+// tasks; deterministic route classification remains the sole dispatch authority.
+type OwnerProviderTargets struct {
+	GrokMinPercent      int `json:"grok_min_percent"`
+	GrokMaxPercent      int `json:"grok_max_percent"`
+	KimiMinPercent      int `json:"kimi_min_percent"`
+	KimiMaxPercent      int `json:"kimi_max_percent"`
+	DirectSolMinPercent int `json:"direct_sol_min_percent"`
+	DirectSolMaxPercent int `json:"direct_sol_max_percent"`
 }
 
 type Config struct {
@@ -115,17 +126,23 @@ type Config struct {
 	// codex/gemini 分别把手工卡与 newTask 派生的审核、修复、收口、复盘、emit 卡钉到对应执行器。
 	// 显式会话续跑与 cross profile 仍尊重其已声明的执行器身份。
 	DefaultRunner string `json:"default_runner,omitempty"`
-	// OwnerRoutingEnforced 把本机确认的六行 Owner 路由提升为配置加载期硬契约。关闭时 Cardex
-	// 仍可作为通用调度器使用；开启时，Kimi/Grok/Cursor、全部六行、独立 Sol/max 审核位与 Fable
-	// 交叉 profile 任一缺失或漂移都拒绝加载，避免“配置仍合法但生产悄悄退回旧路线”。
+	// OwnerRoutingEnforced 把 final Owner 矩阵提升为配置加载期硬契约。关闭时 Cardex 仍可作为
+	// 通用调度器使用；开启时，Kimi/Grok/Cursor、全部风险/审核分支、显式 Sol gate 与 Fable
+	// reviewer-merger 任一缺失或漂移都拒绝加载，避免生产静默退回旧路线。
 	OwnerRoutingEnforced bool `json:"owner_routing_enforced,omitempty"`
+	// AutomaticCodexBudgetStopPercent is provider-specific to automatic Owner route gates. The final
+	// policy requires exactly 65: at or above it Cardex preserves the remaining ~35%; absent/stale
+	// usage_feed evidence fails closed. Explicit manual Codex pins remain outside this automatic budget.
+	AutomaticCodexBudgetStopPercent int                   `json:"automatic_codex_budget_stop_percent,omitempty"`
+	OwnerProviderTargets            *OwnerProviderTargets `json:"owner_provider_targets,omitempty"`
 
 	// ---- 5 小时额度红线（保底额度，给交互/突发任务留余量）----
 	// QueueBudgetTokens: 滑动 5 小时窗口内，队列最多消耗的加权 token 数；0 关闭。
 	// 只统计 cardex 自己派发的调用（桌面端消耗不可见），本质是"队列预算上限"。
 	QueueBudgetTokens int64 `json:"queue_budget_tokens"`
-	// RedlinePercent + UsageFeed: 外部全局用量源（CodexBar usage-history.jsonl 格式），
-	// 最新 claude 5h 窗口样本 usedPercent 达到红线即停止派发；样本过期则放行（fail-open）。
+	// RedlinePercent + UsageFeed: 外部全局用量源（CodexBar usage-history.jsonl 格式）。旧的通用
+	// redline 仍沿用其兼容策略；final Owner 自动 Codex gate 另行要求 provider-specific fresh evidence，
+	// 在 65% 停止且证据缺失时 fail closed。
 	RedlinePercent     int    `json:"redline_percent"`
 	UsageFeed          string `json:"usage_feed"`
 	UsageFeedMaxAgeMin int    `json:"usage_feed_max_age_min"`
@@ -249,7 +266,7 @@ type Config struct {
 	// ModelTiers 自定义分级表：模型 ID（小写；精确或前缀匹配，"glm-4.7" 盖住 "glm-4.7:cloud"）
 	// → 档位关键字（fable/opus/sonnet/haiku）。优先于内置统一标准线——给"机队里没有更强模型"
 	// 的用户按牌面定档：手里最强的模型就是自己的 fable 档，看板/引擎档位展示随之。
-	// Owner 六行自动路由也读取该解析结果；修改映射会改变未显式 pin 新卡的实际派发。
+	// Final Owner 矩阵也读取该解析结果；修改映射会改变未显式 pin 新卡的实际派发。
 	// 值写错载入即拒（fail fast），键必须全小写。见 docs/guide.md「自定义分级」。
 	ModelTiers map[string]string `json:"model_tiers,omitempty"`
 
@@ -656,7 +673,7 @@ func defaultConfig(claudeBin string) *Config {
 			},
 			typeSequence: {
 				PermissionMode: "acceptEdits",
-				// 普通落地默认用 Sonnet 来源档（Grok/high→Luna/max）；模糊、长程、跨仓
+				// 普通落地默认用 Sonnet 来源档（Grok/high→eligible Kimi/max）；模糊、长程、跨仓
 				// 或高风险由派卡方显式升为 Opus，最难裁决才显式使用 Fable/max。
 				Model:  "sonnet",
 				Effort: "xhigh",
@@ -916,25 +933,38 @@ func validateGrokBuild(cfg *Config) error {
 		default:
 			return fmt.Errorf("grok_build.tier_routes.%s.effort %q 非法（当前 Grok 4.6 可选 low/medium/high/xhigh）", key, route.Effort)
 		}
-		if route.CodexFallbackModel == "" {
+		if route.CodexFallbackModel == "" && !cfg.OwnerRoutingEnforced {
 			return fmt.Errorf("grok_build.tier_routes.%s.codex_fallback_model 不能为空", key)
 		}
-		if !validEfforts[route.CodexFallbackEffort] {
+		if route.CodexFallbackEffort != "" && !validEfforts[route.CodexFallbackEffort] {
+			return fmt.Errorf("grok_build.tier_routes.%s.codex_fallback_effort %q 非法（可选 low/medium/high/xhigh/max）", key, route.CodexFallbackEffort)
+		}
+		if route.CodexFallbackEffort == "" && !cfg.OwnerRoutingEnforced {
 			return fmt.Errorf("grok_build.tier_routes.%s.codex_fallback_effort %q 非法（可选 low/medium/high/xhigh/max）", key, route.CodexFallbackEffort)
 		}
 		r.TierRoutes[key] = route
 	}
 	// Owner routing table is an enforcement contract, not a suggestion that per-host config may
 	// silently weaken. Optional rows may be omitted, but any enabled row must match the exact identity.
-	expectedTierRoutes := map[string]GrokTierRoute{
-		"opus_backend": {Effort: "xhigh", CodexFallbackModel: "gpt-5.6-sol", CodexFallbackEffort: "max"},
-		"sonnet":       {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "max"},
-		"haiku":        {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "xhigh"},
-	}
-	for key, expected := range expectedTierRoutes {
-		if route, ok := r.TierRoutes[key]; ok && route != expected {
-			return fmt.Errorf("grok_build.tier_routes.%s 必须严格为 Grok/%s → %s/%s",
-				key, expected.Effort, expected.CodexFallbackModel, expected.CodexFallbackEffort)
+	if cfg.OwnerRoutingEnforced {
+		expectedEfforts := map[string]string{"opus_backend": "xhigh", "sonnet": "high", "haiku": "medium"}
+		for key, expected := range expectedEfforts {
+			route, ok := r.TierRoutes[key]
+			if !ok || route.Effort != expected {
+				return fmt.Errorf("owner final matrix requires grok_build.tier_routes.%s.effort=%s", key, expected)
+			}
+		}
+	} else {
+		expectedTierRoutes := map[string]GrokTierRoute{
+			"opus_backend": {Effort: "xhigh", CodexFallbackModel: "gpt-5.6-sol", CodexFallbackEffort: "max"},
+			"sonnet":       {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "max"},
+			"haiku":        {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "xhigh"},
+		}
+		for key, expected := range expectedTierRoutes {
+			if route, ok := r.TierRoutes[key]; ok && route != expected {
+				return fmt.Errorf("grok_build.tier_routes.%s 必须严格为 Grok/%s → %s/%s",
+					key, expected.Effort, expected.CodexFallbackModel, expected.CodexFallbackEffort)
+			}
 		}
 	}
 	if len(r.TierRoutes) > 0 && r.Model != "grok-4.6" {
@@ -946,7 +976,7 @@ func validateGrokBuild(cfg *Config) error {
 	if r.OpusAdversarialReview && (r.ReviewCodexModel != "gpt-5.6-sol" || r.ReviewCodexEffort != "max") {
 		return fmt.Errorf("grok_build Opus 对抗复审必须严格使用 gpt-5.6-sol/max")
 	}
-	if r.KimiOpusFallback {
+	if r.KimiOpusFallback && !cfg.OwnerRoutingEnforced {
 		if r.Model != "grok-4.6" || r.Effort != "xhigh" || r.CodexFallbackModel != "gpt-5.6-sol" || r.CodexFallbackEffort != "xhigh" {
 			return fmt.Errorf("Grok→Kimi→Sol 策略必须严格使用 grok-4.6/xhigh → kimi-code/k3/max → gpt-5.6-sol/xhigh")
 		}
@@ -956,8 +986,17 @@ func validateGrokBuild(cfg *Config) error {
 		}
 		for _, key := range []string{"opus_backend", "sonnet", "haiku"} {
 			if _, ok := r.TierRoutes[key]; !ok {
-				return fmt.Errorf("Owner 六行路由启用 Kimi 腿时缺 grok_build.tier_routes.%s", key)
+				return fmt.Errorf("legacy generic Owner compatibility route 启用 Kimi 腿时缺 grok_build.tier_routes.%s", key)
 			}
+		}
+	}
+	if r.KimiOpusFallback && cfg.OwnerRoutingEnforced {
+		if r.Model != "grok-4.6" || r.Effort != "xhigh" {
+			return fmt.Errorf("Owner final matrix requires grok_build grok-4.6/xhigh base identity")
+		}
+		if cfg.KimiCLIOpus == nil || strings.TrimSpace(cfg.KimiCLIOpus.Model) != "kimi-code/k3" ||
+			strings.ToLower(strings.TrimSpace(cfg.KimiCLIOpus.Effort)) != "max" {
+			return fmt.Errorf("Owner final matrix requires kimi_cli_opus kimi-code/k3/max")
 		}
 	}
 	if (r.KimiOpusFallback || r.FableClaudeFallback || r.FableFirstPrinciples || r.OpusAdversarialReview || len(r.TierRoutes) > 0) && strings.TrimSpace(cfg.CodexBin) == "" {

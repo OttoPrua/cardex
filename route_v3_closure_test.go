@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"os"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -13,62 +12,57 @@ func v3ProofAuthorization() fallbackAuthorization {
 	return fallbackAuthorization{verified: true, beforeDigest: "unchanged", afterDigest: "unchanged"}
 }
 
-func TestRouteV3ClosureExactSixRows(t *testing.T) {
+func TestRouteV3ClosureFinalOwnerMatrix(t *testing.T) {
 	cfg := policyTestConfig()
-	leg := func(runner, model, effort string) policyLeg {
-		return policyLeg{Runner: runner, Model: model, Effort: effort}
-	}
 	tests := []struct {
 		name       string
 		typ        string
 		model      string
 		routeClass string
-		legs       []policyLeg
-		merge      *policyLeg
+		risk       string
 	}{
-		{name: "fable_explicit", typ: typeSequence, model: "fable", routeClass: routeClassGeneral,
-			legs: []policyLeg{leg(cursorRunnerName, "claude-fable-5-thinking-max", "max"),
-				leg(grokBuildRunnerName, "grok-4.6", "xhigh"), leg("codex", "gpt-5.6-sol", "ultra")},
-			merge: ptrLeg(leg("codex", "gpt-5.6-sol", "max"))},
-		{name: "opus_general", typ: typeSequence, model: "opus", routeClass: routeClassGeneral,
-			legs: []policyLeg{leg(grokBuildRunnerName, "grok-4.6", "xhigh"),
-				leg(kimiCLIRunnerName, "kimi-code/k3", "max"), leg("codex", "gpt-5.6-sol", "xhigh")}},
-		{name: "opus_backend", typ: typeSequence, model: "opus", routeClass: routeClassBackend,
-			legs: []policyLeg{leg(grokBuildRunnerName, "grok-4.6", "xhigh"), leg("codex", "gpt-5.6-sol", "max")}},
-		{name: "review_standalone", typ: typeReview, model: "opus", routeClass: routeClassGeneral,
-			legs: []policyLeg{leg("codex", "gpt-5.6-sol", "max")}},
-		{name: "sonnet", typ: typeSequence, model: "sonnet", routeClass: routeClassGeneral,
-			legs: []policyLeg{leg(grokBuildRunnerName, "grok-4.6", "high"), leg("codex", "gpt-5.6-luna", "max")}},
-		{name: "haiku", typ: typeSequence, model: "haiku", routeClass: routeClassGeneral,
-			legs: []policyLeg{leg(grokBuildRunnerName, "grok-4.6", "high"), leg("codex", "gpt-5.6-luna", "xhigh")}},
+		{name: "fable_explicit", typ: typeSequence, model: "fable", routeClass: routeClassGeneral},
+		{name: "opus_non_backend", typ: typeSequence, model: "opus", routeClass: routeClassGeneral, risk: riskClassOrdinary},
+		{name: "opus_backend_ordinary", typ: typeSequence, model: "opus", routeClass: routeClassBackend, risk: riskClassOrdinary},
+		{name: "opus_backend_high_risk", typ: typeSequence, model: "opus", routeClass: routeClassBackend},
+		{name: "review_standalone_ordinary", typ: typeReview, model: "opus", risk: riskClassOrdinary},
+		{name: "review_standalone_critical", typ: typeReview, model: "opus", risk: riskClassProduction},
+		{name: "sonnet", typ: typeSequence, model: "sonnet", routeClass: routeClassGeneral, risk: riskClassOrdinary},
+		{name: "haiku", typ: typeSequence, model: "haiku", routeClass: routeClassGeneral, risk: riskClassOrdinary},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			task := &Task{Type: tc.typ, Model: tc.model, RouteClass: tc.routeClass,
+			task := &Task{ID: tc.name, Type: tc.typ, Model: tc.model, RouteClass: tc.routeClass, RiskClass: tc.risk,
 				PreferRunner: "codex", FreshSteps: true, Prompts: []string{"implement"}}
 			got, ok := resolveOwnerRoute(cfg, task)
-			if !ok || got.Name != tc.name || !reflect.DeepEqual(got.Legs, tc.legs) || !reflect.DeepEqual(got.Merge, tc.merge) {
-				t.Fatalf("v3 route mismatch: ok=%v got=%+v want_name=%s want_legs=%+v want_merge=%+v", ok, got, tc.name, tc.legs, tc.merge)
+			if !ok || got.Name != tc.name || len(got.Legs) == 0 {
+				t.Fatalf("final route mismatch: ok=%v got=%+v want_name=%s", ok, got, tc.name)
 			}
 		})
 	}
 }
 
-func TestRouteV3FableFallbackIsQuotaOnly(t *testing.T) {
-	for _, kind := range []fallbackFailureKind{
-		fallbackTransport, fallbackStreamIncomplete, fallbackSemanticStall,
-		fallbackInvalidTerminal, fallbackExecutionEnv,
-	} {
+func TestRouteV3FableFallbackUsesClosedPresemanticSet(t *testing.T) {
+	for _, kind := range []fallbackFailureKind{fallbackSemanticStall, fallbackInvalidTerminal} {
 		t.Run(string(kind), func(t *testing.T) {
 			root := testRoot(t)
 			cfg := policyTestConfig()
 			task := newTask(root, cfg, typeCoordinate, "explicit Fable", t.TempDir(), []string{"decide"}, 1)
 			task.Model = "fable"
 			task.PreferRunner = "codex"
-			if err := prepareCursorFableFallback(root, cfg, task, string(kind), kind, v3ProofAuthorization()); err == nil || !strings.Contains(err.Error(), "quota") {
-				t.Fatalf("non-quota Fable failure must stay held, got %v", err)
+			if err := prepareCursorFableFallback(root, cfg, task, string(kind), kind, v3ProofAuthorization()); err == nil {
+				t.Fatalf("semantic/acceptance Fable failure must stay held, got %v", err)
 			}
 		})
+	}
+	for _, kind := range []fallbackFailureKind{fallbackQuota, fallbackTransport, fallbackStreamIncomplete, fallbackExecutionEnv} {
+		root := testRoot(t)
+		cfg := policyTestConfig()
+		task := newTask(root, cfg, typeCoordinate, "explicit Fable", t.TempDir(), []string{"decide"}, 1)
+		task.Model, task.PreferRunner = "fable", "codex"
+		if err := prepareCursorFableFallback(root, cfg, task, string(kind), kind, v3ProofAuthorization()); err != nil {
+			t.Fatalf("eligible presemantic %s rejected: %v", kind, err)
+		}
 	}
 }
 
@@ -95,14 +89,19 @@ func TestRouteV3GrokAuthDiagnosticRequiresExactTrustedFamily(t *testing.T) {
 		exact + "\npermission denied",
 		exact + "\n" + exact,
 		"HTTP 401 Unauthorized: Invalid or expired credentials; auth_kind=none; auth_kind=none; upstream=Unauthenticated; reason=no auth context",
+		"HTTP 401 Unauthorized: Invalid or expired credentials; upstream=Unauthenticated; auth_kind=none; reason=no auth context",
+		"Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/responses: Invalid or expired credentials (auth_kind=none, x_xai_token_auth=xai-grok-cli, upstream=Unauthenticated, reason=no auth context)",
 		"HTTP 401 Unauthorized: Invalid or expired credentials; auth_kind=none; upstream=Authenticated; reason=no auth context",
 		"HTTP 401 Unauthorized: Invalid or expired credentials; auth_kind=none; upstream=Unauthenticated; reason",
+		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "auth_kind=none, x_xai_token_auth=xai-grok-cli, upstream=Unauthenticated", "auth_kind=none, upstream=Unauthenticated", 1),
+		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "auth_kind=none, x_xai_token_auth=xai-grok-cli, upstream=Unauthenticated", "upstream=Unauthenticated, x_xai_token_auth=xai-grok-cli, auth_kind=none", 1),
 		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "Model:     grok-4.6", "Model:     grok-4.5", 1),
 		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "Auth:      Oidc", "Auth:      ApiKey", 1),
 		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "Version:   1.0.4", "Version:   current", 1),
 		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "Available: grok-4.6", "Available: grok-4.5", 1),
 		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "  Auth:      Oidc\n", "  Auth:      Oidc\n  Auth:      Oidc\n", 1),
 		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "  Version:   1.0.4\n", "  Version:   1.0.4\n  Version:   1.0.5\n", 1),
+		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "  Model:     grok-4.6\n  Auth:      Oidc\n", "  Auth:      Oidc\n  Model:     grok-4.6\n", 1),
 		strings.Replace(grokOIDCNoAuthContextClosedMetadata, "  Version:   1.0.4\n", "  Version 1.0.4\n", 1),
 	} {
 		if got := grokBuildAuthDiagnosticLine(diagnostic); got != "" {
@@ -132,7 +131,7 @@ func TestRouteV3GrokAuthCircuitRequiresCompleteZeroWorkObservation(t *testing.T)
 	}
 }
 
-func TestRouteV3GeneralOpusAdvancesGrokThenKimiThenSol(t *testing.T) {
+func TestRouteV3GeneralOpusAdvancesGrokThenKimiAndStops(t *testing.T) {
 	cfg := policyTestConfig()
 	task := &Task{Type: typeSequence, Model: "opus", RouteClass: routeClassGeneral,
 		PreferRunner: "codex", FreshSteps: true, Prompts: []string{"implement"}}
@@ -151,11 +150,8 @@ func TestRouteV3GeneralOpusAdvancesGrokThenKimiThenSol(t *testing.T) {
 		t.Fatalf("eligible Grok non-auth failure must advance to Kimi: %+v", task)
 	}
 	task.Runner = kimiCLIRunnerName
-	if err := queuePolicyFallback(cfg, task, fallbackTransport, v3ProofAuthorization()); err != nil {
-		t.Fatal(err)
-	}
-	if task.PreferRunner != "codex" || task.CodexModel != "gpt-5.6-sol" || task.Effort != "xhigh" || task.OwnerRouteLeg != 3 {
-		t.Fatalf("eligible Kimi non-auth failure must advance to Sol/xhigh: %+v", task)
+	if err := queuePolicyFallback(cfg, task, fallbackTransport, v3ProofAuthorization()); err == nil {
+		t.Fatalf("Kimi failure must not enter a removed global Codex fallback: %+v", task)
 	}
 }
 
@@ -171,12 +167,14 @@ func TestRouteV3DispatchReadbackNamesRequestedAndActualIdentity(t *testing.T) {
 	detail := dispatchEventDetail(cfg, task, false, false)
 	want := map[string]any{
 		"requested_provider": grokBuildRunnerName,
+		"requested_runner":   grokBuildRunnerName,
 		"requested_model":    "grok-4.6",
 		"requested_effort":   "xhigh",
 		"actual_provider":    grokBuildRunnerName,
+		"actual_runner":      grokBuildRunnerName,
 		"actual_model":       "grok-4.6",
 		"actual_effort":      "xhigh",
-		"owner_route_name":   "opus_backend",
+		"owner_route_name":   "opus_backend_high_risk",
 		"owner_route_leg":    1,
 		"attempt":            0,
 	}
@@ -195,8 +193,8 @@ func TestRouteV3GrokAuthenticationNeverAdvancesAnyTierOrStandalonePin(t *testing
 		explicit   bool
 		wantRoute  string
 	}{
-		{name: "opus_general", model: "opus", routeClass: routeClassGeneral, wantRoute: "opus_general"},
-		{name: "opus_backend", model: "opus", routeClass: routeClassBackend, wantRoute: "opus_backend"},
+		{name: "opus_general", model: "opus", routeClass: routeClassGeneral, wantRoute: "opus_non_backend"},
+		{name: "opus_backend", model: "opus", routeClass: routeClassBackend, wantRoute: "opus_backend_high_risk"},
 		{name: "sonnet", model: "sonnet", routeClass: routeClassGeneral, wantRoute: "sonnet"},
 		{name: "haiku", model: "haiku", routeClass: routeClassGeneral, wantRoute: "haiku"},
 		{name: "standalone_explicit", model: "opus", routeClass: routeClassGeneral, explicit: true},

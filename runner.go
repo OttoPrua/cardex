@@ -1065,13 +1065,20 @@ func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bo
 	return runTaskVia(ctx, root, cfg, t, via)
 }
 
-func routeAttemptIdentity(cfg *Config, t *Task, remote bool) (provider, model, effort string) {
+func routeAttemptIdentity(cfg *Config, t *Task, remote bool) (provider, runner, model, effort string) {
 	if t == nil {
-		return "", "", ""
+		return "", "", "", ""
 	}
-	provider = t.Runner
-	if provider == "" {
+	runner = t.Runner
+	if runner == "" {
+		runner = "claude"
+	}
+	provider = runner
+	if remote {
 		provider = "claude"
+		if !remoteUsesClaude(t) {
+			provider = "codex"
+		}
 	}
 	switch {
 	case remote && !remoteUsesClaude(t):
@@ -1079,30 +1086,30 @@ func routeAttemptIdentity(cfg *Config, t *Task, remote bool) (provider, model, e
 		effort = resolveRemoteCodexReasoning(cfg, t)
 	case remote:
 		model, effort = t.Model, t.Effort
-	case provider == "codex":
+	case runner == "codex":
 		model, effort = resolveCodexModel(cfg, t), resolveCodexReasoning(cfg, t)
-	case provider == kimiCLIRunnerName:
+	case runner == kimiCLIRunnerName:
 		model, effort = resolveKimiCLIModel(cfg, t), resolveKimiCLIEffort(cfg, t)
-	case provider == grokBuildRunnerName:
+	case runner == grokBuildRunnerName:
 		model, effort = resolveGrokBuildModel(cfg, t), resolveGrokBuildEffort(cfg, t)
-	case provider == cursorRunnerName:
+	case runner == cursorRunnerName:
 		model = resolveCursorModel(cfg, t)
 		effort = cursorEffortFromModel(model)
-	case provider == "opencode":
+	case runner == "opencode":
 		model, effort = resolveOpenCodeRunModel(cfg, t), resolveOpenCodeRunVariant(cfg, t)
-	case provider == "gemini":
+	case runner == "gemini":
 		model, _ = resolveGeminiModel(cfg, t)
 	default:
 		model, effort = t.Model, t.Effort
 	}
-	return strings.TrimSpace(provider), strings.TrimSpace(model), strings.ToLower(strings.TrimSpace(effort))
+	return strings.TrimSpace(provider), strings.TrimSpace(runner), strings.TrimSpace(model), strings.ToLower(strings.TrimSpace(effort))
 }
 
 func beginRouteAttemptReadback(cfg *Config, t *Task, remote bool) {
-	provider, model, effort := routeAttemptIdentity(cfg, t, remote)
+	provider, runner, model, effort := routeAttemptIdentity(cfg, t, remote)
 	t.LastRouteAttempt = &RouteAttemptReadback{
-		RequestedProvider: provider, RequestedModel: model, RequestedEffort: effort,
-		ActualProvider: provider, ActualModel: model, ActualEffort: effort,
+		RequestedProvider: provider, RequestedRunner: runner, RequestedModel: model, RequestedEffort: effort,
+		ActualProvider: provider, ActualRunner: runner, ActualModel: model, ActualEffort: effort,
 		OwnerRouteName: t.OwnerRouteName, OwnerRouteLeg: t.OwnerRouteLeg, Attempt: t.Attempts,
 	}
 }
@@ -1134,9 +1141,11 @@ func withRouteAttempt(detail map[string]any, t *Task) map[string]any {
 	}
 	r := t.LastRouteAttempt
 	detail["requested_provider"] = r.RequestedProvider
+	detail["requested_runner"] = r.RequestedRunner
 	detail["requested_model"] = r.RequestedModel
 	detail["requested_effort"] = r.RequestedEffort
 	detail["actual_provider"] = r.ActualProvider
+	detail["actual_runner"] = r.ActualRunner
 	detail["actual_model"] = r.ActualModel
 	detail["actual_effort"] = r.ActualEffort
 	detail["owner_route_name"] = r.OwnerRouteName
@@ -1237,12 +1246,55 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		_ = archiveTask(root, t)
 		return nil
 	}
+	if reason := ownerRoutingPolicyWaitReason(cfg, t); reason != "" {
+		t.Status = statusHeld
+		t.LastError = reason
+		t.touch()
+		emitTaskEvent(root, t.ID, evHeld, "runner:owner-policy", statusHeld, t.Step,
+			withCostTelemetry(map[string]any{"reason": "closed_owner_task_state_invalid", "detail": reason}, t))
+		return saveTask(root, t)
+	}
 	// CG-4 幂等墓碑 reset-at-entry:上一轮盘上状态非 running(即 queued/limit_paused/held)才 reset
 	// 当前步的 resume 墓碑——这是"编排层认可的新一轮尝试"信号(合法限额恢复/人工 release),让新一轮
 	// 的 bound=2 保护从零起算;若上一轮仍是 running,则本次是"上一轮 runTask 中途崩溃遗留",保留墓碑
 	// 以让 bound 挡住崩溃风暴。详见 tombstones.go 文件头【为什么 reset-at-entry ...】。
 	if t.Status != statusRunning {
 		_ = resetTombstoneKind(root, t.ID, resumeKind(t.Step))
+	}
+	if t.AutomaticCodex {
+		if !useCodex {
+			t.Status = statusHeld
+			t.LastError = "automatic Sol route identity drifted away from Codex; held before invocation"
+			t.touch()
+			emitTaskEvent(root, t.ID, evHeld, "runner:automatic-sol", statusHeld, t.Step,
+				withCostTelemetry(map[string]any{"reason": "automatic_sol_provider_drift"}, t))
+			return saveTask(root, t)
+		}
+		evidence := currentAutomaticCodexBudgetEvidence(cfg, time.Now())
+		if allowed, reason := automaticCodexBudgetAllowed(t, evidence, cfg.AutomaticCodexBudgetStopPercent); !allowed {
+			t.Status = statusHeld
+			t.LastError = reason
+			t.touch()
+			emitTaskEvent(root, t.ID, evHeld, "runner:automatic-codex-budget", statusHeld, t.Step,
+				withCostTelemetry(map[string]any{
+					"reason": reason, "route_stage": t.OwnerRouteStage,
+					"budget_source": evidence.Source, "used_percent": evidence.UsedPercent,
+					"evidence_available": evidence.Available,
+				}, t))
+			return saveTask(root, t)
+		}
+		if err := beginAutomaticSolInvocation(t); err != nil {
+			t.Status = statusHeld
+			t.LastError = err.Error()
+			t.touch()
+			emitTaskEvent(root, t.ID, evHeld, "runner:automatic-sol", statusHeld, t.Step,
+				withCostTelemetry(map[string]any{
+					"reason": "automatic_sol_invocation_limit", "detail": err.Error(),
+					"automatic_sol_calls":       t.AutomaticSolCalls,
+					"automatic_sol_invocations": t.AutomaticSolInvocations,
+				}, t))
+			return saveTask(root, t)
+		}
 	}
 	if useGrokBuild {
 		// 人工显式 Grok 与自动路由走同一冻结纪律：实际开跑前把模型/档位写回卡面，
@@ -1579,9 +1631,10 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		// zero/forged authorization, so no next writer can be queued before all three proof axes pass.
 		if kind, candidateFailure := classifyPolicyFallbackFailure(via, res, combined, runErr); candidateFailure &&
 			policyFallbackCandidate(cfg, t, via) {
-			if via == cursorRunnerName && kind != fallbackQuota {
-				// Explicit Fable has exactly one automatic trigger: a confirmed eligible quota-limit.
-				// Every other runner terminal is held on the same card; it never creates answer or merge legs.
+			if via == cursorRunnerName && !fableFallbackKindEligible(kind) {
+				// Semantic stalls and invalid/acceptance terminals do not authorize the Fable chain.
+				// Quota and the closed set of proven presemantic failures may proceed only after the
+				// same complete-observation, 0/0/0, unchanged-workspace, zero-residue proof below.
 				semanticEvents, modelEvents, toolEvents, observationComplete := 0, 0, 0, false
 				if res != nil {
 					semanticEvents, modelEvents, toolEvents = res.SemanticEvents, res.ModelEvents, res.ToolEvents
@@ -1593,10 +1646,10 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					t.LastRouteAttempt.ProcessResidue = residue
 				}
 				t.Status = statusHeld
-				t.LastError = fmt.Sprintf("Cursor Fable 非 quota 终态保持 held（未启动 fallback）: %s", kind)
+				t.LastError = fmt.Sprintf("Cursor Fable ineligible semantic/terminal failure held (fallback not started): %s", kind)
 				t.touch()
 				emitTaskEvent(root, t.ID, evHeld, "runner:policy-fallback", statusHeld, t.Step, withCostTelemetry(withRouteAttempt(map[string]any{
-					"reason": "fable_non_quota_held", "failure_kind": string(kind),
+					"reason": "fable_ineligible_failure_held", "failure_kind": string(kind),
 					"observation_complete": observationComplete, "semantic_events": semanticEvents,
 					"model_events": modelEvents, "tool_events": toolEvents,
 					"process_residue": residue,
@@ -1659,13 +1712,29 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 						return err
 					}
 					logBlock(lg, "SAFE_FALLBACK", fmt.Sprintf(
-						"%s proof passed (fingerprint=%s, semantic=0, model=0, tools=0, residue=false); serial Grok→Sol→Sol merge chain queued",
+						"%s proof passed (fingerprint=%s, semantic=0, model=0, tools=0, residue=false); serial Grok answer→single Sol/ultra adversarial terminal merge queued",
 						kind, auth.beforeDigest))
 					return nil
 				}
 				previousRunner := via
 				if err := queuePolicyFallback(cfg, t, kind, auth); err != nil {
-					return err
+					// A proved eligible failure does not create authority for a provider that is
+					// absent from the resolved row. Keep the exact current card/identity and hold;
+					// never reinterpret a missing next leg as the removed global Codex fallback.
+					t.Status = statusHeld
+					t.FallbackReason = string(kind)
+					t.LastError = fmt.Sprintf("eligible serial transition held: %v; global Codex fallback disabled", err)
+					t.touch()
+					emitTaskEvent(root, t.ID, evHeld, "runner:policy-fallback", statusHeld, t.Step,
+						withCostTelemetry(withRouteAttempt(map[string]any{
+							"reason": "no_resolver_proven_next_leg", "failure_kind": string(kind),
+							"detail": err.Error(), "previous_runner": previousRunner,
+							"workspace_fingerprint_before": auth.beforeDigest,
+							"workspace_fingerprint_after":  auth.afterDigest,
+							"semantic_events":              0, "model_events": 0, "tool_events": 0,
+							"process_residue": false,
+						}, t), t))
+					return saveTask(root, t)
 				}
 				if err := saveTask(root, t); err != nil {
 					return err
@@ -2116,13 +2185,14 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		logSection(lg, fmt.Sprintf("步骤完成  turns=%d cost=$%.4f duration=%.0fs", res.NumTurns, res.TotalCostUSD, float64(res.DurationMS)/1000))
 
 		if t.Step >= len(t.Prompts) {
-			if t.ReviewAfter && t.SolMaxAdversarialReview && reviewAfterEligibleType(t) {
+			plannedReviewStage := pendingRequiredReviewStage(t)
+			if t.ReviewAfter && reviewAfterEligibleType(t) && (t.SolMaxAdversarialReview || plannedReviewStage != "") {
 				// Persist the completed implementation as held/pending before the reviewer child. A crash
 				// anywhere after this write cannot expose a done Opus implementation without its review
 				// obligation, and tick can reconcile by ReviewOf without rerunning the model step.
 				t.Status = statusHeld
 				t.ReviewObligationPending = true
-				t.LastError = "实现已完成，等待独立 Sol/max 对抗复审义务落盘"
+				t.LastError = "implementation complete; waiting for mandatory review obligation to persist"
 				t.touch()
 				if err := saveTask(root, t); err != nil {
 					return err
@@ -2133,7 +2203,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					if err == nil {
 						err = fmt.Errorf("review helper returned no child")
 					}
-					t.LastError = "独立 Sol/max 对抗复审义务未落盘: " + err.Error()
+					t.LastError = "mandatory review obligation was not persisted: " + err.Error()
 					t.touch()
 					if saveErr := saveTask(root, t); saveErr != nil {
 						return errors.Join(err, saveErr)
@@ -2145,6 +2215,20 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				}
 				t.ReviewTaskID = rv.ID
 				t.ReviewObligationPending = false
+				if plannedReviewStage != "" {
+					t.Status = statusHeld
+					t.LastError = "required Owner review gate queued: " + plannedReviewStage
+					t.touch()
+					emitTaskEvent(root, t.ID, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+						"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
+					})
+					emitTaskEvent(root, t.ID, evHeld, "runner:owner-review-plan", statusHeld, t.Step,
+						withCostTelemetry(map[string]any{
+							"reason": "required_review_pending", "review_stage": plannedReviewStage,
+							"review_child": rv.ID,
+						}, t))
+					return saveTask(root, t)
+				}
 				t.LastError = ""
 			}
 			t.Status = statusDone
@@ -2156,6 +2240,17 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				_ = os.Remove(progressPath(root, t.ProgressKey)) // 清可能残留的陈旧报告，防冒充终局
 				logBlock(lg, "CROSS", t.LastError)
 			}
+			if t.XRole == "C" && t.FableReviewerMerger && t.Status == statusDone {
+				if fableMergeDisposition(res.Result) != fableMergeTerminal {
+					t.Status = statusHeld
+					t.EmitProgress = false
+					t.LastError = "Fable Sol/ultra terminal merger retains unresolved P0/P1 or uncertainty; held for Owner"
+					logBlock(lg, "FABLE", t.LastError)
+				} else if !reviewCompleted(t, reviewStageFableSolUltra) {
+					t.CompletedReviews = append(t.CompletedReviews, reviewStageFableSolUltra)
+					t.OwnerRouteStage = routeStageTerminal
+				}
+			}
 			t.touch()
 			// 最后一步的 step_ok 事件先记(与中间步一致语义),再据终局标 done 或交叉契约违规的 failed。
 			emitTaskEvent(root, t.ID, evStepOK, "runner", statusRunning, t.Step, map[string]any{
@@ -2166,6 +2261,11 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				// 复盘计数器：只数真 done。上面交叉 C 契约违规改判 failed 的分支不该计入
 				// "产能"，否则复盘窗口里混进从未交付的卡。
 				noteTaskDoneLogged(root, cfg, t, lg)
+			} else if t.Status == statusHeld {
+				emitTaskEvent(root, t.ID, evHeld, "runner:fable-terminal-merge", statusHeld, t.Step,
+					withCostTelemetry(map[string]any{
+						"reason": "fable_owner_hold", "route_stage": routeStageFableMerge,
+					}, t))
 			} else {
 				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step,
 					withCostTelemetry(map[string]any{
@@ -2174,6 +2274,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			}
 			if err := saveTask(root, t); err != nil {
 				return err
+			}
+			if t.Status == statusHeld {
+				return nil
 			}
 			postComplete(root, cfg, t, res, lg)
 			// postComplete 期间任务可能被 cancel 并归档（done 态 cancel 走立即归档），
@@ -2419,7 +2522,7 @@ func existingReviewAfterChild(root, parentID string) (*Task, error) {
 			if err := json.Unmarshal(data, &candidate); err != nil {
 				return nil, err
 			}
-			if candidate.ReviewOf == parentID {
+			if candidate.ReviewOf == parentID && candidate.ReviewPlanStage == "" {
 				matches = append(matches, &candidate)
 			}
 		}
@@ -2433,9 +2536,172 @@ func existingReviewAfterChild(root, parentID string) (*Task, error) {
 	return nil, nil
 }
 
+func pendingRequiredReviewStage(t *Task) string {
+	if t == nil {
+		return ""
+	}
+	for _, stage := range t.RequiredReviews {
+		if closedReviewStages[stage] && !reviewCompleted(t, stage) {
+			return stage
+		}
+	}
+	return ""
+}
+
+func existingPlannedReviewChild(root, parentID, stage string) (*Task, error) {
+	var matches []*Task
+	for _, dir := range []string{tasksDir(root), archiveDir(root)} {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			data, err := os.ReadFile(filepath.Join(dir, entry.Name()))
+			if err != nil {
+				return nil, err
+			}
+			var candidate Task
+			if err := json.Unmarshal(data, &candidate); err != nil {
+				return nil, err
+			}
+			if candidate.ReviewOf == parentID && candidate.ReviewPlanRoot == parentID && candidate.ReviewPlanStage == stage {
+				matches = append(matches, &candidate)
+			}
+		}
+	}
+	if len(matches) > 1 {
+		return nil, fmt.Errorf("planned review %s/%s has %d children", parentID, stage, len(matches))
+	}
+	if len(matches) == 1 {
+		return matches[0], nil
+	}
+	return nil, nil
+}
+
+func pinPlannedReviewIdentity(cfg *Config, parent, review *Task, stage string) error {
+	if parent == nil || review == nil || !closedReviewStages[stage] {
+		return fmt.Errorf("invalid closed review stage %q", stage)
+	}
+	review.ReviewAfter = false
+	review.SolMaxAdversarialReview = false
+	review.ReviewPlanRoot = parent.ID
+	review.ReviewPlanStage = stage
+	review.OwnerRouteName = parent.OwnerRouteName
+	review.RiskClass = parent.RiskClass
+	review.RouteClass = routeClassGeneral
+	review.SessionID = ""
+	review.MidStep = false
+	review.RunnerExplicit = true
+	switch stage {
+	case reviewStageKimiAdversarial:
+		review.PreferRunner = kimiCLIRunnerName
+		review.KimiModel = "kimi-code/k3"
+		review.Effort = "max"
+		review.EffortExplicit = true
+		review.OwnerRouteStage = routeStageAdversarialReview
+		review.AdvisoryReview = false
+	case reviewStageKimiSecondView:
+		review.PreferRunner = kimiCLIRunnerName
+		review.KimiModel = "kimi-code/k3"
+		review.Effort = "max"
+		review.EffortExplicit = true
+		review.OwnerRouteStage = routeStageSecondView
+		review.AdvisoryReview = true
+	case reviewStageSolXHigh, reviewStageSolMax:
+		if parent.AutomaticSolInvocations != 0 {
+			return fmt.Errorf("automatic Sol invocation limit already consumed by lineage: %d/1", parent.AutomaticSolInvocations)
+		}
+		if parent.AutomaticSolCalls == 0 {
+			stageName := routeStageConditionalRelease
+			if stage == reviewStageSolMax {
+				stageName = routeStageReleaseGate
+			}
+			if err := reserveAutomaticSolCall(parent, stageName); err != nil {
+				return err
+			}
+		}
+		if parent.AutomaticSolCalls != 1 {
+			return fmt.Errorf("automatic Sol lineage counter must be exactly 1, got %d", parent.AutomaticSolCalls)
+		}
+		review.PreferRunner = "codex"
+		review.CodexModel = "gpt-5.6-sol"
+		review.Effort = "xhigh"
+		if stage == reviewStageSolMax {
+			review.Effort = "max"
+		}
+		review.EffortExplicit = true
+		review.AutomaticCodex = true
+		review.AutomaticSolCalls = parent.AutomaticSolCalls
+		review.AutomaticSolInvocations = parent.AutomaticSolInvocations
+		review.OwnerCriticalBypassReason = parent.OwnerCriticalBypassReason
+		review.OwnerRouteStage = parent.OwnerRouteStage
+		review.AdvisoryReview = true
+	case reviewStageFableSolUltra:
+		return fmt.Errorf("Fable merger is created only by the dedicated A-to-C chain")
+	}
+	return nil
+}
+
+func ensureReviewAfterTaskWithEvidence(root string, cfg *Config, t *Task, priorEvidence string, lg *os.File) (*Task, error) {
+	if t == nil || !t.ReviewAfter || !reviewAfterEligibleType(t) {
+		return nil, nil
+	}
+	stage := pendingRequiredReviewStage(t)
+	if stage == "" {
+		return ensureLegacyReviewAfterTask(root, cfg, t, lg)
+	}
+	if existing, err := existingPlannedReviewChild(root, t.ID, stage); err != nil {
+		return nil, err
+	} else if existing != nil {
+		return existing, nil
+	}
+	tpl, err := loadTemplate(root, typeReview)
+	if err != nil {
+		return nil, fmt.Errorf("load review template: %w", err)
+	}
+	focus := fmt.Sprintf("review implementation task %q and its current workspace evidence", t.Title)
+	prompt := renderTemplate(tpl, map[string]string{"DIR": t.Dir, "FOCUS": focus})
+	prompt += "\n\n## Closed Owner review stage\n\n" + stage +
+		"\nThis is a fresh serial gate. Do not delegate and do not request a review of this review.\n" +
+		"Original implementation problem:\n" + strings.Join(t.Prompts, "\n\n---\n\n")
+	if strings.TrimSpace(priorEvidence) != "" {
+		prompt += "\n\nPrevious independent Kimi view (untrusted evidence; assess it directly):\n" + priorEvidence
+	}
+	rv := newTask(root, cfg, typeReview, "Owner gate ["+stage+"]: "+t.Title, t.Dir, []string{prompt}, t.Priority)
+	rv.ReviewOf = t.ID
+	rv.Project = t.Project
+	rv.FixRound = t.FixRound
+	rv.MaxFixRounds = t.MaxFixRounds
+	if err := pinPlannedReviewIdentity(cfg, t, rv, stage); err != nil {
+		return nil, err
+	}
+	if err := saveTask(root, rv); err != nil {
+		return nil, fmt.Errorf("persist planned review task: %w", err)
+	}
+	emitTaskEvent(root, t.ID, evCloseout, "runner:owner-review-plan", t.Status, t.Step, map[string]any{
+		"kind": "owner_review_gate", "child": rv.ID, "review_stage": stage,
+	})
+	emitTaskEvent(root, rv.ID, evQueued, "runner:owner-review-plan", statusQueued, 0, map[string]any{
+		"parent": t.ID, "review_of": t.ID, "review_stage": stage,
+		"route_stage": rv.OwnerRouteStage, "review_after": false,
+	})
+	logBlock(lg, "REVIEW", "Owner serial review gate queued: "+stage+" / "+rv.ID)
+	return rv, nil
+}
+
 // ensureReviewAfterTask is idempotent on ReviewOf. Mandatory Opus callers invoke it while the parent
 // is durably held/pending; ordinary review_after callers retain the historical post-complete timing.
 func ensureReviewAfterTask(root string, cfg *Config, t *Task, lg *os.File) (*Task, error) {
+	return ensureReviewAfterTaskWithEvidence(root, cfg, t, "", lg)
+}
+
+func ensureLegacyReviewAfterTask(root string, cfg *Config, t *Task, lg *os.File) (*Task, error) {
 	if t == nil || !t.ReviewAfter || !reviewAfterEligibleType(t) {
 		return nil, nil
 	}
@@ -2491,10 +2757,140 @@ func ensureReviewAfterTask(root string, cfg *Config, t *Task, lg *os.File) (*Tas
 	return rv, nil
 }
 
+func appendCompletedReview(t *Task, stage string) error {
+	if t == nil || !closedReviewStages[stage] {
+		return fmt.Errorf("unknown completed review stage %q", stage)
+	}
+	if !reviewCompleted(t, stage) {
+		t.CompletedReviews = append(t.CompletedReviews, stage)
+	}
+	return nil
+}
+
+func advancePlannedReview(root string, cfg *Config, review *Task, result string, lg *os.File) {
+	if review == nil || review.ReviewPlanRoot == "" || !closedReviewStages[review.ReviewPlanStage] {
+		return
+	}
+	parent, err := findTaskAnywhere(root, review.ReviewPlanRoot)
+	if err != nil {
+		logBlock(lg, "REVIEW", "Owner review root unavailable: "+err.Error())
+		return
+	}
+	stage := review.ReviewPlanStage
+	if stage == reviewStageSolXHigh || stage == reviewStageSolMax {
+		// The actual process counter lives first on the fresh Sol child. Copy it back to the durable
+		// implementation root before interpreting the verdict so every later repair/closeout descendant
+		// inherits a lineage-wide consumed call instead of accidentally minting a second automatic Sol.
+		if review.AutomaticSolInvocations > parent.AutomaticSolInvocations {
+			parent.AutomaticSolInvocations = review.AutomaticSolInvocations
+		}
+	}
+	if pending := pendingRequiredReviewStage(parent); pending != stage {
+		parent.Status = statusHeld
+		parent.LastError = fmt.Sprintf("Owner review stage order mismatch: completed=%s pending=%s", stage, pending)
+		parent.touch()
+		_ = saveTask(root, parent)
+		return
+	}
+	verdict := parseReviewVerdict(result)
+	if verdict == nil {
+		parent.Status = statusHeld
+		parent.LastError = "Owner review gate " + stage + " did not emit a closed pass|concerns|block verdict"
+		parent.touch()
+		_ = saveTask(root, parent)
+		emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
+			"reason": "invalid_review_terminal", "review_stage": stage, "review_child": review.ID,
+		}, parent))
+		return
+	}
+	if err := appendCompletedReview(parent, stage); err != nil {
+		parent.Status = statusHeld
+		parent.LastError = err.Error()
+		parent.touch()
+		_ = saveTask(root, parent)
+		return
+	}
+	// An ordinary Kimi adversarial review that finds acceptance failures does not release the stale
+	// implementation. The existing fix loop may create a separately routed repair card; the original
+	// lineage stays held and the failed acceptance also records the closed Sol escalation reason.
+	if stage == reviewStageKimiAdversarial && verdict.Verdict != "pass" {
+		parent.SolEscalationReason = solEscalationAcceptanceFailed
+		var appendErr error
+		parent.RequiredReviews, appendErr = appendClosedReview(parent.RequiredReviews, reviewStageSolXHigh)
+		parent.Status = statusHeld
+		parent.LastError = fmt.Sprintf("Kimi adversarial review returned %s; implementation held for repair before any release gate", verdict.Verdict)
+		if appendErr != nil {
+			parent.LastError = appendErr.Error()
+		}
+		parent.touch()
+		_ = saveTask(root, parent)
+		emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
+			"reason": "kimi_acceptance_failed", "review_stage": stage, "verdict": verdict.Verdict,
+			"review_child": review.ID,
+		}, parent))
+		return
+	}
+	if stage == reviewStageSolXHigh || stage == reviewStageSolMax {
+		if verdict.Verdict != "pass" || len(verdict.P0) != 0 || len(verdict.P1) != 0 {
+			parent.Status = statusHeld
+			parent.LastError = fmt.Sprintf("%s release gate returned %s with %d P0/%d P1; held for Owner",
+				stage, verdict.Verdict, len(verdict.P0), len(verdict.P1))
+			parent.touch()
+			_ = saveTask(root, parent)
+			emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
+				"reason": "sol_release_gate_blocked", "review_stage": stage, "verdict": verdict.Verdict,
+				"review_child": review.ID,
+			}, parent))
+			return
+		}
+	}
+	if next := pendingRequiredReviewStage(parent); next != "" {
+		parent.Status = statusHeld
+		parent.ReviewObligationPending = true
+		parent.LastError = "waiting for required Owner review stage " + next
+		parent.touch()
+		if err := saveTask(root, parent); err != nil {
+			logBlock(lg, "REVIEW", "failed to persist next Owner review obligation: "+err.Error())
+			return
+		}
+		nextReview, err := ensureReviewAfterTaskWithEvidence(root, cfg, parent, result, lg)
+		if err != nil || nextReview == nil {
+			if err == nil {
+				err = fmt.Errorf("review helper returned no child")
+			}
+			parent.LastError = "next Owner review gate was not persisted: " + err.Error()
+			parent.touch()
+			_ = saveTask(root, parent)
+			return
+		}
+		parent.ReviewTaskID = nextReview.ID
+		parent.ReviewObligationPending = false
+		parent.LastError = "required Owner review gate queued: " + next
+		parent.touch()
+		_ = saveTask(root, parent)
+		return
+	}
+	parent.Status = statusDone
+	parent.ReviewObligationPending = false
+	parent.LastError = ""
+	parent.OwnerRouteStage = routeStageTerminal
+	parent.touch()
+	if err := saveTask(root, parent); err != nil {
+		logBlock(lg, "REVIEW", "failed to release Owner review root: "+err.Error())
+		return
+	}
+	emitTaskEvent(root, parent.ID, evDone, "runner:owner-review-plan", statusDone, parent.Step,
+		withCostTelemetry(map[string]any{
+			"review_child": review.ID, "review_stage": stage,
+			"required_reviews": parent.RequiredReviews, "completed_reviews": parent.CompletedReviews,
+		}, parent))
+}
+
 func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task, activeIDs map[string]bool) {
 	for _, t := range tasks {
 		if t == nil || activeIDs[t.ID] || t.Status != statusHeld || !t.ReviewObligationPending ||
-			!t.SolMaxAdversarialReview || !t.ReviewAfter || !reviewAfterEligibleType(t) {
+			(!t.SolMaxAdversarialReview && pendingRequiredReviewStage(t) == "") ||
+			!t.ReviewAfter || !reviewAfterEligibleType(t) {
 			continue
 		}
 		lg, _ := openTaskLog(root, t.ID)
@@ -2514,6 +2910,21 @@ func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task
 		}
 		t.ReviewTaskID = rv.ID
 		t.ReviewObligationPending = false
+		if stage := pendingRequiredReviewStage(t); stage != "" {
+			t.Status = statusHeld
+			t.LastError = "required Owner review gate queued: " + stage
+			t.touch()
+			if err := saveTask(root, t); err != nil {
+				t.ReviewObligationPending = true
+				t.LastError = "review gate persisted but root update failed: " + err.Error()
+				t.touch()
+				_ = saveTask(root, t)
+			}
+			if lg != nil {
+				_ = lg.Close()
+			}
+			continue
+		}
 		t.Status = statusDone
 		t.LastError = ""
 		t.touch()
@@ -2601,6 +3012,11 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 			t.ReviewTaskID = rv.ID
 		}
 	}
+	// Planned Owner gates update their implementation root and may serially materialize the next gate.
+	// Each gate has review_after=false, so this cannot create a review-of-review.
+	if t.Type == typeReview && t.ReviewPlanStage != "" {
+		advancePlannedReview(root, cfg, t, res.Result, lg)
+	}
 	// 修复闭环：对抗审核完成后消费 verdict——pass 收口；concerns/block 自动派下一轮修复卡；
 	// 超轮限挂 held 升级卡交人工。这是"实现→审核→修复→再审"循环的自动闭合点。
 	if t.Type == typeReview && !t.AdvisoryReview {
@@ -2646,6 +3062,10 @@ type emitTask struct {
 	Runner      string `json:"runner"`
 	// RouteClass 让协调器显式标注后端开发例外；空值由调度器对存量卡做确定性判定。
 	RouteClass string `json:"route_class"`
+	// RiskClass is closed; backend omission remains valid input but resolves to high-risk.
+	RiskClass           string `json:"risk_class"`
+	QualitySensitive    bool   `json:"quality_sensitive"`
+	SpecializedFrontend bool   `json:"specialized_frontend"`
 	// CodexModel 卡级钉定 codex 模型（runner=codex 时随卡生效，档位对等制下协调器可按档发 terra/luna）。
 	CodexModel string `json:"codex_model"`
 	// GeminiModel 卡级钉定 gemini 模型（runner=gemini 时随卡生效；推荐官方别名 pro/flash/flash-lite）。
@@ -2934,6 +3354,8 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		// 链账随谱系留档：人裁后若从升级卡续出新一轮审核，链账不该从 0 重新起算。
 		esc.ChainCostUSD = chainCost
 		esc.ChainTurnsUsed = chainTurns
+		esc.AutomaticSolCalls = orig.AutomaticSolCalls
+		esc.AutomaticSolInvocations = orig.AutomaticSolInvocations
 		if saveTask(root, esc) == nil {
 			// 父审核卡 closeout：超轮限 held 卡是审核链的显式终点，父卡账本必须留指针。
 			emitTaskEvent(root, t.ID, evCloseout, "runner:escalation", statusDone, t.Step, map[string]any{
@@ -2985,6 +3407,13 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	nt.ChainTurnsUsed = chainTurns
 	nt.Stakes = orig.Stakes // 审计留档随链传递（非运行期判据，见 stakes.go 文件头）
 	nt.RouteClass = orig.RouteClass
+	nt.RiskClass = orig.RiskClass
+	nt.QualitySensitive = orig.QualitySensitive
+	nt.SpecializedFrontend = orig.SpecializedFrontend
+	nt.SolEscalationReason = orig.SolEscalationReason
+	nt.OwnerCriticalBypassReason = orig.OwnerCriticalBypassReason
+	nt.AutomaticSolCalls = orig.AutomaticSolCalls
+	nt.AutomaticSolInvocations = orig.AutomaticSolInvocations
 	nt.Model = orig.Model
 	nt.SkipPermissions = orig.SkipPermissions
 	nt.PermissionMode = orig.PermissionMode
@@ -3262,6 +3691,64 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 	}
 	switch t.XRole {
 	case "A":
+		if t.OwnerRouteName == "fable_explicit" && t.OwnerRouteStage == routeStageFableAnswer {
+			// Final Fable is intentionally not the generic A→B→C cross-check. Grok is the sole
+			// independent answer and the one fresh Sol/ultra call both attacks and repairs it before
+			// emitting the terminal conclusion. Creating a blind Sol answer B or a later Sol/max C
+			// would violate both the one-Codex limit and the Owner-resolved role semantics.
+			tpl, err := loadTemplate(root, "fable-adversarial-merge")
+			if err != nil {
+				breakChain("fable-adversarial-merge 模板不可得: " + err.Error())
+				return
+			}
+			prompt := renderTemplate(tpl, map[string]string{
+				"TASK": t.XTask,
+				"A":    strings.TrimSpace(resultText(res)),
+			})
+			c := newTask(root, cfg, typeCrossCheck, "Fable terminal merger["+t.XProfile+"]: "+base,
+				t.Dir, []string{prompt}, t.Priority)
+			c.XRole = "C"
+			c.Project = t.Project
+			c.XKey = t.XKey
+			c.XProfile = t.XProfile
+			c.XTask = t.XTask
+			c.XEngineB = t.XEngineB
+			c.XEngineC = nil
+			c.OwnerRouteName = "fable_explicit"
+			c.OwnerRouteLeg = 3
+			c.RouteClass = routeClassGeneral
+			c.RiskClass = riskClassOrdinary
+			c.RequiredReviews = append([]string(nil), t.RequiredReviews...)
+			c.CompletedReviews = append([]string(nil), t.CompletedReviews...)
+			c.FableReviewerMerger = true
+			c.ReviewAfter = false
+			c.SolMaxAdversarialReview = false
+			c.AutomaticSolCalls = t.AutomaticSolCalls
+			if err := reserveAutomaticSolCall(c, routeStageFableMerge); err != nil {
+				breakChain("Fable single automatic Sol reservation failed: " + err.Error())
+				return
+			}
+			c.AutomaticCodex = true
+			applyFrozenEngine(c, t.XEngineB)
+			if c.PreferRunner != "codex" || c.XCodexModel != "gpt-5.6-sol" || c.Effort != "ultra" {
+				breakChain("Fable reviewer-merger frozen identity is not fresh Sol/ultra")
+				return
+			}
+			if err := saveTask(root, c); err != nil {
+				breakChain("Fable reviewer-merger card persist failed: " + err.Error())
+				return
+			}
+			emitTaskEvent(root, t.ID, evCloseout, "runner:fable-terminal-merge", statusDone, t.Step, map[string]any{
+				"kind": "fable_sol_ultra_adversarial_merge", "child": c.ID, "xkey": t.XKey,
+				"route_stage": routeStageFableMerge, "automatic_sol_calls": 1,
+			})
+			emitTaskEvent(root, c.ID, evQueued, "runner:fable-terminal-merge", statusQueued, 0, map[string]any{
+				"parent": t.ID, "xkey": t.XKey, "role": "C", "route_stage": routeStageFableMerge,
+				"read_only": true, "review_after": false,
+			})
+			logBlock(lg, "FABLE", fmt.Sprintf("Grok answer → fresh Sol/ultra adversarial merge → terminal card %s (no B, no Sol/max child)", c.ID))
+			return
+		}
 		// 甲结论落隔离侧车——不进 B 的任何字段/prompt/日志（被动暴露最小化，非硬沙箱）。
 		if err := writeCrossPeer(root, t.XKey, resultText(res)); err != nil {
 			breakChain("甲结论侧车落盘失败: " + err.Error())
@@ -3362,6 +3849,9 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 		next := "C"
 		if t.XRole == "A" {
 			next = "B"
+			if t.OwnerRouteName == "fable_explicit" && t.OwnerRouteStage == routeStageFableAnswer {
+				next = "C"
+			}
 		}
 		if has[t.XKey][next] {
 			continue // 后继在 tasks/，链正常
@@ -3576,6 +4066,9 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 			nt.EmitTasks = true
 		}
 		nt.FreshSteps = s.FreshSteps
+		if s.Model != "" {
+			nt.Model = s.Model
+		}
 		nt.RouteClass = strings.ToLower(strings.TrimSpace(s.RouteClass))
 		if nt.RouteClass != "" && nt.RouteClass != routeClassGeneral && nt.RouteClass != routeClassBackend {
 			return ids, fmt.Errorf("产出任务 %q: 未知 route_class %q（可选 general/backend）", title, s.RouteClass)
@@ -3583,6 +4076,14 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		if err := validateNewTaskRouteClass(cfg, nt); err != nil {
 			return ids, fmt.Errorf("产出任务 %q: %w", title, err)
 		}
+		nt.RiskClass = strings.ToLower(strings.TrimSpace(s.RiskClass))
+		switch nt.RiskClass {
+		case "", riskClassOrdinary, riskClassHigh, riskClassCritical, riskClassProduction:
+		default:
+			return ids, fmt.Errorf("产出任务 %q: 未知 risk_class %q（可选 ordinary/high-risk/critical/production）", title, s.RiskClass)
+		}
+		nt.QualitySensitive = s.QualitySensitive
+		nt.SpecializedFrontend = s.SpecializedFrontend
 		// 协调可把填充类任务钉在 codex 上（独立 GPT 额度）；形状不合规则忽略指定。
 		if s.Runner == "codex" {
 			nt.PreferRunner = "codex"
@@ -3600,9 +4101,6 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		if s.Runner == "gemini" {
 			nt.PreferRunner = "gemini"
 			nt.GeminiModel = s.GeminiModel
-		}
-		if s.Model != "" {
-			nt.Model = s.Model
 		}
 		if validEfforts[s.Effort] {
 			nt.Effort = s.Effort
@@ -3626,6 +4124,8 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		// emit 出的每张子卡都记 queued 起点，parent 指针留在 detail 里。
 		emitTaskEvent(root, nt.ID, evQueued, "runner:emit", statusQueued, 0, map[string]any{
 			"parent": parent.ID, "type": typ, "emit_hold": parent.EmitHold, "route_class": nt.RouteClass,
+			"risk_class": nt.RiskClass, "quality_sensitive": nt.QualitySensitive,
+			"specialized_frontend": nt.SpecializedFrontend,
 		})
 		if parent.EmitHold {
 			// EmitHold 意味着新卡立即置 held——先 queued 后 held 忠实反映状态起点与人工待放行的实际语义。

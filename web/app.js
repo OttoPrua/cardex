@@ -238,8 +238,8 @@ const ROUTE_REASON_ZH = {
   cursor_explicit: '显式 Cursor CLI',
   cursor_fable_preferred: 'Cursor Fable 5/max 优先',
   cursor_fable_policy_wait: 'Fable Owner 形态或配置待修复，未派发',
-  cursor_fable_dual_fallback_pending: 'Fable 限额/合格前语义失败 → Grok 后 Sol 串行双解，待 Sol/max 第一性合并',
-  cursor_fable_dual_fallback: 'Fable 限额/合格前语义失败 → Grok 后 Sol 串行双解 + Sol/max 第一性合并',
+  cursor_fable_dual_fallback_pending: 'Fable quota/合格前语义失败 → Grok answer → 单次 Sol/ultra 对抗合并 → terminal',
+  cursor_fable_dual_fallback: 'Fable → Grok answer → 单次 Sol/ultra 对抗合并 → terminal',
   owner_review_sol_max: '独立审核卡 → Sol/max',
   fable_grok_unavailable_to_sol_pending: '旧版 Fable 链，待转 Sol/max',
   fable_grok_unavailable_to_sol: '旧版 Fable → Sol/max',
@@ -280,6 +280,17 @@ function routeChip(reason) {
 function modelRouteChip(route) {
   if (!route) return null;
   return metaChip(`模型链 · ${route}`, { kind: 'model-route', title: `完整模型链：${route}` });
+}
+
+function routeEvidenceChips(t) {
+  const out = [];
+  if (t.route_stage) out.push(metaChip(`stage · ${t.route_stage}`, { kind: 'route', title: `精确路由阶段：${t.route_stage}` }));
+  if (t.fallback_reason) out.push(metaChip(`fallback · ${t.fallback_reason}`, { kind: 'route', title: `闭集回退原因：${t.fallback_reason}` }));
+	if (t.risk_class) out.push(metaChip(`risk · ${t.risk_class}`, { title: `Owner 风险分类：${t.risk_class}` }));
+	if (t.owner_critical_bypass_reason) out.push(metaChip('Owner critical budget bypass', {
+		kind: 'route', title: `自动 Codex 预算旁路理由：${t.owner_critical_bypass_reason}`,
+	}));
+  return out;
 }
 
 function effortChip(t) {
@@ -1828,6 +1839,7 @@ function taskRow(t) {
   tags.push(routeChip(t.route_reason));
   tags.push(modelRouteChip(t.model_route));
   tags.push(routeClassChip(t.route_class));
+  tags.push(...routeEvidenceChips(t));
   // step 是 0-based（契约如此），展示成「第 N/M 步」必须 +1，与活动流文案对齐。
   if (t.steps_total > 1) tags.push(metaChip(`第 ${t.step + 1}/${t.steps_total} 步`));
   if (t.status === 'running' && t.elapsed_minutes > 0) tags.push(metaChip(`已跑 ${fmtDur(t.elapsed_minutes)}`));
@@ -2002,6 +2014,7 @@ function taskCard(t) {
   tags.push(routeChip(t.route_reason));
   tags.push(modelRouteChip(t.model_route));
   tags.push(routeClassChip(t.route_class));
+  tags.push(...routeEvidenceChips(t));
   if (t.remote_host) tags.push(metaChip(`@${t.remote_host}`, { mono: true }));
   if (t.steps_total > 1) tags.push(metaChip(`第 ${t.step + 1}/${t.steps_total} 步`));
   if (t.status === 'running' && t.elapsed_minutes > 0) tags.push(metaChip(`已跑 ${fmtDur(t.elapsed_minutes)}`));
@@ -2024,15 +2037,25 @@ function taskCard(t) {
       row('工作性质', `${KIND_ZH[t.kind] || t.kind}（判定来源：${KIND_SOURCE_ZH[t.kind_source] || t.kind_source || '未知'}）`);
     }
     row('优先级', t.priority);
-    row('执行器', runnerDisplayName(t.runner));
+	row('当前/计划执行器', runnerDisplayName(t.runner));
     row('执行器来源', RUNNER_SOURCE_ZH[t.runner_source] || t.runner_source);
-    row('实际模型', t.model, true);
+	row('当前/计划模型', t.model, true);
     row('模型来源', modelSourceText(t.model_source));
-    row('执行档位', t.effort);
+	row('当前/计划档位', t.effort);
     row('档位来源', EFFORT_SOURCE_ZH[t.effort_source] || t.effort_source);
     row('路由说明', routeReasonText(t.route_reason));
     row('完整模型链', t.model_route);
     row('任务路由分类', ROUTE_CLASS_ZH[t.route_class] || t.route_class);
+    row('实际 provider', t.actual_provider, true);
+    row('实际 runner', t.actual_runner, true);
+    row('实际模型', t.actual_model, true);
+    row('实际档位', t.actual_effort);
+    row('精确路由阶段', t.route_stage, true);
+    row('回退原因', t.fallback_reason, true);
+	row('风险分类', t.risk_class, true);
+	row('Owner critical 预算旁路理由', t.owner_critical_bypass_reason);
+    if (Array.isArray(t.required_reviews)) row('必需审核', t.required_reviews.join(' → '));
+    if (Array.isArray(t.completed_reviews)) row('已完成审核', t.completed_reviews.join(' → '));
     row('目录', t.dir, true);
     row('创建', fmtTime(t.created_at));
     row('更新', fmtTime(t.updated_at));

@@ -43,6 +43,8 @@ type OverviewResp struct {
 	MaxParallel int          `json:"max_parallel"`
 	Projects    []*Project   `json:"projects"`
 	Quota       QuotaSummary `json:"quota"`
+	// Reporting-only lineage targets. They are never an instruction to rebalance or rewrite cards.
+	OwnerProviderTargets *OwnerProviderTargets `json:"owner_provider_targets,omitempty"`
 	// BoardOverrideError 是 board.json 加载/解析失败的诊断串（有则挂前端告警）。
 	// omitempty：正常场景下响应里不出现该键；一旦出现，前端必须显式披露——
 	// 静默吞掉解析错误会让"整个 override 静默蒸发"与"没配 override"看起来完全一样，
@@ -297,6 +299,7 @@ func (s *boardServer) handleOverview(w http.ResponseWriter, r *http.Request) {
 		MaxParallel:            snap.Cfg.MaxParallel,
 		Projects:               projects,
 		Quota:                  quota,
+		OwnerProviderTargets:   snap.Cfg.OwnerProviderTargets,
 		BoardOverrideError:     snap.BoardOverrideError,
 		BoardOverrideErrorKind: snap.BoardOverrideErrorKind,
 		ProjectAliasError:      snap.ProjectAliasError,

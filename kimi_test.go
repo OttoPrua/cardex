@@ -259,11 +259,12 @@ func TestInvokeKimiCLI0361PreservesEMFILEStderr(t *testing.T) {
 	}
 }
 
-func TestRunTaskKimiCLILimitQueuesSolFallback(t *testing.T) {
+func TestRunTaskKimiCLILimitHoldsWithoutGlobalSolFallback(t *testing.T) {
 	root := testRoot(t)
 	payload := `{"role":"meta","type":"error","content":"HTTP 429: usage limit reached"}`
 	bin, _, _ := fakeKimiCLI(t, payload, 1)
 	cfg := kimiCLITestConfig(t, bin)
+	cfg.OwnerRoutingEnforced = true
 	task := newTask(root, cfg, typeSequence, "kimi limit", t.TempDir(), []string{"p"}, 1)
 	task.Model = "opus"
 	task.RouteClass = routeClassGeneral
@@ -286,11 +287,10 @@ func TestRunTaskKimiCLILimitQueuesSolFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != statusQueued || got.RouteReason != routeReasonKimiToSolPending ||
-		got.PreferRunner != "codex" || got.CodexModel != "gpt-5.6-sol" ||
-		got.Effort != "xhigh" || !got.EffortExplicit || got.OwnerRouteLeg != 3 ||
-		got.SessionID != "" || got.Attempts != 0 {
-		t.Fatalf("Kimi 安全限额应串行排队 Sol/xhigh 第三腿: %+v", got)
+	if got.Status != statusHeld || got.RouteReason != routeReasonGrokToKimi ||
+		got.PreferRunner != kimiCLIRunnerName || got.CodexModel != "" || got.OwnerRouteLeg != 2 ||
+		got.SessionID != "" || got.Attempts != 0 || !strings.Contains(got.LastError, "global Codex fallback disabled") {
+		t.Fatalf("Kimi 安全限额必须保持第二腿并关闭全局 Sol 回退: %+v", got)
 	}
 	cd := loadEngineCooldown(root, kimiCLICooldownName)
 	if cd == nil || !cd.active(time.Now()) || cd.UntilEpoch < time.Now().Add(179*time.Minute).Unix() {
@@ -301,12 +301,11 @@ func TestRunTaskKimiCLILimitQueuesSolFallback(t *testing.T) {
 	}
 	events := readAllEventsRaw(t, root, task.ID)
 	last := events[len(events)-1]
-	if last.Type != evRetry || last.Actor != "runner:kimi-cli" ||
-		last.Detail["fallback_runner"] != "codex" || last.Detail["fallback_model"] != "gpt-5.6-sol" ||
-		last.Detail["fallback_reasoning"] != "xhigh" ||
+	if last.Type != evHeld || last.Actor != "runner:policy-fallback" ||
+		last.Detail["reason"] != "no_resolver_proven_next_leg" ||
 		last.Detail["workspace_fingerprint_before"] == "" ||
 		last.Detail["workspace_fingerprint_before"] != last.Detail["workspace_fingerprint_after"] {
-		t.Fatalf("应留下 Kimi CLI→Sol/xhigh 三证接力事件: %+v", last)
+		t.Fatalf("应留下 Kimi CLI 无解析下一腿的三证持有事件: %+v", last)
 	}
 }
 

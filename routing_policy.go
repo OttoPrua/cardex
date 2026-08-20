@@ -23,6 +23,10 @@ type policyLeg struct {
 	Runner string
 	Model  string
 	Effort string
+	Stage  string
+	// ReadOnly is an execution contract, not a display hint. Fable answer/merge legs, standalone
+	// reviews, backend second views, and release gates must never write product bytes.
+	ReadOnly bool
 }
 
 type ownerRoute struct {
@@ -30,6 +34,9 @@ type ownerRoute struct {
 	Legs               []policyLeg
 	Review             *policyLeg
 	Merge              *policyLeg
+	ReleaseGate        *policyLeg
+	ConditionalSol     *policyLeg
+	RiskClass          string
 	IndependentAnswers bool
 }
 
@@ -73,29 +80,21 @@ func ownerAutoRouteEligible(t *Task) bool {
 		t.SessionID == "" && !t.MidStep && codexEligible(t)
 }
 
-// resolveOwnerRoute returns the exact six-row owner table without changing task state. The result is
-// also the board/manual-dispatch authority: execution helpers consume the same configured identities.
-func resolveOwnerRoute(cfg *Config, t *Task) (ownerRoute, bool) {
-	if cfg == nil || invalidExplicitRouteClass(t) || !ownerAutoRouteEligible(t) {
-		return ownerRoute{}, false
-	}
-	// A standalone review is an explicit review lane, not an Opus implementation. Keep it out of the
-	// Kimi/Grok writer chain and pin one clean Sol/max session; typeReview is already non-recursive.
+// resolveLegacyOwnerRoute preserves the exact R2 resolver for installations that have not enabled the
+// final Owner contract. This is compatibility only: the frozen production projection enables the final
+// policy, so none of these legacy global Codex legs can authorize an Owner-pinned lineage.
+func resolveLegacyOwnerRoute(cfg *Config, t *Task) (ownerRoute, bool) {
 	if t.Type == typeReview {
 		if cfg.GrokBuild == nil || strings.TrimSpace(cfg.GrokBuild.ReviewCodexModel) == "" ||
 			strings.TrimSpace(cfg.GrokBuild.ReviewCodexEffort) == "" {
 			return ownerRoute{}, false
 		}
-		return ownerRoute{
-			Name: "review_standalone",
-			Legs: []policyLeg{{Runner: "codex", Model: strings.TrimSpace(cfg.GrokBuild.ReviewCodexModel),
-				Effort: strings.ToLower(strings.TrimSpace(cfg.GrokBuild.ReviewCodexEffort))}},
-		}, true
+		return ownerRoute{Name: "review_standalone", Legs: []policyLeg{{Runner: "codex",
+			Model:  strings.TrimSpace(cfg.GrokBuild.ReviewCodexModel),
+			Effort: strings.ToLower(strings.TrimSpace(cfg.GrokBuild.ReviewCodexEffort))}}}, true
 	}
-	tier := modelTierKeyword(cfg, t.Model)
-	switch tier {
+	switch tier := modelTierKeyword(cfg, t.Model); tier {
 	case "fable":
-		// Fable is opt-in only: an empty source model can never reach this row through a default.
 		if strings.TrimSpace(t.Model) == "" || !cursorFablePolicyApplies(cfg, t) {
 			return ownerRoute{}, false
 		}
@@ -105,145 +104,255 @@ func resolveOwnerRoute(cfg *Config, t *Task) (ownerRoute, bool) {
 		}
 		primary := policyLeg{Runner: cursorRunnerName, Model: strings.TrimSpace(cfg.CursorFable.Model)}
 		primary.Effort = cursorEffortFromModel(primary.Model)
-		return ownerRoute{
-			Name:               "fable_explicit",
-			Legs:               []policyLeg{primary, crossPolicyLeg(cfg, prof.A), crossPolicyLeg(cfg, prof.B)},
-			Merge:              ptrLeg(crossPolicyLeg(cfg, *prof.Merge)),
-			IndependentAnswers: true,
-		}, true
+		return ownerRoute{Name: "fable_explicit",
+			Legs:  []policyLeg{primary, crossPolicyLeg(cfg, prof.A), crossPolicyLeg(cfg, prof.B)},
+			Merge: ptrLeg(crossPolicyLeg(cfg, *prof.Merge)), IndependentAnswers: true}, true
 	case "opus":
 		if backendDevelopmentTask(t) {
-			_, route, ok := grokBuildTierRoute(cfg, t)
+			_, legacy, ok := grokBuildTierRoute(cfg, t)
 			if !ok {
 				return ownerRoute{}, false
 			}
-			resolved := ownerRoute{
-				Name: "opus_backend",
-				Legs: []policyLeg{
-					{Runner: grokBuildRunnerName, Model: strings.TrimSpace(cfg.GrokBuild.Model), Effort: route.Effort},
-					{Runner: "codex", Model: route.CodexFallbackModel, Effort: route.CodexFallbackEffort},
-				},
-			}
+			resolved := ownerRoute{Name: "opus_backend", Legs: []policyLeg{
+				{Runner: grokBuildRunnerName, Model: strings.TrimSpace(cfg.GrokBuild.Model), Effort: legacy.Effort},
+				{Runner: "codex", Model: legacy.CodexFallbackModel, Effort: legacy.CodexFallbackEffort},
+			}}
 			if cfg.GrokBuild.OpusAdversarialReview {
-				resolved.Review = ptrLeg(policyLeg{Runner: "codex", Model: cfg.GrokBuild.ReviewCodexModel, Effort: cfg.GrokBuild.ReviewCodexEffort})
+				resolved.Review = ptrLeg(policyLeg{Runner: "codex", Model: cfg.GrokBuild.ReviewCodexModel,
+					Effort: cfg.GrokBuild.ReviewCodexEffort})
 			}
 			return resolved, true
 		}
 		if cfg.KimiCLIOpus == nil || !cfg.KimiCLIOpus.Enabled || !grokBuildKimiFallbackEnabled(cfg) {
 			return ownerRoute{}, false
 		}
-		resolved := ownerRoute{
-			Name: "opus_general",
-			Legs: []policyLeg{
-				{Runner: grokBuildRunnerName, Model: cfg.GrokBuild.Model, Effort: cfg.GrokBuild.Effort},
-				{Runner: kimiCLIRunnerName, Model: cfg.KimiCLIOpus.Model, Effort: cfg.KimiCLIOpus.Effort},
-				{Runner: "codex", Model: cfg.GrokBuild.CodexFallbackModel, Effort: cfg.GrokBuild.CodexFallbackEffort},
-			},
-		}
+		resolved := ownerRoute{Name: "opus_general", Legs: []policyLeg{
+			{Runner: grokBuildRunnerName, Model: cfg.GrokBuild.Model, Effort: cfg.GrokBuild.Effort},
+			{Runner: kimiCLIRunnerName, Model: cfg.KimiCLIOpus.Model, Effort: cfg.KimiCLIOpus.Effort},
+			{Runner: "codex", Model: cfg.GrokBuild.CodexFallbackModel, Effort: cfg.GrokBuild.CodexFallbackEffort},
+		}}
 		if cfg.GrokBuild.OpusAdversarialReview {
-			resolved.Review = ptrLeg(policyLeg{Runner: "codex", Model: cfg.GrokBuild.ReviewCodexModel, Effort: cfg.GrokBuild.ReviewCodexEffort})
+			resolved.Review = ptrLeg(policyLeg{Runner: "codex", Model: cfg.GrokBuild.ReviewCodexModel,
+				Effort: cfg.GrokBuild.ReviewCodexEffort})
 		}
 		return resolved, true
 	case "sonnet", "haiku":
-		key, route, ok := grokBuildTierRoute(cfg, t)
+		key, legacy, ok := grokBuildTierRoute(cfg, t)
 		if !ok || key != tier {
 			return ownerRoute{}, false
 		}
-		return ownerRoute{
-			Name: tier,
-			Legs: []policyLeg{
-				{Runner: grokBuildRunnerName, Model: cfg.GrokBuild.Model, Effort: route.Effort},
-				{Runner: "codex", Model: route.CodexFallbackModel, Effort: route.CodexFallbackEffort},
-			},
-		}, true
+		return ownerRoute{Name: tier, Legs: []policyLeg{
+			{Runner: grokBuildRunnerName, Model: cfg.GrokBuild.Model, Effort: legacy.Effort},
+			{Runner: "codex", Model: legacy.CodexFallbackModel, Effort: legacy.CodexFallbackEffort},
+		}}, true
 	default:
 		return ownerRoute{}, false
 	}
 }
 
-// validateOwnerRoutingPolicy is the production configuration lock for the exact six-row table.
+// resolveOwnerRoute returns the final closed Owner matrix without changing task state. Generic Cardex
+// installations receive the byte-compatible R2 resolver above; this Owner-pinned host enables the new
+// branch, which is the shared board/manual-dispatch/runtime authority.
+func resolveOwnerRoute(cfg *Config, t *Task) (ownerRoute, bool) {
+	if cfg == nil || invalidExplicitRouteClass(t) || !ownerAutoRouteEligible(t) {
+		return ownerRoute{}, false
+	}
+	if !cfg.OwnerRoutingEnforced {
+		return resolveLegacyOwnerRoute(cfg, t)
+	}
+	risk := effectiveOwnerRiskClass(t)
+	kimiLeg := func(stage string, readOnly bool) policyLeg {
+		return policyLeg{Runner: kimiCLIRunnerName, Model: strings.TrimSpace(cfg.KimiCLIOpus.Model),
+			Effort: strings.ToLower(strings.TrimSpace(cfg.KimiCLIOpus.Effort)), Stage: stage, ReadOnly: readOnly}
+	}
+	grokLeg := func(effort, stage string, readOnly bool) policyLeg {
+		return policyLeg{Runner: grokBuildRunnerName, Model: strings.TrimSpace(cfg.GrokBuild.Model),
+			Effort: effort, Stage: stage, ReadOnly: readOnly}
+	}
+	solLeg := func(effort, stage string) policyLeg {
+		return policyLeg{Runner: "codex", Model: "gpt-5.6-sol", Effort: effort, Stage: stage, ReadOnly: true}
+	}
+	if cfg.KimiCLIOpus == nil || !cfg.KimiCLIOpus.Enabled || cfg.GrokBuild == nil || !cfg.GrokBuild.Enabled {
+		return ownerRoute{}, false
+	}
+
+	// Standalone review is classified independently from implementation work. Missing/ambiguous review
+	// risk fails closed to the critical Sol/max lane; only explicit ordinary uses fresh Kimi K3/max.
+	if t.Type == typeReview {
+		if risk == riskClassOrdinary {
+			return ownerRoute{Name: "review_standalone_ordinary", RiskClass: risk,
+				Legs: []policyLeg{kimiLeg(routeStageStandaloneReview, true)}}, true
+		}
+		return ownerRoute{Name: "review_standalone_critical", RiskClass: risk,
+			Legs: []policyLeg{solLeg("max", routeStageStandaloneReview)}}, true
+	}
+	tier := modelTierKeyword(cfg, t.Model)
+	switch tier {
+	case "fable":
+		// Fable is opt-in only: an empty source model can never reach this row through a default.
+		if strings.TrimSpace(t.Model) == "" || !cursorFablePolicyApplies(cfg, t) {
+			return ownerRoute{}, false
+		}
+		prof, ok := cfg.CrossProfiles[strings.TrimSpace(cfg.CursorFable.FallbackProfile)]
+		if !ok || prof.Merge != nil {
+			return ownerRoute{}, false
+		}
+		primary := policyLeg{Runner: cursorRunnerName, Model: strings.TrimSpace(cfg.CursorFable.Model),
+			Stage: routeStagePrimary, ReadOnly: true}
+		primary.Effort = cursorEffortFromModel(primary.Model)
+		answer := crossPolicyLeg(cfg, prof.A)
+		answer.Stage, answer.ReadOnly = routeStageFableAnswer, true
+		merger := crossPolicyLeg(cfg, prof.B)
+		merger.Stage, merger.ReadOnly = routeStageFableMerge, true
+		return ownerRoute{
+			Name: "fable_explicit", RiskClass: riskClassOrdinary,
+			Legs: []policyLeg{primary, answer, merger},
+		}, true
+	case "opus":
+		if backendDevelopmentTask(t) {
+			if risk != riskClassOrdinary {
+				return ownerRoute{Name: "opus_backend_high_risk", RiskClass: riskClassHigh,
+					Legs:        []policyLeg{grokLeg("xhigh", routeStagePrimary, false)},
+					Review:      ptrLeg(kimiLeg(routeStageSecondView, true)),
+					ReleaseGate: ptrLeg(solLeg("max", routeStageReleaseGate))}, true
+			}
+			resolved := ownerRoute{Name: "opus_backend_ordinary", RiskClass: riskClassOrdinary,
+				Legs:           []policyLeg{grokLeg("xhigh", routeStagePrimary, false)},
+				Review:         ptrLeg(kimiLeg(routeStageAdversarialReview, true)),
+				ConditionalSol: ptrLeg(solLeg("xhigh", routeStageConditionalRelease))}
+			if deterministicSolSample(t.ID, 20) || t.SolEscalationReason == solEscalationDisagreement ||
+				t.SolEscalationReason == solEscalationAcceptanceFailed || t.SolEscalationReason == solEscalationExplicitHighRisk ||
+				t.SpecializedFrontend {
+				resolved.ReleaseGate = ptrLeg(solLeg("xhigh", routeStageConditionalRelease))
+			}
+			return resolved, true
+		}
+		resolved := ownerRoute{
+			Name: "opus_non_backend", RiskClass: risk,
+			Legs: []policyLeg{
+				grokLeg("xhigh", routeStagePrimary, false),
+				kimiLeg(routeStageFallbackReview, false),
+			},
+			ConditionalSol: ptrLeg(solLeg("xhigh", routeStageConditionalEscalation)),
+		}
+		if risk != riskClassOrdinary || t.SolEscalationReason == solEscalationDisagreement ||
+			t.SolEscalationReason == solEscalationAcceptanceFailed ||
+			t.SolEscalationReason == solEscalationExplicitHighRisk {
+			resolved.ReleaseGate = ptrLeg(solLeg("xhigh", routeStageConditionalRelease))
+		}
+		if t.SpecializedFrontend {
+			effort := "xhigh"
+			if risk != riskClassOrdinary {
+				effort = "max"
+			}
+			resolved.ReleaseGate = ptrLeg(solLeg(effort, routeStageConditionalRelease))
+		}
+		return resolved, true
+	case "sonnet":
+		resolved := ownerRoute{Name: "sonnet", RiskClass: risk,
+			Legs: []policyLeg{grokLeg("high", routeStagePrimary, false), kimiLeg(routeStageFallbackReview, false)}}
+		if t.SpecializedFrontend {
+			effort := "xhigh"
+			if risk != riskClassOrdinary {
+				effort = "max"
+			}
+			resolved.ReleaseGate = ptrLeg(solLeg(effort, routeStageConditionalRelease))
+		}
+		return resolved, true
+	case "haiku":
+		effort := "medium"
+		if t.QualitySensitive {
+			effort = "high"
+		}
+		resolved := ownerRoute{Name: "haiku", RiskClass: risk,
+			Legs: []policyLeg{grokLeg(effort, routeStagePrimary, false), kimiLeg(routeStageFallbackReview, false)}}
+		if t.SpecializedFrontend {
+			solEffort := "xhigh"
+			if risk != riskClassOrdinary {
+				solEffort = "max"
+			}
+			resolved.ReleaseGate = ptrLeg(solLeg(solEffort, routeStageConditionalRelease))
+		}
+		return resolved, true
+	default:
+		return ownerRoute{}, false
+	}
+}
+
+// validateOwnerRoutingPolicy is the production configuration lock for the final closed matrix.
 // The generic Cardex defaults leave it disabled; this host enables it explicitly. Validation asks the
-// same resolver used by tick, board, and manual takeover to resolve all six rows, so a syntactically
-// valid provider config cannot silently remove a row or weaken a model/review identity.
+// same resolver used by tick, board, and manual takeover to resolve every effective matrix branch, so
+// a syntactically valid provider config cannot silently remove a risk/review branch or weaken an identity.
 func validateOwnerRoutingPolicy(cfg *Config) error {
 	if cfg == nil || !cfg.OwnerRoutingEnforced {
 		return nil
 	}
+	if err := validateGrokBuild(cfg); err != nil {
+		return err
+	}
+	if err := validateCursor(cfg); err != nil {
+		return err
+	}
 	if cfg.DefaultRunner != "codex" {
 		return fmt.Errorf("owner_routing_enforced=true 需要 default_runner=codex")
+	}
+	if cfg.AutomaticCodexBudgetStopPercent != 65 {
+		return fmt.Errorf("Owner automatic Codex budget stop must be exactly 65%%, got %d%%", cfg.AutomaticCodexBudgetStopPercent)
+	}
+	wantTargets := OwnerProviderTargets{
+		GrokMinPercent: 70, GrokMaxPercent: 80,
+		KimiMinPercent: 15, KimiMaxPercent: 25,
+		DirectSolMinPercent: 5, DirectSolMaxPercent: 10,
+	}
+	if cfg.OwnerProviderTargets == nil || *cfg.OwnerProviderTargets != wantTargets {
+		return fmt.Errorf("Owner provider lineage targets must be exactly Grok 70-80, Kimi/OpenCode 15-25, direct Sol 5-10")
 	}
 	if cfg.KimiCLIOpus == nil || !cfg.KimiCLIOpus.Enabled || !cfg.KimiCLIOpus.ExcludeBackend ||
 		strings.TrimSpace(cfg.KimiCLIOpus.Model) != "kimi-code/k3" ||
 		strings.ToLower(strings.TrimSpace(cfg.KimiCLIOpus.Effort)) != "max" {
-		return fmt.Errorf("Owner 非后端 Opus 第二腿必须严格启用 kimi-code/k3/max 且 exclude_backend=true")
+		return fmt.Errorf("Owner Kimi fallback/review lane must strictly enable kimi-code/k3/max with exclude_backend=true")
 	}
 	if cfg.GrokBuild == nil || !cfg.GrokBuild.Enabled || !cfg.GrokBuild.KimiOpusFallback {
-		return fmt.Errorf("Owner 六行路由需要完整启用 Grok 接力")
+		return fmt.Errorf("Owner final matrix requires the Grok and Kimi lanes")
 	}
 	if cfg.GrokBuild.OpusAdversarialReview {
-		return fmt.Errorf("Owner 当前路由不自动追加 Opus 对抗复审；请使用独立 Sol/max 审核卡")
+		return fmt.Errorf("legacy global Opus Codex review must be disabled; every Codex entry is an explicit route gate")
 	}
-	if strings.TrimSpace(cfg.GrokBuild.ReviewCodexModel) != "gpt-5.6-sol" ||
-		strings.ToLower(strings.TrimSpace(cfg.GrokBuild.ReviewCodexEffort)) != "max" {
-		return fmt.Errorf("Owner 独立审核卡必须严格使用 gpt-5.6-sol/max")
+	if cfg.CodexFallback {
+		return fmt.Errorf("owner final matrix requires codex_fallback=false; every Codex entry is an explicit route gate")
+	}
+	if cfg.GrokBuild.FableClaudeFallback || cfg.GrokBuild.FableFirstPrinciples {
+		return fmt.Errorf("legacy Fable fallback/review flags must be disabled; the single Sol/ultra reviewer-merger is terminal")
 	}
 	if cfg.CursorFable == nil || !cfg.CursorFable.Enabled {
-		return fmt.Errorf("Owner 显式 Fable 行需要启用 Cursor Fable 5 主腿")
+		return fmt.Errorf("Owner explicit Fable row requires Cursor Fable 5")
 	}
-
-	type expectedRoute struct {
-		name        string
-		model       string
-		routeClass  string
-		legs        []policyLeg
-		review      *policyLeg
-		merge       *policyLeg
-		independent bool
+	checks := []*Task{
+		{ID: "owner-fable", Type: typeSequence, Model: "fable", PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
+		{ID: "owner-opus-general", Type: typeSequence, Model: "opus", RouteClass: routeClassGeneral, RiskClass: riskClassOrdinary, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
+		{ID: "owner-opus-ordinary", Type: typeSequence, Model: "opus", RouteClass: routeClassBackend, RiskClass: riskClassOrdinary, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
+		{ID: "owner-opus-high", Type: typeSequence, Model: "opus", RouteClass: routeClassBackend, RiskClass: riskClassHigh, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
+		{ID: "owner-sonnet", Type: typeSequence, Model: "sonnet", RouteClass: routeClassGeneral, RiskClass: riskClassOrdinary, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
+		{ID: "owner-haiku", Type: typeSequence, Model: "haiku", RouteClass: routeClassGeneral, RiskClass: riskClassOrdinary, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
+		{ID: "owner-review-ordinary", Type: typeReview, Model: "opus", RiskClass: riskClassOrdinary, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
+		{ID: "owner-review-production", Type: typeReview, Model: "opus", RiskClass: riskClassProduction, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}},
 	}
-	solMax := policyLeg{Runner: "codex", Model: "gpt-5.6-sol", Effort: "max"}
-	solXHigh := policyLeg{Runner: "codex", Model: "gpt-5.6-sol", Effort: "xhigh"}
-	expected := []expectedRoute{
-		{name: "fable_explicit", model: "fable", routeClass: routeClassGeneral,
-			legs: []policyLeg{{Runner: cursorRunnerName, Model: "claude-fable-5-thinking-max", Effort: "max"},
-				{Runner: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh"},
-				{Runner: "codex", Model: "gpt-5.6-sol", Effort: "ultra"}},
-			merge: ptrLeg(solMax), independent: true},
-		{name: "opus_general", model: "opus", routeClass: routeClassGeneral,
-			legs: []policyLeg{{Runner: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh"},
-				{Runner: kimiCLIRunnerName, Model: "kimi-code/k3", Effort: "max"}, solXHigh}},
-		{name: "opus_backend", model: "opus", routeClass: routeClassBackend,
-			legs: []policyLeg{{Runner: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh"}, solMax}},
-		{name: "sonnet", model: "sonnet", routeClass: routeClassGeneral,
-			legs: []policyLeg{{Runner: grokBuildRunnerName, Model: "grok-4.6", Effort: "high"},
-				{Runner: "codex", Model: "gpt-5.6-luna", Effort: "max"}}},
-		{name: "haiku", model: "haiku", routeClass: routeClassGeneral,
-			legs: []policyLeg{{Runner: grokBuildRunnerName, Model: "grok-4.6", Effort: "high"},
-				{Runner: "codex", Model: "gpt-5.6-luna", Effort: "xhigh"}}},
-		{name: "review_standalone", model: "opus", routeClass: routeClassGeneral,
-			legs: []policyLeg{solMax}},
+	wantNames := []string{"fable_explicit", "opus_non_backend", "opus_backend_ordinary", "opus_backend_high_risk", "sonnet", "haiku", "review_standalone_ordinary", "review_standalone_critical"}
+	for i, task := range checks {
+		got, ok := resolveOwnerRoute(cfg, task)
+		if !ok || got.Name != wantNames[i] || len(got.Legs) == 0 {
+			return fmt.Errorf("Owner final route %s cannot be resolved exactly: got=%+v ok=%v", wantNames[i], got, ok)
+		}
 	}
-	for _, want := range expected {
-		typ := typeSequence
-		if want.name == "review_standalone" {
-			typ = typeReview
-		}
-		t := &Task{Type: typ, Model: want.model, RouteClass: want.routeClass,
-			PreferRunner: "codex", FreshSteps: true, Prompts: []string{"owner route validation"}}
-		got, ok := resolveOwnerRoute(cfg, t)
-		if !ok || got.Name != want.name || len(got.Legs) != len(want.legs) || got.IndependentAnswers != want.independent {
-			return fmt.Errorf("Owner 路由 %s 无法由生产 resolver 完整解析", want.name)
-		}
-		for i := range want.legs {
-			if got.Legs[i] != want.legs[i] {
-				return fmt.Errorf("Owner 路由 %s 第 %d 腿漂移: got=%+v want=%+v", want.name, i+1, got.Legs[i], want.legs[i])
-			}
-		}
-		if (got.Review == nil) != (want.review == nil) || (got.Review != nil && *got.Review != *want.review) {
-			return fmt.Errorf("Owner 路由 %s 复审身份漂移", want.name)
-		}
-		if (got.Merge == nil) != (want.merge == nil) || (got.Merge != nil && *got.Merge != *want.merge) {
-			return fmt.Errorf("Owner 路由 %s 合并身份漂移", want.name)
-		}
+	fable, _ := resolveOwnerRoute(cfg, checks[0])
+	if len(fable.Legs) != 3 || fable.Legs[1].Stage != routeStageFableAnswer ||
+		fable.Legs[2] != (policyLeg{Runner: "codex", Model: "gpt-5.6-sol", Effort: "ultra", Stage: routeStageFableMerge, ReadOnly: true}) ||
+		fable.Merge != nil || fable.Review != nil || fable.ReleaseGate != nil {
+		return fmt.Errorf("Fable must be Grok answer -> one Sol/ultra adversarial merge -> terminal: %+v", fable)
+	}
+	high, _ := resolveOwnerRoute(cfg, checks[3])
+	if high.Review == nil || high.Review.Runner != kimiCLIRunnerName || high.ReleaseGate == nil || high.ReleaseGate.Effort != "max" {
+		return fmt.Errorf("high-risk backend release chain drifted: %+v", high)
 	}
 	return nil
 }
@@ -299,6 +408,9 @@ func ownerRouteSnapshotLegMatches(t *Task, leg policyLeg) bool {
 	if t == nil {
 		return false
 	}
+	if t.OwnerRouteStage != "" && t.OwnerRouteStage != leg.Stage {
+		return false
+	}
 	// Cross/remote/session identities were rejected by the caller. Every remaining provider pin must
 	// either be exactly the frozen current leg or empty; an unrelated later pin invalidates readback.
 	switch leg.Runner {
@@ -326,7 +438,7 @@ func ownerRouteSnapshotLegMatches(t *Task, leg policyLeg) bool {
 }
 
 // resolvePinnedTaskLeg is the single read-only identity resolver for cards intentionally outside the
-// six-row automatic table. Board and `cardex cmd` consume it so an explicit pin is never re-inferred
+// final automatic table. Board and `cardex cmd` consume it so an explicit pin is never re-inferred
 // as Cursor/Kimi/Grok by legacy display helpers.
 func resolvePinnedTaskLeg(cfg *Config, t *Task) (policyLeg, bool) {
 	if cfg == nil || t == nil || t.RemoteHost != "" || ownerRoutingPolicyWaitReason(cfg, t) != "" {
@@ -362,6 +474,55 @@ func freezeOwnerSolMaxReview(t *Task, route ownerRoute) {
 	enforceReviewAfterEligibility(t)
 }
 
+func applyOwnerRouteRequirements(t *Task, route ownerRoute) bool {
+	if t == nil {
+		return false
+	}
+	t.RiskClass = route.RiskClass
+	if route.Name == "fable_explicit" {
+		// Fable is a dedicated decision/synthesis role. The eventual subject matter cannot relabel the
+		// read-only planning lineage as backend; a later implementation is a separate independently routed card.
+		t.RouteClass = routeClassGeneral
+		t.ReviewAfter = false
+		t.SolMaxAdversarialReview = false
+		return true
+	}
+	var stages []string
+	if route.Review != nil {
+		switch route.Review.Stage {
+		case routeStageAdversarialReview:
+			stages = append(stages, reviewStageKimiAdversarial)
+		case routeStageSecondView:
+			stages = append(stages, reviewStageKimiSecondView)
+		default:
+			return false
+		}
+	}
+	if route.ReleaseGate != nil {
+		switch route.ReleaseGate.Effort {
+		case "xhigh":
+			stages = append(stages, reviewStageSolXHigh)
+		case "max":
+			stages = append(stages, reviewStageSolMax)
+		default:
+			return false
+		}
+	}
+	for _, stage := range stages {
+		var err error
+		t.RequiredReviews, err = appendClosedReview(t.RequiredReviews, stage)
+		if err != nil {
+			return false
+		}
+	}
+	if len(stages) > 0 && t.Type == typeSequence {
+		t.ReviewAfter = true
+		t.SolMaxAdversarialReview = false
+		enforceReviewAfterEligibility(t)
+	}
+	return true
+}
+
 // pinOwnerPrimaryRoute consumes the first leg returned by resolveOwnerRoute. Cursor is selected through
 // the per-dispatch value; all other providers are frozen on the card before dispatch so config hot
 // reload cannot change a queued leg's model or effort.
@@ -372,22 +533,70 @@ func pinOwnerPrimaryRoute(t *Task, route ownerRoute) bool {
 	leg := route.Legs[0]
 	t.OwnerRouteName = route.Name
 	t.OwnerRouteLeg = 1
+	if leg.Stage == "" {
+		// R2 compatibility resolver: preserve its route/review semantics without introducing
+		// final-matrix stages or requirements into existing generic task history.
+		switch leg.Runner {
+		case cursorRunnerName:
+			return true
+		case kimiCLIRunnerName:
+			t.PreferRunner, t.KimiModel = kimiCLIRunnerName, leg.Model
+			t.Effort, t.EffortExplicit = leg.Effort, true
+			return true
+		case "codex":
+			if route.Name != "review_standalone" {
+				return false
+			}
+			t.PreferRunner, t.CodexModel = "codex", leg.Model
+			t.Effort, t.EffortExplicit = leg.Effort, true
+			t.RouteReason = routeReasonOwnerReviewSol
+			return true
+		case grokBuildRunnerName:
+			t.PreferRunner, t.GrokModel, t.GrokEffort = grokBuildRunnerName, leg.Model, leg.Effort
+			switch route.Name {
+			case "opus_general":
+				t.RouteReason = routeReasonGrokOpusGeneral
+			case "opus_backend":
+				t.RouteReason = routeReasonGrokOpusBackend
+			case "sonnet":
+				t.RouteReason = routeReasonGrokSonnet
+			case "haiku":
+				t.RouteReason = routeReasonGrokHaiku
+			default:
+				return false
+			}
+			freezeOwnerSolMaxReview(t, route)
+			return true
+		default:
+			return false
+		}
+	}
+	t.OwnerRouteStage = leg.Stage
+	if !applyOwnerRouteRequirements(t, route) {
+		return false
+	}
 	switch leg.Runner {
 	case cursorRunnerName:
 		return true
 	case kimiCLIRunnerName:
+		t.PreferRunner = kimiCLIRunnerName
 		t.KimiModel = leg.Model
 		t.Effort = leg.Effort
 		t.EffortExplicit = true
+		t.RouteReason = routeReasonKimiCLIOpus
 		return true
 	case "codex":
 		t.PreferRunner = "codex"
 		t.CodexModel = leg.Model
 		t.Effort = leg.Effort
 		t.EffortExplicit = true
-		if route.Name != "review_standalone" {
+		if route.Name != "review_standalone_critical" {
 			return false
 		}
+		if err := reserveAutomaticSolCall(t, leg.Stage); err != nil {
+			return false
+		}
+		t.AutomaticCodex = true
 		t.RouteReason = routeReasonOwnerReviewSol
 		return true
 	case grokBuildRunnerName:
@@ -395,9 +604,9 @@ func pinOwnerPrimaryRoute(t *Task, route ownerRoute) bool {
 		t.GrokModel = leg.Model
 		t.GrokEffort = leg.Effort
 		switch route.Name {
-		case "opus_general":
+		case "opus_non_backend":
 			t.RouteReason = routeReasonGrokOpusGeneral
-		case "opus_backend":
+		case "opus_backend_ordinary", "opus_backend_high_risk":
 			t.RouteReason = routeReasonGrokOpusBackend
 		case "sonnet":
 			t.RouteReason = routeReasonGrokSonnet
@@ -406,14 +615,13 @@ func pinOwnerPrimaryRoute(t *Task, route ownerRoute) bool {
 		default:
 			return false
 		}
-		freezeOwnerSolMaxReview(t, route)
 		return true
 	default:
 		return false
 	}
 }
 
-// ownerPrimaryDispatch is the single production selector for fresh six-row routes. matched=true with
+// ownerPrimaryDispatch is the single production selector for fresh final-matrix routes. matched=true with
 // an empty runner means the current first-leg lane is cooling down and the card must wait, never skip.
 func ownerPrimaryDispatch(root string, cfg *Config, t *Task, now time.Time) (runner string, matched bool) {
 	route, ok := resolveOwnerRoute(cfg, t)
@@ -966,6 +1174,9 @@ func queuePolicyFallback(cfg *Config, t *Task, kind fallbackFailureKind, auth fa
 	}
 	nextIndex := t.OwnerRouteLeg
 	next := route.Legs[nextIndex]
+	if !independentModelOpinion(current, next) {
+		return fmt.Errorf("fallback blocked: provider redundancy is not an independent model opinion")
+	}
 	// Clear every provider-specific pin before freezing the next leg. The route snapshot and last
 	// attempt readback retain the previous identity; carrying its concrete fields would make readback
 	// ambiguous and could silently substitute a provider after config reload.
@@ -1009,7 +1220,8 @@ func queuePolicyFallback(cfg *Config, t *Task, kind fallbackFailureKind, auth fa
 	}
 	t.OwnerRouteName = route.Name
 	t.OwnerRouteLeg = nextIndex + 1
-	freezeOwnerSolMaxReview(t, route)
+	t.OwnerRouteStage = next.Stage
+	t.FallbackReason = string(kind)
 	resetQueuedPolicyLeg(t)
 	t.LastError = fmt.Sprintf("%s 安全回退已证明，串行排队下一执行腿", kind)
 	t.touch()

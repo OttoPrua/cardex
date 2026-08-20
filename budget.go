@@ -146,8 +146,13 @@ type feedSample struct {
 	WindowKind    string `json:"windowKind"`
 }
 
-// latestFeedSample 取用量源里最新的 claude 5 小时窗口样本。
-func latestFeedSample(path string) (*feedSample, error) {
+// latestFeedSampleForProvider takes the newest primary/5h sample for exactly one provider. Automatic
+// Codex gates must never consume the legacy Claude percentage merely because both share one CodexBar file.
+func latestFeedSampleForProvider(path, provider string) (*feedSample, error) {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	if provider == "" {
+		return nil, fmt.Errorf("用量源 provider 不能为空")
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
@@ -159,11 +164,11 @@ func latestFeedSample(path string) (*feedSample, error) {
 	var best *feedSample
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || !strings.Contains(line, `"provider":"claude"`) {
+		if line == "" {
 			continue
 		}
 		var s feedSample
-		if json.Unmarshal([]byte(line), &s) != nil || s.Provider != "claude" {
+		if json.Unmarshal([]byte(line), &s) != nil || strings.ToLower(strings.TrimSpace(s.Provider)) != provider {
 			continue
 		}
 		// 5 小时窗口：windowMinutes 300，或标记为 primary。
@@ -176,9 +181,14 @@ func latestFeedSample(path string) (*feedSample, error) {
 		}
 	}
 	if best == nil {
-		return nil, fmt.Errorf("用量源里没有 claude 的 5 小时窗口样本")
+		return nil, fmt.Errorf("用量源里没有 %s 的 5 小时窗口样本", provider)
 	}
 	return best, nil
+}
+
+// latestFeedSample preserves the legacy Claude redline API and behavior.
+func latestFeedSample(path string) (*feedSample, error) {
+	return latestFeedSampleForProvider(path, "claude")
 }
 
 // ---- 分时段红线 ----
@@ -570,13 +580,18 @@ func collectPercentReads(cfg *Config, now time.Time) []percentRead {
 	return out
 }
 
-func readUsageFeedPercent(cfg *Config, now time.Time) percentRead {
-	r := percentRead{Source: "usage_feed"}
+func readUsageFeedProviderPercent(cfg *Config, now time.Time, provider string) percentRead {
+	provider = strings.ToLower(strings.TrimSpace(provider))
+	source := "usage_feed"
+	if provider != "claude" {
+		source += ":" + provider
+	}
+	r := percentRead{Source: source}
 	if cfg.UsageFeed == "" {
 		r.Reason = "未配置"
 		return r
 	}
-	s, err := latestFeedSample(cfg.UsageFeed)
+	s, err := latestFeedSampleForProvider(cfg.UsageFeed, provider)
 	if err != nil {
 		r.Reason = err.Error()
 		return r
@@ -603,6 +618,12 @@ func readUsageFeedPercent(cfg *Config, now time.Time) percentRead {
 	r.Percent = s.UsedPercent
 	r.AgeSuffix = fmt.Sprintf("，样本 %s 前", age.Round(time.Minute))
 	return r
+}
+
+// readUsageFeedPercent preserves the legacy Claude redline API. Final automatic Codex gates use the
+// provider-specific helper directly and fail closed when the Codex sample is absent or stale.
+func readUsageFeedPercent(cfg *Config, now time.Time) percentRead {
+	return readUsageFeedProviderPercent(cfg, now, "claude")
 }
 
 // oauthUsageCache 是进程级样本缓存:

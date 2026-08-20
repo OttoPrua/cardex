@@ -72,7 +72,7 @@ func TestGrokTierRoutesPinEffortFallbackAndOpusReview(t *testing.T) {
 				t.Fatalf("unexpected primary route: %+v", task)
 			}
 			if task.OwnerRouteName == "" || task.OwnerRouteLeg != 1 {
-				t.Fatalf("automatic Grok route did not freeze resolver snapshot: %+v", task)
+				t.Fatalf("generic compatibility route did not preserve its R2 resolver snapshot: %+v", task)
 			}
 			pinGrokBuildCodexFallback(cfg, task)
 			if task.PreferRunner != "codex" || task.CodexModel != tc.wantFallback ||
@@ -82,9 +82,10 @@ func TestGrokTierRoutesPinEffortFallbackAndOpusReview(t *testing.T) {
 		})
 	}
 
-	nonBackendOpus := &Task{Type: typeSequence, Model: "opus", RouteClass: routeClassGeneral, PreferRunner: "codex", Prompts: []string{"p"}}
-	route, ok := resolveOwnerRoute(cfg, nonBackendOpus)
-	if !ok || route.Name != "opus_general" || !pinOwnerPrimaryRoute(nonBackendOpus, route) {
+	ownerCfg := policyTestConfig()
+	nonBackendOpus := &Task{Type: typeSequence, Model: "opus", RouteClass: routeClassGeneral, RiskClass: riskClassOrdinary, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}}
+	route, ok := resolveOwnerRoute(ownerCfg, nonBackendOpus)
+	if !ok || route.Name != "opus_non_backend" || !pinOwnerPrimaryRoute(nonBackendOpus, route) {
 		t.Fatalf("non-backend Opus must resolve through the unified Owner route: ok=%v route=%+v task=%+v", ok, route, nonBackendOpus)
 	}
 	if nonBackendOpus.PreferRunner != grokBuildRunnerName || nonBackendOpus.GrokModel != "grok-4.6" ||
@@ -255,7 +256,7 @@ func fakeGrokBuildExpiredAuth(t *testing.T) (bin, probeCalls, productCalls strin
 		"for arg in \"$@\"; do\n" +
 		"  if [ \"$arg\" = 'models' ]; then\n" +
 		"    printf 'probe\\n' >> " + shSingleQuote(probeCalls) + "\n" +
-		"    printf '%s\\n' 'Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/responses: Invalid or expired credentials (auth_kind=none, x_xai_token_auth=xai-grok-cli, upstream=Unauthenticated, reason=no auth context)' >&2\n" +
+		"    printf '%s\\n' " + shSingleQuote(grokOIDCNoAuthContextClosedMetadata) + " >&2\n" +
 		"    exit 1\n" +
 		"  fi\n" +
 		"done\n" +
@@ -480,10 +481,11 @@ func TestValidateGrokBuildRejectsUnsupportedMax(t *testing.T) {
 	}
 }
 
-func TestRunTaskKimiLimitQueuesSolXHigh(t *testing.T) {
+func TestRunTaskKimiLimitHoldsWithoutGlobalSolFallback(t *testing.T) {
 	root := testRoot(t)
 	kimiBin, _, _ := fakeKimiCLI(t, `{"role":"meta","type":"error","content":"HTTP 429: usage limit reached"}`, 1)
 	cfg := kimiCLITestConfig(t, kimiBin)
+	cfg.OwnerRoutingEnforced = true
 	grokBin, _, _ := fakeGrokBuild(t, "", "", 0)
 	cfg.GrokBuildBin = grokBin
 	cfg.GrokBuild = grokBuildTestConfig(t, grokBin).GrokBuild
@@ -509,10 +511,10 @@ func TestRunTaskKimiLimitQueuesSolXHigh(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != statusQueued || got.PreferRunner != "codex" ||
-		got.CodexModel != "gpt-5.6-sol" || got.Effort != "xhigh" || !got.EffortExplicit ||
-		got.RouteReason != routeReasonKimiToSolPending || got.OwnerRouteLeg != 3 || got.SessionID != "" || got.Attempts != 0 {
-		t.Fatalf("Kimi limit must queue Sol/xhigh as the third leg: %+v", got)
+	if got.Status != statusHeld || got.PreferRunner != kimiCLIRunnerName || got.CodexModel != "" ||
+		got.RouteReason != routeReasonGrokToKimi || got.OwnerRouteLeg != 2 || got.SessionID != "" || got.Attempts != 0 ||
+		!strings.Contains(got.LastError, "global Codex fallback disabled") {
+		t.Fatalf("Kimi limit must hold on the second leg without a global Sol fallback: %+v", got)
 	}
 	if got.LastRouteAttempt == nil || got.LastRouteAttempt.ActualProvider != kimiCLIRunnerName ||
 		got.LastRouteAttempt.ActualModel != "kimi-code/k3" || got.LastRouteAttempt.ActualEffort != "max" ||
@@ -524,7 +526,8 @@ func TestRunTaskKimiLimitQueuesSolXHigh(t *testing.T) {
 func TestRunTaskGrokLimitQueuesKimiSecond(t *testing.T) {
 	root := testRoot(t)
 	bin, _, _ := fakeGrokBuild(t, `{"type":"error","message":"HTTP 429: usage limit reached"}`, "", 1)
-	cfg := grokBuildTestConfig(t, bin)
+	cfg := policyTestConfig()
+	cfg.GrokBuildBin = bin
 	task := newTask(root, cfg, typeSequence, "grok to kimi", t.TempDir(), []string{"p"}, 1)
 	task.Model = "opus"
 	task.RouteClass = routeClassGeneral
@@ -561,7 +564,7 @@ func TestRunTaskGrokLimitQueuesKimiSecond(t *testing.T) {
 		last.Detail["requested_provider"] != grokBuildRunnerName || last.Detail["actual_provider"] != grokBuildRunnerName ||
 		last.Detail["requested_model"] != "grok-4.6" || last.Detail["actual_model"] != "grok-4.6" ||
 		last.Detail["requested_effort"] != "xhigh" || last.Detail["actual_effort"] != "xhigh" ||
-		last.Detail["owner_route_name"] != "opus_general" || last.Detail["owner_route_leg"] != float64(1) ||
+		last.Detail["owner_route_name"] != "opus_non_backend" || last.Detail["owner_route_leg"] != float64(1) ||
 		last.Detail["attempt"] != float64(0) || last.Detail["failure_kind"] != string(fallbackQuota) ||
 		last.Detail["workspace_fingerprint_before"] == "" ||
 		last.Detail["workspace_fingerprint_before"] != last.Detail["workspace_fingerprint_after"] ||

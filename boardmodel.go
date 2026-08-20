@@ -118,18 +118,33 @@ type TaskBrief struct {
 	ModelSource string `json:"model_source"`
 	// ModelRoute 是当前卡所属的完整模型路线；Model 仍只表示当前实际生效的一跳，
 	// 两者分开避免把尚未执行的回退模型伪装成已执行模型。
-	ModelRoute   string   `json:"model_route,omitempty"`
-	Runner       string   `json:"runner"`
-	RunnerSource string   `json:"runner_source"`
-	RouteReason  string   `json:"route_reason,omitempty"`
-	RouteClass   string   `json:"route_class,omitempty"`
-	Effort       string   `json:"effort"`
-	EffortSource string   `json:"effort_source"`
-	ETA          BoardETA `json:"eta"`
-	CreatedAt    string   `json:"created_at"`
-	UpdatedAt    string   `json:"updated_at"`
-	LastSummary  string   `json:"last_summary"`
-	LastError    string   `json:"last_error"`
+	ModelRoute   string `json:"model_route,omitempty"`
+	Runner       string `json:"runner"`
+	RunnerSource string `json:"runner_source"`
+	RouteReason  string `json:"route_reason,omitempty"`
+	RouteClass   string `json:"route_class,omitempty"`
+	// The actual identity is deliberately separate from the configured/current route.  A serial
+	// fallback may already have selected the next provider while LastRouteAttempt still records the
+	// provider that really ran.  Consumers must not reconstruct this evidence from display labels.
+	ActualProvider   string   `json:"actual_provider,omitempty"`
+	ActualRunner     string   `json:"actual_runner,omitempty"`
+	ActualModel      string   `json:"actual_model,omitempty"`
+	ActualEffort     string   `json:"actual_effort,omitempty"`
+	RouteStage       string   `json:"route_stage,omitempty"`
+	FallbackReason   string   `json:"fallback_reason,omitempty"`
+	RiskClass        string   `json:"risk_class,omitempty"`
+	RequiredReviews  []string `json:"required_reviews,omitempty"`
+	CompletedReviews []string `json:"completed_reviews,omitempty"`
+	// OwnerCriticalBypassReason is intentionally visible: an automatic-Codex budget bypass is invalid
+	// if its durable reason exists only in an opaque task file or log.
+	OwnerCriticalBypassReason string   `json:"owner_critical_bypass_reason,omitempty"`
+	Effort                    string   `json:"effort"`
+	EffortSource              string   `json:"effort_source"`
+	ETA                       BoardETA `json:"eta"`
+	CreatedAt                 string   `json:"created_at"`
+	UpdatedAt                 string   `json:"updated_at"`
+	LastSummary               string   `json:"last_summary"`
+	LastError                 string   `json:"last_error"`
 	// ElapsedMinutes 只对 running 卡有意义（自最近一次状态变更起算），其余卡为 0。
 	ElapsedMinutes float64 `json:"elapsed_minutes"`
 	Attempts       int     `json:"attempts"`
@@ -988,6 +1003,12 @@ func ownerModelRoute(route ownerRoute) string {
 	if len(route.Legs) == 0 {
 		return ""
 	}
+	if route.Name == "fable_explicit" && len(route.Legs) == 3 && route.Merge == nil {
+		return boardRouteLeg(route.Legs[0].Runner, route.Legs[0].Model, route.Legs[0].Effort) +
+			" → [仅确认 quota 或 eligible presemantic trigger 后: Grok answer → Sol/ultra adversarial merge → terminal]" +
+			"（" + boardRouteLeg(route.Legs[1].Runner, route.Legs[1].Model, route.Legs[1].Effort) + " → " +
+			boardRouteLeg(route.Legs[2].Runner, route.Legs[2].Model, route.Legs[2].Effort) + "；只读、无 review-of-review）"
+	}
 	if route.Name == "fable_explicit" && len(route.Legs) == 3 && route.Merge != nil {
 		return boardRouteLeg(route.Legs[0].Runner, route.Legs[0].Model, route.Legs[0].Effort) +
 			" → [仅确认 eligible quota-limit 后: " +
@@ -999,13 +1020,33 @@ func ownerModelRoute(route ownerRoute) string {
 	for _, leg := range route.Legs {
 		parts = append(parts, boardRouteLeg(leg.Runner, leg.Model, leg.Effort))
 	}
-	result := strings.Join(parts, " →（仅安全失败）")
+	legacy := route.Name == "opus_general" || route.Name == "opus_backend" || route.Name == "review_standalone"
+	separator := " →（仅已证明的串行回退/复审）"
+	if legacy || (route.Name == "sonnet" && len(route.Legs) > 1 && route.Legs[1].Runner == "codex") ||
+		(route.Name == "haiku" && len(route.Legs) > 1 && route.Legs[1].Runner == "codex") {
+		separator = " →（仅安全失败）"
+	}
+	result := strings.Join(parts, separator)
 	if route.Review != nil {
-		prefix := "；实现完成后另派 "
-		if route.Name == "opus_general" {
-			prefix = "；进入 Grok 路径且完成实现后另派 "
+		if legacy {
+			prefix := "；实现完成后另派 "
+			if route.Name == "opus_general" {
+				prefix = "；进入 Grok 路径且完成实现后另派 "
+			}
+			return result + prefix + boardRouteLeg(route.Review.Runner, route.Review.Model, route.Review.Effort) + " 独立对抗复审"
 		}
-		result += prefix + boardRouteLeg(route.Review.Runner, route.Review.Model, route.Review.Effort) + " 独立对抗复审"
+		label := "独立对抗复审"
+		if route.Review.Stage == routeStageSecondView {
+			label = "只读第二视角"
+		}
+		result += "；实现成功后串行 " + boardRouteLeg(route.Review.Runner, route.Review.Model, route.Review.Effort) + " " + label
+	}
+	if route.ReleaseGate != nil {
+		result += " → " + boardRouteLeg(route.ReleaseGate.Runner, route.ReleaseGate.Model, route.ReleaseGate.Effort) + " 必需发布门"
+	}
+	if route.ConditionalSol != nil && route.ReleaseGate == nil {
+		result += "；条件升级 " + boardRouteLeg(route.ConditionalSol.Runner, route.ConditionalSol.Model, route.ConditionalSol.Effort) +
+			"[仅 Grok-Kimi 分歧、验收失败或显式高风险]"
 	}
 	return result
 }
@@ -1036,7 +1077,7 @@ func cursorFableModelRoute(cfg *Config, t *Task) string {
 
 	primary := "Cursor " + boardRouteModelName(cfg.CursorFable.Model)
 	prof, ok := cfg.CrossProfiles[fallbackProfile]
-	if !ok || prof.Merge == nil {
+	if !ok || prof.Merge != nil {
 		return primary
 	}
 
@@ -1069,28 +1110,9 @@ func cursorFableModelRoute(cfg *Config, t *Task) string {
 		bEffort = strings.TrimSpace(cfg.CodexReasoning)
 	}
 
-	cLeg := crossPolicyLeg(cfg, *prof.Merge)
-	if t.XEngineC != nil {
-		cLeg.Runner = t.XEngineC.PreferRunner
-		switch t.XEngineC.PreferRunner {
-		case "codex":
-			cLeg.Model = t.XEngineC.CodexModel
-		case cursorRunnerName:
-			cLeg.Model = t.XEngineC.CursorModel
-		case grokBuildRunnerName:
-			cLeg.Model = t.XEngineC.GrokModel
-		default:
-			if t.XEngineC.Model != "" {
-				cLeg.Model = t.XEngineC.Model
-			}
-		}
-		cLeg.Effort = t.XEngineC.Effort
-	}
-
-	return primary + " → [仅确认 eligible quota-limit 后: " +
-		boardRouteLeg("Grok Build", aModel, aEffort) + " 独立作答 → " +
-		boardRouteLeg("Codex", bModel, bEffort) + " 独立作答] → " +
-		boardRouteLeg(cLeg.Runner, cLeg.Model, cLeg.Effort) + " 第一性合并（不预设原方案正确）"
+	return primary + " → [仅确认 quota 或 eligible presemantic trigger 后: Grok answer → Sol/ultra adversarial merge → terminal]" +
+		"（" + boardRouteLeg("Grok Build", aModel, aEffort) + " → " +
+		boardRouteLeg("Codex", bModel, bEffort) + "；只读、无第三腿、无 review-of-review）"
 }
 
 func effectiveModelRoute(cfg *Config, t *Task) string {
@@ -1252,6 +1274,11 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 			leg := route.Legs[0]
 			copyTask.OwnerRouteName = route.Name
 			copyTask.OwnerRouteLeg = 1
+			copyTask.OwnerRouteStage = leg.Stage
+			if cfg != nil && cfg.OwnerRoutingEnforced && !applyOwnerRouteRequirements(&copyTask, route) {
+				return TaskBrief{ID: t.ID, Title: t.Title, Status: t.Status, Type: t.Type,
+					LastError: "Owner route requirements could not be rendered from the closed resolver"}
+			}
 			copyTask.Runner = leg.Runner
 			switch leg.Runner {
 			case cursorRunnerName:
@@ -1265,9 +1292,9 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 				copyTask.GrokModel = leg.Model
 				copyTask.GrokEffort = leg.Effort
 				switch route.Name {
-				case "opus_general":
+				case "opus_general", "opus_non_backend":
 					copyTask.RouteReason = routeReasonGrokOpusGeneral
-				case "opus_backend":
+				case "opus_backend", "opus_backend_ordinary", "opus_backend_high_risk":
 					copyTask.RouteReason = routeReasonGrokOpusBackend
 				case "sonnet":
 					copyTask.RouteReason = routeReasonGrokSonnet
@@ -1322,35 +1349,58 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 	} else if routeReason == "" && kimiCLIBackendExcluded(cfg, t) {
 		routeReason = routeReasonCodexBackendExcluded
 	}
+	actualProvider, actualRunner, actualModel, actualEffort := "", "", "", ""
+	if t.LastRouteAttempt != nil {
+		actualProvider = t.LastRouteAttempt.ActualProvider
+		actualRunner = t.LastRouteAttempt.ActualRunner
+		actualModel = t.LastRouteAttempt.ActualModel
+		actualEffort = t.LastRouteAttempt.ActualEffort
+	} else if t.Runner != "" {
+		actualProvider, actualRunner, actualModel, actualEffort = routeAttemptIdentity(cfg, t, t.RemoteHost != "")
+	}
+	routeClass := t.RouteClass
+	if t.OwnerRouteName == "fable_explicit" || modelTierKeyword(cfg, t.Model) == "fable" {
+		routeClass = routeClassGeneral
+	}
 	b := TaskBrief{
-		ID:            t.ID,
-		Title:         t.Title,
-		Desc:          taskDesc(t),
-		Status:        t.Status,
-		Type:          t.Type,
-		Priority:      t.Priority,
-		Step:          t.Step,
-		StepsTotal:    len(t.Prompts),
-		Model:         model,
-		ModelTier:     modelTier(cfg, model),
-		ModelSource:   source,
-		ModelRoute:    effectiveModelRoute(cfg, displayTask),
-		Runner:        runner,
-		RunnerSource:  runnerSource,
-		RouteReason:   routeReason,
-		RouteClass:    t.RouteClass,
-		Effort:        effort,
-		EffortSource:  effortSource,
-		CreatedAt:     t.CreatedAt,
-		UpdatedAt:     t.UpdatedAt,
-		LastSummary:   t.LastSummary,
-		LastError:     t.LastError,
-		Attempts:      t.Attempts,
-		FixRound:      t.FixRound,
-		ReviewOf:      t.ReviewOf,
-		XRole:         t.XRole,
-		RemoteHost:    t.RemoteHost,
-		BlockedReason: blockedReason(t),
+		ID:                        t.ID,
+		Title:                     t.Title,
+		Desc:                      taskDesc(t),
+		Status:                    t.Status,
+		Type:                      t.Type,
+		Priority:                  t.Priority,
+		Step:                      t.Step,
+		StepsTotal:                len(t.Prompts),
+		Model:                     model,
+		ModelTier:                 modelTier(cfg, model),
+		ModelSource:               source,
+		ModelRoute:                effectiveModelRoute(cfg, displayTask),
+		Runner:                    runner,
+		RunnerSource:              runnerSource,
+		RouteReason:               routeReason,
+		RouteClass:                routeClass,
+		ActualProvider:            actualProvider,
+		ActualRunner:              actualRunner,
+		ActualModel:               actualModel,
+		ActualEffort:              actualEffort,
+		RouteStage:                displayTask.OwnerRouteStage,
+		FallbackReason:            t.FallbackReason,
+		RiskClass:                 effectiveOwnerRiskClass(displayTask),
+		RequiredReviews:           append([]string(nil), displayTask.RequiredReviews...),
+		CompletedReviews:          append([]string(nil), t.CompletedReviews...),
+		OwnerCriticalBypassReason: t.OwnerCriticalBypassReason,
+		Effort:                    effort,
+		EffortSource:              effortSource,
+		CreatedAt:                 t.CreatedAt,
+		UpdatedAt:                 t.UpdatedAt,
+		LastSummary:               t.LastSummary,
+		LastError:                 t.LastError,
+		Attempts:                  t.Attempts,
+		FixRound:                  t.FixRound,
+		ReviewOf:                  t.ReviewOf,
+		XRole:                     t.XRole,
+		RemoteHost:                t.RemoteHost,
+		BlockedReason:             blockedReason(t),
 	}
 	if t.Status == statusRunning {
 		if ts, ok := parseRFC3339(t.UpdatedAt); ok {

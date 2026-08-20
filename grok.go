@@ -122,55 +122,17 @@ var (
 	grokBuildTrustedAuthLineRe  = regexp.MustCompile(`(?i)^(?:(?:http(?:/\d(?:\.\d)?)?\s+)?401\s+unauthorized|unauthorized\s*\(\s*401\s*\))(?:\s*:\s*(?:invalid or expired credentials|invalid api key|credentials invalid or expired))?(?:\s*;\s*[a-z_]+\s*=\s*[a-z0-9 _-]+)*$`)
 )
 
-// exactGrokBuildNoAuthDiagnostic accepts only the trusted process diagnostic family authorized to
-// open the engine-wide circuit. It is deliberately a field parser, not a substring matcher: prompt
-// prose, mixed text, missing fields, duplicate fields, and a different auth_kind all fail closed.
+const (
+	grokBuildExactBareAuthDiagnostic = "HTTP 401 Unauthorized: Invalid or expired credentials; auth_kind=none; upstream=Unauthenticated; reason=no auth context"
+	grokBuildExactQuotedAuthBody     = "Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/responses: Invalid or expired credentials (auth_kind=none, x_xai_token_auth=xai-grok-cli, upstream=Unauthenticated, reason=no auth context)"
+)
+
+// exactGrokBuildNoAuthDiagnostic accepts only the two process bodies observed and authorized for
+// the engine-wide circuit. Context still matters: grokBuildAuthDiagnosticLine admits the first only
+// as a bare one-line stderr and the second only inside the exact quoted wrapper and closed footer.
 func exactGrokBuildNoAuthDiagnostic(line string) bool {
-	match := grokBuildAuthEnvelopeRe.FindStringSubmatch(strings.TrimSpace(line))
-	if len(match) != 2 {
-		return false
-	}
-	tail := strings.TrimSpace(match[1])
-	switch {
-	case strings.HasPrefix(tail, "(") && strings.HasSuffix(tail, ")"):
-		tail = strings.TrimSpace(strings.TrimSuffix(strings.TrimPrefix(tail, "("), ")"))
-	case strings.HasPrefix(tail, ";"):
-		tail = strings.TrimSpace(strings.TrimPrefix(tail, ";"))
-	default:
-		return false
-	}
-	want := map[string]string{
-		"auth_kind": "none",
-		"upstream":  "unauthenticated",
-		"reason":    "no auth context",
-	}
-	seen := map[string]bool{}
-	parts := strings.FieldsFunc(tail, func(r rune) bool { return r == ';' || r == ',' })
-	for _, raw := range parts {
-		field := strings.SplitN(strings.TrimSpace(raw), "=", 2)
-		if len(field) != 2 {
-			return false
-		}
-		key := strings.ToLower(strings.TrimSpace(field[0]))
-		value := strings.ToLower(strings.TrimSpace(field[1]))
-		if key == "x_xai_token_auth" {
-			if value != "xai-grok-cli" || seen[key] {
-				return false
-			}
-			seen[key] = true
-			continue
-		}
-		if expected, ok := want[key]; !ok || value != expected || seen[key] {
-			return false
-		}
-		seen[key] = true
-	}
-	for key := range want {
-		if !seen[key] {
-			return false
-		}
-	}
-	return true
+	line = strings.TrimSpace(line)
+	return line == grokBuildExactBareAuthDiagnostic || line == grokBuildExactQuotedAuthBody
 }
 
 func grokBuildTrustedAuthDiagnosticLine(stderr string) string {
@@ -643,6 +605,16 @@ func grokBuildAuthDiagnosticLine(stderr string) string {
 		}
 		lines[0] = strings.TrimSpace(strings.TrimPrefix(lines[0], `Internal error: "`))
 		lines[len(lines)-1] = strings.TrimSpace(strings.TrimSuffix(lines[len(lines)-1], `"`))
+		if lines[0] != grokBuildExactQuotedAuthBody {
+			return ""
+		}
+	} else if len(lines) != 1 {
+		// The only unquoted production form is the complete diagnostic on one physical line.
+		// A bare diagnostic followed by an otherwise-valid footer is still an unquoted multiline
+		// diagnostic and must not be promoted into authentication evidence.
+		return ""
+	} else if lines[0] != grokBuildExactBareAuthDiagnostic {
+		return ""
 	}
 	if !exactGrokBuildNoAuthDiagnostic(lines[0]) {
 		return ""

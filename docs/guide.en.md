@@ -33,8 +33,10 @@ cardex progress                   # progress overview (a "status" column shows w
 **The board doubles as progress**: `cardex list`'s title column shows each task's "title ▸ latest progress" (preferring the status from a pulled progress report, otherwise falling back to an auto-captured summary of the last step's output); `cardex progress` has a dedicated "status" column, and `progress -show <KEY>` is a human-readable render (goal / in-progress / done / remaining / blockers / key files, with the multi-thousand-word handoff prompt folded by default, `-full` to expand) — so you read *where things stand*, not a static title.
 
 **Model routing**: with `default_runner=codex`, a task's `model` is its source tier and the scheduler resolves
-the current production execution chain: explicit Fable uses Cursor Fable 5; non-backend Opus uses
-Grok→Kimi→Sol; backend Opus uses Grok→Sol; and Sonnet/Haiku use Grok with tier-specific Luna fallbacks.
+the final Owner matrix. Explicit Fable uses Cursor→Grok answer→one Sol/ultra reviewer-merger. Non-backend
+Opus uses Grok→eligible Kimi and reaches Sol/xhigh only through a named condition. Ordinary backend uses
+Grok→Kimi review/repair→conditional Sol/xhigh; high-risk backend uses Grok→Kimi second view→mandatory
+Sol/max. Sonnet/Haiku use Grok→eligible Kimi, with no global Codex fallback.
 The coordinator emits explicit tiers along “hardest adjudication→Fable / ambiguous, long-horizon,
 cross-repository, or high-risk→Opus / complex implementation→Sonnet+xhigh / routine
 implementation→Sonnet+xhigh / mechanical→Haiku+medium.” Source tier and concrete model are recorded
@@ -65,9 +67,9 @@ Run implementation locally while routing the adversarial review to another `remo
 
 **Global default divert** (config trio — avoids per-card manual specification): when all three keys `default_review_host` / `remote_mirror_root` / `default_review_sync` are set, any local implementation card (`RemoteHost` empty) whose `review_after` review has no explicit `ReviewHost` is automatically diverted to `default_review_host`, with the review directory auto-derived as `<remote_mirror_root>/<impl-card-dirname>` and the sync command inherited from `default_review_sync`. **All three must be set** for the default to apply (any missing key disables it); per-card `-review-host` / `-review-dir` / `-review-sync` explicit values always take precedence; remote implementation cards (`RemoteHost` non-empty) are excluded (they are already reviewed remotely).
 
-### Cross-verification (fable stand-in: two independent engines + adversarial cross-check)
+### Generic manual cross-verification (two independent engines + adversarial cross-check)
 
-When a design-tier model (fable) hits its weekly limit, have two **different** engines each answer the same fable-tier task (design / review / ruling / ratification) independently, then let the second engine take the first's conclusion and adversarially hunt for gaps — two independent perspectives are far harder to lead astray with the same blind spot than one:
+This explicit `cardex cross` tool is not the final Owner Fable automatic fallback. A user may select two **different** engines to answer the same task independently, then have the second engine adversarially inspect the first conclusion for gaps:
 
 ```bash
 cardex cross -dir ~/Projects/myapp "rule on the contract semantics of a missing config key"  # default engine pair
@@ -451,32 +453,46 @@ codex are unaffected.
 They are empty by default and in production; structured `stakes=low` Opus cards only downgrade if
 both fields are deliberately configured later.
 
-The Owner table has exactly six rows: explicit Fable→Cursor Fable 5/thinking-max; only after a confirmed
-eligible Fable quota-limit do read-only Grok 4.6/xhigh and Sol/ultra produce independent answers serially
-before a fresh Sol/max run merges from first principles; non-backend Opus→Grok 4.6/xhigh→Kimi K3/max→Sol/xhigh;
-backend Opus→Grok 4.6/xhigh→Sol/max; Sonnet→Grok 4.6/high→Luna/max; and Haiku→Grok 4.6/high→Luna/xhigh.
-Implementation cards do not automatically append a review. Standalone `design-review` cards go directly
-to a fresh Sol/max session and reviews do not recurse.
+The final Owner matrix resolves role, work surface, and closed risk. Explicit Fable uses Cursor Fable
+5/thinking-max. Only confirmed quota, or an eligible proven quota/transport/stream-incomplete/execution-
+environment presemantic failure, starts one read-only Grok 4.6/xhigh answer followed by the lineage's sole
+fresh Sol/ultra call. That call receives the original problem/evidence and Grok answer, reconstructs goals,
+constraints, risks, and acceptance criteria from first principles, attacks and repairs the proposal, and
+emits the corrected terminal conclusion. Semantic or acceptance failure is not a trigger. There is no blind
+Sol answer B, third Sol/max leg, backend default, or review-of-review; unresolved P0/P1/uncertainty holds for Owner.
+
+Non-backend Opus uses Grok 4.6/xhigh with eligible serial Kimi K3/max fallback/review; Sol/xhigh appears only
+for Grok-Kimi disagreement, failed acceptance, or explicit high-risk escalation. Ordinary backend is Grok
+implementer→fresh Kimi K3/max adversarial review/repair, with Sol/xhigh for deterministic 20% sampling,
+disagreement, or failed acceptance. High-risk backend is Grok implementer→fresh read-only Kimi K3/max second
+view→fresh mandatory Sol/max release gate. Standalone ordinary review uses fresh Kimi K3/max; critical,
+production, or missing-risk review uses fresh independent Sol/max. Sonnet is Grok 4.6/high→eligible Kimi,
+with no automatic Codex. Haiku is Grok 4.6/medium, or high only with explicit `quality_sensitive=true`, and
+eligible overflow/fallback is limited to Kimi or the already-proven OpenCode Go lightweight lane. Complex
+React/frontend refactoring, accessibility, or fixing sets `specialized_frontend=true` and requires fresh
+Sol/xhigh or Sol/max final review according to risk.
 Ambiguous, long-horizon, cross-repository, or high-risk work is promoted to Opus;
 both routine and well-bounded complex implementation use Sonnet/xhigh; only the hardest adjudication
 sets `effort=max`. Every Codex `dispatched` event records the resolved `codex_model` and
 `codex_reasoning`, so later comparisons group by the model combination that actually ran rather than
 the card's source-tier alias.
 
-**All-day Kimi Code CLI/K3 second leg**: with `kimi_cli_opus.enabled=true`, an eligible non-backend
-default-Codex Opus card starts on Grok 4.6/xhigh and advances to the locally authenticated Kimi Code CLI
-only after an eligible non-auth Grok failure passes the complete proof gate. Production pins
-`kimi-code/k3`; max is injected only into that child process through the CLI's official
-`KIMI_MODEL_THINKING_EFFORT` variable. Backend work bypasses Kimi and runs directly on Grok 4.6/xhigh.
-The owner definition of backend covers service, persistence, protocol, database, network execution,
-identity/credential, manifest/launchd, Control/authority, and live cutover. With
-`owner_routing_enforced=true`, every new `sequence` card must declare `route_class=backend|general`
-(`-route-class` on the CLI, `route_class` in emitted JSON); omission fails before enqueue. Explicit values
-are authoritative; text inference is only a compatibility path for eligible implementation/sequence
-cards whose value is empty.
+**All-day Kimi Code CLI/K3 serial leg**: with `kimi_cli_opus.enabled=true`, the final resolver uses exact
+`kimi-code/k3`/max for eligible non-backend Opus/Sonnet/Haiku fallback, ordinary-backend fresh adversarial
+review/repair, and high-risk-backend fresh read-only second view. Max is injected only into that child
+process through the CLI's official `KIMI_MODEL_THINKING_EFFORT` variable. Kimi CLI and OpenCode Go Kimi K3
+are capacity redundancy rather than independent model opinions; the same semantic Kimi failure cannot be
+replayed through the other provider and counted as review.
 
-Except for normal successful A→B→merge stage progression inside an already-created Fable chain,
-every fallback next leg is queued only for quota, transport failure, stream-incomplete, semantic stall/timeout,
+With `owner_routing_enforced=true`, every new `sequence` card declares `route_class=backend|general`
+(`-route-class` on the CLI, `route_class` in emitted JSON). Backend also uses a closed `risk_class`: only
+explicit `ordinary` selects ordinary, while missing or ambiguous risk fails closed to high risk. High risk
+includes identity/credential, DB/schema/migration, protocol/network execution, manifest/launchd,
+Control/authority, live cutover, security, and funds. Fable is always rewritten to general; any later product
+implementation is a separate card classified from its own work and risk. Text inference remains only for
+legacy cards missing the fields.
+
+Except for Fable's narrow presemantic trigger, every fallback next leg is queued only for quota, transport failure, stream-incomplete, semantic stall/timeout,
 invalid terminal result, or a presemantic execution-environment error that explicitly identifies the
 `.grok`/`GROK_HOME`/Grok session store, and only after Cardex proves all three conditions: zero semantic/model/tool
 events; an identical pre/post product-worktree fingerprint including exact Git index bytes, pre-existing
@@ -493,9 +509,13 @@ be transferred safely across CLIs. The compatible `opencode_night_opus` route re
 other nighttime OpenCode models only in generic mode; Owner-enforced mode disables that legacy automatic
 branch while preserving explicit `-runner opencode` pins.
 
-Provider legs, serial fallback, zero-residue proof, and the standalone Sol/max review identity are mechanically enforced.
-Fable's first-principles/no-presumed-direction method is enforced by prompts, sidecar exposure discipline,
-and merge contract rather than separate OS identities; it is a management-method constraint, not hard
+Provider legs, serial fallback, zero-residue proof, risk class, and required/completed review are mechanically
+enforced and exposed by resolver/board readback. Each lineage gets at most one automatic Sol call, with no
+Fable exception and no review-of-review. Automatic Codex consumes provider-specific evidence, stops at 65%
+used to preserve about 35%, and fails closed when evidence is unavailable. Only an Owner-pinned critical card
+with a visible durable reason may bypass. Grok/Kimi/direct-Sol targets of 70–80%/15–25%/5–10% are bounded
+reporting policy, never authority to rewrite existing tasks. Fable's first-principles method is enforced by
+prompt, sidecar exposure discipline, and terminal contract rather than separate OS identities; it is not hard
 information isolation.
 
 ```json
@@ -517,27 +537,17 @@ information isolation.
   "limit_fallback_min": 180,
   "kimi_opus_fallback": true,
   "opus_adversarial_review": false,
-  "codex_fallback_model": "gpt-5.6-sol",
-  "codex_fallback_effort": "xhigh",
-  "review_codex_model": "gpt-5.6-sol",
-  "review_codex_effort": "max",
   "tier_routes": {
-    "opus_backend": {
-      "effort": "xhigh",
-      "codex_fallback_model": "gpt-5.6-sol",
-      "codex_fallback_effort": "max"
-    },
-    "sonnet": {
-      "effort": "high",
-      "codex_fallback_model": "gpt-5.6-luna",
-      "codex_fallback_effort": "max"
-    },
-    "haiku": {
-      "effort": "high",
-      "codex_fallback_model": "gpt-5.6-luna",
-      "codex_fallback_effort": "xhigh"
-    }
+    "opus_backend": {"effort": "xhigh"},
+    "sonnet": {"effort": "high"},
+    "haiku": {"effort": "medium"}
   }
+},
+"automatic_codex_budget_stop_percent": 65,
+"owner_provider_targets": {
+  "grok_min_percent": 70, "grok_max_percent": 80,
+  "kimi_min_percent": 15, "kimi_max_percent": 25,
+  "direct_sol_min_percent": 5, "direct_sol_max_percent": 10
 }
 ```
 
@@ -553,36 +563,43 @@ to the same Grok queue without another probe or an auth-triggered writer fallbac
 `cardex doctor`; only a successful live probe clears the auth circuit, and an existing quota cooldown is
 preserved. Production should point `grok_build_bin` at an explicit versioned binary. Both the preflight and
 product invocation pass `--no-auto-update`, preventing an unattended dispatch from changing CLI versions.
-The enforced Owner configuration leaves `opus_adversarial_review` disabled. When review is needed, a
-standalone `design-review` card is pinned directly to a fresh Sol/max session; the recursion guard remains.
+The enforced Owner configuration leaves legacy global `opus_adversarial_review` disabled. The resolver
+creates backend Kimi/Sol gates explicitly by risk. A standalone ordinary `design-review` goes to fresh
+Kimi/max; critical, production, or missing-risk review goes to fresh independent Sol/max. Neither recurses.
 
 **Fable 5 exception**: Fable is source-tier opt-in only and its owner primary is Cursor Fable
 5/thinking-max. The older Claude Fable→Grok→advisory proposal is not an owner auto-route. Existing Claude
-sessions and explicit Claude pins keep their identity. Only the unified safety proof may create the
-serial A→B→C chain below.
+sessions and explicit Claude pins keep their identity. Only the narrow trigger plus unified safety proof
+may create the two-leg continuation below.
 
-### Cursor Fable 5 primary route and three-model fallback
+### Cursor Fable 5 primary route and one-Sol terminal
 
-The account-specific Cursor model list is authoritative for Fable. The local Codex 0.145.0 model capability
-cache explicitly exposes both `ultra` (maximum reasoning with automatic delegation) and `max` for GPT-5.6 Sol.
-The Fable primary remains `claude-fable-5-thinking-max`; answer B uses Sol/ultra while merge C deliberately
-uses a fresh Sol/max session.
+The account-specific Cursor model list is authoritative for Fable. The primary remains
+`claude-fable-5-thinking-max`. Fallback-profile A is fixed to Grok 4.6/xhigh; B is fixed to Sol/ultra and
+simultaneously serves as adversarial reviewer, repairer, and terminal merger. The profile must have no third
+`merge` engine.
 
 With `cursor_fable.enabled=true`, explicit fresh single-step Fable cards on the default Codex route
 prefer Cursor Fable 5/thinking-max. An explicit multi-step Fable card, or one whose route configuration
 is incomplete, waits in place and never falls through to generic Codex; dispatchers must express a Fable
-adjudication as one fresh prompt. One of the five safe failure kinds plus a complete three-axis proof
-atomically converts the same card into read-only serial Grok Build `grok-4.6/xhigh` then Codex
-`gpt-5.6-sol/ultra` independent answers, followed by a separate fresh Codex `gpt-5.6-sol/max` merger.
-The merger reconstructs goals and constraints from
-first principles and presumes neither answer nor the existing direction is correct. This chain does
-not spawn another ordinary review loop. Cursor auto-review, force, and yolo remain disabled.
-The existing cross-profile freeze contract supplies the Codex identity: B is
-B is `{kind:"codex", effort:"ultra"}` and C is `{kind:"codex", effort:"max"}`; both freeze global
-`codex_model="gpt-5.6-sol"`. A profile-level `model` is a no-op impostor and is rejected at load.
+adjudication as one fresh prompt. Only confirmed quota, or an eligible proven quota/transport/stream-
+incomplete/execution-environment presemantic failure, plus the complete three-axis proof atomically converts
+the card into:
+
+1. one read-only Grok Build `grok-4.6/xhigh` answer;
+2. the one fresh Codex `gpt-5.6-sol/ultra` call, receiving the original problem/evidence plus Grok's answer,
+   reconstructing goals, constraints, risks, and acceptance, attacking and repairing the proposal, and
+   directly emitting the corrected terminal conclusion.
+
+Neither leg may write product bytes. Sol/ultra has `review_after=false` and creates no blind Sol answer,
+Sol/max child, ordinary review, or review-of-review. Unresolved P0/P1/uncertainty holds for Owner. Cursor
+auto-review, force, and yolo remain disabled. The cross-profile Codex leg is
+`{kind:"codex", effort:"ultra"}` and freezes global `codex_model="gpt-5.6-sol"`; a profile-level `model` is
+rejected, and profile `merge` must be absent. Board readback is fixed to
+`Grok answer → Sol/ultra adversarial merge → terminal`.
 
 Fable 5 may require the account owner to acknowledge its data-retention policy on first use. Cardex
-does not accept account policy on the owner's behalf; a pre-semantic policy gate can fall back safely,
+does not accept account policy on the owner's behalf; only a presemantic gate satisfying the narrow trigger may continue safely,
 but Fable itself is not considered proven until that acknowledgement is completed.
 
 **All other pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
@@ -773,8 +790,9 @@ lets you tier by the hand you actually hold; **custom entries always beat the st
 
 Where it applies: model tier labels on the board / `cardex list`, engine tiers in
 `cardex engines` / `cardex quota` / the board quota strip (derived from the highest mapped model
-when `tier` isn't set explicitly), the spend page's top-model tier, and the six-row Owner auto-route.
-That route selects the concrete execution chain from the resolved fable/opus/sonnet/haiku tier, so a
+when `tier` isn't set explicitly), the spend page's top-model tier, and the final Owner matrix.
+That matrix selects the concrete execution chain from the resolved fable/opus/sonnet/haiku tier plus
+route/risk/review fields, so a
 mapping change changes dispatch for new unpinned cards; existing sessions, remote/cross identities,
 and explicit runner/model pins remain untouched. The standard-line table stays for unlisted models,
 while entries you list are authoritative for this fleet.

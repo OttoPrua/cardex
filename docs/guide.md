@@ -33,9 +33,11 @@ cardex progress             # 进度一览（“现状”列看进展）；-show
 
 **看板即进度**：`cardex list` 的标题列显示每个任务的「标题 ▸ 最新进度」（优先取已回收进度报告的现状，没有则回落到最近一步输出的自动摘要）；`cardex progress` 列表带独立的「现状」列，`progress -show <KEY>` 改为人读渲染（目标/进行中/完成/剩余/阻塞/关键文件，几千字接力 prompt 默认折叠、`-full` 展开）——一眼读出进展，不再是静态标题。
 
-**模型路由**：在 `default_runner=codex` 下，任务的 `model` 是来源档位，调度器再按当前生产策略解析
-实际执行链：显式 Fable 走 Cursor Fable 5；非后端 Opus 走 Grok→Kimi→Sol；后端 Opus 走
-Grok→Sol；Sonnet/Haiku 走 Grok→对应 Luna 回退。
+**模型路由**：在 `default_runner=codex` 下，任务的 `model` 是来源档位，调度器再按 Final Owner 矩阵解析
+实际执行链：显式 Fable 走 Cursor→Grok answer→唯一 Sol/ultra reviewer-merger；非后端 Opus 走
+Grok→eligible Kimi，只有显式条件才到 Sol/xhigh；backend ordinary 走 Grok→Kimi review/repair→条件 Sol/xhigh，
+backend high-risk 走 Grok→Kimi second view→mandatory Sol/max；Sonnet/Haiku 走 Grok→eligible Kimi，
+无全局 Codex fallback。
 协调模板按"最难裁决→Fable / 模糊长程跨仓高风险→Opus / 复杂落地→Sonnet+xhigh /
 常规落地→Sonnet+xhigh / 机械→Haiku+medium"显式发卡。来源档位和实际模型分开记录；只有明确续接
 旧 Claude session 的卡保留 Claude 执行器。
@@ -74,9 +76,9 @@ Grok→Sol；Sonnet/Haiku 走 Grok→对应 Luna 回退。
 
 **全局默认分流**（config 三件套，省去每张卡手动指定）：三键 `default_review_host` / `remote_mirror_root` / `default_review_sync` 齐备时，本地实现卡（`RemoteHost` 空）且未显式声明 `ReviewHost` 的 `review_after` 自动审核，一律分流到 `default_review_host`，审核目录自动推导为 `<remote_mirror_root>/<实现卡目录名>`，同步命令继承 `default_review_sync`。三键**缺任一则不套默认**；任务级 `-review-host` / `-review-dir` / `-review-sync` 显式值恒优先；远端实现卡（`RemoteHost` 非空）不受此默认影响（已在远端审）。
 
-### 交叉验证（fable 顶替：双引擎独立作答 + 对抗式交叉查漏）
+### 通用人工交叉验证（双引擎独立作答 + 对抗式交叉查漏）
 
-设计档模型（fable）撞周限额时，用两个**不同**引擎对同一 fable 级任务（设计/审核/裁决/追认）各自独立作答，再让第二个引擎拿第一个的结论对抗式查漏——两份独立视角比一个更难被同一盲点带偏：
+这是显式 `cardex cross` 的通用工具，不是 Final Owner Fable 自动 fallback。人工选择两个**不同**引擎对同一任务各自独立作答，再让第二个引擎拿第一个的结论对抗式查漏：
 
 ```bash
 cardex cross -dir ~/Projects/myapp "某配置键缺省时的契约语义，请裁决"   # 用默认引擎对
@@ -442,33 +444,45 @@ codex 主跑卡与远端 codex 不受影响。
 `codex_opus_simple_model` / `codex_opus_simple_reasoning` 是保留的显式可选开关，默认与当前生产均为空；
 只有以后主动填写时，结构化 `stakes=low` 的 Opus 才会降档。
 
-生产路由严格为六行：显式 Fable→Cursor Fable 5/thinking-max；仅在确认的 eligible Fable quota-limit 失败后串行取得
-只读 Grok 4.6/xhigh 与 Sol/ultra 两份独立答案，再由全新 Sol/max 第一性合并；Opus 非 backend
-→Grok 4.6/xhigh→Kimi K3/max→Sol/xhigh；Opus backend→Grok 4.6/xhigh→Sol/max；
-Sonnet→Grok 4.6/high→Luna/max；Haiku→Grok 4.6/high→Luna/xhigh。实现卡不自动追加复审；
-单独 `design-review` 卡直达新的 Sol/max 会话，复审卡本身不再递归复审。
+Final Owner 矩阵按角色、工作面与闭合风险解析：显式 Fable→Cursor Fable 5/thinking-max；仅在确认 quota
+或 eligible 且已经证明的 quota/transport/stream-incomplete/execution-environment 前语义失败后，串行取得
+一份只读 Grok 4.6/xhigh answer，再由唯一一次 fresh Sol/ultra 读取原问题/证据和 Grok answer，从第一性
+重建目标/约束/风险/验收、攻击并修复该提案，直接给出终局；语义或验收失败不触发，也没有 blind Sol B、
+Sol/max 第三腿、backend 默认或 review-of-review。未决 P0/P1/uncertainty 挂起交 Owner。
+
+Opus non-backend 以 Grok 4.6/xhigh 为主，eligible 时串行 Kimi K3/max fallback/review；Sol/xhigh 只在
+Grok-Kimi 分歧、验收失败或显式高风险升级时出现。Opus backend ordinary 为 Grok implementer→fresh
+Kimi K3/max adversarial review/repair；确定性 20% 抽样、分歧或验收失败再进入 Sol/xhigh。backend
+high-risk 为 Grok implementer→fresh Kimi K3/max 只读第二视角→fresh Sol/max mandatory release gate。
+standalone review ordinary 用 fresh Kimi K3/max，critical/production（以及缺失风险）用 fresh independent Sol/max。
+Sonnet 为 Grok 4.6/high→eligible Kimi K3/max，无自动 Codex；Haiku 为 Grok 4.6/medium，只有显式
+`quality_sensitive=true` 才用 high，eligible overflow/fallback 仅 Kimi 或已证明 OpenCode Go 轻量车道。
+复杂 React/frontend refactor、accessibility 或 fixing 写 `specialized_frontend=true`，按 ordinary/high-risk
+分别要求 fresh Sol/xhigh 或 Sol/max 最终审核。
 模糊、长程、跨仓或高风险任务升到 Opus；边界明确的复杂与常规实现都用 Sonnet/xhigh；只有最难
 裁决才显式写 `effort=max`。每次 Codex 派发还会在 `dispatched` 事件里记录最终解析出的
 `codex_model` / `codex_reasoning`，因此后续比较按真实执行组合而不是卡面别名统计。
 
-**全时段 Kimi Code CLI/K3 第二腿**：配置 `kimi_cli_opus.enabled=true` 后，调度器先把默认 Codex 且
-可无损回退的非后端 Opus 单步/`fresh_steps` 卡派给 Grok 4.6/xhigh；只有 Grok 的合格非鉴权失败通过完整证明闸后，同一张卡才推进到本地已登录的 Kimi Code CLI。生产模型显式钉
-`kimi-code/k3`；`max` 通过 CLI 官方 `KIMI_MODEL_THINKING_EFFORT` 只注入该子进程，不改用户全局配置。
-backend 卡不进入 Kimi，而由 Grok 4.6/xhigh 直接承接。Fable 的 transport/stream/stall 等非配额失败保持 held；除已由确认配额触发的 Fable 链内 A 成功→B 成功→merge
-的正常串行阶段推进外，所有 fallback 下一腿都只在 quota、transport、
+**全时段 Kimi Code CLI/K3 串行腿**：`kimi_cli_opus.enabled=true` 后，Final Owner resolver 将其用于
+非 backend Opus/Sonnet/Haiku 的 eligible fallback、backend ordinary 的 fresh adversarial review/repair，
+以及 backend high-risk 的 fresh read-only second view。生产模型显式钉 `kimi-code/k3`；`max` 通过 CLI 官方
+`KIMI_MODEL_THINKING_EFFORT` 只注入该子进程，不改用户全局配置。Kimi CLI 与 OpenCode Go Kimi K3 是
+容量冗余，不是独立模型意见；同一语义 Kimi 失败不得换 provider 重放并计作 review。
+
+除 Fable 的窄前语义 trigger 外，所有 fallback 下一腿都只在 quota、transport、
 stream-incomplete、semantic stall/timeout、invalid terminal result，或明确指向 `.grok`/`GROK_HOME`/Grok session
 存储的 presemantic execution-environment 失败后进入，而且必须由 Cardex 同时证明：
 零语义/模型/工具事件；调用前后 product/worktree 指纹完全相同（包括 Git index 原始字节、调用前已经
 dirty 的 tracked/untracked 字节、权限位、空目录、symbolic HEAD 与 linked-worktree Git 身份）；没有存活 writer/process residue。证明缺失或不一致就沿既有 retry/held 策略
 fail closed，绝不 fallback。各腿严格串行；已有 cooldown 只让本腿等待，不能被当成“provider 不可用”
-而跳腿。Sonnet 和 Haiku 分别直派 Grok 4.6/high，安全失败后回退 Luna/max 与 Luna/xhigh；远端卡、
-交叉链、显式 runner/model pin 与已有会话都不自动改道。
+而跳腿。远端卡、通用交叉链、显式 runner/model pin 与已有会话都不自动改道。
 
 开启 `owner_routing_enforced=true` 后，新 `sequence` 卡必须显式写 `route_class=backend|general`
-（命令行为 `-route-class`，协调 emit JSON 用 `route_class`）；缺失会在入队前失败。backend 的 Owner 定义是 service、persistence、protocol、database、network execution、
-identity/credential、manifest/launchd、Control/authority 与 live cutover（服务、持久化、协议、数据库、
-网络执行、身份/凭据、清单/launchd、Control/权限、在线切换）。显式值恒权威；空值只为存量卡保留，
-且调度器仅对 eligible implementation/sequence 卡做确定性文本兼容判定；误命中可显式标成 `general`。人工测试可在任意时段显式使用
+（命令行为 `-route-class`，协调 emit JSON 用 `route_class`）；缺失会在入队前失败。backend 还使用闭合
+`risk_class`：只有显式 `ordinary` 才走 ordinary，缺失或歧义 fail closed 到 high-risk。high-risk 包括
+identity/credential、DB/schema/migration、protocol/network execution、manifest/launchd、Control/authority、
+live cutover、security 与 funds。Fable 始终重写为 general；后续产品实现必须另建卡并按实际工作/风险分类。
+显式分类恒权威；文本兼容判定只保留给缺字段的存量卡。人工测试可在任意时段显式使用
 `-runner kimi-cli -kimi-model kimi-code/k3 -effort max`；人工显式 pin 保持原身份；只有 Cardex 已用
 `owner_route_name` + `owner_route_leg` 快照且当前 provider 字段仍精确匹配的在途腿才继续受同一证明闸控制；
 `route_reason` 单独不能恢复旧链，后加的显式 pin/session/remote 身份优先。受管 launchd 还应设置
@@ -478,9 +492,12 @@ identity/credential、manifest/launchd、Control/authority 与 live cutover（�
 `opencode_night_opus` 仅在通用模式可用于其它 OpenCode 夜间模型；Owner 强制模式完全禁用这条旧自动分支，
 显式 `-runner opencode` 仍保持人工 pin。
 
-路由腿、串行回退、零残留证明和独立审核卡 Sol/max 身份是机械强制；Fable 的“第一性、不预设原方案
-正确”由独立 prompt/侧车暴露纪律与合并契约执行，并不是独立 OS 身份提供的硬信息隔离，审计时必须按
-管理方法约束表述，不能宣称为物理隔离。
+路由腿、串行回退、零残留证明、风险类和 required/completed review 是机械强制并在 resolver/board 读回。
+每个 lineage 最多一个自动 Sol，不含 Fable 例外，也不允许 review-of-review。自动 Codex 使用 provider-specific
+证据，在已用 65% 时停止以保留约 35%；证据不可用同样 fail closed，只有带可见、持久原因的
+Owner-pinned critical 卡可绕过。Grok/Kimi/direct Sol 的 70–80%/15–25%/5–10% 仅是有界政策读回目标，
+不能用来改写既有任务。Fable 的“第一性、不预设原方案正确”由 prompt/侧车暴露纪律与终局契约执行，
+不能宣称为物理隔离。
 
 ```json
 "kimi_cli_bin": "/Users/ottoprua/.kimi-code/bin/kimi",
@@ -501,27 +518,17 @@ identity/credential、manifest/launchd、Control/authority 与 live cutover（�
   "limit_fallback_min": 180,
   "kimi_opus_fallback": true,
   "opus_adversarial_review": false,
-  "codex_fallback_model": "gpt-5.6-sol",
-  "codex_fallback_effort": "xhigh",
-  "review_codex_model": "gpt-5.6-sol",
-  "review_codex_effort": "max",
   "tier_routes": {
-    "opus_backend": {
-      "effort": "xhigh",
-      "codex_fallback_model": "gpt-5.6-sol",
-      "codex_fallback_effort": "max"
-    },
-    "sonnet": {
-      "effort": "high",
-      "codex_fallback_model": "gpt-5.6-luna",
-      "codex_fallback_effort": "max"
-    },
-    "haiku": {
-      "effort": "high",
-      "codex_fallback_model": "gpt-5.6-luna",
-      "codex_fallback_effort": "xhigh"
-    }
+    "opus_backend": {"effort": "xhigh"},
+    "sonnet": {"effort": "high"},
+    "haiku": {"effort": "medium"}
   }
+},
+"automatic_codex_budget_stop_percent": 65,
+"owner_provider_targets": {
+  "grok_min_percent": 70, "grok_max_percent": 80,
+  "kimi_min_percent": 15, "kimi_max_percent": 25,
+  "direct_sol_min_percent": 5, "direct_sol_max_percent": 10
 }
 ```
 
@@ -535,35 +542,37 @@ Cardex 在每次 Grok 任务前先执行 `grok --no-auto-update models`：它只
 重新登录后运行 `cardex doctor`；只有实时预检成功才解除认证熔断，已有额度冷却不会被误清。生产配置
 建议让 `grok_build_bin` 指向明确的版本化二进制；Cardex 的预检和产品调用都传 `--no-auto-update`，
 避免无人值守任务在派发途中换版本。
-当前 Owner 强制配置关闭 `opus_adversarial_review`；需要复审时使用单独 `design-review` 卡，resolver
-将它直接钉到新的 Sol/max 会话，并沿用防递归门禁。
+当前 Owner 强制配置关闭旧的全局 `opus_adversarial_review`。resolver 按风险显式创建 backend 的
+Kimi/Sol gate；单独 `design-review` ordinary 直达 fresh Kimi/max，critical/production 或缺失风险直达
+fresh independent Sol/max，二者都沿用防递归门禁。
 
 **Fable 5 特例**：Fable 只接受显式来源档位，并由 Cursor Fable 5/thinking-max 主跑；旧的
 Claude Fable→Grok→补盲提案不属于 Owner 自动路由。已有 Claude 会话或人工 Claude pin 保持原身份，
-不能借 Fable 标签切到新链。Cursor 主腿只有在统一安全证明闸通过后才创建下述 A→B→C 串行链。
+不能借 Fable 标签切到新链。Cursor 主腿只有在窄触发与统一安全证明闸通过后才创建下述两腿接力。
 
-### Cursor Fable 5 主路由与三模型回退
+### Cursor Fable 5 主路由与单次 Sol 终局
 
-本机 Cursor Agent CLI 的账号模型清单是 Fable 能力真源；本机 Codex 0.145.0 模型能力缓存则明确
-列出 GPT-5.6 Sol 的 `ultra`（最大推理并自动任务委派）与 `max`。Fable 主腿固定
-`claude-fable-5-thinking-max`；独立答案 B 使用 Sol/ultra，合并 C 刻意使用新的 Sol/max 会话。
+本机 Cursor Agent CLI 的账号模型清单是 Fable 能力真源；Fable 主腿固定
+`claude-fable-5-thinking-max`。fallback profile 的 A 固定 Grok 4.6/xhigh，B 固定 Sol/ultra 且同时承担
+adversarial reviewer、repairer 与 terminal merger；profile 必须没有第三个 `merge`。
 
 `cursor_fable.enabled=true` 后，默认 Codex 路由中显式 Fable、无会话、首步且单步的卡优先走
 Cursor Fable 5/thinking-max。fresh 多步或配置不完整的显式 Fable 卡会原地等待，绝不落到通用 Codex
-偷换主腿；dispatcher 必须把 Fable 裁决做成只有一个 prompt 的 fresh 卡。若遇到五类安全失败之一且
-三轴证明全部通过，同一母卡原子转换为：
+偷换主腿；dispatcher 必须把 Fable 裁决做成只有一个 prompt 的 fresh 卡。仅在确认 quota，或
+quota/transport/stream-incomplete/execution-environment 中 eligible 且已证明的前语义失败发生，并且
+三轴证明全部通过时，同一母卡原子转换为：
 
-1. Grok Build `grok-4.6/xhigh` 独立作答；
-2. Codex `gpt-5.6-sol/ultra` 在看不到 A 结论的情况下只读独立作答；
-3. 全新的 Codex `gpt-5.6-sol/max` 会话作为第三方，从零重建目标和约束，对两份答案同时证伪并合并。
+1. Grok Build `grok-4.6/xhigh` 只读独立作答；
+2. 唯一一次 fresh Codex `gpt-5.6-sol/ultra` 同时接收原始问题/证据与 Grok answer，从零重建目标、约束、
+   风险和验收，攻击 Grok 提案、修复遗漏/错误并直接输出 corrected terminal conclusion。
 
-第三腿不会默认 A、B 或既有方向正确，也不会再生成普通 `review_after` 或旧的第一性补盲卡，避免
-复审重复。Cursor 调用保持 `--auto-review`、`--force`、`--yolo` 全关闭；A/B 均为只读分析卡。
-交叉 profile 的 Codex 腿沿用既有冻结契约：B 写 `{kind:"codex", effort:"ultra"}`，C 写
-`{kind:"codex", effort:"max"}`，二者都从全局 `codex_model="gpt-5.6-sol"` 冻结；profile 的
-`model` 是无效伪覆盖，配置加载会直接拒绝。
+两腿均不得写 product bytes。Sol/ultra 的 `review_after=false`，不会再生成 blind Sol answer、Sol/max child、
+普通复审或 review-of-review；若终局仍含 P0/P1 或 uncertainty 就 held for Owner。Cursor 调用保持
+`--auto-review`、`--force`、`--yolo` 全关闭。交叉 profile 的 Codex 腿写
+`{kind:"codex", effort:"ultra"}` 并从全局 `codex_model="gpt-5.6-sol"` 冻结；profile 的 `model` 非法，
+配置加载会拒绝。看板固定读回 `Grok answer → Sol/ultra adversarial merge → terminal`。
 Fable 5 首次调用可能要求账号所有者在 Cursor 中确认该模型的数据保留政策；Cardex 不代签。门禁发生在
-语义事件前时，本卡可无损进入上述三腿链，但直到所有者确认前，不能声称 Fable 主模型已实际跑通。
+语义事件前且满足上述窄触发时，本卡可无损进入接力，但直到所有者确认前，不能声称 Fable 主模型已实际跑通。
 
 **其余钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
 
@@ -725,8 +734,8 @@ gemini-3.5-flash-lite = 36 / gemini-2.5-pro = 26（haiku 档）。
 ```
 
 生效面：看板/`cardex list` 的模型档位标签、`cardex engines`/`cardex quota`/看板额度条的
-引擎档位（未显式写 `tier` 时从最高档映射模型自动推导）、消耗页的主力模型档位，以及 Owner
-六行自动路由。后者按解析出的 fable/opus/sonnet/haiku 选择真实执行链，所以修改映射会改变未显式
+引擎档位（未显式写 `tier` 时从最高档映射模型自动推导）、消耗页的主力模型档位，以及 Final Owner
+矩阵。后者按解析出的 fable/opus/sonnet/haiku 再结合 route/risk/review 字段选择真实执行链，所以修改映射会改变未显式
 pin 新卡的派发；已有 session、remote、cross profile 与显式 runner/model pin 仍保持原身份。
 统一标准线表仍在（未列条目回落它），你列出的条目就是本机队的权威口径。
 

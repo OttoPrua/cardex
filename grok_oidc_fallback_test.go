@@ -11,6 +11,9 @@ import (
 
 const grokOIDCNoAuthContextDiagnostic = "HTTP 401 Unauthorized: Invalid or expired credentials; auth_kind=none; upstream=Unauthenticated; reason=no auth context"
 
+const grokOIDCNoAuthContextBareFooter = grokOIDCNoAuthContextDiagnostic + "\n" +
+	"Model: grok-4.6\nAuth: Oidc\nVersion: 1.0.5\nAvailable: grok-4.6"
+
 const grokOIDCNoAuthContextClosedMetadata = "Internal error: \"Unauthorized (401) from https://cli-chat-proxy.grok.com/v1/responses: Invalid or expired credentials " +
 	"(auth_kind=none, x_xai_token_auth=xai-grok-cli, upstream=Unauthenticated, reason=no auth context)\n\n" +
 	"  Model:     grok-4.6\n" +
@@ -24,7 +27,7 @@ func ownerBackendGrokTask(t *testing.T, root string, cfg *Config, dir string) *T
 	task.Model = "opus"
 	task.RouteClass = routeClassBackend
 	route, ok := resolveOwnerRoute(cfg, task)
-	if !ok || route.Name != "opus_backend" || !pinOwnerPrimaryRoute(task, route) {
+	if !ok || route.Name != "opus_backend_high_risk" || !pinOwnerPrimaryRoute(task, route) {
 		t.Fatalf("failed to freeze resolver-proven Owner Grok leg: route=%+v ok=%v task=%+v", route, ok, task)
 	}
 	return task
@@ -48,44 +51,57 @@ func fakeGrokBuildProbeFailure(t *testing.T, stderr string) string {
 }
 
 func TestGrokAuthPreflightMixedStderrDoesNotOpenCircuit(t *testing.T) {
-	root := testRoot(t)
-	bin := fakeGrokBuildProbeFailure(t, grokOIDCNoAuthContextDiagnostic+"\nanalysis: ordinary wrapper or prompt-carried prose")
-	cfg := policyTestConfig()
-	cfg.GrokBuildBin = bin
-	err := ensureGrokBuildAuth(context.Background(), root, cfg, "grok-4.6")
-	if err == nil || isGrokBuildAuthProbeError(err) {
-		t.Fatalf("mixed stderr must remain a non-auth preflight failure: %T %v", err, err)
-	}
-	if cd := loadEngineCooldown(root, grokBuildCooldownName); grokBuildAuthCooldownActive(cd, time.Now()) {
-		t.Fatalf("mixed preflight stderr must not open the Grok auth circuit: %+v", cd)
+	for name, stderr := range map[string]string{
+		"diagnostic plus prose":       grokOIDCNoAuthContextDiagnostic + "\nanalysis: ordinary wrapper or prompt-carried prose",
+		"bare diagnostic plus footer": grokOIDCNoAuthContextBareFooter,
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := testRoot(t)
+			bin := fakeGrokBuildProbeFailure(t, stderr)
+			cfg := policyTestConfig()
+			cfg.GrokBuildBin = bin
+			err := ensureGrokBuildAuth(context.Background(), root, cfg, "grok-4.6")
+			if err == nil || isGrokBuildAuthProbeError(err) {
+				t.Fatalf("mixed stderr must remain a non-auth preflight failure: %T %v", err, err)
+			}
+			if cd := loadEngineCooldown(root, grokBuildCooldownName); grokBuildAuthCooldownActive(cd, time.Now()) {
+				t.Fatalf("mixed preflight stderr must not open the Grok auth circuit: %+v", cd)
+			}
+		})
 	}
 }
 
 func TestRunTaskGrokMixedStderrIncompleteObservationOpensNoCircuit(t *testing.T) {
-	root := testRoot(t)
-	stderr := grokOIDCNoAuthContextDiagnostic + "\nanalysis: ordinary wrapper or prompt-carried prose"
-	bin, _, _ := fakeGrokBuild(t, `{"type":"system.version","version":"1.0.4"}`, stderr, 1)
-	cfg := policyTestConfig()
-	cfg.GrokBuildBin = bin
-	task := ownerBackendGrokTask(t, root, cfg, t.TempDir())
-	if err := saveTask(root, task); err != nil {
-		t.Fatal(err)
-	}
-	if err := runTaskVia(context.Background(), root, cfg, task, grokBuildRunnerName); err != nil {
-		t.Fatal(err)
-	}
-	got, err := loadTask(root, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got.LastRouteAttempt == nil || !got.LastRouteAttempt.ObservationSeen || got.LastRouteAttempt.ObservationOK {
-		t.Fatalf("mixed stderr must remain an incomplete observation: %+v", got.LastRouteAttempt)
-	}
-	if got.LastRouteAttempt.FailureClass == string(failureAuth) || strings.HasPrefix(got.LastError, "[auth]") {
-		t.Fatalf("mixed stderr must return non-auth: %+v", got)
-	}
-	if cd := loadEngineCooldown(root, grokBuildCooldownName); grokBuildAuthCooldownActive(cd, time.Now()) {
-		t.Fatalf("mixed model stderr must not open the Grok auth circuit: %+v", cd)
+	for name, stderr := range map[string]string{
+		"diagnostic plus prose":       grokOIDCNoAuthContextDiagnostic + "\nanalysis: ordinary wrapper or prompt-carried prose",
+		"bare diagnostic plus footer": grokOIDCNoAuthContextBareFooter,
+	} {
+		t.Run(name, func(t *testing.T) {
+			root := testRoot(t)
+			bin, _, _ := fakeGrokBuild(t, `{"type":"system.version","version":"1.0.4"}`, stderr, 1)
+			cfg := policyTestConfig()
+			cfg.GrokBuildBin = bin
+			task := ownerBackendGrokTask(t, root, cfg, t.TempDir())
+			if err := saveTask(root, task); err != nil {
+				t.Fatal(err)
+			}
+			if err := runTaskVia(context.Background(), root, cfg, task, grokBuildRunnerName); err != nil {
+				t.Fatal(err)
+			}
+			got, err := loadTask(root, task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got.LastRouteAttempt == nil || !got.LastRouteAttempt.ObservationSeen || got.LastRouteAttempt.ObservationOK {
+				t.Fatalf("mixed stderr must remain an incomplete observation: %+v", got.LastRouteAttempt)
+			}
+			if got.LastRouteAttempt.FailureClass == string(failureAuth) || strings.HasPrefix(got.LastError, "[auth]") {
+				t.Fatalf("mixed stderr must return non-auth: %+v", got)
+			}
+			if cd := loadEngineCooldown(root, grokBuildCooldownName); grokBuildAuthCooldownActive(cd, time.Now()) {
+				t.Fatalf("mixed model stderr must not open the Grok auth circuit: %+v", cd)
+			}
+		})
 	}
 }
 
@@ -156,7 +172,7 @@ func TestRunTaskOwnerGrokOIDCNoAuthContextHoldsSameCardAndOpensCircuit(t *testin
 		t.Fatal(err)
 	}
 	if got.Status != statusHeld || got.ID != task.ID || got.PreferRunner != grokBuildRunnerName ||
-		got.CodexModel != "" || got.OwnerRouteName != "opus_backend" || got.OwnerRouteLeg != 1 ||
+		got.CodexModel != "" || got.OwnerRouteName != "opus_backend_high_risk" || got.OwnerRouteLeg != 1 ||
 		got.RouteReason != routeReasonGrokOpusBackend || got.Attempts != 0 ||
 		!strings.HasPrefix(got.LastError, "[auth]") || !strings.Contains(got.LastError, "Invalid or expired credentials") {
 		t.Fatalf("exact OIDC terminal must hold the same Grok card without fallback/attempt burn: %+v", got)
@@ -184,7 +200,7 @@ func TestRunTaskOwnerGrokOIDCNoAuthContextHoldsSameCardAndOpensCircuit(t *testin
 		last.Detail["requested_provider"] != grokBuildRunnerName || last.Detail["actual_provider"] != grokBuildRunnerName ||
 		last.Detail["requested_model"] != "grok-4.6" || last.Detail["actual_model"] != "grok-4.6" ||
 		last.Detail["requested_effort"] != "xhigh" || last.Detail["actual_effort"] != "xhigh" ||
-		last.Detail["owner_route_name"] != "opus_backend" || last.Detail["owner_route_leg"] != float64(1) ||
+		last.Detail["owner_route_name"] != "opus_backend_high_risk" || last.Detail["owner_route_leg"] != float64(1) ||
 		last.Detail["attempt"] != float64(0) {
 		t.Fatalf("auth hold did not preserve the classified terminal receipt: %+v", last)
 	}

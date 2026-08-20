@@ -6,7 +6,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"testing"
@@ -17,6 +16,12 @@ func policyTestConfig() *Config {
 	cfg := defaultConfig("")
 	cfg.DefaultRunner = "codex"
 	cfg.OwnerRoutingEnforced = true
+	cfg.AutomaticCodexBudgetStopPercent = 65
+	cfg.OwnerProviderTargets = &OwnerProviderTargets{
+		GrokMinPercent: 70, GrokMaxPercent: 80,
+		KimiMinPercent: 15, KimiMaxPercent: 25,
+		DirectSolMinPercent: 5, DirectSolMaxPercent: 10,
+	}
 	cfg.CodexBin = "/usr/bin/true"
 	cfg.CodexModel = "gpt-5.6-sol"
 	cfg.GrokBuildBin = "/usr/bin/true"
@@ -31,7 +36,7 @@ func policyTestConfig() *Config {
 		TierRoutes: map[string]GrokTierRoute{
 			"opus_backend": {Effort: "xhigh", CodexFallbackModel: "gpt-5.6-sol", CodexFallbackEffort: "max"},
 			"sonnet":       {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "max"},
-			"haiku":        {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "xhigh"},
+			"haiku":        {Effort: "medium", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "xhigh"},
 		},
 	}
 	cfg.CursorBin = "/usr/bin/true"
@@ -41,97 +46,41 @@ func policyTestConfig() *Config {
 	}
 	cfg.CrossProfiles = map[string]CrossProfile{
 		"fable-dual": {
-			A:     CrossEngine{Kind: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh"},
-			B:     CrossEngine{Kind: "codex", Effort: "ultra"},
-			Merge: &CrossEngine{Kind: "codex", Effort: "max"},
+			A: CrossEngine{Kind: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh"},
+			B: CrossEngine{Kind: "codex", Effort: "ultra"},
 		},
 	}
 	return cfg
 }
 
-func TestOwnerRouteResolutionAllSixRows(t *testing.T) {
+func TestOwnerRouteResolutionFinalMatrixLock(t *testing.T) {
 	cfg := policyTestConfig()
-	leg := func(runner, model, effort string) policyLeg {
-		return policyLeg{Runner: runner, Model: model, Effort: effort}
+	if err := validateOwnerRoutingPolicy(cfg); err != nil {
+		t.Fatalf("final Owner matrix rejected: %v", err)
 	}
-	tests := []struct {
-		name        string
-		model       string
-		routeClass  string
-		wantLegs    []policyLeg
-		wantReview  *policyLeg
-		wantMerge   *policyLeg
-		independent bool
-	}{
-		{
-			name: "explicit fable", model: "claude-fable-5", routeClass: routeClassGeneral,
-			wantLegs: []policyLeg{
-				leg(cursorRunnerName, "claude-fable-5-thinking-max", "max"),
-				leg(grokBuildRunnerName, "grok-4.6", "xhigh"),
-				leg("codex", "gpt-5.6-sol", "ultra"),
-			},
-			wantMerge:   ptrPolicyLeg(leg("codex", "gpt-5.6-sol", "max")),
-			independent: true,
-		},
-		{
-			name: "non-backend opus", model: "opus", routeClass: routeClassGeneral,
-			wantLegs: []policyLeg{
-				leg(grokBuildRunnerName, "grok-4.6", "xhigh"),
-				leg(kimiCLIRunnerName, "kimi-code/k3", "max"),
-				leg("codex", "gpt-5.6-sol", "xhigh"),
-			},
-		},
-		{
-			name: "backend opus", model: "opus", routeClass: routeClassBackend,
-			wantLegs: []policyLeg{
-				leg(grokBuildRunnerName, "grok-4.6", "xhigh"),
-				leg("codex", "gpt-5.6-sol", "max"),
-			},
-		},
-		{
-			name: "sonnet", model: "sonnet", routeClass: routeClassGeneral,
-			wantLegs: []policyLeg{
-				leg(grokBuildRunnerName, "grok-4.6", "high"),
-				leg("codex", "gpt-5.6-luna", "max"),
-			},
-		},
-		{
-			name: "haiku", model: "haiku", routeClass: routeClassGeneral,
-			wantLegs: []policyLeg{
-				leg(grokBuildRunnerName, "grok-4.6", "high"),
-				leg("codex", "gpt-5.6-luna", "xhigh"),
-			},
-		},
+	cfg.CodexFallback = true
+	if err := validateOwnerRoutingPolicy(cfg); err == nil || !strings.Contains(err.Error(), "codex_fallback=false") {
+		t.Fatalf("global Codex fallback drift must fail closed: %v", err)
 	}
-
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			task := &Task{Type: typeSequence, Model: tc.model, RouteClass: tc.routeClass,
-				PreferRunner: "codex", FreshSteps: true, Prompts: []string{"implement"}}
-			got, ok := resolveOwnerRoute(cfg, task)
-			if !ok {
-				t.Fatal("expected owner route")
-			}
-			if !reflect.DeepEqual(got.Legs, tc.wantLegs) || !reflect.DeepEqual(got.Review, tc.wantReview) ||
-				!reflect.DeepEqual(got.Merge, tc.wantMerge) || got.IndependentAnswers != tc.independent {
-				t.Fatalf("route mismatch\n got: %+v\nwant legs=%+v review=%+v merge=%+v independent=%v",
-					got, tc.wantLegs, tc.wantReview, tc.wantMerge, tc.independent)
-			}
-		})
+	cfg.CodexFallback = false
+	cfg.GrokBuild.FableClaudeFallback = true
+	cfg.GrokBuild.FableFirstPrinciples = true
+	if err := validateOwnerRoutingPolicy(cfg); err == nil || !strings.Contains(err.Error(), "legacy Fable") {
+		t.Fatalf("legacy Fable third-leg flags must fail closed: %v", err)
 	}
 }
 
 func TestStandaloneReviewUsesDirectSolMax(t *testing.T) {
 	cfg := policyTestConfig()
-	task := &Task{Type: typeReview, Model: "opus", PreferRunner: "codex", Prompts: []string{"review"}}
+	task := &Task{Type: typeReview, Model: "opus", RiskClass: riskClassProduction, PreferRunner: "codex", Prompts: []string{"review"}}
 	route, ok := resolveOwnerRoute(cfg, task)
-	if !ok || route.Name != "review_standalone" || len(route.Legs) != 1 ||
-		route.Legs[0] != (policyLeg{Runner: "codex", Model: "gpt-5.6-sol", Effort: "max"}) ||
+	if !ok || route.Name != "review_standalone_critical" || len(route.Legs) != 1 ||
+		route.Legs[0] != (policyLeg{Runner: "codex", Model: "gpt-5.6-sol", Effort: "max", Stage: routeStageStandaloneReview, ReadOnly: true}) ||
 		route.Review != nil {
 		t.Fatalf("standalone review must route directly to Sol/max without review-of-review: %+v ok=%v", route, ok)
 	}
 	if runner, matched := ownerPrimaryDispatch(testRoot(t), cfg, task, time.Now()); !matched || runner != "codex" ||
-		task.CodexModel != "gpt-5.6-sol" || task.Effort != "max" || !task.EffortExplicit {
+		task.CodexModel != "gpt-5.6-sol" || task.Effort != "max" || !task.EffortExplicit || !task.AutomaticCodex {
 		t.Fatalf("standalone review primary was not frozen to direct Sol/max: runner=%q matched=%v task=%+v", runner, matched, task)
 	}
 	brief := toBrief(cfg, task, time.Now())
@@ -141,7 +90,7 @@ func TestStandaloneReviewUsesDirectSolMax(t *testing.T) {
 	}
 }
 
-func TestOwnerRouteDrivesManualCommandAndBoardForAllSixRows(t *testing.T) {
+func TestOwnerRouteDrivesManualCommandAndBoardForFinalMatrixBranches(t *testing.T) {
 	cfg := policyTestConfig()
 	now := time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
 	tests := []struct {
@@ -151,7 +100,7 @@ func TestOwnerRouteDrivesManualCommandAndBoardForAllSixRows(t *testing.T) {
 		{"opus general", "opus", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "xhigh", "--reasoning-effort xhigh"},
 		{"opus backend", "opus", routeClassBackend, grokBuildRunnerName, "grok-4.6", "xhigh", "--reasoning-effort xhigh"},
 		{"sonnet", "sonnet", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "high", "--reasoning-effort high"},
-		{"haiku", "haiku", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "high", "--reasoning-effort high"},
+		{"haiku", "haiku", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "medium", "--reasoning-effort medium"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -239,7 +188,7 @@ func TestOwnerReadbackRejectsLaterExplicitPin(t *testing.T) {
 	if runner, matched := ownerPrimaryDispatch(testRoot(t), cfg, task, time.Now()); !matched || runner != grokBuildRunnerName {
 		t.Fatalf("primary dispatch=(%q,%v)", runner, matched)
 	}
-	if route, ok := resolveOwnerRouteReadback(cfg, task); !ok || route.Name != "opus_general" {
+	if route, ok := resolveOwnerRouteReadback(cfg, task); !ok || route.Name != "opus_non_backend" {
 		t.Fatalf("frozen primary snapshot should read back: route=%+v ok=%v", route, ok)
 	}
 	task.RunnerExplicit = true
@@ -318,8 +267,13 @@ func TestOwnerRouteConfigRejectsIdentityDrift(t *testing.T) {
 		route := cfg.GrokBuild.TierRoutes["opus_backend"]
 		route.CodexFallbackEffort = "xhigh"
 		cfg.GrokBuild.TierRoutes["opus_backend"] = route
-		if err := validateGrokBuild(cfg); err == nil {
-			t.Fatal("backend Opus Sol/xhigh drift must be rejected; owner requires Sol/max")
+		if err := validateGrokBuild(cfg); err != nil {
+			t.Fatalf("legacy global Codex fallback fields are inert in Owner mode, got %v", err)
+		}
+		task := finalOwnerTask("opus", routeClassBackend, riskClassHigh)
+		resolved, _ := resolveOwnerRoute(cfg, task)
+		if resolved.ReleaseGate == nil || resolved.ReleaseGate.Effort != "max" {
+			t.Fatalf("explicit high-risk release gate must remain Sol/max: %+v", resolved)
 		}
 	})
 	t.Run("Grok model identity", func(t *testing.T) {
@@ -332,8 +286,10 @@ func TestOwnerRouteConfigRejectsIdentityDrift(t *testing.T) {
 	t.Run("review identity", func(t *testing.T) {
 		cfg := policyTestConfig()
 		cfg.GrokBuild.ReviewCodexEffort = "xhigh"
-		if err := validateOwnerRoutingPolicy(cfg); err == nil {
-			t.Fatal("standalone reviewer drift must be rejected")
+		task := &Task{Type: typeReview, RiskClass: riskClassProduction, PreferRunner: "codex", Prompts: []string{"review"}}
+		resolved, ok := resolveOwnerRoute(cfg, task)
+		if !ok || resolved.Legs[0].Effort != "max" {
+			t.Fatalf("legacy review field must not alter explicit standalone Sol/max: %+v", resolved)
 		}
 	})
 	t.Run("automatic review remains disabled", func(t *testing.T) {
@@ -413,7 +369,6 @@ func TestOwnerRouteConfigRejectsIdentityDrift(t *testing.T) {
 		{"Grok row disabled", func(cfg *Config) { cfg.GrokBuild.Enabled = false }},
 		{"Cursor row disabled", func(cfg *Config) { cfg.CursorFable.Enabled = false }},
 		{"Sonnet row removed", func(cfg *Config) { delete(cfg.GrokBuild.TierRoutes, "sonnet") }},
-		{"review identity changed", func(cfg *Config) { cfg.GrokBuild.ReviewCodexModel = "gpt-5.6-luna" }},
 	} {
 		t.Run("owner lock rejects "+tc.name, func(t *testing.T) {
 			cfg := policyTestConfig()
@@ -495,7 +450,7 @@ func TestOwnerEnforcementRequiresRouteClassOnNewSequenceCards(t *testing.T) {
 	}
 }
 
-func TestSafeFallbackKindsQueueGrokToKimiToSolAndGrokToTierCodex(t *testing.T) {
+func TestSafeFallbackKindsFollowOnlyResolvedSerialLegsAndNeverGlobalCodex(t *testing.T) {
 	cfg := policyTestConfig()
 	kinds := []fallbackFailureKind{
 		fallbackQuota, fallbackTransport, fallbackStreamIncomplete, fallbackSemanticStall, fallbackInvalidTerminal,
@@ -526,35 +481,39 @@ func TestSafeFallbackKindsQueueGrokToKimiToSolAndGrokToTierCodex(t *testing.T) {
 
 			general.Runner = kimiCLIRunnerName
 			general.RouteReason = routeReasonGrokToKimi
-			if err := queuePolicyFallback(cfg, general, kind, auth); err != nil {
-				t.Fatal(err)
-			}
-			if general.PreferRunner != "codex" || general.CodexModel != "gpt-5.6-sol" ||
-				general.Effort != "xhigh" || general.RouteReason != routeReasonKimiToSolPending {
-				t.Fatalf("Kimi safe failure did not queue Sol/xhigh: %+v", general)
+			if err := queuePolicyFallback(cfg, general, kind, auth); err == nil {
+				t.Fatal("Kimi failure must stop: the final non-backend row has no global Codex leg")
 			}
 
 			for _, tier := range []struct {
-				name, model, routeClass, routeReason, wantModel, wantEffort, wantReason string
+				name, model, routeClass, riskClass, routeReason string
+				wantKimi                                        bool
 			}{
-				{"backend opus", "opus", routeClassBackend, routeReasonGrokOpusBackend, "gpt-5.6-sol", "max", routeReasonGrokToSolPending},
-				{"sonnet", "sonnet", routeClassGeneral, routeReasonGrokSonnet, "gpt-5.6-luna", "max", routeReasonGrokSonnetToLunaPending},
-				{"haiku", "haiku", routeClassGeneral, routeReasonGrokHaiku, "gpt-5.6-luna", "xhigh", routeReasonGrokHaikuToLunaPending},
+				{"backend opus missing risk", "opus", routeClassBackend, "", routeReasonGrokOpusBackend, false},
+				{"sonnet", "sonnet", routeClassGeneral, riskClassOrdinary, routeReasonGrokSonnet, true},
+				{"haiku", "haiku", routeClassGeneral, riskClassOrdinary, routeReasonGrokHaiku, true},
 			} {
 				grok := &Task{Type: typeSequence, Model: tier.model, RouteClass: tier.routeClass,
-					PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}}
+					RiskClass: tier.riskClass, PreferRunner: "codex", FreshSteps: true, Prompts: []string{"p"}}
 				grokRoute, ok := resolveOwnerRoute(cfg, grok)
 				if !ok || !pinOwnerPrimaryRoute(grok, grokRoute) {
 					t.Fatalf("%s: failed to freeze Grok owner primary", tier.name)
 				}
 				grok.Runner = grokBuildRunnerName
 				grok.RouteReason = tier.routeReason
-				if err := queuePolicyFallback(cfg, grok, kind, auth); err != nil {
+				err := queuePolicyFallback(cfg, grok, kind, auth)
+				if !tier.wantKimi {
+					if err == nil {
+						t.Fatalf("%s must hold because review/release legs are not fallback writers", tier.name)
+					}
+					continue
+				}
+				if err != nil {
 					t.Fatalf("%s: %v", tier.name, err)
 				}
-				if grok.PreferRunner != "codex" || grok.CodexModel != tier.wantModel ||
-					grok.Effort != tier.wantEffort || grok.RouteReason != tier.wantReason {
-					t.Fatalf("%s fallback mismatch: %+v", tier.name, grok)
+				if grok.PreferRunner != kimiCLIRunnerName || grok.KimiModel != "kimi-code/k3" ||
+					grok.Effort != "max" || grok.RouteReason != routeReasonGrokToKimiPending {
+					t.Fatalf("%s resolved fallback mismatch: %+v", tier.name, grok)
 				}
 			}
 		})

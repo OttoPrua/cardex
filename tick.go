@@ -167,7 +167,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							continue
 						}
 					case ownerMatched:
-						// 六行 Owner 主路由只由 resolveOwnerRoute→ownerPrimaryDispatch 解析。
+						// Final Owner 主路由只由 resolveOwnerRoute→ownerPrimaryDispatch 解析。
 						// 空 runner 表示第一腿冷却/不可派；不得据另一 provider 的可用性跳腿。
 						if ownerRunner == "" {
 							continue
@@ -241,6 +241,27 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							continue
 						}
 						viaRunner[t.ID] = via
+					}
+					if viaRunner[t.ID] == "codex" && t.AutomaticCodex {
+						evidence := currentAutomaticCodexBudgetEvidence(cfg, now)
+						allowed, reason := automaticCodexBudgetAllowed(t, evidence, cfg.AutomaticCodexBudgetStopPercent)
+						if !allowed {
+							t.Status = statusHeld
+							t.LastError = reason
+							t.touch()
+							if err := saveTask(root, t); err != nil {
+								if !quiet {
+									fmt.Fprintf(os.Stderr, "警告: automatic Codex budget hold persist failed for %s: %v\n", t.ID, err)
+								}
+								continue
+							}
+							emitTaskEvent(root, t.ID, evHeld, "runner:automatic-codex-budget", statusHeld, t.Step, withCostTelemetry(map[string]any{
+								"reason": reason, "route_stage": t.OwnerRouteStage,
+								"budget_source": evidence.Source, "used_percent": evidence.UsedPercent,
+								"evidence_available": evidence.Available,
+							}, t))
+							continue
+						}
 					}
 					cands = append(cands, t)
 				}
@@ -346,6 +367,12 @@ func qualityFloorCard(t *Task) bool {
 // 的那类逻辑，必须有能直接构造场景断言的入口。
 func codexDivertOK(cfg *Config, t *Task) bool {
 	if cfg == nil || t == nil || !cfg.CodexFallback || cfg.CodexBin == "" {
+		return false
+	}
+	if cfg.OwnerRoutingEnforced {
+		// Owner mode has no global Codex fallback. Every permitted Codex invocation is materialized
+		// by the closed resolver as a standalone review, conditional/mandatory release gate, or the
+		// single Fable reviewer-merger and is budget-checked separately at dispatch.
 		return false
 	}
 	if !codexEligible(t) {

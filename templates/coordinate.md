@@ -30,18 +30,19 @@
      B. 承重假设清单：逐条标注证据等级（源码证实/实测/推断/未验证），未验证的承重假设必须显式登记为待验证项；
      C. 必要性测试：是否存在更简单机制满足同一底层需求；复杂度必须由已证明的需求支撑，否则选简单方案或把复杂度列为待裁；
    - 任务一律设 "fresh_steps": true（每步全新会话，谁来跑都一样）；只有确需延续某个既有会话上下文时才填 session_id 并去掉 fresh_steps；
-   - 为每个任务选择来源档位与执行器。除续接既有会话或已有显式 pin 外，新卡一律设 `"runner":"codex"`；`model` 是来源档位，由同一张 Owner 路由表解析：
-     - **仅显式最难裁决**：`"model":"claude-fable-5","effort":"max"` → Cursor Fable 5/thinking-max。Fable 卡必须是 fresh 且只有一个 prompt；不满足该无损形态就等待人工改卡，绝不落到通用 Codex。仅在确认的 eligible Fable quota-limit 失败后，才严格串行取得只读的 Grok 4.6/xhigh 与 GPT-5.6 Sol/ultra 两份互相不可见的独立答案，再由全新 GPT-5.6 Sol/max 从第一性合并；transport/stream/stall 等非配额失败保持 held；
-     - **非 backend Opus**：`"model":"claude-opus-5","effort":"xhigh"` → Grok 4.6/xhigh → Kimi K3/max → GPT-5.6 Sol/xhigh；
-     - **backend Opus**：`"model":"claude-opus-5","effort":"xhigh"` → Grok 4.6/xhigh → GPT-5.6 Sol/max；实现卡不自动追加复审，单独 `design-review` 卡直达新的 GPT-5.6 Sol/max 会话且不递归；
-     - **Sonnet（边界清楚但复杂或常规实现）**：`"model":"sonnet","effort":"max"` → Grok 4.6/high → GPT-5.6 Luna/max，沿用正常复审策略；
-     - **Haiku（机械重复、批量整理、琐碎格式化）**：`"model":"haiku","effort":"xhigh"` → Grok 4.6/high → GPT-5.6 Luna/xhigh，沿用正常复审策略；
-     每张 sequence 卡必须填 `"route_class":"backend"` 或 `"route_class":"general"`。backend 的 Owner 定义包括：service、persistence、protocol、database、network execution、identity/credential、manifest/launchd、Control/authority、live cutover（中文对应服务、持久化、协议、数据库、网络执行、身份/凭据、清单/launchd、Control/权限、在线切换）；其余填 general。显式分类恒优先；只有存量 implementation/sequence 卡为空时才允许按文本兼容推断。边界不清且可能命中任何一类时按 backend。不得因标题或 prompt 短而降档；判断不清时仍按 Opus。不要直接钉 Kimi/Grok 来模拟自动路由；已有 session、remote、cross profile、显式 runner/model pin 保持原身份；
-     只有配额可创建 Fable fallback 链；该链建立后 A 成功→B 成功→merge 按正常串行阶段推进。其他 Owner 腿的 fallback 下一腿只在合格 quota、transport、stream-incomplete、semantic stall/timeout、invalid terminal result 或限定 presemantic execution-environment 失败发生且 Cardex 同时证明零语义/模型/工具事件、调用前后 product/worktree 指纹完全相同（含已有 dirty tracked 与 untracked 字节）、无存活 writer/process residue 后排队。Grok 鉴权/权限失败保持原腿 held，绝不推进。证明缺失或不一致沿既有 retry/held 规则 fail closed；不得据 cooldown 或“看起来不可用”跳腿，fallback writers 永不并发；
+   - 为每个任务选择来源档位。Final Owner 自动路由卡依赖已锁定的 `default_runner=codex`，emit JSON **省略 `runner`**；出现 `runner` 就表示人工显式 pin，不得被 resolver 改写。`model` 是来源档位，由同一张 Owner 路由表解析：
+     - **仅显式最难裁决**：`"model":"claude-fable-5","effort":"max","route_class":"general"` → Cursor Fable 5/thinking-max。Fable 是专用只读决策/方案综合，fresh 且只有一个 prompt；只有确认 quota 或 eligible 已证明的 quota/transport/stream-incomplete/execution-environment 前语义失败，才走一份只读 Grok 4.6/xhigh answer → 唯一一次 fresh Sol/ultra 对抗审查、修复并直接终局。没有 blind Sol answer B、Sol/max 第三腿、backend 默认或 review-of-review；未决 P0/P1/uncertainty held for Owner；
+     - **非 backend Opus**：Grok 4.6/xhigh primary → eligible 串行 Kimi K3/max fallback/review；只有 Grok-Kimi 分歧、验收失败或显式高风险升级才进入 Sol/xhigh；
+     - **backend Opus ordinary**：Grok 4.6/xhigh implementer → fresh Kimi K3/max 对抗审查/修复；确定性 20% 抽样、分歧或验收失败再进 Sol/xhigh；
+     - **backend Opus high-risk**：Grok 4.6/xhigh implementer → fresh Kimi K3/max 只读第二视角 → fresh Sol/max mandatory release gate；
+     - **独立审核**：ordinary→fresh Kimi K3/max；critical/production 或缺失风险→fresh independent Sol/max，审核不递归；
+     - **Sonnet**：Grok 4.6/high → eligible Kimi K3/max fallback/review，无自动 Codex；
+     - **Haiku**：Grok 4.6/medium；只有显式 `quality_sensitive=true` 才用 high。eligible overflow/fallback 只用 Kimi 或已证明的 OpenCode Go 轻量车道，无自动 Codex；
+     每张 sequence 卡必须填 `"route_class":"backend"` 或 `"route_class":"general"`，并填闭合 `"risk_class"`。backend high-risk 包括 identity/credential、DB/schema/migration、protocol/network execution、manifest/launchd、Control/authority、live cutover、security 与 funds；只有明确 `ordinary` 才走 ordinary，缺失/歧义按 high-risk。复杂 React/frontend refactor、accessibility 或 fixing 另写 `"specialized_frontend":true`，按 ordinary/high-risk 分别要求 fresh Sol/xhigh 或 Sol/max 最终门。不得从标题短小推断 ordinary；已有 session、remote、cross profile 与人工显式 pin 保持原身份；
+     所有 eligible transition 必须严格串行，并同时证明 semantic/model/tool=0/0/0、调用前后 product/workspace 完全不变（含原 dirty tracked/untracked 字节）及零 writer/process residue；Grok 鉴权/权限保持原腿 held，绝不推进。Fable 不接受 semantic stall 或 invalid/acceptance failure 触发。任何 lineage 最多一个自动 Sol，自动 Codex provider-specific 用量达到 65% 或证据不可用即 held；只有带可见持久原因的 Owner-pinned critical bypass。Kimi CLI 与 OpenCode Go Kimi K3 只是容量冗余，不得把同一语义失败重放并计作独立意见；
    - 用 priority 表达先后：被依赖的排前（priority 更大），可并行的同级；
-   - 只有 `type=sequence` 的上述高风险实现任务，或明确修改多个现役消费方共享契约的中风险实现任务，才设 `review_after: true`；`design-review`、审计、coordinate、prompt-assembly、progress-pull 无论风险档位多高都必须为 false，禁止生成“审核: 审核…”；
-   - 填充类任务（独立视角审计、文档整理、低耦合支线）同样用 "runner":"codex"——走独立的 GPT-5.6 额度，
-     不占 claude 限额、claude 冷却期间也照跑；须配 "fresh_steps": true 或单步。
+   - 不要手工扩展复审链；Final Owner resolver 会为 backend 与 specialized frontend 机械设置必需的串行 review/release gate。独立 `design-review`、审计、coordinate、prompt-assembly、progress-pull 以及 Fable reviewer-merger 一律 `review_after:false`，禁止 review-of-review；
+   - 填充类任务（独立视角审计、文档整理、低耦合支线）同样省略 `runner`，由 `default_runner=codex` 进入矩阵；须配 `fresh_steps:true` 或单步。
    - 也可加 "runner":"gemini"（独立 Google 订阅额度，按每日请求数计）：多步可用（有会话），
      "gemini_model" 可选 pro/flash/flash-lite（默认按档位映射）；注意非 sequence 类型在 gemini
      上只读运行（plan 模式），写盘类任务须为 sequence 类型。
@@ -50,4 +51,4 @@
 
 最后，仅以一个 ```json 代码块输出结果（机器解析接口，务必合法 JSON，代码块后不要再输出任何内容）。
 JSON 字符串值内**禁止出现未转义的英文双引号**——内层引用一律改用中文引号「」或单引号，这是最常见的解析失败原因：
-{"tasks":[{"title":"任务标题","type":"sequence","dir":"{{DIR}}","priority":5,"model":"sonnet","effort":"xhigh","route_class":"general","session_id":"","review_after":false,"fresh_steps":true,"runner":"codex","prompts":["第一步的完整 prompt"]}]}
+{"tasks":[{"title":"任务标题","type":"sequence","dir":"{{DIR}}","priority":5,"model":"sonnet","effort":"xhigh","route_class":"general","risk_class":"ordinary","quality_sensitive":false,"specialized_frontend":false,"session_id":"","review_after":false,"fresh_steps":true,"prompts":["第一步的完整 prompt"]}]}

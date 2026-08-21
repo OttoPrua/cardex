@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -1257,9 +1258,17 @@ func TestAcquireTombstoneLockExcludesConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var release1Once sync.Once
+	releasePrimary := func() { release1Once.Do(release1) }
 	// 第二次 acquire 应等待: 用一个短窗口内的并发调用观察其是否立即成功.
 	acquired2 := make(chan time.Time, 1)
+	done2 := make(chan struct{})
+	t.Cleanup(func() {
+		releasePrimary()
+		<-done2
+	})
 	go func() {
+		defer close(done2)
 		release2, err := acquireTombstoneLock(root, "lock-excl")
 		if err != nil {
 			return
@@ -1275,7 +1284,7 @@ func TestAcquireTombstoneLockExcludesConcurrent(t *testing.T) {
 	case <-time.After(60 * time.Millisecond):
 		// 期望: 60ms 内第二次 acquire 未成功.
 	}
-	release1()
+	releasePrimary()
 	// 释锁后, 第二次 acquire 应能在自旋周期 (5ms) 内成功.
 	select {
 	case <-acquired2:
@@ -1283,6 +1292,7 @@ func TestAcquireTombstoneLockExcludesConcurrent(t *testing.T) {
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("释锁后第二次 acquire 应能在自旋周期内拿到, 500ms 内未见完成")
 	}
+	<-done2
 }
 
 // TestReleaseTombstoneLockChecksPID (R2 类闭合: release 侧 PID 校验)

@@ -114,7 +114,7 @@ func TestFinalOwnerMatrixResolvesEveryEffectiveRow(t *testing.T) {
 			name: "haiku",
 			task: finalOwnerTask("haiku", routeClassGeneral, riskClassOrdinary),
 			want: ownerRoute{Name: "haiku", RiskClass: riskClassOrdinary, Legs: []policyLeg{
-				finalOwnerLeg(grokBuildRunnerName, "grok-4.6", "medium", routeStagePrimary, false),
+				finalOwnerLeg(grokBuildRunnerName, "grok-4.6", "high", routeStagePrimary, false),
 				finalOwnerLeg(kimiCLIRunnerName, "kimi-code/k3", "max", routeStageFallbackReview, false),
 			}},
 		},

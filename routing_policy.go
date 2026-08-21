@@ -260,7 +260,7 @@ func resolveOwnerRoute(cfg *Config, t *Task) (ownerRoute, bool) {
 		}
 		return resolved, true
 	case "haiku":
-		effort := "medium"
+		effort := "high"
 		if t.QualitySensitive {
 			effort = "high"
 		}

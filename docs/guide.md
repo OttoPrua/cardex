@@ -39,7 +39,7 @@ Grok→eligible Kimi，只有显式条件才到 Sol/xhigh；backend ordinary 走
 backend high-risk 走 Grok→Kimi second view→mandatory Sol/max；Sonnet/Haiku 走 Grok→eligible Kimi，
 无全局 Codex fallback。
 协调模板按"最难裁决→Fable / 模糊长程跨仓高风险→Opus / 复杂落地→Sonnet+xhigh /
-常规落地→Sonnet+xhigh / 机械→Haiku+medium"显式发卡。来源档位和实际模型分开记录；只有明确续接
+常规落地→Sonnet+xhigh / 机械→Haiku+high"显式发卡。来源档位和实际模型分开记录；只有明确续接
 旧 Claude session 的卡保留 Claude 执行器。
 
 **生产 profile**：装配、协调和例行审核仍以 Opus 作为来源档位，普通 `sequence` 默认 Sonnet；只有
@@ -455,7 +455,7 @@ Grok-Kimi 分歧、验收失败或显式高风险升级时出现。Opus backend 
 Kimi K3/max adversarial review/repair；确定性 20% 抽样、分歧或验收失败再进入 Sol/xhigh。backend
 high-risk 为 Grok implementer→fresh Kimi K3/max 只读第二视角→fresh Sol/max mandatory release gate。
 standalone review ordinary 用 fresh Kimi K3/max，critical/production（以及缺失风险）用 fresh independent Sol/max。
-Sonnet 为 Grok 4.6/high→eligible Kimi K3/max，无自动 Codex；Haiku 为 Grok 4.6/medium，只有显式
+Sonnet 为 Grok 4.6/high→eligible Kimi K3/max，无自动 Codex；Haiku 为 Grok 4.6/high，只有显式
 `quality_sensitive=true` 才用 high，eligible overflow/fallback 仅 Kimi 或已证明 OpenCode Go 轻量车道。
 复杂 React/frontend refactor、accessibility 或 fixing 写 `specialized_frontend=true`，按 ordinary/high-risk
 分别要求 fresh Sol/xhigh 或 Sol/max 最终审核。
@@ -521,7 +521,7 @@ Owner-pinned critical 卡可绕过。Grok/Kimi/direct Sol 的 70–80%/15–25%/
   "tier_routes": {
     "opus_backend": {"effort": "xhigh"},
     "sonnet": {"effort": "high"},
-    "haiku": {"effort": "medium"}
+    "haiku": {"effort": "high"}
   }
 },
 "automatic_codex_budget_stop_percent": 65,

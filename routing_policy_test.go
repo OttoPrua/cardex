@@ -36,7 +36,7 @@ func policyTestConfig() *Config {
 		TierRoutes: map[string]GrokTierRoute{
 			"opus_backend": {Effort: "xhigh", CodexFallbackModel: "gpt-5.6-sol", CodexFallbackEffort: "max"},
 			"sonnet":       {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "max"},
-			"haiku":        {Effort: "medium", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "xhigh"},
+			"haiku":        {Effort: "high", CodexFallbackModel: "gpt-5.6-luna", CodexFallbackEffort: "xhigh"},
 		},
 	}
 	cfg.CursorBin = "/usr/bin/true"
@@ -100,7 +100,7 @@ func TestOwnerRouteDrivesManualCommandAndBoardForFinalMatrixBranches(t *testing.
 		{"opus general", "opus", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "xhigh", "--reasoning-effort xhigh"},
 		{"opus backend", "opus", routeClassBackend, grokBuildRunnerName, "grok-4.6", "xhigh", "--reasoning-effort xhigh"},
 		{"sonnet", "sonnet", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "high", "--reasoning-effort high"},
-		{"haiku", "haiku", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "medium", "--reasoning-effort medium"},
+		{"haiku", "haiku", routeClassGeneral, grokBuildRunnerName, "grok-4.6", "high", "--reasoning-effort high"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -126,6 +126,54 @@ func TestOwnerRouteDrivesManualCommandAndBoardForFinalMatrixBranches(t *testing.
 				t.Fatalf("board did not consume owner resolver: %+v", brief)
 			}
 		})
+	}
+}
+
+func TestOwnerEnforcedGrokConfigLocksOrdinaryHaikuHigh(t *testing.T) {
+	accept := policyTestConfig()
+	haiku := accept.GrokBuild.TierRoutes["haiku"]
+	haiku.Effort = "high"
+	accept.GrokBuild.TierRoutes["haiku"] = haiku
+	if err := validateGrokBuild(accept); err != nil {
+		t.Fatalf("Owner-enforced Grok config must accept Haiku/high: %v", err)
+	}
+	if err := validateOwnerRoutingPolicy(accept); err != nil {
+		t.Fatalf("Owner-enforced matrix must accept Haiku/high: %v", err)
+	}
+	if got := accept.GrokBuild.TierRoutes["haiku"]; got.CodexFallbackModel != "gpt-5.6-luna" || got.CodexFallbackEffort != "xhigh" {
+		t.Fatalf("Haiku Codex fallback identity must stay Luna/xhigh: %+v", got)
+	}
+
+	reject := policyTestConfig()
+	haiku = reject.GrokBuild.TierRoutes["haiku"]
+	haiku.Effort = "medium"
+	reject.GrokBuild.TierRoutes["haiku"] = haiku
+	err := validateGrokBuild(reject)
+	if err == nil || !strings.Contains(err.Error(), "owner final matrix requires grok_build.tier_routes.haiku.effort=high") {
+		t.Fatalf("Owner-enforced Grok config must reject Haiku/medium, got %v", err)
+	}
+
+	task := &Task{
+		ID: "ordinary-haiku", Type: typeSequence, Status: statusQueued, Model: "haiku",
+		RouteClass: routeClassGeneral, RiskClass: riskClassOrdinary, PreferRunner: "codex",
+		FreshSteps: true, Dir: t.TempDir(), Prompts: []string{"mechanical"},
+	}
+	resolved, ok := resolveOwnerRoute(accept, task)
+	if !ok || resolved.Name != "haiku" || len(resolved.Legs) < 1 ||
+		resolved.Legs[0] != (policyLeg{Runner: grokBuildRunnerName, Model: "grok-4.6", Effort: "high", Stage: routeStagePrimary, ReadOnly: false}) {
+		t.Fatalf("ordinary Haiku resolver must use Grok 4.6/high: %+v ok=%v", resolved, ok)
+	}
+	if len(resolved.Legs) != 2 || resolved.Legs[1].Runner != kimiCLIRunnerName {
+		t.Fatalf("ordinary Haiku eligible Kimi fallback must remain: %+v", resolved)
+	}
+
+	route, leg, command, ok := ownerManualDispatchCommand(accept, task, "mechanical")
+	if !ok || route.Name != "haiku" || leg.Effort != "high" || !strings.Contains(command, "--reasoning-effort high") {
+		t.Fatalf("manual command must use Haiku/high: route=%+v leg=%+v command=%s ok=%v", route, leg, command, ok)
+	}
+	brief := toBrief(accept, task, time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC))
+	if brief.Runner != grokBuildRunnerName || brief.Model != "grok-4.6" || brief.Effort != "high" {
+		t.Fatalf("board readback must use Haiku/high: %+v", brief)
 	}
 }
 

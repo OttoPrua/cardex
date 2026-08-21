@@ -39,7 +39,7 @@ Grok→Kimi review/repair→conditional Sol/xhigh; high-risk backend uses Grok�
 Sol/max. Sonnet/Haiku use Grok→eligible Kimi, with no global Codex fallback.
 The coordinator emits explicit tiers along “hardest adjudication→Fable / ambiguous, long-horizon,
 cross-repository, or high-risk→Opus / complex implementation→Sonnet+xhigh / routine
-implementation→Sonnet+xhigh / mechanical→Haiku+medium.” Source tier and concrete model are recorded
+implementation→Sonnet+xhigh / mechanical→Haiku+high.” Source tier and concrete model are recorded
 separately; only cards explicitly resuming an old Claude session keep the Claude runner.
 
 **Production profile**: assembly, coordination, and routine review retain Opus as their source tier,
@@ -467,7 +467,7 @@ implementer→fresh Kimi K3/max adversarial review/repair, with Sol/xhigh for de
 disagreement, or failed acceptance. High-risk backend is Grok implementer→fresh read-only Kimi K3/max second
 view→fresh mandatory Sol/max release gate. Standalone ordinary review uses fresh Kimi K3/max; critical,
 production, or missing-risk review uses fresh independent Sol/max. Sonnet is Grok 4.6/high→eligible Kimi,
-with no automatic Codex. Haiku is Grok 4.6/medium, or high only with explicit `quality_sensitive=true`, and
+with no automatic Codex. Haiku is Grok 4.6/high, or high only with explicit `quality_sensitive=true`, and
 eligible overflow/fallback is limited to Kimi or the already-proven OpenCode Go lightweight lane. Complex
 React/frontend refactoring, accessibility, or fixing sets `specialized_frontend=true` and requires fresh
 Sol/xhigh or Sol/max final review according to risk.
@@ -540,7 +540,7 @@ information isolation.
   "tier_routes": {
     "opus_backend": {"effort": "xhigh"},
     "sonnet": {"effort": "high"},
-    "haiku": {"effort": "medium"}
+    "haiku": {"effort": "high"}
   }
 },
 "automatic_codex_budget_stop_percent": 65,

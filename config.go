@@ -947,7 +947,7 @@ func validateGrokBuild(cfg *Config) error {
 	// Owner routing table is an enforcement contract, not a suggestion that per-host config may
 	// silently weaken. Optional rows may be omitted, but any enabled row must match the exact identity.
 	if cfg.OwnerRoutingEnforced {
-		expectedEfforts := map[string]string{"opus_backend": "xhigh", "sonnet": "high", "haiku": "medium"}
+		expectedEfforts := map[string]string{"opus_backend": "xhigh", "sonnet": "high", "haiku": "high"}
 		for key, expected := range expectedEfforts {
 			route, ok := r.TierRoutes[key]
 			if !ok || route.Effort != expected {

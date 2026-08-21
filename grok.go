@@ -529,25 +529,39 @@ func grokBuildExactShape(fields map[string]json.RawMessage, keyTypes ...string) 
 	return true
 }
 
-func grokBuildEndShape(fields map[string]json.RawMessage) bool {
+func grokBuildEndShape(fields map[string]json.RawMessage) (valid, public105 bool) {
 	allowed := map[string]string{
 		"type": "string", "stopReason": "string", "sessionId": "string",
 		"num_turns": "number", "total_cost_usd": "number", "duration_ms": "number",
-		"usage": "object",
+		"usage": "object", "requestId": "string", "modelUsage": "object",
 	}
 	if _, ok := fields["type"]; !ok {
-		return false
+		return false, false
 	}
 	if _, ok := fields["stopReason"]; !ok {
-		return false
+		return false, false
+	}
+	_, hasRequestID := fields["requestId"]
+	_, hasModelUsage := fields["modelUsage"]
+	public105 = hasRequestID || hasModelUsage
+	if public105 && (!hasRequestID || !hasModelUsage) {
+		return false, true
 	}
 	for key, raw := range fields {
 		want, ok := allowed[key]
 		if !ok || grokBuildJSONType(raw) != want {
-			return false
+			return false, public105
 		}
 	}
-	return true
+	return true, public105
+}
+
+func grokBuildUsageShape(fields map[string]json.RawMessage) bool {
+	return grokBuildExactShape(fields,
+		"signature", "string", "type", "string", "usage", "object") ||
+		grokBuildExactShape(fields,
+			"messageId", "string", "signature", "string", "stopReason", "string",
+			"type", "string", "usage", "object")
 }
 
 func grokBuildAvailableCommandsShape(fields map[string]json.RawMessage) bool {
@@ -710,10 +724,10 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 				grokBuildCountUnclassified(res, ev.Type, fields)
 			}
 		case "usage":
-			// The host probe proved only the signed 1.0.5 envelope. Usage remains accounting
-			// metadata, never a terminal, and non-zero usage conservatively proves model work.
-			valid := grokBuildExactShape(fields,
-				"signature", "string", "type", "string", "usage", "object")
+			// Usage remains accounting metadata, never a terminal, and non-zero usage
+			// conservatively proves model work. Identifier/signature values are shape-checked
+			// in the raw envelope only and are never copied into the parsed result.
+			valid := grokBuildUsageShape(fields)
 			observeGrokBuildUsage(res, ev.Usage, valid)
 			if !valid {
 				res.ObservationComplete = false
@@ -731,13 +745,19 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 		case "end":
 			sawEnd = true
 			res.TerminalEvents++
-			if !grokBuildEndShape(fields) || ev.StopReason != "end_turn" || res.TerminalEvents != 1 {
+			validEnd, public105End := grokBuildEndShape(fields)
+			if !validEnd || ev.StopReason != "end_turn" || res.TerminalEvents != 1 {
 				observeGrokBuildUsage(res, ev.Usage, false)
 				grokBuildCountUnclassified(res, ev.Type, fields)
 				markGrokBuildInvalidTerminal(res)
 				break
 			}
-			res.SessionID = ev.SessionID
+			// The documented 1.0.5 envelope carries request/session identifiers and opaque
+			// modelUsage metadata. Validate their types without retaining their values. The
+			// legacy envelope keeps its established resumable session behavior.
+			if !public105End {
+				res.SessionID = ev.SessionID
+			}
 			res.NumTurns = ev.NumTurns
 			res.TotalCostUSD = ev.TotalCostUSD
 			res.DurationMS = ev.DurationMS

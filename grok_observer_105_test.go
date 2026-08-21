@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -19,6 +20,137 @@ const grok105ObservedPrefix = `{"commands":[],"tools":[],"type":"available_comma
 
 const grokLegacyCleanEnd = `{"type":"end","stopReason":"end_turn","sessionId":"session-legacy","num_turns":2,"duration_ms":210}`
 const grokLegacyMinimalEnd = `{"type":"end","stopReason":"end_turn","sessionId":"session-legacy"}`
+const grok105PublicUsage = `{"type":"usage","messageId":"message-public-private","stopReason":"tool_use","usage":{"input_tokens":21,"output_tokens":8},"signature":"signature-public-private"}`
+const grok105PublicEnd = `{"type":"end","stopReason":"end_turn","sessionId":"session-public-private","requestId":"request-public-private","usage":{"input_tokens":34,"output_tokens":13},"num_turns":3,"modelUsage":{"grok-4.6":{"input_tokens":34,"output_tokens":13}}}`
+
+func TestGrokBuild105PublicUsageAndEndCompleteWithoutIdentifierExposure(t *testing.T) {
+	raw := `{"type":"text","data":"PUBLIC_OK"}` + "\n" + grok105PublicUsage + "\n" + grok105PublicEnd
+	res := parseGrokBuildJSONL(raw)
+	if res == nil || res.IsError || !res.ObservationComplete {
+		t.Fatalf("documented 1.0.5 usage and end envelopes must parse: %+v", res)
+	}
+	if res.Result != "PUBLIC_OK" || res.SessionID != "" || res.NumTurns != 3 {
+		t.Fatalf("public terminal metadata must parse without retaining its session identifier: %+v", res)
+	}
+	if res.Usage == nil || res.Usage.InputTokens != 34 || res.Usage.OutputTokens != 13 {
+		t.Fatalf("public end usage must remain authoritative: %+v", res.Usage)
+	}
+	encoded, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, privateValue := range []string{
+		"message-public-private",
+		"signature-public-private",
+		"session-public-private",
+		"request-public-private",
+		"grok-4.6",
+	} {
+		if strings.Contains(string(encoded), privateValue) {
+			t.Fatalf("public identifiers and opaque metadata must not be retained or exposed: %s", encoded)
+		}
+	}
+}
+
+func TestGrokBuild105PublicEndRetainsLegacyOptionalSpendFields(t *testing.T) {
+	publicEndWithSpend := strings.TrimSuffix(grok105PublicEnd, "}") + `,"total_cost_usd":0.25,"duration_ms":610}`
+	res := parseGrokBuildJSONL(`{"type":"text","data":"OK"}` + "\n" + publicEndWithSpend)
+	if res == nil || res.IsError || !res.ObservationComplete || res.SessionID != "" {
+		t.Fatalf("documented end with proven optional spend fields must parse privately: %+v", res)
+	}
+	if res.TotalCostUSD != 0.25 || res.DurationMS != 610 {
+		t.Fatalf("legacy optional spend fields were not retained: %+v", res)
+	}
+}
+
+func TestGrokBuild105PublicUsageEnvelopeRejectsWrongOrMissingFields(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		usage string
+	}{
+		{"missing messageId", `{"type":"usage","stopReason":"end_turn","usage":{},"signature":"s"}`},
+		{"missing stopReason", `{"type":"usage","messageId":"m","usage":{},"signature":"s"}`},
+		{"wrong messageId type", `{"type":"usage","messageId":7,"stopReason":"end_turn","usage":{},"signature":"s"}`},
+		{"wrong stopReason type", `{"type":"usage","messageId":"m","stopReason":{},"usage":{},"signature":"s"}`},
+		{"wrong usage type", `{"type":"usage","messageId":"m","stopReason":"end_turn","usage":[],"signature":"s"}`},
+		{"wrong signature type", `{"type":"usage","messageId":"m","stopReason":"end_turn","usage":{},"signature":null}`},
+		{"extra top-level field", `{"type":"usage","messageId":"m","stopReason":"end_turn","usage":{},"signature":"s","extra":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(tc.usage + "\n" + grokLegacyMinimalEnd)
+			if res == nil || !res.IsError || res.ObservationComplete {
+				t.Fatalf("malformed public usage envelope must fail closed: %+v", res)
+			}
+		})
+	}
+}
+
+func TestGrokBuild105PublicEndEnvelopeRejectsWrongExtraOrMissingCoreFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  string
+	}{
+		{"missing requestId", `{"type":"end","stopReason":"end_turn","sessionId":"s","usage":{},"num_turns":1,"modelUsage":{}}`},
+		{"missing modelUsage", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":{},"num_turns":1}`},
+		{"missing stopReason", `{"type":"end","sessionId":"s","requestId":"r","usage":{},"num_turns":1,"modelUsage":{}}`},
+		{"wrong requestId type", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":7,"usage":{},"num_turns":1,"modelUsage":{}}`},
+		{"wrong modelUsage type", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":{},"num_turns":1,"modelUsage":[]}`},
+		{"wrong sessionId type", `{"type":"end","stopReason":"end_turn","sessionId":7,"requestId":"r","usage":{},"num_turns":1,"modelUsage":{}}`},
+		{"wrong usage type", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":[],"num_turns":1,"modelUsage":{}}`},
+		{"extra top-level field", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":{},"num_turns":1,"modelUsage":{},"extra":true}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(`{"type":"text","data":"work"}` + "\n" + tc.end)
+			if res == nil || !res.IsError || res.ObservationComplete {
+				t.Fatalf("malformed public end envelope must fail closed: %+v", res)
+			}
+			if res.SessionID != "" {
+				t.Fatalf("invalid public end must not retain its session identifier: %+v", res)
+			}
+		})
+	}
+}
+
+func TestGrokBuild105PublicEndMustBeSingleFinalEndTurn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"non-end_turn", strings.Replace(grok105PublicEnd, `"stopReason":"end_turn"`, `"stopReason":"max_tokens"`, 1)},
+		{"duplicate end", grok105PublicEnd + "\n" + grok105PublicEnd},
+		{"nonempty final tail", grok105PublicEnd + "\n" + `{"type":"text","data":"late"}`},
+		{"usage after end", grok105PublicEnd + "\n" + grok105PublicUsage},
+		{"malformed after end", grok105PublicEnd + "\n" + `not-json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(tc.raw)
+			if res == nil || !res.IsError || res.Subtype != "grok_build_invalid_terminal" || res.ObservationComplete {
+				t.Fatalf("public end must be one final end_turn event: %+v", res)
+			}
+			if res.SessionID != "" {
+				t.Fatalf("public terminal identifiers must not be retained on failure: %+v", res)
+			}
+		})
+	}
+}
+
+func TestGrokBuild105PublicFieldsDoNotLoosenLegacyEnvelopes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  string
+	}{
+		{"legacy usage plus messageId only", `{"type":"usage","messageId":"m","usage":{},"signature":"s"}` + "\n" + grokLegacyMinimalEnd},
+		{"legacy end plus requestId only", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r"}`},
+		{"legacy end plus modelUsage only", `{"type":"end","stopReason":"end_turn","sessionId":"s","modelUsage":{}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(tc.raw)
+			if res == nil || !res.IsError || res.ObservationComplete {
+				t.Fatalf("hybrid public/legacy envelope must fail closed: %+v", res)
+			}
+		})
+	}
+}
 
 func TestGrokBuild105ObservedShapesWithLegacyTerminalComplete(t *testing.T) {
 	res := parseGrokBuildJSONL(grok105ObservedPrefix + "\n" + grokLegacyCleanEnd)

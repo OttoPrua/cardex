@@ -547,6 +547,11 @@ func grokBuildEndShape(fields map[string]json.RawMessage) (valid, public105 bool
 	if public105 && (!hasRequestID || !hasModelUsage) {
 		return false, true
 	}
+	if public105 {
+		// The public 1.0.5 terminal may report this numeric shape marker. It is
+		// deliberately absent from grokBuildEvent so it cannot enter accounting.
+		allowed["total_cost_usd_ticks"] = "number"
+	}
 	for key, raw := range fields {
 		want, ok := allowed[key]
 		if !ok || grokBuildJSONType(raw) != want {

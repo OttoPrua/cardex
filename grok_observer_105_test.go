@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,7 @@ const grokLegacyCleanEnd = `{"type":"end","stopReason":"end_turn","sessionId":"s
 const grokLegacyMinimalEnd = `{"type":"end","stopReason":"end_turn","sessionId":"session-legacy"}`
 const grok105PublicUsage = `{"type":"usage","messageId":"message-public-private","stopReason":"tool_use","usage":{"input_tokens":21,"output_tokens":8},"signature":"signature-public-private"}`
 const grok105PublicEnd = `{"type":"end","stopReason":"end_turn","sessionId":"session-public-private","requestId":"request-public-private","usage":{"input_tokens":34,"output_tokens":13},"num_turns":3,"modelUsage":{"grok-4.6":{"input_tokens":34,"output_tokens":13}}}`
+const grok105PublicEndWithTicks = `{"type":"end","stopReason":"end_turn","sessionId":"session-public-private","requestId":"request-public-private","usage":{"input_tokens":34,"output_tokens":13},"num_turns":3,"modelUsage":{"grok-4.6":{"input_tokens":34,"output_tokens":13}},"total_cost_usd_ticks":731.125}`
 
 func TestGrokBuild105PublicUsageAndEndCompleteWithoutIdentifierExposure(t *testing.T) {
 	raw := `{"type":"text","data":"PUBLIC_OK"}` + "\n" + grok105PublicUsage + "\n" + grok105PublicEnd
@@ -49,6 +51,101 @@ func TestGrokBuild105PublicUsageAndEndCompleteWithoutIdentifierExposure(t *testi
 		if strings.Contains(string(encoded), privateValue) {
 			t.Fatalf("public identifiers and opaque metadata must not be retained or exposed: %s", encoded)
 		}
+	}
+}
+
+func TestGrokBuild105PublicEndTicksAreShapeOnly(t *testing.T) {
+	rawPrefix := `{"type":"text","data":"PUBLIC_OK"}` + "\n" + grok105PublicUsage + "\n"
+	want := parseGrokBuildJSONL(rawPrefix + grok105PublicEnd)
+	got := parseGrokBuildJSONL(rawPrefix + grok105PublicEndWithTicks)
+	if got == nil || got.IsError || !got.ObservationComplete {
+		t.Fatalf("documented 1.0.5 public end with numeric total_cost_usd_ticks must parse: %+v", got)
+	}
+	if got.TotalCostUSD != 0 {
+		t.Fatalf("total_cost_usd_ticks must not contribute to TotalCostUSD: %+v", got)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("total_cost_usd_ticks must not be retained or alter parser/accounting output: got=%+v want=%+v", got, want)
+	}
+	encoded, err := json.Marshal(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "total_cost_usd_ticks") || strings.Contains(string(encoded), "731.125") {
+		t.Fatalf("total_cost_usd_ticks name/value must not be exposed: %s", encoded)
+	}
+}
+
+func TestGrokBuild105PublicEndTicksRejectLegacyAndWrongTypes(t *testing.T) {
+	legacyWithTicks := strings.TrimSuffix(grokLegacyCleanEnd, "}") + `,"total_cost_usd_ticks":731.125}`
+	if res := parseGrokBuildJSONL(legacyWithTicks); res == nil || !res.IsError || res.ObservationComplete {
+		t.Fatalf("legacy end containing total_cost_usd_ticks must fail closed: %+v", res)
+	}
+
+	for _, tc := range []struct {
+		name  string
+		value string
+	}{
+		{"string", `"731.125"`},
+		{"object", `{}`},
+		{"boolean", `true`},
+		{"null", `null`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			end := strings.Replace(grok105PublicEndWithTicks, "731.125", tc.value, 1)
+			res := parseGrokBuildJSONL(end)
+			if res == nil || !res.IsError || res.ObservationComplete {
+				t.Fatalf("non-number total_cost_usd_ticks must fail closed: %+v", res)
+			}
+		})
+	}
+}
+
+func TestGrokBuild105PublicEndTicksRejectExtraOrMissingPublicCoordinate(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  string
+	}{
+		{
+			"extra field",
+			strings.TrimSuffix(grok105PublicEndWithTicks, "}") + `,"extra":true}`,
+		},
+		{
+			"missing requestId",
+			strings.Replace(grok105PublicEndWithTicks, `,"requestId":"request-public-private"`, "", 1),
+		},
+		{
+			"missing modelUsage",
+			strings.Replace(grok105PublicEndWithTicks, `,"modelUsage":{"grok-4.6":{"input_tokens":34,"output_tokens":13}}`, "", 1),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(tc.end)
+			if res == nil || !res.IsError || res.ObservationComplete {
+				t.Fatalf("ticks-bearing public end outside the closed coordinate must fail closed: %+v", res)
+			}
+		})
+	}
+}
+
+func TestGrokBuild105PublicEndTicksMustBeSingleAndFinal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		tail string
+	}{
+		{"duplicate end", grok105PublicEndWithTicks},
+		{"text tail", `{"type":"text","data":"late"}`},
+		{"usage tail", grok105PublicUsage},
+		{"error tail", `{"type":"error","message":"late"}`},
+		{"unknown tail", `{"type":"future_event"}`},
+		{"malformed tail", `not-json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(grok105PublicEndWithTicks + "\n" + tc.tail)
+			if res == nil || !res.IsError || res.ObservationComplete {
+				t.Fatalf("every nonempty record after a ticks-bearing end must fail closed: %+v", res)
+			}
+		})
 	}
 }
 

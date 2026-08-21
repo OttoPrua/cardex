@@ -919,6 +919,53 @@ func grokBuildAuthDiagnosticLine(stderr string) string {
 	return line
 }
 
+func grokBuildIndependentStdoutSuccess(res *claudeResult) bool {
+	return res != nil && !res.IsError && res.ObservationComplete &&
+		res.TerminalEvents == 1 && strings.TrimSpace(res.Result) != ""
+}
+
+func grokBuildStderrHasAuthOrQuotaEvidence(stderr string) bool {
+	if grokBuildAuthDiagnosticLine(stderr) != "" || grokBuildTrustedAuthDiagnosticLine(stderr) != "" {
+		return true
+	}
+	return grokBuildQuotaRe.MatchString(stderr) || authClassRe.MatchString(stderr)
+}
+
+// grokBuildJSONObservation keeps streaming-json stdout authoritative. Unknown non-JSON plain
+// stderr is omitted only after an exit-zero stdout-alone parse proves a nonempty complete
+// success. Every JSON stderr record, malformed structured JSON, and scanner loss still join
+// the observation. Auth/quota evidence and every other failure keep the generic adapter.
+func grokBuildJSONObservation(stdout, stderr string, runErr error) string {
+	if runErr != nil || grokBuildStderrHasAuthOrQuotaEvidence(stderr) ||
+		!grokBuildIndependentStdoutSuccess(parseGrokBuildJSONL(stdout)) {
+		return providerJSONObservation(grokBuildRunnerName, stdout, stderr)
+	}
+	var out strings.Builder
+	out.WriteString(stdout)
+	scanner := bufio.NewScanner(strings.NewReader(stderr))
+	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if !json.Valid([]byte(line)) {
+			if !strings.HasPrefix(line, "{") && !strings.HasPrefix(line, "[") {
+				continue
+			}
+			line = "__CARDEX_MALFORMED_STDERR_JSON__"
+		}
+		if out.Len() > 0 {
+			out.WriteByte('\n')
+		}
+		out.WriteString(line)
+	}
+	if scanner.Err() != nil {
+		out.WriteString("\n__CARDEX_UNOBSERVED_STDERR__")
+	}
+	return out.String()
+}
+
 func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	if !grokBuildEnabled(cfg) {
 		return nil, "", fmt.Errorf("grok_build_bin/grok_build 未启用")
@@ -999,7 +1046,7 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 		// observation look partial. Mixed or unknown stderr never reaches this branch.
 		observedStderr = ""
 	}
-	res := parseGrokBuildJSONL(providerJSONObservation(grokBuildRunnerName, stdout.String(), observedStderr))
+	res := parseGrokBuildJSONL(grokBuildJSONObservation(stdout.String(), observedStderr, runErr))
 	// Grok 1.0.4/1.0.5 may emit only system.version on stdout and put the concrete OIDC 401 on
 	// stderr. The metadata-only parser correctly calls that stream incomplete, but that synthetic
 	// symptom must not mask a trusted process diagnostic: preserve the auth root cause so the generic

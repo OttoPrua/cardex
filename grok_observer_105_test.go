@@ -558,3 +558,153 @@ func TestGrokBuild105EndRejectsContentSemanticToolOrErrorShapedFields(t *testing
 		})
 	}
 }
+
+const grok105CompletePublicStdout = `{"type":"text","data":"PUBLIC_OK"}` + "\n" + grok105PublicEnd
+const grok105CompleteLegacyStdout = grok105ObservedPrefix + "\n" + grokLegacyCleanEnd
+const grok105AncillaryWarningToken = "ANCILLARY_GROK_WARN_TOKEN_DO_NOT_RETAIN"
+
+// Representative ANSI/plain Grok CLI warning/ancillary reporting lines. Values are fixtures only
+// and must never appear in parsed results.
+var grok105RepresentativeAncillaryWarnings = []string{
+	"\x1b[90m15:55:17.906\x1b[0m \x1b[33mwarn\x1b[0m: disabled background tool reporter token=" + grok105AncillaryWarningToken + "-01",
+	"\x1b[90m15:55:17.907\x1b[0m \x1b[33mwarn\x1b[0m: disabled background tool reporter token=" + grok105AncillaryWarningToken + "-02",
+	"\x1b[90m15:55:17.908\x1b[0m \x1b[33mwarn\x1b[0m: failed background connection reporting token=" + grok105AncillaryWarningToken + "-03",
+	"\x1b[90m15:55:17.909\x1b[0m \x1b[33mwarn\x1b[0m: reporter error payload { code: timeout, retry: false } token=" + grok105AncillaryWarningToken + "-04",
+	"\x1b[90m15:55:17.910\x1b[0m \x1b[33mwarn\x1b[0m: error opening ancillary log stream (syscall error EPIPE) token=" + grok105AncillaryWarningToken + "-05",
+	"\x1b[33mwarn\x1b[0m: background connection reporting failed: connection refused token=" + grok105AncillaryWarningToken + "-06",
+	"\x1b[1m\x1b[33mwarn\x1b[0m: background connection reporting failed: connection reset by peer token=" + grok105AncillaryWarningToken + "-07",
+	"\x1b[90m15:55:17.913\x1b[0m \x1b[33mwarn\x1b[0m: error opening ancillary log stream (syscall error EPIPE) token=" + grok105AncillaryWarningToken + "-08",
+	"\x1b[33mwarn\x1b[0m: background connection reporting failed: connection refused token=" + grok105AncillaryWarningToken + "-09",
+	"\x1b[33mwarn\x1b[0m: background session reporting failed: connection reset by peer token=" + grok105AncillaryWarningToken + "-10",
+	"\x1b[33mwarn\x1b[0m: session reporting failed, dropping ancillary error stream: transport error: error sending request token=" + grok105AncillaryWarningToken + "-11",
+	"\x1b[33mwarn\x1b[0m: session reporting failed after successful model turn token=" + grok105AncillaryWarningToken + "-12",
+}
+
+func grok105AncillaryStderr(n int) string {
+	return strings.Join(grok105RepresentativeAncillaryWarnings[:n], "\n")
+}
+
+func grok105InvokeWithIO(t *testing.T, stdout, stderr string, exitCode int) (*claudeResult, error) {
+	t.Helper()
+	bin, _, _ := fakeGrokBuild(t, stdout, stderr, exitCode)
+	cfg := grokBuildTestConfig(t, bin)
+	task := &Task{ID: "grok-105-io", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
+	res, _, err := invokeGrokBuild(context.Background(), t.TempDir(), cfg, task, "harmless prompt")
+	return res, err
+}
+
+func grok105AssertFailedClosed(t *testing.T, res *claudeResult, err error) {
+	t.Helper()
+	if err == nil || res == nil || !res.IsError {
+		t.Fatalf("must fail closed: res=%+v err=%v", res, err)
+	}
+}
+
+func TestGrokBuild105CompleteStdoutOmitsAncillaryWarningStderr(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stdout string
+		n      int
+		want   string
+	}{
+		{"11 public", grok105CompletePublicStdout, 11, "PUBLIC_OK"},
+		{"12 legacy", grok105CompleteLegacyStdout, 12, "GROK_OK"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stderr := grok105AncillaryStderr(tc.n)
+			if strings.Count(stderr, "\n") != tc.n-1 {
+				t.Fatalf("fixture must contain %d warning lines", tc.n)
+			}
+			want := parseGrokBuildJSONL(tc.stdout)
+			got, err := grok105InvokeWithIO(t, tc.stdout, stderr, 0)
+			if err != nil || got == nil || got.IsError || !got.ObservationComplete {
+				t.Fatalf("complete stdout plus %d ancillary warnings must succeed: res=%+v err=%v", tc.n, got, err)
+			}
+			if got.Result != tc.want || got.TerminalEvents != 1 {
+				t.Fatalf("stdout semantic/terminal result lost: %+v", got)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("ancillary stderr must not alter the stdout-alone parse: got=%+v want=%+v", got, want)
+			}
+			grok105AssertNoOpaqueExposure(t, got, grok105AncillaryWarningToken,
+				"reporting failed", "session reporting", "background connection",
+				"EPIPE", "syscall error", "\x1b[")
+		})
+	}
+}
+
+func TestGrokBuild105CompleteStdoutStructuredStderrFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		stderr string
+	}{
+		{"text", `{"type":"text","data":"hidden-stderr-text"}`},
+		{"thought", `{"type":"thought","data":"hidden-stderr-thought"}`},
+		{"tool", `{"type":"tool"}`},
+		{"tool_call", `{"content":[],"kind":"tool","locations":[],"rawInput":{},"status":"pending","title":"read","toolCallId":"call-stderr","toolName":"read_file","type":"tool_call"}`},
+		{"tool_call_update", `{"content":[],"locations":[],"rawOutput":null,"status":null,"toolCallId":"call-stderr","type":"tool_call_update"}`},
+		{"error", `{"type":"error","message":"hidden-stderr-error"}`},
+		{"unknown", `{"type":"future_event"}`},
+		{"duplicate-end", grok105PublicEnd},
+		{"malformed-structured", `{"type":"text","data":"truncated"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := grok105InvokeWithIO(t, grok105CompletePublicStdout, tc.stderr, 0)
+			grok105AssertFailedClosed(t, res, err)
+			if res.ObservationComplete {
+				t.Fatalf("structured stderr must make the combined observation incomplete: %+v", res)
+			}
+			if res.Result == "PUBLIC_OK" && !res.IsError {
+				t.Fatalf("structured stderr must not keep a successful semantic result: %+v", res)
+			}
+			grok105AssertNoOpaqueExposure(t, res, "hidden-stderr-text", "hidden-stderr-thought",
+				"hidden-stderr-error", "call-stderr")
+		})
+	}
+}
+
+func TestGrokBuild105IncompleteOrInvalidStdoutKeepsAncillaryStderrFailed(t *testing.T) {
+	stderr := grok105AncillaryStderr(12)
+	for _, tc := range []struct {
+		name   string
+		stdout string
+	}{
+		{"incomplete prefix", grok105ObservedPrefix},
+		{"missing terminal", `{"type":"text","data":"PUBLIC_OK"}`},
+		{"duplicate terminal", grok105CompletePublicStdout + "\n" + grok105PublicEnd},
+		{"semantic after end", grok105CompletePublicStdout + "\n" + `{"type":"text","data":"late"}`},
+		{"tool after end", grok105CompletePublicStdout + "\n" + `{"type":"tool"}`},
+		{"error after end", grok105CompletePublicStdout + "\n" + `{"type":"error","message":"late"}`},
+		{"malformed after end", grok105CompletePublicStdout + "\n" + `not-json`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res, err := grok105InvokeWithIO(t, tc.stdout, stderr, 0)
+			grok105AssertFailedClosed(t, res, err)
+			grok105AssertNoOpaqueExposure(t, res, grok105AncillaryWarningToken)
+			if res.Result == "PUBLIC_OK" && res.ObservationComplete && !res.IsError {
+				t.Fatalf("invalid/incomplete stdout must not become success via ancillary stderr: %+v", res)
+			}
+		})
+	}
+}
+
+func TestGrokBuild105NonzeroExitPreservesRootCauseWithAncillaryStderr(t *testing.T) {
+	t.Run("complete stdout plus warnings", func(t *testing.T) {
+		res, err := grok105InvokeWithIO(t, grok105CompletePublicStdout, grok105AncillaryStderr(11), 1)
+		grok105AssertFailedClosed(t, res, err)
+		if !res.IsError || (res.ObservationComplete && res.Result == "PUBLIC_OK" && res.Subtype == "") {
+			t.Fatalf("nonzero exit must not become a clean semantic success: %+v", res)
+		}
+		grok105AssertNoOpaqueExposure(t, res, grok105AncillaryWarningToken)
+	})
+	t.Run("exact oidc diagnostic", func(t *testing.T) {
+		res, err := grok105InvokeWithIO(t, `{"type":"system.version","version":"1.0.5"}`, grokOIDCNoAuthContextDiagnostic, 1)
+		grok105AssertFailedClosed(t, res, err)
+		if res.Subtype != "grok_build_process_auth_exact" {
+			t.Fatalf("exact OIDC stderr must keep auth root cause: %+v err=%v", res, err)
+		}
+		if res.Result != grokOIDCNoAuthContextDiagnostic {
+			t.Fatalf("exact diagnostic must remain the classified result: %+v", res)
+		}
+	})
+}

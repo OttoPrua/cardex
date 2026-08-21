@@ -260,12 +260,8 @@ func resolveOwnerRoute(cfg *Config, t *Task) (ownerRoute, bool) {
 		}
 		return resolved, true
 	case "haiku":
-		effort := "high"
-		if t.QualitySensitive {
-			effort = "high"
-		}
 		resolved := ownerRoute{Name: "haiku", RiskClass: risk,
-			Legs: []policyLeg{grokLeg(effort, routeStagePrimary, false), kimiLeg(routeStageFallbackReview, false)}}
+			Legs: []policyLeg{grokLeg("high", routeStagePrimary, false), kimiLeg(routeStageFallbackReview, false)}}
 		if t.SpecializedFrontend {
 			solEffort := "xhigh"
 			if risk != riskClassOrdinary {

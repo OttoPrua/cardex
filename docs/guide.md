@@ -455,8 +455,9 @@ Grok-Kimi 分歧、验收失败或显式高风险升级时出现。Opus backend 
 Kimi K3/max adversarial review/repair；确定性 20% 抽样、分歧或验收失败再进入 Sol/xhigh。backend
 high-risk 为 Grok implementer→fresh Kimi K3/max 只读第二视角→fresh Sol/max mandatory release gate。
 standalone review ordinary 用 fresh Kimi K3/max，critical/production（以及缺失风险）用 fresh independent Sol/max。
-Sonnet 为 Grok 4.6/high→eligible Kimi K3/max，无自动 Codex；Haiku 为 Grok 4.6/high，只有显式
-`quality_sensitive=true` 才用 high，eligible overflow/fallback 仅 Kimi 或已证明 OpenCode Go 轻量车道。
+Sonnet 为 Grok 4.6/high→eligible Kimi K3/max，无自动 Codex；Haiku 为 Grok 4.6/high，
+eligible overflow/fallback 仅 Kimi 或已证明 OpenCode Go 轻量车道。`quality_sensitive` 仍可作为兼容元数据
+填写，不再抬升 effort。
 复杂 React/frontend refactor、accessibility 或 fixing 写 `specialized_frontend=true`，按 ordinary/high-risk
 分别要求 fresh Sol/xhigh 或 Sol/max 最终审核。
 模糊、长程、跨仓或高风险任务升到 Opus；边界明确的复杂与常规实现都用 Sonnet/xhigh；只有最难

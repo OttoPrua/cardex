@@ -37,7 +37,7 @@
      - **backend Opus high-risk**：Grok 4.6/xhigh implementer → fresh Kimi K3/max 只读第二视角 → fresh Sol/max mandatory release gate；
      - **独立审核**：ordinary→fresh Kimi K3/max；critical/production 或缺失风险→fresh independent Sol/max，审核不递归；
      - **Sonnet**：Grok 4.6/high → eligible Kimi K3/max fallback/review，无自动 Codex；
-     - **Haiku**：Grok 4.6/medium；只有显式 `quality_sensitive=true` 才用 high。eligible overflow/fallback 只用 Kimi 或已证明的 OpenCode Go 轻量车道，无自动 Codex；
+     - **Haiku**：Grok 4.6/high。eligible overflow/fallback 只用 Kimi 或已证明的 OpenCode Go 轻量车道，无自动 Codex；`quality_sensitive` 仍可作为兼容元数据填写，不再抬升 effort；
      每张 sequence 卡必须填 `"route_class":"backend"` 或 `"route_class":"general"`，并填闭合 `"risk_class"`。backend high-risk 包括 identity/credential、DB/schema/migration、protocol/network execution、manifest/launchd、Control/authority、live cutover、security 与 funds；只有明确 `ordinary` 才走 ordinary，缺失/歧义按 high-risk。复杂 React/frontend refactor、accessibility 或 fixing 另写 `"specialized_frontend":true`，按 ordinary/high-risk 分别要求 fresh Sol/xhigh 或 Sol/max 最终门。不得从标题短小推断 ordinary；已有 session、remote、cross profile 与人工显式 pin 保持原身份；
      所有 eligible transition 必须严格串行，并同时证明 semantic/model/tool=0/0/0、调用前后 product/workspace 完全不变（含原 dirty tracked/untracked 字节）及零 writer/process residue；Grok 鉴权/权限保持原腿 held，绝不推进。Fable 不接受 semantic stall 或 invalid/acceptance failure 触发。任何 lineage 最多一个自动 Sol，自动 Codex provider-specific 用量达到 65% 或证据不可用即 held；只有带可见持久原因的 Owner-pinned critical bypass。Kimi CLI 与 OpenCode Go Kimi K3 只是容量冗余，不得把同一语义失败重放并计作独立意见；
    - 用 priority 表达先后：被依赖的排前（priority 更大），可并行的同级；

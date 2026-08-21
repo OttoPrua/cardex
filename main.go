@@ -241,7 +241,7 @@ func cmdAdd(args []string) error {
 	cursorModel := fs.String("cursor-model", "", "钉定 Cursor 账号模型 ID（思考档已编码在 ID 内）")
 	routeClass := fs.String("route-class", "", "工作负载路由分类：backend=服务/持久化/协议/数据库/网络执行/身份凭据/manifest-launchd/Control权限/live cutover，general=明确非后端；Owner 强制模式下新 sequence 卡必填，空值仅供存量卡兼容判定")
 	riskClass := fs.String("risk-class", "", "Owner 风险分类：ordinary|high-risk|critical|production；backend 缺失或不明确时按 high-risk fail closed")
-	qualitySensitive := fs.Bool("quality-sensitive", false, "显式质量敏感 Haiku：Grok primary 从 medium 提升为 high")
+	qualitySensitive := fs.Bool("quality-sensitive", false, "兼容元数据：Haiku 已固定 Grok 4.6/high 基线，本标志不再抬升 effort")
 	specializedFrontend := fs.Bool("specialized-frontend", false, "复杂 React/frontend refactor、accessibility 或 fixing：要求 fresh Sol 最终质量门")
 	ownerCriticalBypassReason := fs.String("owner-critical-bypass-reason", "", "Owner-pinned critical automatic Codex 预算旁路的持久、可见理由（仅 high/critical/production 有效）")
 	host := fs.String("host", "", "远程执行主机（config.remote_hosts 的键，SSH→远端 codex；要求单步或 -fresh）")

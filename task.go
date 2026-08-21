@@ -131,7 +131,8 @@ type Task struct {
 	// assertion; missing, unknown, critical, and production values all resolve to high-risk. Standalone
 	// reviews use ordinary versus critical/production, with missing or unknown values failing closed.
 	RiskClass string `json:"risk_class,omitempty"`
-	// QualitySensitive raises the Haiku Grok primary from medium to high. SpecializedFrontend marks
+	// QualitySensitive is compatibility metadata under the Owner Haiku high baseline: still accepted,
+	// persisted, and displayed, but it no longer raises Grok effort. SpecializedFrontend marks
 	// complex React/frontend refactor, accessibility, or fixing work that requires a fresh Sol final gate.
 	QualitySensitive    bool `json:"quality_sensitive,omitempty"`
 	SpecializedFrontend bool `json:"specialized_frontend,omitempty"`

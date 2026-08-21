@@ -467,8 +467,9 @@ implementer→fresh Kimi K3/max adversarial review/repair, with Sol/xhigh for de
 disagreement, or failed acceptance. High-risk backend is Grok implementer→fresh read-only Kimi K3/max second
 view→fresh mandatory Sol/max release gate. Standalone ordinary review uses fresh Kimi K3/max; critical,
 production, or missing-risk review uses fresh independent Sol/max. Sonnet is Grok 4.6/high→eligible Kimi,
-with no automatic Codex. Haiku is Grok 4.6/high, or high only with explicit `quality_sensitive=true`, and
-eligible overflow/fallback is limited to Kimi or the already-proven OpenCode Go lightweight lane. Complex
+with no automatic Codex. Haiku is Grok 4.6/high, and eligible overflow/fallback is limited to Kimi
+or the already-proven OpenCode Go lightweight lane. `quality_sensitive` remains accepted as compatibility
+metadata under that high baseline and no longer raises effort. Complex
 React/frontend refactoring, accessibility, or fixing sets `specialized_frontend=true` and requires fresh
 Sol/xhigh or Sol/max final review according to risk.
 Ambiguous, long-horizon, cross-repository, or high-risk work is promoted to Opus;

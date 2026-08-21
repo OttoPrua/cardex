@@ -24,6 +24,15 @@ const grokLegacyMinimalEnd = `{"type":"end","stopReason":"end_turn","sessionId":
 const grok105PublicUsage = `{"type":"usage","messageId":"message-public-private","stopReason":"tool_use","usage":{"input_tokens":21,"output_tokens":8},"signature":"signature-public-private"}`
 const grok105PublicEnd = `{"type":"end","stopReason":"end_turn","sessionId":"session-public-private","requestId":"request-public-private","usage":{"input_tokens":34,"output_tokens":13},"num_turns":3,"modelUsage":{"grok-4.6":{"input_tokens":34,"output_tokens":13}}}`
 const grok105PublicEndWithTicks = `{"type":"end","stopReason":"end_turn","sessionId":"session-public-private","requestId":"request-public-private","usage":{"input_tokens":34,"output_tokens":13},"num_turns":3,"modelUsage":{"grok-4.6":{"input_tokens":34,"output_tokens":13}},"total_cost_usd_ticks":731.125}`
+const grok105ClosedMetadata = `{"type":"metadata"}`
+const grok105ClosedSystemVersion = `{"type":"system.version","version":"1.0.5"}`
+const grokOpaqueEndEventID = "event-opaque-private"
+const grokOpaqueEndTraceID = "trace-opaque-private"
+const grokOpaqueEndChannel = "acct-opaque-channel"
+
+func grok105EndWithAdditiveMetadata(end string) string {
+	return strings.TrimSuffix(end, "}") + `,"eventId":"` + grokOpaqueEndEventID + `","traceId":"` + grokOpaqueEndTraceID + `","accounting_channel":"` + grokOpaqueEndChannel + `","closed":true}`
+}
 
 func TestGrokBuild105PublicUsageAndEndCompleteWithoutIdentifierExposure(t *testing.T) {
 	raw := `{"type":"text","data":"PUBLIC_OK"}` + "\n" + grok105PublicUsage + "\n" + grok105PublicEnd
@@ -107,8 +116,8 @@ func TestGrokBuild105PublicEndTicksRejectExtraOrMissingPublicCoordinate(t *testi
 		end  string
 	}{
 		{
-			"extra field",
-			strings.TrimSuffix(grok105PublicEndWithTicks, "}") + `,"extra":true}`,
+			"content-bearing extra field",
+			strings.TrimSuffix(grok105PublicEndWithTicks, "}") + `,"data":"hidden"}`,
 		},
 		{
 			"missing requestId",
@@ -135,10 +144,10 @@ func TestGrokBuild105PublicEndTicksMustBeSingleAndFinal(t *testing.T) {
 	}{
 		{"duplicate end", grok105PublicEndWithTicks},
 		{"text tail", `{"type":"text","data":"late"}`},
-		{"usage tail", grok105PublicUsage},
 		{"error tail", `{"type":"error","message":"late"}`},
 		{"unknown tail", `{"type":"future_event"}`},
 		{"malformed tail", `not-json`},
+		{"invalid usage tail", `{"type":"usage","messageId":"m","stopReason":"end_turn","usage":{},"signature":"s","extra":true}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res := parseGrokBuildJSONL(grok105PublicEndWithTicks + "\n" + tc.tail)
@@ -194,7 +203,7 @@ func TestGrokBuild105PublicEndEnvelopeRejectsWrongExtraOrMissingCoreFields(t *te
 		{"wrong modelUsage type", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":{},"num_turns":1,"modelUsage":[]}`},
 		{"wrong sessionId type", `{"type":"end","stopReason":"end_turn","sessionId":7,"requestId":"r","usage":{},"num_turns":1,"modelUsage":{}}`},
 		{"wrong usage type", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":[],"num_turns":1,"modelUsage":{}}`},
-		{"extra top-level field", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":{},"num_turns":1,"modelUsage":{},"extra":true}`},
+		{"content-bearing extra field", `{"type":"end","stopReason":"end_turn","sessionId":"s","requestId":"r","usage":{},"num_turns":1,"modelUsage":{},"data":"hidden"}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res := parseGrokBuildJSONL(`{"type":"text","data":"work"}` + "\n" + tc.end)
@@ -215,8 +224,7 @@ func TestGrokBuild105PublicEndMustBeSingleFinalEndTurn(t *testing.T) {
 	}{
 		{"non-end_turn", strings.Replace(grok105PublicEnd, `"stopReason":"end_turn"`, `"stopReason":"max_tokens"`, 1)},
 		{"duplicate end", grok105PublicEnd + "\n" + grok105PublicEnd},
-		{"nonempty final tail", grok105PublicEnd + "\n" + `{"type":"text","data":"late"}`},
-		{"usage after end", grok105PublicEnd + "\n" + grok105PublicUsage},
+		{"nonempty semantic tail", grok105PublicEnd + "\n" + `{"type":"text","data":"late"}`},
 		{"malformed after end", grok105PublicEnd + "\n" + `not-json`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -347,7 +355,6 @@ func TestGrokBuildTerminalMustBeSingleFinalEndTurn(t *testing.T) {
 		{"nonclean stop reason", `{"type":"text","data":"OK"}` + "\n" + `{"type":"end","stopReason":"max_tokens","sessionId":"s"}`},
 		{"duplicate terminal", `{"type":"text","data":"OK"}` + "\n" + grokLegacyCleanEnd + "\n" + grokLegacyCleanEnd},
 		{"semantic event after terminal", `{"type":"text","data":"OK"}` + "\n" + grokLegacyCleanEnd + "\n" + `{"type":"text","data":"late"}`},
-		{"usage event after terminal", `{"type":"text","data":"OK"}` + "\n" + grokLegacyCleanEnd + "\n" + `{"signature":"s","type":"usage","usage":{"input_tokens":1}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			res := parseGrokBuildJSONL(tc.raw)
@@ -394,5 +401,160 @@ func TestInvokeGrokBuildAcceptsProved105ShapesAndLegacyTerminal(t *testing.T) {
 	}
 	if res.SessionID != "session-legacy" || !strings.Contains(res.Result, "GROK_OK") {
 		t.Fatalf("invoke lost terminal identity or semantic text: %+v", res)
+	}
+}
+
+func grok105AssertNoOpaqueExposure(t *testing.T, res *claudeResult, values ...string) {
+	t.Helper()
+	encoded, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, value := range values {
+		if strings.Contains(string(encoded), value) {
+			t.Fatalf("opaque identifiers and additive metadata values must not be retained or exposed: %s", encoded)
+		}
+	}
+}
+
+func TestGrokBuild105AdditiveEndMetadataIsAcceptedWithoutRetention(t *testing.T) {
+	rawPrefix := `{"type":"text","data":"PUBLIC_OK"}` + "\n" + grok105PublicUsage + "\n"
+	for _, tc := range []struct {
+		name string
+		base string
+	}{
+		{"public end", grok105PublicEnd},
+		{"public end with ticks", grok105PublicEndWithTicks},
+		{"legacy end", grokLegacyCleanEnd},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := parseGrokBuildJSONL(rawPrefix + tc.base)
+			got := parseGrokBuildJSONL(rawPrefix + grok105EndWithAdditiveMetadata(tc.base))
+			if got == nil || got.IsError || !got.ObservationComplete || got.TerminalEvents != 1 {
+				t.Fatalf("additive top-level end metadata must parse: %+v", got)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("additive end metadata must not be retained or alter parser/accounting output: got=%+v want=%+v", got, want)
+			}
+			grok105AssertNoOpaqueExposure(t, got,
+				grokOpaqueEndEventID, grokOpaqueEndTraceID, grokOpaqueEndChannel,
+				"eventId", "traceId", "accounting_channel")
+		})
+	}
+}
+
+func TestGrokBuild105UsageAndMetadataTailsAfterEndAreAcceptedWithoutRetention(t *testing.T) {
+	publicPrefix := `{"type":"text","data":"PUBLIC_OK"}` + "\n"
+	legacyPrefix := `{"type":"text","data":"OK"}` + "\n"
+	legacyUsage := `{"signature":"signature-legacy-private","type":"usage","usage":{"input_tokens":1,"output_tokens":1}}`
+
+	t.Run("public usage and metadata tails", func(t *testing.T) {
+		want := parseGrokBuildJSONL(publicPrefix + grok105PublicEnd)
+		got := parseGrokBuildJSONL(publicPrefix + grok105PublicEnd + "\n" + grok105PublicUsage + "\n" + grok105ClosedMetadata)
+		if got == nil || got.IsError || !got.ObservationComplete || got.TerminalEvents != 1 {
+			t.Fatalf("known-valid usage and closed metadata tails after public end must parse: %+v", got)
+		}
+		if got.Result != "PUBLIC_OK" || got.SessionID != "" {
+			t.Fatalf("post-end tails must not change semantic text or retain public session identity: %+v", got)
+		}
+		if got.Usage == nil || got.Usage.InputTokens != 34 || got.Usage.OutputTokens != 13 {
+			t.Fatalf("trailing usage must not displace the accepted end usage: %+v", got.Usage)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("closed post-end accounting/metadata must not alter parser/accounting output: got=%+v want=%+v", got, want)
+		}
+		grok105AssertNoOpaqueExposure(t, got,
+			"message-public-private", "signature-public-private",
+			"session-public-private", "request-public-private")
+	})
+
+	t.Run("legacy usage and system.version tails", func(t *testing.T) {
+		want := parseGrokBuildJSONL(legacyPrefix + grokLegacyCleanEnd)
+		got := parseGrokBuildJSONL(legacyPrefix + grokLegacyCleanEnd + "\n" + legacyUsage + "\n" + grok105ClosedSystemVersion)
+		if got == nil || got.IsError || !got.ObservationComplete || got.TerminalEvents != 1 {
+			t.Fatalf("known-valid usage and closed metadata tails after legacy end must parse: %+v", got)
+		}
+		if got.Result != "OK" || got.SessionID != "session-legacy" {
+			t.Fatalf("legacy post-end tails must keep semantic text and resumable session identity: %+v", got)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("legacy post-end accounting/metadata must not alter parser/accounting output: got=%+v want=%+v", got, want)
+		}
+		grok105AssertNoOpaqueExposure(t, got, "signature-legacy-private")
+	})
+
+	t.Run("additive end plus usage and metadata tails", func(t *testing.T) {
+		want := parseGrokBuildJSONL(publicPrefix + grok105PublicEndWithTicks)
+		got := parseGrokBuildJSONL(publicPrefix + grok105EndWithAdditiveMetadata(grok105PublicEndWithTicks) + "\n" + grok105PublicUsage + "\n" + grok105ClosedMetadata)
+		if got == nil || got.IsError || !got.ObservationComplete || got.TerminalEvents != 1 {
+			t.Fatalf("additive end plus closed post-end tails must parse: %+v", got)
+		}
+		if got.TotalCostUSD != 0 {
+			t.Fatalf("total_cost_usd_ticks must not contribute to TotalCostUSD: %+v", got)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("additive end plus tails must not retain metadata or alter accounting: got=%+v want=%+v", got, want)
+		}
+		grok105AssertNoOpaqueExposure(t, got,
+			grokOpaqueEndEventID, grokOpaqueEndTraceID, grokOpaqueEndChannel,
+			"731.125", "total_cost_usd_ticks",
+			"message-public-private", "signature-public-private")
+	})
+}
+
+func TestGrokBuild105RejectsForbiddenTailsAfterEnd(t *testing.T) {
+	prefix := `{"type":"text","data":"OK"}` + "\n" + grok105PublicEnd + "\n"
+	for _, tc := range []struct {
+		name string
+		tail string
+	}{
+		{"text", `{"type":"text","data":"late"}`},
+		{"thought", `{"type":"thought","data":"late"}`},
+		{"reasoning", `{"type":"reasoning","data":"late"}`},
+		{"model", `{"type":"model"}`},
+		{"tool", `{"type":"tool"}`},
+		{"tool_call", `{"content":[],"kind":"tool","locations":[],"rawInput":{},"status":"pending","title":"read","toolCallId":"call-late","toolName":"read_file","type":"tool_call"}`},
+		{"tool_call_update", `{"content":[],"locations":[],"rawOutput":null,"status":null,"toolCallId":"call-late","type":"tool_call_update"}`},
+		{"error", `{"type":"error","message":"late"}`},
+		{"content-bearing metadata", `{"type":"metadata","data":"hidden"}`},
+		{"malformed json", `not-json`},
+		{"unknown event", `{"type":"future_event"}`},
+		{"invalid usage", `{"type":"usage","messageId":"m","stopReason":"end_turn","usage":{},"signature":"s","extra":true}`},
+		{"invalid metadata", `{"type":"metadata","extra":true}`},
+		{"duplicate end", grok105PublicEnd},
+		{"non-end_turn", `{"type":"end","stopReason":"max_tokens","sessionId":"s"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(prefix + tc.tail)
+			if res == nil || !res.IsError || res.Subtype != "grok_build_invalid_terminal" || res.ObservationComplete {
+				t.Fatalf("forbidden tail after end must fail closed: %+v", res)
+			}
+			if res.SessionID != "" {
+				t.Fatalf("failed public terminal must not retain its session identifier: %+v", res)
+			}
+			grok105AssertNoOpaqueExposure(t, res, "call-late", "hidden")
+		})
+	}
+}
+
+func TestGrokBuild105EndRejectsContentSemanticToolOrErrorShapedFields(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		end  string
+	}{
+		{"data", strings.TrimSuffix(grok105PublicEnd, "}") + `,"data":"hidden"}`},
+		{"message", strings.TrimSuffix(grokLegacyMinimalEnd, "}") + `,"message":"late"}`},
+		{"content", strings.TrimSuffix(grok105PublicEnd, "}") + `,"content":[]}`},
+		{"error", strings.TrimSuffix(grokLegacyCleanEnd, "}") + `,"error":"late"}`},
+		{"toolName", strings.TrimSuffix(grok105PublicEnd, "}") + `,"toolName":"read_file"}`},
+		{"toolCallId", strings.TrimSuffix(grokLegacyMinimalEnd, "}") + `,"toolCallId":"call-end"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			res := parseGrokBuildJSONL(`{"type":"text","data":"OK"}` + "\n" + tc.end)
+			if res == nil || !res.IsError || res.ObservationComplete {
+				t.Fatalf("content/semantic/tool/error-shaped end fields must fail closed: %+v", res)
+			}
+			grok105AssertNoOpaqueExposure(t, res, "hidden", "late", "read_file", "call-end")
+		})
 	}
 }

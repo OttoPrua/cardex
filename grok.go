@@ -529,11 +529,26 @@ func grokBuildExactShape(fields map[string]json.RawMessage, keyTypes ...string) 
 	return true
 }
 
+func grokBuildEndForbiddenField(fields map[string]json.RawMessage) bool {
+	if grokBuildHasContent(fields) {
+		return true
+	}
+	for _, key := range []string{"kind", "locations", "title", "toolCallId", "toolName", "tools"} {
+		if raw, ok := fields[key]; ok && grokBuildJSONType(raw) != "null" {
+			return true
+		}
+	}
+	return false
+}
+
 func grokBuildEndShape(fields map[string]json.RawMessage) (valid, public105 bool) {
-	allowed := map[string]string{
+	known := map[string]string{
 		"type": "string", "stopReason": "string", "sessionId": "string",
 		"num_turns": "number", "total_cost_usd": "number", "duration_ms": "number",
 		"usage": "object", "requestId": "string", "modelUsage": "object",
+		// Public 1.0.5 may report this numeric marker. It stays absent from grokBuildEvent
+		// so it cannot enter accounting, and it remains illegal on the legacy envelope.
+		"total_cost_usd_ticks": "number",
 	}
 	if _, ok := fields["type"]; !ok {
 		return false, false
@@ -547,18 +562,40 @@ func grokBuildEndShape(fields map[string]json.RawMessage) (valid, public105 bool
 	if public105 && (!hasRequestID || !hasModelUsage) {
 		return false, true
 	}
-	if public105 {
-		// The public 1.0.5 terminal may report this numeric shape marker. It is
-		// deliberately absent from grokBuildEvent so it cannot enter accounting.
-		allowed["total_cost_usd_ticks"] = "number"
+	if _, hasTicks := fields["total_cost_usd_ticks"]; hasTicks && !public105 {
+		return false, public105
+	}
+	if grokBuildEndForbiddenField(fields) {
+		return false, public105
 	}
 	for key, raw := range fields {
-		want, ok := allowed[key]
-		if !ok || grokBuildJSONType(raw) != want {
+		want, ok := known[key]
+		if !ok {
+			continue
+		}
+		if grokBuildJSONType(raw) != want {
 			return false, public105
 		}
 	}
 	return true, public105
+}
+
+func grokBuildPostEndAccountingOrMetadata(typ string, fields map[string]json.RawMessage) bool {
+	if grokBuildHasContent(fields) {
+		return false
+	}
+	switch typ {
+	case "usage":
+		return grokBuildUsageShape(fields)
+	case "start", "system", "metadata":
+		return grokBuildExactShape(fields, "type", "string")
+	case "system.version":
+		return grokBuildExactShape(fields, "type", "string", "version", "string")
+	case "available_commands":
+		return grokBuildAvailableCommandsShape(fields)
+	default:
+		return false
+	}
 }
 
 func grokBuildUsageShape(fields map[string]json.RawMessage) bool {
@@ -658,24 +695,39 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 		if line == "" {
 			continue
 		}
-		if sawEnd {
-			markGrokBuildInvalidTerminal(res)
-		}
 		var fields map[string]json.RawMessage
 		if json.Unmarshal([]byte(line), &fields) != nil || fields == nil {
+			if sawEnd {
+				markGrokBuildInvalidTerminal(res)
+			}
 			res.ObservationComplete = false
 			continue
 		}
 		var typ string
 		if json.Unmarshal(fields["type"], &typ) != nil || typ == "" {
+			if sawEnd {
+				markGrokBuildInvalidTerminal(res)
+			}
 			res.ObservationComplete = false
 			grokBuildCountUnclassified(res, "", fields)
 			continue
 		}
 		var ev grokBuildEvent
 		if json.Unmarshal([]byte(line), &ev) != nil {
+			if sawEnd {
+				markGrokBuildInvalidTerminal(res)
+			}
 			res.ObservationComplete = false
 			grokBuildCountUnclassified(res, typ, fields)
+			continue
+		}
+		if sawEnd {
+			// A valid end_turn is the terminal. Closed usage/metadata may follow it; anything
+			// else, including a second end, stays an invalid terminal.
+			if grokBuildPostEndAccountingOrMetadata(ev.Type, fields) {
+				continue
+			}
+			markGrokBuildInvalidTerminal(res)
 			continue
 		}
 		switch ev.Type {

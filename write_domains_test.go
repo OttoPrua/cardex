@@ -243,3 +243,202 @@ func TestAuditWriteDomainsBlocksSharedClosedResourcesAndDuplicateLineage(t *test
 		t.Fatalf("overlap error must stay value-free: %v", err)
 	}
 }
+
+func TestNormalizePathClaimCanonicalizesFileAndDirectorySymlinkAliases(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "internal", "auth")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realDir, "token.go"), []byte("package auth\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, filepath.Join("internal", "auth", "token.go"), filepath.Join(root, "token-alias.go"))
+	mustSymlink(t, filepath.Join("internal", "auth"), filepath.Join(root, "auth-alias"))
+
+	realPath := mustNormalizePath(t, root, "internal/auth/token.go")
+	if realPath != "internal/auth/token.go" {
+		t.Fatalf("real file canonical=%q", realPath)
+	}
+	fileAlias := mustNormalizePath(t, root, "token-alias.go")
+	dirAlias := mustNormalizePath(t, root, "auth-alias/token.go")
+	if fileAlias != realPath || dirAlias != realPath {
+		t.Fatalf("symlink aliases must collapse to the real path: real=%q file=%q dir=%q", realPath, fileAlias, dirAlias)
+	}
+}
+
+func TestNormalizePathClaimCanonicalizesNonexistentSuffixBelowSymlink(t *testing.T) {
+	root := t.TempDir()
+	realDir := filepath.Join(root, "internal", "auth")
+	if err := os.MkdirAll(realDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, filepath.Join("internal", "auth"), filepath.Join(root, "auth-alias"))
+
+	realPath := mustNormalizePath(t, root, "internal/auth/newpkg/token.go")
+	if realPath != "internal/auth/newpkg/token.go" {
+		t.Fatalf("missing suffix under real ancestor canonical=%q", realPath)
+	}
+	aliasPath := mustNormalizePath(t, root, "auth-alias/newpkg/token.go")
+	if aliasPath != realPath {
+		t.Fatalf("missing suffix under symlink ancestor: real=%q alias=%q", realPath, aliasPath)
+	}
+
+	plain := mustNormalizePath(t, root, "does/not/exist.go")
+	if plain != "does/not/exist.go" {
+		t.Fatalf("ordinary missing child canonical=%q", plain)
+	}
+}
+
+func TestNormalizePathClaimCanonicalizesRepoRootSymlinkAlias(t *testing.T) {
+	realRoot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(realRoot, "internal", "auth"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(realRoot, "internal", "auth", "token.go"), []byte("package auth\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(t.TempDir(), "repo-alias")
+	mustSymlink(t, realRoot, aliasRoot)
+
+	fromReal := mustNormalizePath(t, realRoot, "internal/auth/token.go")
+	fromAlias := mustNormalizePath(t, aliasRoot, "internal/auth/token.go")
+	if fromReal != "internal/auth/token.go" || fromAlias != fromReal {
+		t.Fatalf("repo-root symlink alias: real=%q alias=%q", fromReal, fromAlias)
+	}
+}
+
+func TestNormalizePathClaimRejectsSymlinkEscapeDanglingAndCycle(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret"), []byte("nope\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, outside, filepath.Join(root, "escape"))
+	mustSymlink(t, "..", filepath.Join(root, "up"))
+	mustSymlink(t, "missing-target", filepath.Join(root, "dangling"))
+	mustSymlink(t, "cycle-b", filepath.Join(root, "cycle-a"))
+	mustSymlink(t, "cycle-a", filepath.Join(root, "cycle-b"))
+
+	cases := []struct {
+		name string
+		raw  string
+		want error
+	}{
+		{name: "outside-root dir", raw: "escape", want: errWriteDomainTraversal},
+		{name: "outside-root child", raw: "escape/secret", want: errWriteDomainTraversal},
+		{name: "parent symlink escape", raw: "up/secret", want: errWriteDomainTraversal},
+		{name: "dangling", raw: "dangling", want: errWriteDomainCanonicalization},
+		{name: "dangling child", raw: "dangling/child", want: errWriteDomainCanonicalization},
+		{name: "cyclic", raw: "cycle-a", want: errWriteDomainCanonicalization},
+		{name: "cyclic child", raw: "cycle-a/child", want: errWriteDomainCanonicalization},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := NormalizePathClaim(root, tc.raw)
+			if err == nil || !errors.Is(err, tc.want) {
+				t.Fatalf("NormalizePathClaim(%q)=%q, %v; want %v", tc.raw, got, err, tc.want)
+			}
+			if got != "" {
+				t.Fatalf("rejected claim must not return a path, got %q", got)
+			}
+			msg := err.Error()
+			for _, leak := range []string{tc.raw, root, outside, "secret", "missing-target", "passwd", "SELECT"} {
+				if strings.Contains(msg, leak) {
+					t.Fatalf("canonicalization error must stay value-free: %q contains %q", msg, leak)
+				}
+			}
+		})
+	}
+}
+
+func TestAuditWriteDomainsBlocksSymlinkAliasOverlapDeterministically(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "internal", "auth"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "internal", "auth", "token.go"), []byte("package auth\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustSymlink(t, filepath.Join("internal", "auth"), filepath.Join(root, "auth-alias"))
+
+	dup := WriteDomain{
+		ID: "auth-tokens", Lineage: "auth-tokens-lineage", Component: "auth",
+		Paths: []string{"internal/auth/token.go", "auth-alias/token.go"},
+	}
+	if _, err := NormalizeWriteDomain(root, dup); !errors.Is(err, errWriteDomainDuplicateClaim) {
+		t.Fatalf("alias of an owned path is a duplicate claim: %v", err)
+	}
+
+	realDom := WriteDomain{
+		ID: "auth-real", Lineage: "auth-real-lineage", Component: "auth",
+		Paths: []string{"internal/auth/token.go"},
+	}
+	aliasDom := WriteDomain{
+		ID: "auth-alias", Lineage: "auth-alias-lineage", Component: "auth",
+		Paths: []string{"auth-alias/token.go"},
+	}
+	missingReal := WriteDomain{
+		ID: "auth-future", Lineage: "auth-future-lineage", Component: "auth",
+		Paths: []string{"internal/auth/newpkg/token.go"},
+	}
+	missingAlias := WriteDomain{
+		ID: "auth-future-alias", Lineage: "auth-future-alias-lineage", Component: "auth",
+		Paths: []string{"auth-alias/newpkg/token.go"},
+	}
+
+	wantExact := WriteDomainConflict{
+		Kind:    overlapKindExact,
+		DomainA: "auth-alias",
+		DomainB: "auth-real",
+		PathA:   "internal/auth/token.go",
+		PathB:   "internal/auth/token.go",
+	}
+	assertStablePathOverlap(t, root, []WriteDomain{aliasDom, realDom}, wantExact)
+	assertStablePathOverlap(t, root, []WriteDomain{realDom, aliasDom}, wantExact)
+
+	wantMissing := WriteDomainConflict{
+		Kind:    overlapKindExact,
+		DomainA: "auth-future",
+		DomainB: "auth-future-alias",
+		PathA:   "internal/auth/newpkg/token.go",
+		PathB:   "internal/auth/newpkg/token.go",
+	}
+	assertStablePathOverlap(t, root, []WriteDomain{missingAlias, missingReal}, wantMissing)
+	assertStablePathOverlap(t, root, []WriteDomain{missingReal, missingAlias}, wantMissing)
+}
+
+func mustSymlink(t *testing.T, target, link string) {
+	t.Helper()
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func mustNormalizePath(t *testing.T, root, raw string) string {
+	t.Helper()
+	got, err := NormalizePathClaim(root, raw)
+	if err != nil {
+		t.Fatalf("NormalizePathClaim(%q): %v", raw, err)
+	}
+	if got == "" || strings.Contains(got, `\`) || strings.HasPrefix(got, "/") {
+		t.Fatalf("normalized path must be slash-separated and repository-relative: %q", got)
+	}
+	return got
+}
+
+func assertStablePathOverlap(t *testing.T, root string, domains []WriteDomain, want WriteDomainConflict) {
+	t.Helper()
+	_, err := AuditWriteDomains(root, domains)
+	var overlap *WriteDomainOverlapError
+	if !errors.As(err, &overlap) || !errors.Is(err, errWriteDomainPathOverlap) || len(overlap.Conflicts) != 1 {
+		t.Fatalf("inspectable alias overlap: %+v / %v", overlap, err)
+	}
+	got := overlap.Conflicts[0]
+	if got != want {
+		t.Fatalf("stable overlap payload: %+v; want %+v", got, want)
+	}
+	if strings.Contains(err.Error(), "auth-alias/token.go") || strings.Contains(err.Error(), root) {
+		t.Fatalf("overlap error must stay value-free: %v", err)
+	}
+}

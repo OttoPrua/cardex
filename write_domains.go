@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -28,6 +29,7 @@ var (
 	errWriteDomainTraversal        = errors.New("write domain path traversal")
 	errWriteDomainEmptyClaim       = errors.New("write domain empty claim")
 	errWriteDomainAmbiguousClaim   = errors.New("write domain ambiguous claim")
+	errWriteDomainCanonicalization = errors.New("write domain path canonicalization")
 	errWriteDomainMalformedID      = errors.New("write domain malformed identifier")
 	errWriteDomainDuplicateLineage = errors.New("write domain duplicate lineage ownership")
 	errWriteDomainPathOverlap      = errors.New("write domain path overlap")
@@ -124,10 +126,40 @@ func validResourceID(id string) bool {
 	return resourceIDRe.MatchString(id)
 }
 
-// NormalizePathClaim returns a slash-separated path bound lexically under
-// repoRoot. It does not touch the filesystem, follow symlinks, or accept
-// traversal, empty, or ambiguous claims.
+// NormalizePathClaim returns a slash-separated, repository-relative path bound
+// under the canonical real repoRoot. Existing prefixes are resolved through
+// symlinks; a missing suffix is reattached so aliases collide. Traversal,
+// empty, ambiguous, escaping, dangling, cyclic, or unprovable claims fail closed.
 func NormalizePathClaim(repoRoot, raw string) (string, error) {
+	root, err := canonicalizeRepoRoot(repoRoot)
+	if err != nil {
+		return "", err
+	}
+	rel, err := lexicalPathClaim(raw)
+	if err != nil {
+		return "", err
+	}
+
+	full := filepath.Clean(filepath.Join(root, filepath.FromSlash(rel)))
+	if !pathInsideRoot(root, full) {
+		return "", errWriteDomainTraversal
+	}
+	if full == root {
+		return "", errWriteDomainAmbiguousClaim
+	}
+
+	resolved, err := resolveThroughExistingPrefix(root, full)
+	if err != nil {
+		return "", err
+	}
+	rootAgain, err := canonicalizeRepoRoot(repoRoot)
+	if err != nil || rootAgain != root {
+		return "", errWriteDomainCanonicalization
+	}
+	return confinedRepoRel(root, resolved)
+}
+
+func canonicalizeRepoRoot(repoRoot string) (string, error) {
 	if strings.TrimSpace(repoRoot) == "" {
 		return "", errWriteDomainEmptyClaim
 	}
@@ -138,7 +170,17 @@ func NormalizePathClaim(repoRoot, raw string) (string, error) {
 	if !filepath.IsAbs(root) {
 		return "", errWriteDomainAmbiguousClaim
 	}
+	resolved, err := evalStable(root)
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(resolved) {
+		return "", errWriteDomainAmbiguousClaim
+	}
+	return resolved, nil
+}
 
+func lexicalPathClaim(raw string) (string, error) {
 	if strings.TrimSpace(raw) == "" {
 		return "", errWriteDomainEmptyClaim
 	}
@@ -182,24 +224,125 @@ func NormalizePathClaim(repoRoot, raw string) (string, error) {
 			return "", errWriteDomainAmbiguousClaim
 		}
 	}
+	return trimmed, nil
+}
 
-	full := filepath.Clean(filepath.Join(root, filepath.FromSlash(trimmed)))
-	sep := string(filepath.Separator)
-	if full != root && !strings.HasPrefix(full, root+sep) {
+func resolveThroughExistingPrefix(root, full string) (string, error) {
+	existing, missing, err := deepestExistingPrefix(root, full)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := evalStable(existing)
+	if err != nil {
+		return "", err
+	}
+	existing2, missing2, err := deepestExistingPrefix(root, full)
+	if err != nil {
+		return "", err
+	}
+	resolved2, err := evalStable(existing2)
+	if err != nil {
+		return "", err
+	}
+	if existing2 != existing || resolved2 != resolved || !sameStringSlice(missing, missing2) {
+		return "", errWriteDomainCanonicalization
+	}
+	if !pathInsideRoot(root, resolved) {
 		return "", errWriteDomainTraversal
 	}
-	if full == root {
+	if len(missing) == 0 {
+		return resolved, nil
+	}
+	out := filepath.Clean(filepath.Join(append([]string{resolved}, missing...)...))
+	if !pathInsideRoot(root, out) {
+		return "", errWriteDomainTraversal
+	}
+	return out, nil
+}
+
+func deepestExistingPrefix(root, full string) (string, []string, error) {
+	existing := filepath.Clean(full)
+	var missing []string
+	for {
+		_, err := os.Lstat(existing)
+		if err == nil {
+			return existing, missing, nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", nil, errWriteDomainCanonicalization
+		}
+		if existing == root {
+			return "", nil, errWriteDomainCanonicalization
+		}
+		parent := filepath.Dir(existing)
+		if parent == existing || !pathInsideRoot(root, parent) {
+			return "", nil, errWriteDomainCanonicalization
+		}
+		missing = append([]string{filepath.Base(existing)}, missing...)
+		existing = parent
+	}
+}
+
+func evalStable(path string) (string, error) {
+	first, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", errWriteDomainCanonicalization
+	}
+	first = filepath.Clean(first)
+	if !filepath.IsAbs(first) {
+		return "", errWriteDomainCanonicalization
+	}
+	second, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return "", errWriteDomainCanonicalization
+	}
+	if filepath.Clean(second) != first {
+		return "", errWriteDomainCanonicalization
+	}
+	return first, nil
+}
+
+func confinedRepoRel(root, path string) (string, error) {
+	path = filepath.Clean(path)
+	if !pathInsideRoot(root, path) {
+		return "", errWriteDomainTraversal
+	}
+	if path == root {
 		return "", errWriteDomainAmbiguousClaim
 	}
-	rel, err := filepath.Rel(root, full)
+	rel, err := filepath.Rel(root, path)
 	if err != nil {
-		return "", errWriteDomainAmbiguousClaim
+		return "", errWriteDomainCanonicalization
 	}
 	rel = filepath.ToSlash(rel)
-	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || strings.Contains(rel, "/../") {
 		return "", errWriteDomainTraversal
 	}
+	if rel == "" || strings.HasPrefix(rel, "/") || strings.Contains(rel, `\`) {
+		return "", errWriteDomainCanonicalization
+	}
 	return rel, nil
+}
+
+func pathInsideRoot(root, path string) bool {
+	root = filepath.Clean(root)
+	path = filepath.Clean(path)
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+func sameStringSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func pathHasDotDot(p string) bool {

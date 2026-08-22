@@ -54,8 +54,8 @@ func TestAnalyzeDependencyDAGDiagnosesCyclesAndMissingDependencies(t *testing.T)
 	if !errors.As(err, &audit) {
 		t.Fatalf("diagnosis must be inspectable: %v", err)
 	}
-	if !reflect.DeepEqual(got.Ready, []string{"ready"}) || !reflect.DeepEqual(audit.Diagnosis.Ready, []string{"ready"}) {
-		t.Fatalf("unrelated ready node must remain ready: %+v", got)
+	if len(got.Ready) != 0 || len(audit.Diagnosis.Ready) != 0 {
+		t.Fatalf("audit error must withhold ready authorization: %+v", got)
 	}
 	if len(got.Cycles) != 1 || !reflect.DeepEqual(got.Cycles[0], []string{"alpha", "beta", "gamma"}) {
 		t.Fatalf("cycle must rotate onto the least id: %v", got.Cycles)
@@ -68,6 +68,59 @@ func TestAnalyzeDependencyDAGDiagnosesCyclesAndMissingDependencies(t *testing.T)
 	selfGot, selfErr := AnalyzeDependencyDAG(self)
 	if !errors.Is(selfErr, errDAGCycle) || len(selfGot.Cycles) != 1 || !reflect.DeepEqual(selfGot.Cycles[0], []string{"loop"}) {
 		t.Fatalf("self-cycle: %+v / %v", selfGot, selfErr)
+	}
+	if len(selfGot.Ready) != 0 {
+		t.Fatalf("self-cycle must withhold ready: %+v", selfGot)
+	}
+}
+
+func TestAnalyzeDependencyDAGWithholdsReadyWhenDisjointNodeCoexistsWithAuditFailure(t *testing.T) {
+	disjoint := DependencyNode{ID: "ready", Lineage: "ready-lineage"}
+
+	t.Run("cycle", func(t *testing.T) {
+		got, err := AnalyzeDependencyDAG([]DependencyNode{
+			{ID: "alpha", Lineage: "alpha-lineage", DependsOn: []string{"beta"}},
+			{ID: "beta", Lineage: "beta-lineage", DependsOn: []string{"alpha"}},
+			disjoint,
+		})
+		assertEmptyReadyOnAudit(t, got, err, errDAGCycle)
+		if len(got.Cycles) != 1 || !reflect.DeepEqual(got.Cycles[0], []string{"alpha", "beta"}) {
+			t.Fatalf("cycle diagnosis must remain: %v", got.Cycles)
+		}
+		if len(got.Missing) != 0 {
+			t.Fatalf("missing must stay empty: %+v", got.Missing)
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		got, err := AnalyzeDependencyDAG([]DependencyNode{
+			{ID: "leaf", Lineage: "leaf-lineage", DependsOn: []string{"ghost"}},
+			disjoint,
+		})
+		assertEmptyReadyOnAudit(t, got, err, errDAGMissingDependency)
+		if len(got.Missing) != 1 || got.Missing[0].NodeID != "leaf" || got.Missing[0].MissingID != "ghost" {
+			t.Fatalf("missing diagnosis must remain: %+v", got.Missing)
+		}
+		if len(got.Cycles) != 0 {
+			t.Fatalf("cycles must stay empty: %v", got.Cycles)
+		}
+	})
+}
+
+func assertEmptyReadyOnAudit(t *testing.T, got DAGDiagnosis, err error, want error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("dag audit must fail closed")
+	}
+	if !errors.Is(err, want) {
+		t.Fatalf("want %v, got %v", want, err)
+	}
+	var audit *DAGAuditError
+	if !errors.As(err, &audit) {
+		t.Fatalf("diagnosis must be inspectable: %v", err)
+	}
+	if len(got.Ready) != 0 || len(audit.Diagnosis.Ready) != 0 {
+		t.Fatalf("non-nil dag audit error must yield empty ready: %+v", got)
 	}
 }
 

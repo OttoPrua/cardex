@@ -63,8 +63,8 @@ func (e *DAGAuditError) Is(target error) bool {
 
 // AnalyzeDependencyDAG validates identifiers, then reports ready nodes,
 // cycles, and missing edges. Input order does not affect Ready, Cycles, or
-// Missing. Cycle or missing diagnosis fail-closes while still returning the
-// report so an auditor can read the graph.
+// Missing. Any cycle, missing dependency, or other DAG audit error
+// fail-closes Ready authorization; Cycles and Missing remain inspectable.
 func AnalyzeDependencyDAG(nodes []DependencyNode) (DAGDiagnosis, error) {
 	byID := make(map[string]DependencyNode, len(nodes))
 	order := make([]string, 0, len(nodes))
@@ -107,18 +107,16 @@ func AnalyzeDependencyDAG(nodes []DependencyNode) (DAGDiagnosis, error) {
 	})
 
 	cycles := diagnoseCycles(order, edges)
-	cyclic := map[string]bool{}
-	for _, cycle := range cycles {
-		for _, id := range cycle {
-			cyclic[id] = true
-		}
+	if len(cycles) > 0 || len(missing) > 0 {
+		diag := DAGDiagnosis{Cycles: cycles, Missing: missing}
+		return diag, &DAGAuditError{Diagnosis: diag}
 	}
 
 	ready := make([]string, 0)
 	sort.Strings(order)
 	for _, id := range order {
 		n := byID[id]
-		if n.Satisfied || cyclic[id] {
+		if n.Satisfied {
 			continue
 		}
 		blocked := false
@@ -135,11 +133,7 @@ func AnalyzeDependencyDAG(nodes []DependencyNode) (DAGDiagnosis, error) {
 		ready = append(ready, id)
 	}
 
-	diag := DAGDiagnosis{Ready: ready, Cycles: cycles, Missing: missing}
-	if len(cycles) > 0 || len(missing) > 0 {
-		return diag, &DAGAuditError{Diagnosis: diag}
-	}
-	return diag, nil
+	return DAGDiagnosis{Ready: ready}, nil
 }
 
 func validateDependencyNode(n DependencyNode) error {

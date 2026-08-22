@@ -19,6 +19,7 @@ const (
 	cursorSchemaV1         = "cardex.manager_wake.cursor.v1"
 	errorSchemaV1          = "cardex.manager_wake.error.v1"
 	receiptSchemaV1        = "cardex.manager_wake.receipt.v1"
+	inflightSchemaV1       = "cardex.manager_wake.inflight.v1"
 )
 
 // ManagerWakeSubscription is a closed, scoped delivery target. IDs must be
@@ -51,6 +52,9 @@ var (
 	// managerWakeCommitCursor is the post-queue ack. Tests inject a one-shot
 	// save failure to prove receipts suppress a second queue spawn.
 	managerWakeCommitCursor = saveManagerWakeCursor
+	// managerWakePersistReceipts is the sender receipt fsync. Tests inject a
+	// crash after queue success and before this write.
+	managerWakePersistReceipts = rememberManagerWakeReceipts
 )
 
 type managerWakeOutboxRow struct {
@@ -106,6 +110,15 @@ type managerWakeReceipt struct {
 	UpdatedAt      string   `json:"updated_at"`
 }
 
+type managerWakeInflight struct {
+	Schema          string   `json:"schema"`
+	SubscriptionID  string   `json:"subscription_id"`
+	ThreadID        string   `json:"thread_id,omitempty"`
+	WakeEventIDs    []string `json:"wake_event_ids"`
+	OutboxHighWater int64    `json:"outbox_high_water,omitempty"`
+	UpdatedAt       string   `json:"updated_at"`
+}
+
 type wakeBindKind int
 
 const (
@@ -139,11 +152,22 @@ func managerWakeReceiptDir(root string) string {
 }
 
 func managerWakeReceiptPath(root, subID string) string {
+	return closedManagerWakeSubFile(managerWakeReceiptDir(root), subID)
+}
+
+func managerWakeInflightDir(root string) string {
+	return filepath.Join(managerWakeDir(root), "inflight")
+}
+
+func managerWakeInflightPath(root, subID string) string {
+	return closedManagerWakeSubFile(managerWakeInflightDir(root), subID)
+}
+
+func closedManagerWakeSubFile(dir, subID string) string {
 	id, ok := closedManagerWakeSubID(subID)
 	if !ok {
 		return ""
 	}
-	dir := managerWakeReceiptDir(root)
 	path := filepath.Join(dir, id+".json")
 	rel, err := filepath.Rel(dir, path)
 	if err != nil || rel == "" || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
@@ -173,20 +197,7 @@ func closedManagerWakeSubID(id string) (string, bool) {
 }
 
 func managerWakeCursorPath(root, subID string) string {
-	id, ok := closedManagerWakeSubID(subID)
-	if !ok {
-		return ""
-	}
-	dir := managerWakeCursorDir(root)
-	path := filepath.Join(dir, id+".json")
-	rel, err := filepath.Rel(dir, path)
-	if err != nil || rel == "" || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
-		return ""
-	}
-	if filepath.Base(path) != id+".json" {
-		return ""
-	}
-	return path
+	return closedManagerWakeSubFile(managerWakeCursorDir(root), subID)
 }
 
 func wakeEligibleEventType(evType string) bool {
@@ -552,6 +563,99 @@ func rememberManagerWakeReceipts(root, subID string, rows []managerWakeOutboxRow
 	return atomicWriteSync(path, append(data, '\n'))
 }
 
+func loadManagerWakeInflightIDs(root, subID string) (map[string]bool, string, error) {
+	path := managerWakeInflightPath(root, subID)
+	if path == "" {
+		return nil, "invalid_subscription_id", fmt.Errorf("invalid_subscription_id")
+	}
+	ids := map[string]bool{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ids, "", nil
+		}
+		return nil, "inflight_unreadable", fmt.Errorf("inflight_unreadable")
+	}
+	var rec managerWakeInflight
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, "inflight_corrupt", fmt.Errorf("inflight_corrupt")
+	}
+	for _, id := range rec.WakeEventIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids[id] = true
+		}
+	}
+	return ids, "", nil
+}
+
+func saveManagerWakeInflight(root, subID, threadID string, rows []managerWakeOutboxRow, highWater int64) error {
+	path := managerWakeInflightPath(root, subID)
+	if path == "" {
+		return fmt.Errorf("invalid_subscription_id")
+	}
+	id, _ := closedManagerWakeSubID(subID)
+	list := make([]string, 0, len(rows))
+	seen := map[string]bool{}
+	for _, row := range rows {
+		wid := strings.TrimSpace(row.WakeEventID)
+		if wid == "" || seen[wid] {
+			continue
+		}
+		seen[wid] = true
+		list = append(list, wid)
+	}
+	sort.Strings(list)
+	if len(list) == 0 {
+		return fmt.Errorf("inflight_save_failed")
+	}
+	rec := managerWakeInflight{
+		Schema:          inflightSchemaV1,
+		SubscriptionID:  id,
+		ThreadID:        strings.TrimSpace(threadID),
+		WakeEventIDs:    list,
+		OutboxHighWater: highWater,
+		UpdatedAt:       time.Now().Format(time.RFC3339Nano),
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteSync(path, append(data, '\n'))
+}
+
+func clearManagerWakeInflight(root, subID string) error {
+	path := managerWakeInflightPath(root, subID)
+	if path == "" {
+		return fmt.Errorf("invalid_subscription_id")
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func inflightCoversUnacked(inflight map[string]bool, rows []managerWakeOutboxRow) bool {
+	for _, row := range rows {
+		if inflight[row.WakeEventID] {
+			return true
+		}
+	}
+	return false
+}
+
+func failDeliveryUncertain(root string, cur *managerWakeCursor, metrics *managerWakeMetrics) error {
+	if cur != nil {
+		cur.LastErrorClass = "delivery_uncertain"
+		_ = saveManagerWakeCursor(root, cur)
+	}
+	if metrics != nil {
+		metrics.LastErrorClass = "delivery_uncertain"
+	}
+	noteManagerWakeError(root, metrics, "delivery_uncertain")
+	return fmt.Errorf("delivery_uncertain")
+}
+
 func loadManagerWakeMetrics(root string) managerWakeMetrics {
 	var m managerWakeMetrics
 	data, err := os.ReadFile(managerWakeMetricsPath(root))
@@ -696,6 +800,31 @@ func diagnoseManagerWake(root string, mw *ManagerWakeConfig) []string {
 			}
 		}
 	}
+	entries, err = os.ReadDir(managerWakeInflightDir(root))
+	if err == nil {
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+				continue
+			}
+			id := strings.TrimSuffix(e.Name(), ".json")
+			if _, ok := closedManagerWakeSubID(id); !ok {
+				out = append(out, "inflight_name_rejected")
+				continue
+			}
+			inflight, class, _ := loadManagerWakeInflightIDs(root, id)
+			if class != "" {
+				out = append(out, class)
+				continue
+			}
+			receipts, _, _ := loadManagerWakeReceiptIDs(root, id)
+			for wid := range inflight {
+				if !receipts[wid] {
+					out = append(out, "delivery_uncertain")
+					break
+				}
+			}
+		}
+	}
 	return out
 }
 
@@ -821,8 +950,11 @@ func reconcileManagerWakeOutbox(root string) error {
 
 // Local Codex 0.149.0 `queue` grammar is only `--thread` and `--message`.
 // `--idempotency-key`, `--id`, `--client-request-id`, `--request-id`, and
-// `--dedupe-key` are unexpected arguments. Do not invent a flag. Receiver
-// idempotency is the `wake=<WakeEventID>` coordinate inside `--message`.
+// `--dedupe-key` are unexpected arguments. Do not invent a flag.
+// `wake=` in `--message` and app-server `clientUserMessageId` are correlation
+// only; they do not dedupe receiver model turns. A durable inflight claim
+// must be fsynced before queue, and a missing receipt after that claim is
+// fail-closed `delivery_uncertain` with no further model spawn.
 func managerWakeQueueArgv(bin, thread, message string) []string {
 	return []string{bin, "queue", "--thread", thread, "--message", message}
 }
@@ -1156,6 +1288,15 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		}
 		toSend = append(toSend, row)
 	}
+	inflight, class, err := loadManagerWakeInflightIDs(root, sub.ID)
+	if class != "" {
+		metrics.LastErrorClass = class
+		noteManagerWakeError(root, metrics, class)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%s", class)
+	}
 	commit := func() error {
 		cur.OutboxSeq = scanHigh
 		cur.LastWakeID = delta[len(delta)-1].WakeEventID
@@ -1164,7 +1305,11 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		if err := managerWakeCommitCursor(root, cur); err != nil {
 			return failCursorSave(root, metrics, err)
 		}
+		_ = clearManagerWakeInflight(root, sub.ID)
 		return nil
+	}
+	if inflightCoversUnacked(inflight, toSend) {
+		return failDeliveryUncertain(root, cur, metrics)
 	}
 	if len(toSend) == 0 {
 		return commit()
@@ -1180,8 +1325,15 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		noteManagerWakeError(root, metrics, "payload_rejected")
 		return fmt.Errorf("payload_rejected")
 	}
+	if err := saveManagerWakeInflight(root, sub.ID, sub.ThreadID, toSend, scanHigh); err != nil {
+		class := allowlistedWakeError(err, "inflight_save_failed")
+		metrics.LastErrorClass = class
+		noteManagerWakeError(root, metrics, class)
+		return fmt.Errorf("%s", class)
+	}
 	metrics.QueueAttempts++
 	if err := managerWakeQueue(bin, sub.ThreadID, msg); err != nil {
+		_ = clearManagerWakeInflight(root, sub.ID)
 		metrics.QueueFailures++
 		metrics.LastErrorClass = "queue_failed"
 		cur.LastErrorClass = "queue_failed"
@@ -1190,12 +1342,10 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		return fmt.Errorf("queue_failed")
 	}
 	metrics.QueueSuccesses++
-	if err := rememberManagerWakeReceipts(root, sub.ID, toSend); err != nil {
-		class := allowlistedWakeError(err, "receipt_append_failed")
-		metrics.LastErrorClass = class
-		noteManagerWakeError(root, metrics, class)
-		return fmt.Errorf("%s", class)
+	if err := managerWakePersistReceipts(root, sub.ID, toSend); err != nil {
+		return failDeliveryUncertain(root, cur, metrics)
 	}
+	_ = clearManagerWakeInflight(root, sub.ID)
 	return commit()
 }
 

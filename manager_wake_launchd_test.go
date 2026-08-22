@@ -10,7 +10,10 @@ import (
 
 func TestRenderManagerWakePlistWatchPathsAndInterval(t *testing.T) {
 	root := "/tmp/cardex-wake-root"
-	plist := renderManagerWakePlist("/opt/homebrew/bin/cardex", root, 0, "/tmp/wake.log")
+	plist, err := renderManagerWakePlist("/opt/homebrew/bin/cardex", root, 0, "/tmp/wake.log")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !strings.Contains(plist, "<string>"+managerWakeLaunchdLabel+"</string>") {
 		t.Fatalf("missing label:\n%s", plist)
 	}
@@ -32,7 +35,10 @@ func TestRenderManagerWakePlistWatchPathsAndInterval(t *testing.T) {
 	if strings.Contains(plist, "com.cardex.tick") {
 		t.Fatal("manager-wake plist must not bind the tick unit")
 	}
-	plist7 := renderManagerWakePlist("/opt/homebrew/bin/cardex", root, 7, "/tmp/wake.log")
+	plist7, err := renderManagerWakePlist("/opt/homebrew/bin/cardex", root, 7, "/tmp/wake.log")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sec7, err := managerWakePlistStartInterval(plist7)
 	if err != nil || sec7 != managerWakeWatchdogSec {
 		t.Fatalf("hard watchdog ignored 7: interval=%d err=%v", sec7, err)
@@ -43,21 +49,78 @@ func TestRenderManagerWakePlistXMLEscapesText(t *testing.T) {
 	exe := `/opt/bin/cardex & "tool"`
 	root := `/tmp/cardex & root/<wake>`
 	logOut := `/tmp/wake & <err>.log`
-	plist := renderManagerWakePlist(exe, root, 0, logOut)
+	plist, err := renderManagerWakePlist(exe, root, 0, logOut)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if strings.Contains(plist, `cardex & root`) || strings.Contains(plist, `<wake>`) ||
 		strings.Contains(plist, `cardex & "tool"`) || strings.Contains(plist, `wake & <err>`) {
 		t.Fatalf("unescaped XML special characters:\n%s", plist)
 	}
-	if !strings.Contains(plist, plistXMLText(exe)) || !strings.Contains(plist, plistXMLText(root)) {
+	exeXML, err := plistXMLText(exe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootXML, err := plistXMLText(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plist, exeXML) || !strings.Contains(plist, rootXML) {
 		t.Fatalf("escaped exe/root missing:\n%s", plist)
 	}
 	outbox := managerWakeOutboxPath(root)
-	if !strings.Contains(plist, plistXMLText(outbox)) || !strings.Contains(plist, plistXMLText(logOut)) {
+	outboxXML, err := plistXMLText(outbox)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logXML, err := plistXMLText(logOut)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(plist, outboxXML) || !strings.Contains(plist, logXML) {
 		t.Fatalf("escaped outbox/log missing:\n%s", plist)
 	}
 	paths := managerWakePlistWatchPaths(plist)
 	if len(paths) != 1 || paths[0] != outbox {
 		t.Fatalf("WatchPaths unescape=%v want [%s]", paths, outbox)
+	}
+}
+
+func TestRenderManagerWakePlistControlCharsFailClosed(t *testing.T) {
+	if _, err := renderManagerWakePlist("/opt/bin/cardex", "/tmp/cardex\x01root", 0, "/tmp/wake.log"); err == nil {
+		t.Fatal("XML control characters must fail closed")
+	} else if err.Error() != "plist_xml_invalid" {
+		t.Fatalf("err=%v", err)
+	}
+	if got, err := renderManagerWakePlist("/opt/bin/cardex", "/tmp/cardex\x00root", 0, "/tmp/wake.log"); err == nil {
+		t.Fatalf("NUL must fail closed, got %q", got)
+	} else if err.Error() != "plist_xml_invalid" {
+		t.Fatalf("NUL err=%v", err)
+	}
+	if text, err := plistXMLText("ok\x07path"); err == nil || text != "" {
+		t.Fatalf("control char escape must not yield an empty path: text=%q err=%v", text, err)
+	}
+}
+
+func TestInstallManagerWakeRestoreErrorSurfaces(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	prior := []byte("PRIOR PLIST\n")
+	if err := os.WriteFile(pp, prior, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withIsolatedManagerWakeLaunchd(t, pp)
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) > 0 && args[0] == "load" {
+			return fmt.Errorf("boom")
+		}
+		return nil
+	}
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
+		t.Fatal("restore load failure must surface")
+	} else if err.Error() != "launchd_restore_failed" {
+		t.Fatalf("err=%v", err)
 	}
 }
 

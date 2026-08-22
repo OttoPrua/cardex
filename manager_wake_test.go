@@ -314,7 +314,10 @@ func TestHardWatchdogDeltaZeroNoQueue(t *testing.T) {
 	if !containsString(diag, "watchdog_sec_rejected") {
 		t.Fatalf("non-canonical watchdog must be diagnosed: %v", diag)
 	}
-	plist := renderManagerWakePlist("/opt/homebrew/bin/cardex", root, 7, "/tmp/wake.log")
+	plist, err := renderManagerWakePlist("/opt/homebrew/bin/cardex", root, 7, "/tmp/wake.log")
+	if err != nil {
+		t.Fatal(err)
+	}
 	sec, err := managerWakePlistStartInterval(plist)
 	if err != nil || sec != managerWakeWatchdogSec {
 		t.Fatalf("plist interval=%d err=%v", sec, err)
@@ -624,6 +627,93 @@ func TestManagerWakeReadbackSecretFree(t *testing.T) {
 	}
 	if rb["enabled"] != true {
 		t.Fatalf("enabled missing: %+v", rb)
+	}
+}
+
+func TestQueueOkReceiptCrashRestartNoDuplicateWake(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	mw := testWakeCfg(bin, "wake-proj", "12121212-1212-1212-1212-121212121212", "mgr")
+	tk := heldCommittedTask(t, root, "wake-proj", "queue-ok receipt-crash")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+
+	var calls []string
+	origQ := managerWakeQueue
+	origR := managerWakePersistReceipts
+	defer func() {
+		managerWakeQueue = origQ
+		managerWakePersistReceipts = origR
+	}()
+	managerWakeQueue = func(bin, thread, message string) error {
+		calls = append(calls, message)
+		if !strings.Contains(message, "wake="+wantID) {
+			t.Fatalf("receiver contract missing wake id %q in %q", wantID, message)
+		}
+		argv := managerWakeQueueArgv(bin, thread, message)
+		joined := strings.Join(argv, "\n")
+		for _, bad := range []string{"--idempotency-key", "--client-request-id", "--request-id", "--dedupe-key", "--client-user-message-id"} {
+			if strings.Contains(joined, bad) {
+				t.Fatalf("invented flag %s: %q", bad, argv)
+			}
+		}
+		return nil
+	}
+	managerWakePersistReceipts = func(root, subID string, rows []managerWakeOutboxRow) error {
+		return fmt.Errorf("killed_after_queue_before_receipt")
+	}
+
+	if err := managerWakeOnce(root, mw); err == nil {
+		t.Fatal("post-queue/pre-receipt crash must surface")
+	}
+	if len(calls) != 1 {
+		t.Fatalf("queue calls=%d want 1", len(calls))
+	}
+	ids, class, err := loadManagerWakeReceiptIDs(root, "mgr")
+	if err != nil || class != "" {
+		t.Fatalf("receipt load: class=%q err=%v", class, err)
+	}
+	if ids[wantID] {
+		t.Fatal("crash before receipt fsync must not leave a sender receipt")
+	}
+	cur, _, err := loadManagerWakeCursor(root, "mgr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.OutboxSeq != 0 {
+		t.Fatalf("cursor claimed delivery after receipt crash: %+v", cur)
+	}
+
+	if err := managerWakeOnce(root, mw); err == nil {
+		t.Fatal("uncertain post-queue state must stay fail-closed")
+	}
+	if len(calls) != 1 {
+		t.Fatalf("restart duplicated manager model turn: calls=%d second=%q", len(calls), calls)
+	}
+	if loadManagerWakeErrorClass(root) != "delivery_uncertain" {
+		t.Fatalf("durable class=%q want delivery_uncertain", loadManagerWakeErrorClass(root))
+	}
+	cur, _, _ = loadManagerWakeCursor(root, "mgr")
+	if cur.OutboxSeq != 0 {
+		t.Fatalf("uncertain state must not silently ack cursor: %+v", cur)
+	}
+	metrics := loadManagerWakeMetrics(root)
+	if metrics.WatchdogSec != managerWakeWatchdogSec {
+		t.Fatalf("watchdog_sec=%d want %d", metrics.WatchdogSec, managerWakeWatchdogSec)
+	}
+	if metrics.QueueAttempts != 1 {
+		t.Fatalf("watchdog must not spawn a second model queue: %+v", metrics)
+	}
+	rb := managerWakeReadback(root, mw)
+	if rb["last_err_class"] != "delivery_uncertain" {
+		t.Fatalf("readback missing delivery_uncertain: %+v", rb)
+	}
+	if rb["watchdog_sec"] != managerWakeWatchdogSec {
+		t.Fatalf("readback watchdog: %+v", rb)
+	}
+	pending, _ := rb["pending"].(int)
+	if pending < 1 {
+		t.Fatalf("uncertain state must keep pending visible: %+v", rb)
 	}
 }
 

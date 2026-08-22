@@ -319,8 +319,9 @@ printf '%s' '{"response":"done ok","stats":{"models":{"m":{"tokens":{"prompt":10
 	cfg.GeminiBin = bin
 	cfg.StepTimeoutMin = 1
 	task := &Task{ID: "argv-1", Type: typeSequence, Dir: t.TempDir(), Model: "claude-fable-5", Prompts: []string{"p"}}
+	root := admitDirectInvoke(t, "", task)
 
-	res, _, note, err := invokeGemini(context.Background(), t.TempDir(), cfg, task, "任务正文")
+	res, _, note, err := invokeGemini(context.Background(), root, cfg, task, "任务正文")
 	if err != nil || res == nil || res.IsError {
 		t.Fatalf("成功路径: err=%v res=%+v", err, res)
 	}
@@ -358,7 +359,7 @@ printf '%s' '{"response":"done ok","stats":{"models":{"m":{"tokens":{"prompt":10
 
 	// 已有会话 → --resume，不再生成新 --session-id。
 	task.SessionID = "11111111-2222-4333-8444-555555555555"
-	if _, _, _, err = invokeGemini(context.Background(), t.TempDir(), cfg, task, "续跑"); err != nil {
+	if _, _, _, err = invokeGemini(context.Background(), root, cfg, task, "续跑"); err != nil {
 		t.Fatal(err)
 	}
 	argv, _ = os.ReadFile(filepath.Join(capDir, "argv"))
@@ -370,7 +371,8 @@ printf '%s' '{"response":"done ok","stats":{"models":{"m":{"tokens":{"prompt":10
 	}
 	// 复审卡强制 plan。
 	review := &Task{ID: "argv-2", Type: typeReview, Dir: t.TempDir(), Prompts: []string{"p"}}
-	if _, _, _, err = invokeGemini(context.Background(), t.TempDir(), cfg, review, "审"); err != nil {
+	admitDirectInvoke(t, root, review)
+	if _, _, _, err = invokeGemini(context.Background(), root, cfg, review, "审"); err != nil {
 		t.Fatal(err)
 	}
 	argv, _ = os.ReadFile(filepath.Join(capDir, "argv"))

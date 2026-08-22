@@ -175,42 +175,48 @@ func TestInvokeCodexThreadsResolvedModel(t *testing.T) {
 
 	// ① claude 卡降级径（PreferRunner 空）→ -m 降级专用模型
 	tk := &Task{ID: "cm-fb", Dir: t.TempDir(), Type: typeSequence}
-	invokeCodex(context.Background(), t.TempDir(), cfg, tk, "ping")
+	root := admitDirectInvoke(t, "", tk)
+	invokeCodex(context.Background(), root, cfg, tk, "ping")
 	if got := readCapture(); !strings.Contains(got, "fb-terra") || strings.Contains(got, "global-sol") {
 		t.Fatalf("降级径应 -m fb-terra 且不带全局模型, argv:\n%s", got)
 	}
 
 	// ①b Opus 卡降级径 → 专用 gpt-5.6-sol + xhigh；类型默认 high 不应压过档位默认。
 	tkOpus := &Task{ID: "cm-opus", Dir: t.TempDir(), Type: typeSequence, Model: "opus", Effort: "high"}
-	invokeCodex(context.Background(), t.TempDir(), cfg, tkOpus, "ping")
+	admitDirectInvoke(t, root, tkOpus)
+	invokeCodex(context.Background(), root, cfg, tkOpus, "ping")
 	if got := readCapture(); !strings.Contains(got, "gpt-5.6-sol") || !strings.Contains(got, "model_reasoning_effort=xhigh") {
 		t.Fatalf("Opus降级应使用 gpt-5.6-sol + xhigh, argv:\n%s", got)
 	}
 
 	// ①c 默认关闭低投入旁路：stakes=low 的 Opus 仍是 gpt-5.6-sol + xhigh。
 	tkSimple := &Task{ID: "cm-opus-simple", Dir: t.TempDir(), Type: typeSequence, Model: "opus", Stakes: stakesLow, Effort: "high"}
-	invokeCodex(context.Background(), t.TempDir(), cfg, tkSimple, "ping")
+	admitDirectInvoke(t, root, tkSimple)
+	invokeCodex(context.Background(), root, cfg, tkSimple, "ping")
 	if got := readCapture(); !strings.Contains(got, "gpt-5.6-sol") || !strings.Contains(got, "model_reasoning_effort=xhigh") {
 		t.Fatalf("默认低投入 Opus 仍应使用 gpt-5.6-sol + xhigh, argv:\n%s", got)
 	}
 
 	// ①d Sonnet 主跑 Codex → gpt-5.6-luna + max。
 	tkSonnet := &Task{ID: "cm-sonnet", Dir: t.TempDir(), Type: typeSequence, Model: "sonnet", PreferRunner: "codex", Effort: "high"}
-	invokeCodex(context.Background(), t.TempDir(), cfg, tkSonnet, "ping")
+	admitDirectInvoke(t, root, tkSonnet)
+	invokeCodex(context.Background(), root, cfg, tkSonnet, "ping")
 	if got := readCapture(); !strings.Contains(got, "gpt-5.6-luna") || !strings.Contains(got, "model_reasoning_effort=max") {
 		t.Fatalf("Sonnet Codex主跑应使用 gpt-5.6-luna + max, argv:\n%s", got)
 	}
 
 	// ② 卡级钉定盖过降级专用
 	tk2 := &Task{ID: "cm-pin", Dir: t.TempDir(), Type: typeSequence, CodexModel: "pin-luna"}
-	invokeCodex(context.Background(), t.TempDir(), cfg, tk2, "ping")
+	admitDirectInvoke(t, root, tk2)
+	invokeCodex(context.Background(), root, cfg, tk2, "ping")
 	if got := readCapture(); !strings.Contains(got, "pin-luna") || strings.Contains(got, "fb-terra") {
 		t.Fatalf("卡级钉定应 -m pin-luna, argv:\n%s", got)
 	}
 
 	// ③ codex 主跑卡（PreferRunner=codex）不吃降级模型 → 全局
 	tk3 := &Task{ID: "cm-main", Dir: t.TempDir(), Type: typeSequence, PreferRunner: "codex"}
-	invokeCodex(context.Background(), t.TempDir(), cfg, tk3, "ping")
+	admitDirectInvoke(t, root, tk3)
+	invokeCodex(context.Background(), root, cfg, tk3, "ping")
 	if got := readCapture(); !strings.Contains(got, "global-sol") || strings.Contains(got, "fb-terra") {
 		t.Fatalf("codex 主跑应 -m global-sol, argv:\n%s", got)
 	}
@@ -238,6 +244,11 @@ func TestInvokeRemoteCodexThreadsResolvedReasoning(t *testing.T) {
 		ID: "remote-opus", Dir: "D:/work/repo", Type: typeSequence,
 		Model: "claude-opus-5", Effort: "high", RemoteHost: "qmthost", PreferRunner: "codex",
 	}
+	adjudication := *opus
+	adjudication.ID = "remote-adjudication"
+	adjudication.Effort = "max"
+	adjudication.EffortExplicit = true
+	root := admitDirectInvoke(t, "", opus)
 	res, _, err := invokeRemoteCodex(context.Background(), cfg, opus, "ping")
 	if err != nil || res == nil || res.Result != "remote done" {
 		t.Fatalf("fake 远端 Codex 应成功: res=%+v err=%v", res, err)
@@ -248,10 +259,7 @@ func TestInvokeRemoteCodexThreadsResolvedReasoning(t *testing.T) {
 		t.Fatalf("远端 Opus 必须实际穿线 Sol/xhigh, ssh argv:\n%s", got)
 	}
 
-	adjudication := *opus
-	adjudication.ID = "remote-adjudication"
-	adjudication.Effort = "max"
-	adjudication.EffortExplicit = true
+	admitDirectInvoke(t, root, &adjudication)
 	if _, _, err := invokeRemoteCodex(context.Background(), cfg, &adjudication, "ping"); err != nil {
 		t.Fatalf("显式终裁远端执行失败: %v", err)
 	}

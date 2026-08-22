@@ -966,6 +966,16 @@ func grokBuildJSONObservation(stdout, stderr string, runErr error) string {
 	return out.String()
 }
 
+// grokBuildWriteCapable is sequence or SkipPermissions. SkipPermissions is full
+// autonomy, so a non-sequence task still gets workspace/auto and --no-plan.
+// typeCrossCheck is fail-closed read-only/plan even when SkipPermissions is set.
+func grokBuildWriteCapable(t *Task) bool {
+	if t.Type == typeCrossCheck {
+		return false
+	}
+	return t.Type == typeSequence || t.SkipPermissions
+}
+
 func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	if !grokBuildEnabled(cfg) {
 		return nil, "", fmt.Errorf("grok_build_bin/grok_build 未启用")
@@ -1008,8 +1018,9 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 		return nil, "", err
 	}
 
+	writeCapable := grokBuildWriteCapable(t)
 	sandbox, permission := "read-only", "plan"
-	if t.Type == typeSequence || t.SkipPermissions {
+	if writeCapable {
 		sandbox, permission = "workspace", "auto"
 	}
 	args := []string{
@@ -1020,6 +1031,9 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 		"--sandbox", sandbox,
 		"--permission-mode", permission,
 		"--no-memory", "--no-subagents", "--disable-web-search", "--verbatim",
+	}
+	if writeCapable {
+		args = append(args, "--no-plan")
 	}
 	if t.SessionID != "" {
 		args = append(args, "--resume", t.SessionID)

@@ -658,6 +658,31 @@ const (
 	fallbackExecutionEnv     fallbackFailureKind = "presemantic_execution_environment"
 )
 
+// grokTerminalUnknownOutcome derives stream_incomplete / invalid_terminal_result solely
+// from res.Subtype. Classifier precedence, combined text, and stderr diagnostics are not
+// consulted. Unknown is false only for a fully observed 0/0/0/0 terminal, which remains
+// eligible for the existing bounded fallback/retry path.
+func grokTerminalUnknownOutcome(res *claudeResult) (fallbackFailureKind, bool) {
+	if res == nil {
+		return "", false
+	}
+	subtype := strings.ToLower(strings.TrimSpace(res.Subtype))
+	var kind fallbackFailureKind
+	switch {
+	case strings.Contains(subtype, "stream_incomplete"):
+		kind = fallbackStreamIncomplete
+	case strings.Contains(subtype, "invalid_terminal"):
+		kind = fallbackInvalidTerminal
+	default:
+		return "", false
+	}
+	if res.ObservationComplete && res.SemanticEvents == 0 &&
+		res.ModelEvents == 0 && res.ToolEvents == 0 && res.NumTurns == 0 {
+		return kind, false
+	}
+	return kind, true
+}
+
 var (
 	policyTransportRe      = regexp.MustCompile(`(?i)connection (?:reset|refused|closed)|socket (?:closed|error)|error sending request|tls (?:handshake|error)|unexpected eof|disconnected before|(?:read|write) tcp|dial tcp|i/o timeout|econn(?:reset|refused)|stream disconnect|no route to host|network is unreachable|host is unreachable|temporary failure in name resolution|no such host|dns (?:lookup|resolution) (?:failed|error)|lookup [^\s]+(?: on [^:]+)?: no such host|getaddrinfo\s+(?:enotfound|eai_again)|\b(?:enotfound|eai_again)\b`)
 	policyStallRe          = regexp.MustCompile(`(?i)semantic (?:stall|timeout)|model (?:stall|timeout)|步骤超时|context deadline exceeded|deadline exceeded|timed out waiting for (?:model|semantic)`)

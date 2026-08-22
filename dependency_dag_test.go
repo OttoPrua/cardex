@@ -1,0 +1,103 @@
+package main
+
+import (
+	"errors"
+	"reflect"
+	"testing"
+)
+
+func TestAnalyzeDependencyDAGReadinessIsDeterministic(t *testing.T) {
+	nodes := []DependencyNode{
+		{ID: "cutover", Lineage: "cutover-lineage", DependsOn: []string{"migrate", "auth-tokens"}},
+		{ID: "auth-tokens", Lineage: "auth-tokens-lineage"},
+		{ID: "migrate", Lineage: "migrate-lineage", DependsOn: []string{"schema"}, Satisfied: true},
+		{ID: "schema", Lineage: "schema-lineage", Satisfied: true},
+		{ID: "docs", Lineage: "docs-lineage"},
+	}
+	got, err := AnalyzeDependencyDAG([]DependencyNode{nodes[0], nodes[2], nodes[4], nodes[1], nodes[3]})
+	if err != nil {
+		t.Fatalf("healthy dag: %v", err)
+	}
+	wantReady := []string{"auth-tokens", "docs"}
+	if !reflect.DeepEqual(got.Ready, wantReady) {
+		t.Fatalf("ready=%v want %v", got.Ready, wantReady)
+	}
+	if len(got.Cycles) != 0 || len(got.Missing) != 0 {
+		t.Fatalf("healthy diagnosis must be empty: %+v", got)
+	}
+
+	shuffled, err := AnalyzeDependencyDAG([]DependencyNode{nodes[4], nodes[1], nodes[0], nodes[3], nodes[2]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(shuffled.Ready, wantReady) {
+		t.Fatalf("readiness must ignore input order: %v", shuffled.Ready)
+	}
+}
+
+func TestAnalyzeDependencyDAGDiagnosesCyclesAndMissingDependencies(t *testing.T) {
+	nodes := []DependencyNode{
+		{ID: "alpha", Lineage: "alpha-lineage", DependsOn: []string{"beta"}},
+		{ID: "beta", Lineage: "beta-lineage", DependsOn: []string{"gamma"}},
+		{ID: "gamma", Lineage: "gamma-lineage", DependsOn: []string{"alpha"}},
+		{ID: "leaf", Lineage: "leaf-lineage", DependsOn: []string{"ghost", "alpha"}},
+		{ID: "ready", Lineage: "ready-lineage"},
+	}
+	got, err := AnalyzeDependencyDAG(nodes)
+	if err == nil {
+		t.Fatal("cycle and missing deps must fail closed")
+	}
+	if !errors.Is(err, errDAGCycle) || !errors.Is(err, errDAGMissingDependency) {
+		t.Fatalf("want cycle+missing sentinels, got %v", err)
+	}
+	var audit *DAGAuditError
+	if !errors.As(err, &audit) {
+		t.Fatalf("diagnosis must be inspectable: %v", err)
+	}
+	if !reflect.DeepEqual(got.Ready, []string{"ready"}) || !reflect.DeepEqual(audit.Diagnosis.Ready, []string{"ready"}) {
+		t.Fatalf("unrelated ready node must remain ready: %+v", got)
+	}
+	if len(got.Cycles) != 1 || !reflect.DeepEqual(got.Cycles[0], []string{"alpha", "beta", "gamma"}) {
+		t.Fatalf("cycle must rotate onto the least id: %v", got.Cycles)
+	}
+	if len(got.Missing) != 1 || got.Missing[0].NodeID != "leaf" || got.Missing[0].MissingID != "ghost" {
+		t.Fatalf("missing dependency: %+v", got.Missing)
+	}
+
+	self := []DependencyNode{{ID: "loop", Lineage: "loop-lineage", DependsOn: []string{"loop"}}}
+	selfGot, selfErr := AnalyzeDependencyDAG(self)
+	if !errors.Is(selfErr, errDAGCycle) || len(selfGot.Cycles) != 1 || !reflect.DeepEqual(selfGot.Cycles[0], []string{"loop"}) {
+		t.Fatalf("self-cycle: %+v / %v", selfGot, selfErr)
+	}
+}
+
+func TestAnalyzeDependencyDAGRejectsMalformedAndDuplicateIdentifiers(t *testing.T) {
+	valid := DependencyNode{ID: "auth-tokens", Lineage: "auth-tokens-lineage"}
+	cases := []struct {
+		name  string
+		nodes []DependencyNode
+		want  error
+	}{
+		{name: "empty id", nodes: []DependencyNode{{ID: "", Lineage: "auth-tokens-lineage"}}, want: errDAGMalformedID},
+		{name: "uppercase id", nodes: []DependencyNode{{ID: "Auth", Lineage: "auth-tokens-lineage"}}, want: errDAGMalformedID},
+		{name: "missing lineage", nodes: []DependencyNode{{ID: "auth-tokens"}}, want: errDAGMalformedID},
+		{name: "bad lineage", nodes: []DependencyNode{{ID: "auth-tokens", Lineage: "auth_tokens"}}, want: errDAGMalformedID},
+		{name: "bad domain ref", nodes: []DependencyNode{{ID: "auth-tokens", Lineage: "auth-tokens-lineage", DomainID: "Auth"}}, want: errDAGMalformedID},
+		{name: "empty dep", nodes: []DependencyNode{{ID: "auth-tokens", Lineage: "auth-tokens-lineage", DependsOn: []string{""}}}, want: errDAGMalformedID},
+		{name: "duplicate node", nodes: []DependencyNode{valid, valid}, want: errDAGDuplicateNode},
+		{name: "duplicate edges", nodes: []DependencyNode{{
+			ID: "cutover", Lineage: "cutover-lineage", DependsOn: []string{"schema", "schema"},
+		}}, want: errDAGDuplicateNode},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := AnalyzeDependencyDAG(tc.nodes)
+			if err == nil || !errors.Is(err, tc.want) {
+				t.Fatalf("got %v; want %v", err, tc.want)
+			}
+			if len(got.Ready) != 0 || len(got.Cycles) != 0 || len(got.Missing) != 0 {
+				t.Fatalf("malformed input must not emit diagnosis: %+v", got)
+			}
+		})
+	}
+}

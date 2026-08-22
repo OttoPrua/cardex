@@ -169,6 +169,111 @@ func TestInjectAtMostOnceCrashThenRecoverySucceeds(t *testing.T) {
 	}
 }
 
+// TestInjectAtMostOnceUnconsumedAbortRollsBackAndDoesNotCountAgainstBound
+// 预语义中止必须回滚 pending、不消耗 bound。连续 5 次 abort 后仍能成功注入并落 final。
+//
+// 【反例】阶段 2 把 errTombstoneUnconsumedAbort 当普通 crash 留下 pending:两次 abort 即
+// attempt=2,第三次 skipped,成功注入进不去 → calls 远小于 6、账本停 pending(2)。
+func TestInjectAtMostOnceUnconsumedAbortRollsBackAndDoesNotCountAgainstBound(t *testing.T) {
+	root := mkTombRoot(t)
+	calls := 0
+	abort := func() error {
+		calls++
+		return errTombstoneUnconsumedAbort
+	}
+	for i := 0; i < 5; i++ {
+		skipped, _, err := injectAtMostOnce(root, "task-abort", "resume:0", abort)
+		if skipped {
+			t.Fatalf("预语义中止不得 skipped(那是 bound 耗尽/final): round=%d", i)
+		}
+		if !errors.Is(err, errTombstoneUnconsumedAbort) {
+			t.Fatalf("应透传 errTombstoneUnconsumedAbort: round=%d err=%v", i, err)
+		}
+		assertResumeKindAbsent(t, root, "task-abort", "resume:0")
+	}
+	skipped, _, err := injectAtMostOnce(root, "task-abort", "resume:0", func() error { calls++; return nil })
+	if err != nil || skipped {
+		t.Fatalf("5 次 abort 后应仍能成功注入: skipped=%v err=%v", skipped, err)
+	}
+	if calls != 6 {
+		t.Fatalf("5 abort + 1 success 应 6 次 inject,got %d", calls)
+	}
+	j, _, err := readTombstoneJournal(root, "task-abort")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e := j.Entries["resume:0"]
+	if e.Phase != tombstonePhaseFinal || e.Attempt != 1 {
+		t.Fatalf("成功注入应 final(1),got %+v", e)
+	}
+}
+
+// TestInjectAtMostOnceUnconsumedAbortRestoresPriorPending 先前一次真实崩溃留下 pending(1)
+// 后,预语义中止必须把账本恢复成 pending(1),不得删掉、也不得推进到 pending(2)。
+func TestInjectAtMostOnceUnconsumedAbortRestoresPriorPending(t *testing.T) {
+	root := mkTombRoot(t)
+	if skipped, _, err := injectAtMostOnce(root, "task-prior", "resume:0", func() error {
+		return errors.New("crash after semantic start")
+	}); err == nil || skipped {
+		t.Fatalf("首轮崩溃应保留 pending: skipped=%v err=%v", skipped, err)
+	}
+	pre, _, err := readTombstoneJournal(root, "task-prior")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := pre.Entries["resume:0"]
+	if want.Phase != tombstonePhasePending || want.Attempt != 1 {
+		t.Fatalf("前置应 pending(1),got %+v", want)
+	}
+	skipped, _, err := injectAtMostOnce(root, "task-prior", "resume:0", func() error {
+		return fmt.Errorf("%w: %w", errTombstoneUnconsumedAbort, errAdmissionDenied)
+	})
+	if skipped || !errors.Is(err, errTombstoneUnconsumedAbort) || !errors.Is(err, errAdmissionDenied) {
+		t.Fatalf("中止应透传且不 skipped: skipped=%v err=%v", skipped, err)
+	}
+	post, _, err := readTombstoneJournal(root, "task-prior")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := post.Entries["resume:0"]
+	if got.Phase != tombstonePhasePending || got.Attempt != 1 || got.Nonce != want.Nonce {
+		t.Fatalf("中止应原样恢复 pending(1),want %+v got %+v", want, got)
+	}
+}
+
+// TestInjectAtMostOnceNilStillFinalizesAfterRealInject 对照:真正成功的 inject 仍必须升 final,
+// 预语义回滚不得把"return nil → final"这条 at-most-once 契约改掉。
+func TestInjectAtMostOnceNilStillFinalizesAfterRealInject(t *testing.T) {
+	root := mkTombRoot(t)
+	skipped, _, err := injectAtMostOnce(root, "task-real", "resume:0", func() error { return nil })
+	if err != nil || skipped {
+		t.Fatalf("成功注入应 err=nil 且不跳过: skipped=%v err=%v", skipped, err)
+	}
+	j, _, err := readTombstoneJournal(root, "task-real")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if j.Entries["resume:0"].Phase != tombstonePhaseFinal {
+		t.Fatalf("成功注入应 final,got %+v", j.Entries["resume:0"])
+	}
+	calls := 0
+	skipped, _, err = injectAtMostOnce(root, "task-real", "resume:0", func() error { calls++; return nil })
+	if err != nil || !skipped || calls != 0 {
+		t.Fatalf("final 后必须零注入: skipped=%v err=%v calls=%d", skipped, err, calls)
+	}
+}
+
+func assertResumeKindAbsent(t *testing.T, root, id, kind string) {
+	t.Helper()
+	j, corrupted, err := readTombstoneJournal(root, id)
+	if err != nil || corrupted {
+		t.Fatalf("读墓碑失败: corrupted=%v err=%v", corrupted, err)
+	}
+	if e, ok := j.Entries[kind]; ok {
+		t.Fatalf("预语义中止后 %s 应不在账本,got %+v", kind, e)
+	}
+}
+
 // TestInjectAtMostOnceKindsIndependent 不同 kind 的 bound 不能互相污染。
 func TestInjectAtMostOnceKindsIndependent(t *testing.T) {
 	root := mkTombRoot(t)

@@ -287,28 +287,55 @@ func TestParseGrokBuildStreamingJSON(t *testing.T) {
 	}
 }
 
+func grokBuildArgIndex(argv []string, flag string) int {
+	for i, arg := range argv {
+		if arg == flag {
+			return i
+		}
+	}
+	return -1
+}
+
 func TestInvokeGrokBuildUses46XHighAndSandboxModes(t *testing.T) {
 	for _, tc := range []struct {
-		name       string
-		typ        string
-		sandbox    string
-		permission string
+		name            string
+		typ             string
+		skipPermissions bool
+		sessionID       string
+		sandbox         string
+		permission      string
+		wantNoPlan      bool
 	}{
-		{name: "implementation", typ: typeSequence, sandbox: "workspace", permission: "auto"},
-		{name: "review", typ: typeReview, sandbox: "read-only", permission: "plan"},
+		{name: "implementation", typ: typeSequence, skipPermissions: false, sandbox: "workspace", permission: "auto", wantNoPlan: true},
+		{name: "review", typ: typeReview, skipPermissions: false, sandbox: "read-only", permission: "plan", wantNoPlan: false},
+		{name: "review skip-permissions", typ: typeReview, skipPermissions: true, sandbox: "workspace", permission: "auto", wantNoPlan: true},
+		{name: "coordinate skip-permissions", typ: typeCoordinate, skipPermissions: true, sandbox: "workspace", permission: "auto", wantNoPlan: true},
+		{name: "implementation resume", typ: typeSequence, sessionID: "session-grok", sandbox: "workspace", permission: "auto", wantNoPlan: true},
+		{name: "crosscheck", typ: typeCrossCheck, skipPermissions: false, sandbox: "read-only", permission: "plan", wantNoPlan: false},
+		{name: "crosscheck skip-permissions", typ: typeCrossCheck, skipPermissions: true, sandbox: "read-only", permission: "plan", wantNoPlan: false},
+		{name: "crosscheck skip-permissions resume", typ: typeCrossCheck, skipPermissions: true, sessionID: "session-grok", sandbox: "read-only", permission: "plan", wantNoPlan: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			payload := `{"type":"text","data":"GROK_OK"}` + "\n" +
 				`{"type":"end","stopReason":"end_turn","sessionId":"session-grok","num_turns":1}`
 			bin, argsDump, promptDump := fakeGrokBuild(t, payload, "", 0)
 			cfg := grokBuildTestConfig(t, bin)
-			task := &Task{ID: "grok-invoke", Type: tc.typ, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
-			res, _, err := invokeGrokBuild(context.Background(), t.TempDir(), cfg, task, "harmless prompt")
+			task := &Task{
+				ID: "grok-invoke", Type: tc.typ, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName,
+				SkipPermissions: tc.skipPermissions, SessionID: tc.sessionID,
+			}
+			if grokBuildWriteCapable(task) != tc.wantNoPlan {
+				t.Fatalf("write-capable helper=%v want=%v type=%s skip=%v",
+					grokBuildWriteCapable(task), tc.wantNoPlan, tc.typ, tc.skipPermissions)
+			}
+			root := admitDirectInvoke(t, "", task)
+			res, _, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt")
 			if err != nil || res == nil || res.Result != "GROK_OK" || res.SessionID != "session-grok" {
 				t.Fatalf("invoke failed: res=%+v err=%v", res, err)
 			}
 			argsRaw, _ := os.ReadFile(argsDump)
 			args := string(argsRaw)
+			argv := strings.Split(strings.TrimSuffix(args, "\n"), "\n")
 			for _, want := range []string{
 				"--no-auto-update\n",
 				"--model\ngrok-4.6\n", "--reasoning-effort\nxhigh\n",
@@ -320,6 +347,9 @@ func TestInvokeGrokBuildUses46XHighAndSandboxModes(t *testing.T) {
 					t.Fatalf("Grok argv missing %q:\n%s", want, args)
 				}
 			}
+			if hasNoPlan := grokBuildArgIndex(argv, "--no-plan") >= 0; hasNoPlan != tc.wantNoPlan {
+				t.Fatalf("Grok argv --no-plan want=%v got=%v:\n%s", tc.wantNoPlan, hasNoPlan, args)
+			}
 			if strings.Contains(args, "harmless prompt") {
 				t.Fatalf("prompt must not be exposed in process argv:\n%s", args)
 			}
@@ -327,10 +357,45 @@ func TestInvokeGrokBuildUses46XHighAndSandboxModes(t *testing.T) {
 			if string(gotPrompt) != "harmless prompt" {
 				t.Fatalf("prompt-file mismatch: %q", gotPrompt)
 			}
+			if len(argv) < 2 || argv[len(argv)-2] != "--prompt-file" {
+				t.Fatalf("--prompt-file must be the final flag/value pair:\n%s", args)
+			}
+			order := []string{"--no-memory", "--no-subagents", "--disable-web-search", "--verbatim"}
+			if tc.wantNoPlan {
+				order = append(order, "--no-plan")
+			}
+			if tc.sessionID != "" {
+				order = append(order, "--resume")
+			} else if grokBuildArgIndex(argv, "--resume") >= 0 {
+				t.Fatalf("Grok argv must not include --resume without a session:\n%s", args)
+			}
+			order = append(order, "--prompt-file")
+			prev := -1
+			for _, flag := range order {
+				i := grokBuildArgIndex(argv, flag)
+				if i < 0 {
+					t.Fatalf("Grok argv missing %q:\n%s", flag, args)
+				}
+				if i <= prev {
+					t.Fatalf("Grok argv %q must follow previous safety/session flags:\n%s", flag, args)
+				}
+				prev = i
+			}
+			if tc.sessionID != "" {
+				i := grokBuildArgIndex(argv, "--resume")
+				if i+1 >= len(argv) || argv[i+1] != tc.sessionID {
+					t.Fatalf("Grok argv --resume value mismatch:\n%s", args)
+				}
+			}
 			probeArgsRaw, _ := os.ReadFile(argsDump + ".probe")
 			probeArgs := string(probeArgsRaw)
-			if !strings.Contains(probeArgs, "--no-auto-update\n") || !strings.Contains(probeArgs, "models\n") {
-				t.Fatalf("Grok auth preflight must be no-model and disable auto-update:\n%s", probeArgs)
+			probeArgv := strings.Split(strings.TrimSuffix(probeArgs, "\n"), "\n")
+			if len(probeArgv) != 2 || probeArgv[0] != "--no-auto-update" || probeArgv[1] != "models" {
+				t.Fatalf("Grok auth models probe argv must be exactly --no-auto-update models:\n%s", probeArgs)
+			}
+			if grokBuildArgIndex(probeArgv, "--no-plan") >= 0 || grokBuildArgIndex(probeArgv, "--prompt-file") >= 0 ||
+				grokBuildArgIndex(probeArgv, "--model") >= 0 || strings.Contains(probeArgs, "harmless prompt") {
+				t.Fatalf("Grok auth models probe must not start a model session or pass --no-plan/prompt:\n%s", probeArgs)
 			}
 		})
 	}

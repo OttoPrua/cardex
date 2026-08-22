@@ -43,6 +43,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -58,6 +59,12 @@ const (
 	tombstonePhasePending = "pending"
 	tombstonePhaseFinal   = "final"
 )
+
+// errTombstoneUnconsumedAbort 表示 inject 回调在副作用发生前就中止(例如 provider Start
+// 被 admission pause / epoch bump 预语义拒绝,resume 提示从未发出)。injectAtMostOnce 必须
+// 回滚本次 pending 写,不得把这次"没发生的注入"记成 bound 消耗,更不得升 final。
+// 真正发出过语义 Start 的失败仍走普通 err:保留 pending、计入 bound。
+var errTombstoneUnconsumedAbort = errors.New("tombstone inject aborted without consumption")
 
 // Tombstone 是一条注入墓碑。
 // Kind 是注入点的标识(如 "resume:3" / "reconcile:cross"),同一 kind 全生命周期共享 bound 计数。
@@ -144,12 +151,15 @@ func writeTombstoneJournal(root, id string, j tombstoneJournal) error {
 //  1. 读账本。若该 kind 已 phase=final → 返回 skipped=true,不调 inject。
 //  2. 若该 kind pending 且 Attempt≥bound → 返回 skipped=true(崩溃风暴上限),stderr 警告。
 //  3. 否则:写 pending(Attempt+1),调 inject。
-//  4. inject 返回 nil → 写 final(标记成功)。inject 返回 err → 保留 pending(留给下次尝试),透传 err。
+//  4. inject 返回 nil → 写 final(标记成功)。inject 返回普通 err → 保留 pending(留给下次尝试),
+//     透传 err。inject 返回 errTombstoneUnconsumedAbort / errAdmissionDenied → 回滚本次 pending,
+//     不消耗 bound、不升 final(预语义 Start 被拒,副作用未发生)。
 //
 // 返回:
 //   - skipped:注入被跳过(已 final 或已耗尽 bound)。caller 据此决定业务行为(如挂 held 升级)。
 //   - corrupted:账本文件损坏,已按无墓碑处理并 stderr 披露。caller 可加业务日志。
-//   - err:账本 IO 错误或 inject 透传错误。inject 错误时 pending 已落盘,重试次数已+1。
+//   - err:账本 IO 错误或 inject 透传错误。普通 inject 错误时 pending 已落盘,重试次数已+1;
+//     预语义中止时 pending 已回滚,bound 与中止前一致。
 //
 // 【为什么 pending 先落盘再 inject,而不是 inject 后再一次性写 final】
 // 若 inject 先执行,崩溃在 inject 结束到 pending/final 之间的窗口会让下次重启时"账本看不出这次尝试
@@ -210,7 +220,7 @@ func injectAtMostOnce(root, id, kind string, inject func() error) (skipped, corr
 			return true, corrupted, nil
 		}
 	}
-	prev := journal.Entries[kind]
+	prev, hadPrev := journal.Entries[kind]
 	newAttempt := prev.Attempt + 1
 	now := time.Now()
 	pendingNonce := now.UnixNano()
@@ -232,6 +242,11 @@ func injectAtMostOnce(root, id, kind string, inject func() error) (skipped, corr
 	// 阶段 2: inject 无锁跑. 若 CLI 侧 resetTombstoneKind 在此窗口执行,它会拿到锁、清掉本条 kind
 	// 条目——阶段 3 重读若发现条目已不存在或 nonce 不匹配,则视作 reset 胜出, 放弃 final 重建.
 	if injErr := inject(); injErr != nil {
+		if tombstoneInjectUnconsumed(injErr) {
+			if rbErr := rollbackTombstonePending(root, id, kind, pendingNonce, prev, hadPrev); rbErr != nil {
+				return false, corrupted, fmt.Errorf("%w: rollback pending tombstone: %v", injErr, rbErr)
+			}
+		}
 		return false, corrupted, injErr
 	}
 
@@ -266,6 +281,46 @@ func injectAtMostOnce(root, id, kind string, inject func() error) (skipped, corr
 		return false, corrupted, writeErr
 	}
 	return false, corrupted, nil
+}
+
+func tombstoneInjectUnconsumed(err error) bool {
+	return errors.Is(err, errTombstoneUnconsumedAbort) || errors.Is(err, errAdmissionDenied)
+}
+
+// rollbackTombstonePending 把本轮阶段 1 写下的 pending 撤回到 inject 前的账本。仅当盘上条目
+// 仍是我们写的 pending(nonce 匹配)才动笔:并发 reset 已删或别人已推进时放弃,与阶段 3 认领同构。
+func rollbackTombstonePending(root, id, kind string, pendingNonce int64, prev Tombstone, hadPrev bool) error {
+	if id == "" || kind == "" {
+		return nil
+	}
+	mu := tombstoneLockForTask(id)
+	mu.Lock()
+	defer mu.Unlock()
+	release, err := acquireTombstoneLock(root, id)
+	if err != nil {
+		return err
+	}
+	defer release()
+	journal, _, err := readTombstoneJournal(root, id)
+	if err != nil {
+		return err
+	}
+	existing, exists := journal.Entries[kind]
+	if !exists || existing.Nonce != pendingNonce {
+		return nil
+	}
+	if !hadPrev {
+		delete(journal.Entries, kind)
+		if len(journal.Entries) == 0 {
+			if rmErr := os.Remove(tombstonePath(root, id)); rmErr != nil && !os.IsNotExist(rmErr) {
+				return rmErr
+			}
+			return nil
+		}
+		return writeTombstoneJournal(root, id, journal)
+	}
+	journal.Entries[kind] = prev
+	return writeTombstoneJournal(root, id, journal)
 }
 
 // resetTombstoneKind 清除单一 kind 的墓碑条目。runTask 顶部对 "resume:<step>" 调它——同一步的合法

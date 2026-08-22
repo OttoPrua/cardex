@@ -12,6 +12,25 @@ import (
 	"time"
 )
 
+func reservedTaskExec(t *testing.T, workspace string) (root, taskID string) {
+	t.Helper()
+	root = testRoot(t)
+	withSchedulerLock(t, root)
+	if workspace == "" {
+		workspace = t.TempDir()
+	}
+	tk := queuedSequence(t, root, testCfg(), "reserved exec", workspace)
+	if err := reserveDispatchAttempt(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if tk.ActiveAttemptID == "" {
+		t.Fatal("expected reserved attempt")
+	}
+	taskExecRoot.Store(tk.ID, root)
+	t.Cleanup(func() { taskExecRoot.Delete(tk.ID) })
+	return root, tk.ID
+}
+
 func TestInheritedProcessLeaseDetectsSetsidDescendant(t *testing.T) {
 	if os.Getenv("CARDEX_TEST_SETSID_LEASE_CHILD") == "1" {
 		if _, err := syscall.Setsid(); err != nil && !errors.Is(err, syscall.EPERM) {
@@ -21,7 +40,7 @@ func TestInheritedProcessLeaseDetectsSetsidDescendant(t *testing.T) {
 		os.Exit(0)
 	}
 
-	const taskID = "policy-setsid-lease"
+	_, taskID := reservedTaskExec(t, "")
 	cmd := exec.CommandContext(context.Background(), "sh", "-c",
 		`"$CARDEX_TEST_BINARY" -test.run=TestInheritedProcessLeaseDetectsSetsidDescendant >/dev/null 2>&1 &`)
 	cmd.Env = append(os.Environ(),
@@ -72,7 +91,7 @@ func TestWorkspaceLeaseSurvivesMapLossAndBlocksDifferentFallbackTask(t *testing.
 	}
 
 	dir := t.TempDir()
-	const parentID = "workspace-lease-parent"
+	_, parentID := reservedTaskExec(t, dir)
 	cmd := exec.CommandContext(context.Background(), "sh", "-c",
 		`"$CARDEX_TEST_BINARY" -test.run=TestWorkspaceLeaseSurvivesMapLossAndBlocksDifferentFallbackTask >/dev/null 2>&1 &`)
 	cmd.Env = append(os.Environ(),

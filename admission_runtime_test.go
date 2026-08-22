@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -739,5 +741,251 @@ func TestPauseBetweenStep1AndStep2NoSecondProvider(t *testing.T) {
 		if ev.Type == evDone {
 			t.Fatalf("unexpected done event in %v", eventTypes(events))
 		}
+	}
+}
+
+func TestMissingTaskExecRootZeroStart(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "started")
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "printf started > "+shSingleQuote(marker))
+	setupProcGroup(cmd)
+	err := runCmdRegisteredForTask(cmd, "missing-exec-root")
+	if !errors.Is(err, errAdmissionDenied) {
+		t.Fatalf("missing taskExecRoot err=%v, want %v", err, errAdmissionDenied)
+	}
+	if cmd.Process != nil {
+		t.Fatal("task-aware Start ran without taskExecRoot")
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatal("provider process ran despite missing taskExecRoot")
+	}
+}
+
+func TestAttemptSwapZeroStartAndBind(t *testing.T) {
+	root := testRoot(t)
+	withSchedulerLock(t, root)
+	cfg := testCfg()
+	ws := t.TempDir()
+	tk := queuedSequence(t, root, cfg, "attempt swap start", ws)
+	if err := reserveDispatchAttempt(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	originalID := tk.ActiveAttemptID
+	if originalID == "" {
+		t.Fatal("expected reserved attempt")
+	}
+	original, err := loadAttempt(root, tk.ID, originalID)
+	if err != nil || original == nil {
+		t.Fatalf("load original attempt: %v", err)
+	}
+	swappedID := newAttemptID()
+	taskExecRoot.Store(tk.ID, root)
+	t.Cleanup(func() { taskExecRoot.Delete(tk.ID) })
+
+	admissionPreStartHook = func() {
+		now := time.Now().Format(time.RFC3339Nano)
+		swapped := *original
+		swapped.AttemptID = swappedID
+		swapped.CreatedAt = now
+		swapped.UpdatedAt = now
+		swapped.PID = 0
+		swapped.PGID = 0
+		swapped.StartIdentity = ""
+		swapped.State = attemptReserved
+		if werr := writeAttempt(root, &swapped); werr != nil {
+			t.Errorf("write swapped attempt: %v", werr)
+			return
+		}
+		fresh, lerr := loadTask(root, tk.ID)
+		if lerr != nil {
+			t.Errorf("load task for swap: %v", lerr)
+			return
+		}
+		fresh.ActiveAttemptID = swappedID
+		if werr := writeTaskFile(root, fresh); werr != nil {
+			t.Errorf("write swapped task: %v", werr)
+		}
+	}
+	t.Cleanup(func() { admissionPreStartHook = nil })
+
+	marker := filepath.Join(t.TempDir(), "started")
+	cmd := exec.CommandContext(context.Background(), "sh", "-c", "printf started > "+shSingleQuote(marker))
+	cmd.Dir = ws
+	setupProcGroup(cmd)
+	err = runCmdRegisteredForTask(cmd, tk.ID)
+	if !errors.Is(err, errAdmissionDenied) {
+		t.Fatalf("attempt swap err=%v, want %v", err, errAdmissionDenied)
+	}
+	if cmd.Process != nil {
+		t.Fatal("Start ran after active attempt swap")
+	}
+	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
+		t.Fatal("process ran after active attempt swap")
+	}
+	orig, oerr := loadAttempt(root, tk.ID, originalID)
+	if oerr != nil || orig == nil {
+		t.Fatalf("reload original attempt: %v", oerr)
+	}
+	if orig.State == attemptBound || orig.PID != 0 {
+		t.Fatalf("original attempt bound after swap: state=%s pid=%d", orig.State, orig.PID)
+	}
+	swapped, serr := loadAttempt(root, tk.ID, swappedID)
+	if serr != nil || swapped == nil {
+		t.Fatalf("reload swapped attempt: %v", serr)
+	}
+	if swapped.State == attemptBound || swapped.PID != 0 {
+		t.Fatalf("swapped attempt bound: state=%s pid=%d", swapped.State, swapped.PID)
+	}
+}
+
+func TestBindWriteFailureReapsProcessAndReleasesLease(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("workspace flock is POSIX")
+	}
+	root := testRoot(t)
+	withSchedulerLock(t, root)
+	cfg := testCfg()
+	ws := t.TempDir()
+	tk := queuedSequence(t, root, cfg, "bind write failure", ws)
+	if err := reserveDispatchAttempt(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	taskExecRoot.Store(tk.ID, root)
+	t.Cleanup(func() { taskExecRoot.Delete(tk.ID) })
+	attemptWriteHook = func(rec *AttemptRecord) error {
+		if rec != nil && rec.State == attemptBound {
+			return errors.New("injected bind write failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { attemptWriteHook = nil })
+
+	cmd := exec.CommandContext(context.Background(), "sleep", "60")
+	cmd.Dir = ws
+	setupProcGroup(cmd)
+	err := runCmdRegisteredForTask(cmd, tk.ID)
+	if err == nil {
+		t.Fatal("injected bind write failure returned nil")
+	}
+	if cmd.Process == nil {
+		t.Fatal("bind path must Start before durable bind")
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("bind failure must Wait/reap the new process")
+	}
+	if processAlive(cmd.Process.Pid) {
+		t.Fatalf("new process pid=%d still alive after bind failure", cmd.Process.Pid)
+	}
+	lease, lerr := acquireWorkspaceExecutionLease(ws)
+	if lerr != nil {
+		t.Fatalf("workspace lease not acquirable after bind failure: %v", lerr)
+	}
+	if lease != nil {
+		_ = lease.Close()
+	}
+	if workspaceProcessResidue(ws) {
+		t.Fatal("workspace execution lease still held after bind failure cleanup")
+	}
+}
+
+func TestBindFailureHoldsLaunchGateUntilProcessReaped(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("workspace flock is POSIX")
+	}
+	root := testRoot(t)
+	withSchedulerLock(t, root)
+	cfg := testCfg()
+	ws := t.TempDir()
+	tk := queuedSequence(t, root, cfg, "bind failure holds pause", ws)
+	if err := reserveDispatchAttempt(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	taskExecRoot.Store(tk.ID, root)
+	t.Cleanup(func() { taskExecRoot.Delete(tk.ID) })
+
+	bindPID := make(chan int, 1)
+	releaseBind := make(chan struct{})
+	attemptWriteHook = func(rec *AttemptRecord) error {
+		if rec != nil && rec.State == attemptBound {
+			bindPID <- rec.PID
+			<-releaseBind
+			return errors.New("injected bind write failure")
+		}
+		return nil
+	}
+	t.Cleanup(func() { attemptWriteHook = nil })
+
+	cmd := exec.CommandContext(context.Background(), "sleep", "60")
+	cmd.Dir = ws
+	setupProcGroup(cmd)
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = killProcGroup(cmd.Process.Pid)
+			_ = cmd.Process.Kill()
+		}
+	})
+
+	launchDone := make(chan error, 1)
+	go func() {
+		launchDone <- runCmdRegisteredForTask(cmd, tk.ID)
+	}()
+
+	var pid int
+	select {
+	case pid = <-bindPID:
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not reach durable bind write")
+	}
+	if pid <= 0 || !processAlive(pid) {
+		t.Fatalf("bind-failure process pid=%d not live before cleanup", pid)
+	}
+
+	oldMax := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(oldMax) })
+	aboutToPause := make(chan struct{})
+	pauseSawLive := make(chan bool, 1)
+	go func() {
+		close(aboutToPause)
+		if _, err := setAdmissionPaused(root, true, "ops", "drain"); err != nil {
+			t.Errorf("pause: %v", err)
+		}
+		pauseSawLive <- processAlive(pid)
+	}()
+	<-aboutToPause
+	for i := 0; i < 100; i++ {
+		runtime.Gosched()
+	}
+	select {
+	case live := <-pauseSawLive:
+		t.Fatalf("setAdmissionPaused returned before bind-failure cleanup (processAlive=%v)", live)
+	default:
+	}
+	if !processAlive(pid) {
+		t.Fatal("process exited while bind hook still held the launch gate")
+	}
+
+	close(releaseBind)
+
+	select {
+	case err := <-launchDone:
+		if err == nil {
+			t.Fatal("injected bind write failure returned nil")
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("bind-failure launch did not return")
+	}
+
+	select {
+	case live := <-pauseSawLive:
+		if live {
+			t.Fatal("setAdmissionPaused returned while bind-failure cleanup process is still live")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("setAdmissionPaused did not return after bind-failure cleanup")
+	}
+	if processAlive(pid) {
+		t.Fatalf("new process pid=%d still alive after bind-failure cleanup", pid)
+	}
+	if cmd.ProcessState == nil {
+		t.Fatal("bind failure must Wait/reap the new process before releasing the launch gate")
 	}
 }

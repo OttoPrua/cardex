@@ -51,7 +51,8 @@ func TestInvokeKimiCLISelectsLegacyEngineFor0372(t *testing.T) {
 	bin, envDump := fakeKimiCLIEngineProbe(t, payload)
 	cfg := kimiCLITestConfig(t, bin)
 	task := &Task{ID: "kimi-0372-legacy", Model: "opus", Type: typeSequence, Dir: t.TempDir()}
-	res, _, err := invokeKimiCLI(context.Background(), testRoot(t), cfg, task, "p")
+	root := admitDirectInvoke(t, "", task)
+	res, _, err := invokeKimiCLI(context.Background(), root, cfg, task, "p")
 	if err != nil || res == nil || res.Result != "OK" {
 		t.Fatalf("invoke failed: res=%+v err=%v", res, err)
 	}
@@ -72,7 +73,8 @@ func TestInvokeKimiCLIPreservesExplicitCallerEngineOverride(t *testing.T) {
 			bin, envDump := fakeKimiCLIEngineProbe(t, payload)
 			cfg := kimiCLITestConfig(t, bin)
 			task := &Task{ID: "kimi-override-" + override, Model: "opus", Type: typeSequence, Dir: t.TempDir()}
-			if _, _, err := invokeKimiCLI(context.Background(), testRoot(t), cfg, task, "p"); err != nil {
+			root := admitDirectInvoke(t, "", task)
+			if _, _, err := invokeKimiCLI(context.Background(), root, cfg, task, "p"); err != nil {
 				t.Fatal(err)
 			}
 			raw, err := os.ReadFile(envDump)
@@ -113,7 +115,8 @@ func TestKimiEngineReadbackRecordsRequestedAndActual(t *testing.T) {
 	cfg := kimiCLITestConfig(t, bin)
 	task := &Task{ID: "kimi-engine-readback", Model: "opus", Type: typeSequence, Dir: t.TempDir(), PreferRunner: kimiCLIRunnerName}
 	beginRouteAttemptReadback(cfg, task, false)
-	if _, _, err := invokeKimiCLI(context.Background(), testRoot(t), cfg, task, "p"); err != nil {
+	root := admitDirectInvoke(t, "", task)
+	if _, _, err := invokeKimiCLI(context.Background(), root, cfg, task, "p"); err != nil {
 		t.Fatal(err)
 	}
 	if task.LastRouteAttempt == nil || task.LastRouteAttempt.RequestedEngine != "legacy_agent_core" ||
@@ -145,7 +148,8 @@ func TestKimiEngineReadbackReflectsOverrideWithoutEnvValues(t *testing.T) {
 		cfg := kimiCLITestConfig(t, bin)
 		task := &Task{ID: "kimi-engine-v2", Model: "opus", Type: typeSequence, Dir: t.TempDir(), PreferRunner: kimiCLIRunnerName}
 		beginRouteAttemptReadback(cfg, task, false)
-		if _, _, err := invokeKimiCLI(context.Background(), testRoot(t), cfg, task, "p"); err != nil {
+		root := admitDirectInvoke(t, "", task)
+		if _, _, err := invokeKimiCLI(context.Background(), root, cfg, task, "p"); err != nil {
 			t.Fatal(err)
 		}
 		if task.LastRouteAttempt.RequestedEngine != "legacy_agent_core" || task.LastRouteAttempt.ActualEngine != "agent_v2" {
@@ -159,7 +163,8 @@ func TestKimiEngineReadbackReflectsOverrideWithoutEnvValues(t *testing.T) {
 		cfg := kimiCLITestConfig(t, bin)
 		task := &Task{ID: "kimi-engine-opaque", Model: "opus", Type: typeSequence, Dir: t.TempDir(), PreferRunner: kimiCLIRunnerName}
 		beginRouteAttemptReadback(cfg, task, false)
-		if _, _, err := invokeKimiCLI(context.Background(), testRoot(t), cfg, task, "p"); err != nil {
+		root := admitDirectInvoke(t, "", task)
+		if _, _, err := invokeKimiCLI(context.Background(), root, cfg, task, "p"); err != nil {
 			t.Fatal(err)
 		}
 		if task.LastRouteAttempt.ActualEngine == "" || strings.Contains(task.LastRouteAttempt.ActualEngine, sentinel) ||

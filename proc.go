@@ -281,36 +281,54 @@ func runCmdRegisteredHarvestForTaskWorkspace(cmd *exec.Cmd, resultInBuf func() b
 	taskAware := taskID != ""
 	holdingGate := false
 	var launchRoot string
-	if taskAware {
-		if hook := admissionPreStartHook; hook != nil {
-			hook()
-		}
-		if v, ok := taskExecRoot.Load(taskID); ok {
-			launchRoot, _ = v.(string)
-		}
-		admissionLaunchGate.RLock()
-		holdingGate = true
-	}
+	var launchAttemptID string
 	releaseGate := func() {
 		if holdingGate {
 			admissionLaunchGate.RUnlock()
 			holdingGate = false
 		}
 	}
-	if taskAware && launchRoot != "" {
-		if err := revalidateTaskAttemptAdmission(launchRoot, taskID); err != nil {
-			releaseGate()
-			if lease != nil && lease.abort != nil {
-				lease.abort()
+	abortLease := func() {
+		if lease != nil && lease.abort != nil {
+			lease.abort()
+		}
+	}
+	if taskAware {
+		if v, ok := taskExecRoot.Load(taskID); ok {
+			launchRoot, _ = v.(string)
+		}
+		if launchRoot == "" {
+			abortLease()
+			return errAdmissionDenied
+		}
+		if snapErr := withTaskControlLock(launchRoot, taskID, func() error {
+			current, loadErr := loadTask(launchRoot, taskID)
+			if loadErr != nil || current == nil || current.ActiveAttemptID == "" {
+				return errAdmissionDenied
 			}
+			launchAttemptID = current.ActiveAttemptID
+			return nil
+		}); snapErr != nil {
+			abortLease()
+			if errors.Is(snapErr, errAdmissionDenied) {
+				return snapErr
+			}
+			return errAdmissionDenied
+		}
+		if hook := admissionPreStartHook; hook != nil {
+			hook()
+		}
+		admissionLaunchGate.RLock()
+		holdingGate = true
+		if err := revalidateTaskAttemptAdmission(launchRoot, taskID, launchAttemptID); err != nil {
+			releaseGate()
+			abortLease()
 			return err
 		}
 	}
 	if err := cmd.Start(); err != nil {
 		releaseGate()
-		if lease != nil && lease.abort != nil {
-			lease.abort()
-		}
+		abortLease()
 		return err
 	}
 	if lease != nil && lease.commit != nil {
@@ -321,17 +339,27 @@ func runCmdRegisteredHarvestForTaskWorkspace(cmd *exec.Cmd, resultInBuf func() b
 	procGroups[pid] = true
 	procMu.Unlock()
 	registerTaskInvoke(taskID, pid)
-	if taskAware && launchRoot != "" {
-		if err := bindAttemptProcess(launchRoot, taskID, pid); err != nil {
-			releaseGate()
+	if taskAware {
+		if err := bindAttemptProcess(launchRoot, taskID, launchAttemptID, pid); err != nil {
 			_ = killProcGroup(pid)
-			if p, findErr := os.FindProcess(pid); findErr == nil {
-				_ = p.Kill()
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+			_ = cmd.Wait()
+			if lease != nil && lease.done != nil {
+				timer := time.NewTimer(100 * time.Millisecond)
+				select {
+				case <-lease.done:
+					timer.Stop()
+				case <-timer.C:
+					markTaskLeaseResidue(taskID, lease.done)
+				}
 			}
 			procMu.Lock()
 			delete(procGroups, pid)
 			procMu.Unlock()
 			unregisterTaskInvoke(taskID, pid)
+			releaseGate()
 			return err
 		}
 	}

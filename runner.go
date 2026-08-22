@@ -1055,6 +1055,11 @@ func clampEpoch(v int64, now time.Time) int64 {
 	return v
 }
 
+// resumeTombstoneAfterInjectHook 是测试缝:resume 路径 injectAtMostOnce 返回之后、admission
+// 拒绝收尾 abandon 之前调用。用于锁死"预语义 Start 被拒不得先升 final 再弃 reserved attempt"
+// 的顺序。生产必须保持 nil。
+var resumeTombstoneAfterInjectHook func() error
+
 // runTask 是 runTaskVia 的兼容壳：既有调用点/测试用 (useCodex bool) 二态签名，引擎档案
 // 引入后真实路由是 via 三态（""=claude / "codex" / 引擎名），新调用点请直接用 runTaskVia。
 func runTask(ctx context.Context, root string, cfg *Config, t *Task, useCodex bool) error {
@@ -1611,6 +1616,11 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			// 内部错误由 runErr/res.IsError 承接进下方 0/1/2/3 分支处理,墓碑侧不透传——
 			// 墓碑关心"是否已发起注入"而非"注入产物是否成功",inject 的 err 是"墓碑本身写不下"的
 			// IO 错误载体,与 LLM 侧错误正交(LLM 报错也算注入完成,该落 final)。
+			// 例外:admission 在 provider Start 前拒绝时副作用从未发生,必须透传以便
+			// injectAtMostOnce 回滚 pending,不得把这次预语义拒绝记成 resume bound 消耗。
+			if errors.Is(runErr, errAdmissionDenied) {
+				return fmt.Errorf("%w: %w", errTombstoneUnconsumedAbort, runErr)
+			}
 			return nil
 		}
 		if t.Step > 0 {
@@ -1626,7 +1636,16 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			// 成功后落 final,tick 见 final 即跳过——即使进程在"提示已发送、成功未回写"处崩溃,重启后
 			// bound=2 保护也只允许再试一次,不会把一个残尾放大成 N 次续跑提示重发。
 			skipped, corrupted, tombErr := injectAtMostOnce(root, t.ID, resumeKind(t.Step), invoke)
+			if hook := resumeTombstoneAfterInjectHook; hook != nil {
+				if hookErr := hook(); hookErr != nil {
+					return hookErr
+				}
+			}
 			if tombErr != nil {
+				// 预语义 Start 被拒:墓碑已回滚,仍必须诚实关闭 reserved attempt 并恢复可重试。
+				if errors.Is(runErr, errAdmissionDenied) {
+					return finishIfStopped(abandonReservedAttemptForAdmission(root, t))
+				}
 				return tombErr
 			}
 			if corrupted {
@@ -1671,6 +1690,43 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			return finalizeCanceled(root, t, lg)
 		}
 		recordRouteAttemptObservation(t, res)
+
+		// Grok stream_incomplete / invalid_terminal_result with semantic/model/tool activity (or an
+		// incomplete observation) is an unknown first outcome: hold the same card without attempts,
+		// requeue, resume, or serial fallback. Kind is taken from the parser subtype before any
+		// fallback/limit/classifier/retry path; competing diagnostics do not change the family. A
+		// proved complete 0/0/0/0 metadata-only terminal remains eligible for the bounded path below.
+		if via == grokBuildRunnerName {
+			if kind, unknown := grokTerminalUnknownOutcome(res); unknown {
+				semanticEvents, modelEvents, toolEvents, observationComplete := 0, 0, 0, false
+				if res != nil {
+					semanticEvents = res.SemanticEvents
+					if res.NumTurns > semanticEvents {
+						semanticEvents = res.NumTurns
+					}
+					modelEvents = res.ModelEvents
+					toolEvents = res.ToolEvents
+					observationComplete = res.ObservationComplete
+				}
+				if t.LastRouteAttempt != nil {
+					t.LastRouteAttempt.FailureKind = string(kind)
+					t.LastRouteAttempt.FailureClass = "unknown_outcome"
+				}
+				t.Status = statusHeld
+				t.LastError = "Grok terminal unknown outcome held: " + string(kind)
+				t.touch()
+				logBlock(lg, "GROK_TERMINAL_HELD", fmt.Sprintf(
+					"unknown outcome held (kind=%s, observation_complete=%v, semantic=%d, model=%d, tools=%d)",
+					kind, observationComplete, semanticEvents, modelEvents, toolEvents))
+				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:grok-build", statusHeld, t.Step,
+					withCostTelemetry(withRouteAttempt(map[string]any{
+						"reason": "grok_terminal_unknown_outcome_held", "reason_class": "unknown_outcome",
+						"failure_class": "unknown_outcome", "failure_kind": string(kind),
+						"observation_complete": observationComplete,
+						"semantic_events":      semanticEvents, "model_events": modelEvents, "tool_events": toolEvents,
+					}, t), t)))
+			}
+		}
 
 		// Owner serial fallback gate. Classification happens only after invoke returned; the post-state
 		// fingerprint and process-group residue probe happen after that. queuePolicyFallback refuses a

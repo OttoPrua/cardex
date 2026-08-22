@@ -112,6 +112,7 @@ func TestCodexReviewCopyIsolatesWrites(t *testing.T) {
 
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3-iso", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
 	if err != nil {
@@ -189,6 +190,7 @@ func TestCodexReviewSandboxRollbackReadonly(t *testing.T) {
 	cfg.StepTimeoutMin = 1
 
 	task := &Task{ID: "cg-r3-ro", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	// codexReviewNeedsWorktree 必须返回 false(判据:CodexReviewSandbox 归一后 != worktree-write)。
 	if codexReviewNeedsWorktree(context.Background(), cfg, task) {
@@ -228,6 +230,7 @@ func TestCleanupCodexReviewOrphansRemovesCrashed(t *testing.T) {
 	src := mkCodexReviewSrcRepo(t)
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3-crash", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
 	if err != nil {
@@ -287,6 +290,7 @@ func TestCleanupCodexReviewOrphansSkipsActive(t *testing.T) {
 	src := mkCodexReviewSrcRepo(t)
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3-active", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
 	if err != nil {
@@ -324,6 +328,7 @@ func TestCleanupCodexReviewOrphansRecognizesLegacyMarker(t *testing.T) {
 	src := mkCodexReviewSrcRepo(t)
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "bd44-legacy-marker", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	copyDir, cleanup, err := prepareCodexReviewWorkspace(context.Background(), root, cfg, task)
 	if err != nil {
@@ -434,6 +439,7 @@ func TestInvokeCodexWorktreeWriteArgvAndCleanup(t *testing.T) {
 	// 默认 CodexReviewSandbox=worktree-write(defaultConfig 已配),此测试正是要验证默认路径。
 
 	task := &Task{ID: "cg-r3-ww", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	if _, _, err := invokeCodex(context.Background(), root, cfg, task, "ping"); err != nil {
 		t.Fatalf("fake codex 应 exit 0: %v", err)
@@ -500,6 +506,7 @@ func TestInvokeCodexInjectsCopyPreamble(t *testing.T) {
 	cfg.StepTimeoutMin = 1
 
 	task := &Task{ID: "cg-r3-pre", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 	if _, _, err := invokeCodex(context.Background(), root, cfg, task, "USER_PROMPT_MARKER"); err != nil {
 		t.Fatalf("fake codex 应 exit 0: %v", err)
 	}
@@ -553,6 +560,7 @@ func TestInvokeCodexNoCopyPreambleInReadonly(t *testing.T) {
 	cfg.StepTimeoutMin = 1
 
 	task := &Task{ID: "cg-r3-nopre", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 	if _, _, err := invokeCodex(context.Background(), root, cfg, task, "USER_PROMPT_MARKER"); err != nil {
 		t.Fatalf("fake codex 应 exit 0: %v", err)
 	}
@@ -752,13 +760,17 @@ func TestUnknownCodexReviewSandboxDoesNotReachWorktreeWrite(t *testing.T) {
 	src := mkCodexReviewSrcRepo(t) // 真 git 工作树:排除"因为不是 git 仓库才 false"的假通过
 	bad := &Config{CodexReviewSandbox: "readonIy", RemoteMirrorRoot: "D:/Project/PO-lanes"}
 
-	if codexReviewNeedsWorktree(context.Background(), bad, &Task{ID: "cg-r3b-typo", Type: typeReview, Dir: src}) {
+	typo := &Task{ID: "cg-r3b-typo", Type: typeReview, Dir: src}
+	okTask := &Task{ID: "cg-r3b-ok", Type: typeReview, Dir: src}
+	root := admitDirectInvoke(t, "", typo)
+	admitDirectInvoke(t, root, okTask)
+	if codexReviewNeedsWorktree(context.Background(), bad, typo) {
 		t.Fatal("拼错的 codex_review_sandbox 不得让本机径建可写副本(必须回落最小权限 readonly)")
 	}
 	// 前提守卫:同一目录在合法 worktree-write 下确实会建副本——否则上面的 false 可能来自别的原因,
 	// 断言就成了恒真摆设。
 	ok := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
-	if !codexReviewNeedsWorktree(context.Background(), ok, &Task{ID: "cg-r3b-ok", Type: typeReview, Dir: src}) {
+	if !codexReviewNeedsWorktree(context.Background(), ok, okTask) {
 		t.Fatal("前提不成立:合法 worktree-write + git 工作树本应决定建副本,断言无法证伪")
 	}
 
@@ -856,6 +868,7 @@ func TestCodexReviewPrepareKilledOnHangingGit(t *testing.T) {
 	cfg.CodexBin = fakeCodexArgvCapture(t, argvCap)
 	cfg.StepTimeoutMin = 5 // 远大于 700ms 子预算:证明击杀来自建副本子预算,不是步超时顺带收的
 	task := &Task{ID: "cg-r3b-hang", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	done := make(chan error, 1)
 	start := time.Now()
@@ -1110,6 +1123,7 @@ func TestCodexReviewPrepareHonorsParentCtx(t *testing.T) {
 
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite} // StepTimeoutMin=0 → 子预算取 cap
 	task := &Task{ID: "cg-r3b-parent", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()
@@ -1163,6 +1177,7 @@ func TestCodexReviewPrepareReportsProbeKill(t *testing.T) {
 
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3b-probe", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	defer cancel()

@@ -112,6 +112,7 @@ func TestInvokeCursorUsesReadOnlyAskAndNeverAutoReview(t *testing.T) {
 	cfg := cursorTestConfig()
 	cfg.CursorBin = bin
 	task := &Task{ID: "cursor-invoke", Type: typeReview, Dir: t.TempDir(), CursorModel: "cursor-grok-4.6-xhigh"}
+	admitDirectInvoke(t, "", task)
 	res, _, err := invokeCursor(context.Background(), cfg, task, "review this")
 	if err != nil || res == nil || res.IsError || res.Result != "CURSOR_OK" {
 		t.Fatalf("cursor invoke failed: res=%+v err=%v", res, err)
@@ -149,6 +150,7 @@ func TestInvokeCursorFinalOwnerFableSequenceIsReadOnlyAsk(t *testing.T) {
 		ID: "fable-read-only", Type: typeSequence, Dir: t.TempDir(), Model: "fable",
 		CursorModel: "claude-fable-5-thinking-max", OwnerRouteName: "fable_explicit",
 	}
+	admitDirectInvoke(t, "", task)
 	res, _, err := invokeCursor(context.Background(), cfg, task, "decide without writing")
 	if err != nil || res == nil || res.IsError {
 		t.Fatalf("Fable Cursor invoke failed: res=%+v err=%v", res, err)
@@ -225,6 +227,37 @@ func TestCursorFableFallbackBuildsGrokAnswerAndSingleSolTerminalMerge(t *testing
 	}
 	if !strings.Contains(c.Prompts[0], "decide from first principles") || !strings.Contains(c.Prompts[0], "Grok answer") {
 		t.Fatalf("merge prompt must contain original problem and Grok answer: %q", c.Prompts[0])
+	}
+}
+
+func TestPrepareCursorFableFallbackClearsSkipPermissionsAndGrokAIsReadOnly(t *testing.T) {
+	root := testRoot(t)
+	cfg := cursorTestConfig()
+	task := newTask(root, cfg, typeCoordinate, "hard decision", t.TempDir(), []string{"decide from first principles"}, 9)
+	task.Model = "fable"
+	task.PreferRunner = "codex"
+	task.SkipPermissions = true
+	if !task.SkipPermissions {
+		t.Fatal("precondition: Fable mother card must inherit SkipPermissions")
+	}
+	if err := prepareCursorFableFallback(root, cfg, task, "cursor quota exhausted", fallbackQuota, verifiedCursorFallbackAuth(t)); err != nil {
+		t.Fatal(err)
+	}
+	if task.Type != typeCrossCheck || task.XRole != "A" || task.PreferRunner != grokBuildRunnerName {
+		t.Fatalf("fallback A must be a Grok independent-answer cross-check: %+v", task)
+	}
+	if task.SkipPermissions {
+		t.Fatalf("prepareCursorFableFallback must clear inherited SkipPermissions: %+v", task)
+	}
+	if grokBuildWriteCapable(task) {
+		t.Fatalf("Grok A answer must not be write-capable: %+v", task)
+	}
+	got, err := loadTask(root, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Type != typeCrossCheck || got.SkipPermissions || grokBuildWriteCapable(got) {
+		t.Fatalf("persisted Grok A answer must stay read-only: %+v", got)
 	}
 }
 

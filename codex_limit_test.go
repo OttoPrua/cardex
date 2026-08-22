@@ -30,8 +30,9 @@ func TestInvokeCodexUsageLimitFlowsToLimitDetector(t *testing.T) {
 	cfg.CodexBin = fakeCodexUsageLimit(t)
 	cfg.StepTimeoutMin = 1
 	task := &Task{ID: "usage-limit-flow", Type: typeSequence, Dir: work}
+	root := admitDirectInvoke(t, "", task)
 
-	res, combined, err := invokeCodex(context.Background(), t.TempDir(), cfg, task, "test prompt")
+	res, combined, err := invokeCodex(context.Background(), root, cfg, task, "test prompt")
 	if err == nil {
 		t.Fatal("fake codex 应以非零状态退出")
 	}

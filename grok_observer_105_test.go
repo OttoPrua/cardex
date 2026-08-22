@@ -395,7 +395,8 @@ func TestInvokeGrokBuildAcceptsProved105ShapesAndLegacyTerminal(t *testing.T) {
 	bin, _, _ := fakeGrokBuild(t, payload, "", 0)
 	cfg := grokBuildTestConfig(t, bin)
 	task := &Task{ID: "grok-105-invoke", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
-	res, _, err := invokeGrokBuild(context.Background(), t.TempDir(), cfg, task, "harmless prompt")
+	root := admitDirectInvoke(t, "", task)
+	res, _, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt")
 	if err != nil || res == nil || res.IsError || !res.ObservationComplete {
 		t.Fatalf("proved 1.0.5 shapes plus legacy terminal must invoke cleanly: res=%+v err=%v", res, err)
 	}
@@ -589,7 +590,8 @@ func grok105InvokeWithIO(t *testing.T, stdout, stderr string, exitCode int) (*cl
 	bin, _, _ := fakeGrokBuild(t, stdout, stderr, exitCode)
 	cfg := grokBuildTestConfig(t, bin)
 	task := &Task{ID: "grok-105-io", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
-	res, _, err := invokeGrokBuild(context.Background(), t.TempDir(), cfg, task, "harmless prompt")
+	root := admitDirectInvoke(t, "", task)
+	res, _, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt")
 	return res, err
 }
 

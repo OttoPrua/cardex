@@ -398,6 +398,7 @@ func prepareCursorFableFallback(root string, cfg *Config, t *Task, reason string
 	next := *t
 	next.Prompts = []string{renderTemplate(tpl, map[string]string{"TASK": originalTask})}
 	next.Type = typeCrossCheck
+	next.SkipPermissions = false
 	next.Title = "交叉A[" + name + "]: " + crossBase(t.Title)
 	next.XRole = "A"
 	next.XKey = newCrossKey()

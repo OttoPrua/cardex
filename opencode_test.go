@@ -182,6 +182,7 @@ func TestInvokeOpenCodeNightUsesKimiMax(t *testing.T) {
 	bin, argsDump := fakeOpenCode(t, payload, 0)
 	cfg := openCodeNightTestConfig(bin)
 	task := &Task{ID: "oc-kimi-max", Model: "opus", PreferRunner: "codex", Effort: "xhigh", Dir: t.TempDir()}
+	admitDirectInvoke(t, "", task)
 	res, _, err := invokeOpenCode(context.Background(), cfg, task, "p")
 	if err != nil || res == nil || res.Result != "OK" {
 		t.Fatalf("invoke failed: res=%+v err=%v", res, err)

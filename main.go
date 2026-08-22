@@ -1328,15 +1328,19 @@ func manualDispatchCommandForLeg(cfg *Config, t *Task, prompt string, leg policy
 		if bin == "" {
 			bin = "grok"
 		}
+		writeCapable := grokBuildWriteCapable(t)
 		sandbox, permission := "read-only", "plan"
-		if t.Type == typeSequence || t.SkipPermissions {
+		if writeCapable {
 			sandbox, permission = "workspace", "auto"
 		}
 		cmd := shellQuote(bin) + " --no-auto-update --model " + shellQuote(leg.Model) +
 			" --reasoning-effort " + shellQuote(leg.Effort) + " --output-format streaming-json" +
 			" --sandbox " + sandbox + " --permission-mode " + permission +
-			" --no-memory --no-subagents --disable-web-search --verbatim" +
-			" --prompt-file <(printf %s " + shellQuote(prompt) + ")"
+			" --no-memory --no-subagents --disable-web-search --verbatim"
+		if writeCapable {
+			cmd += " --no-plan"
+		}
+		cmd += " --prompt-file <(printf %s " + shellQuote(prompt) + ")"
 		return cd + cmd, true
 	case cursorRunnerName:
 		bin := strings.TrimSpace(cfg.CursorBin)

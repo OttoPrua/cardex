@@ -220,6 +220,7 @@ func TestCodexReviewCopySurvivesUntrackedSymlinkToFifo(t *testing.T) {
 
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3b-r1-fifo", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	var copyDir string
 	var cleanup func()
@@ -282,6 +283,7 @@ func TestCodexReviewCopyGuardsMarkerNamespace(t *testing.T) {
 
 	cfg := &Config{CodexReviewSandbox: codexReviewSandboxWorktreeWrite}
 	task := &Task{ID: "cg-r3b-r1-marker", Type: typeReview, Dir: src}
+	admitDirectInvoke(t, root, task)
 
 	var copyDir string
 	var cleanup func()

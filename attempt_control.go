@@ -1003,16 +1003,12 @@ func requireAdmissionToInvoke(root string, t *Task) error {
 	})
 }
 
-func revalidateTaskAttemptAdmission(root, taskID string) error {
-	if root == "" || taskID == "" {
+func revalidateTaskAttemptAdmission(root, taskID, attemptID string) error {
+	if root == "" || taskID == "" || attemptID == "" {
 		return errAdmissionDenied
 	}
 	return withTaskControlLock(root, taskID, func() error {
-		current, err := loadTask(root, taskID)
-		if err != nil {
-			return fmt.Errorf("%w: %v", errAdmissionDenied, err)
-		}
-		return checkExactTaskAttemptAdmissionLocked(root, taskID, current.ActiveAttemptID)
+		return checkExactTaskAttemptAdmissionLocked(root, taskID, attemptID)
 	})
 }
 
@@ -1102,32 +1098,43 @@ func attemptProducerAlive(rec *AttemptRecord) bool {
 	return verifyAttemptProcess(rec)
 }
 
-func bindAttemptProcess(root, taskID string, pid int) error {
-	if root == "" || taskID == "" || pid <= 0 {
-		return nil
+func bindAttemptProcess(root, taskID, attemptID string, pid int) error {
+	if root == "" || taskID == "" || attemptID == "" || pid <= 0 {
+		return errAdmissionDenied
 	}
 	return withTaskControlLock(root, taskID, func() error {
 		t, err := loadTask(root, taskID)
-		if err != nil || t.ActiveAttemptID == "" {
-			return nil
+		if err != nil || t == nil {
+			return errAdmissionDenied
 		}
-		rec, err := loadAttempt(root, taskID, t.ActiveAttemptID)
-		if err != nil {
-			return nil
+		if t.ActiveAttemptID != attemptID {
+			return errAdmissionDenied
+		}
+		rec, err := loadAttempt(root, taskID, attemptID)
+		if err != nil || rec == nil {
+			return errAdmissionDenied
 		}
 		start, ok := processStartIdentity(pid)
-		if !ok {
-			return nil
+		if !ok || start == "" {
+			return errAdmissionDenied
 		}
 		pgid := attemptProcessPGID(pid)
+		if pgid <= 0 {
+			return errAdmissionDenied
+		}
+		if rec.State != attemptReserved && rec.State != attemptBound {
+			return errAdmissionDenied
+		}
 		if rec.State == attemptBound && rec.PID > 0 {
 			if rec.PID != pid || rec.StartIdentity != start || rec.PGID != pgid {
-				return nil
+				if attemptProducerAlive(rec) {
+					return errAdmissionDenied
+				}
 			}
 		}
 		ws := canonicalWorkspaceID(t.Dir)
 		if rec.WorkspaceLeaseID != "" && rec.WorkspaceLeaseID != ws {
-			return nil
+			return errAdmissionDenied
 		}
 		rec.PID = pid
 		rec.PGID = pgid

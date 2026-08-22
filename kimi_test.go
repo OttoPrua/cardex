@@ -124,6 +124,7 @@ func TestInvokeKimiCLIUsesK3MaxAndVersionCompatibleFlags(t *testing.T) {
 	cfg := kimiCLITestConfig(t, bin)
 	task := &Task{ID: "kimi-k3-max", Model: "opus", PreferRunner: "codex", Effort: "xhigh", Type: typeSequence, Dir: t.TempDir()}
 	root := testRoot(t)
+	admitDirectInvoke(t, root, task)
 	res, combined, err := invokeKimiCLI(context.Background(), root, cfg, task, "p")
 	if err != nil || res == nil || res.Result != "OK" || res.SessionID != "session-ok" {
 		t.Fatalf("invoke failed: res=%+v err=%v", res, err)
@@ -160,6 +161,7 @@ func TestInvokeKimiCLIReviewUsesIsolatedConfiguredPlanMode(t *testing.T) {
 	cfg := kimiCLITestConfig(t, bin)
 	task := &Task{ID: "kimi-review", Model: "opus", Type: "review", Dir: t.TempDir()}
 	root := testRoot(t)
+	admitDirectInvoke(t, root, task)
 	res, _, err := invokeKimiCLI(context.Background(), root, cfg, task, "review")
 	if err != nil || res == nil || res.Result != "REVIEW_OK" {
 		t.Fatalf("review invoke failed: res=%+v err=%v", res, err)
@@ -202,7 +204,8 @@ func TestInvokeKimiCLI0361RetriesMetadataOnlyColdStart(t *testing.T) {
 	}
 	cfg := kimiCLITestConfig(t, bin)
 	task := &Task{ID: "kimi-0361-cold-start", Model: "opus", Type: typeSequence, Dir: t.TempDir()}
-	res, combined, err := invokeKimiCLI(context.Background(), testRoot(t), cfg, task, "read only")
+	root := admitDirectInvoke(t, "", task)
+	res, combined, err := invokeKimiCLI(context.Background(), root, cfg, task, "read only")
 	if err != nil || res == nil || res.Result != "KIMI_0361_OK" || res.SessionID != "session-0361" {
 		t.Fatalf("0.36.1 metadata-only cold start should restart transport once: res=%+v err=%v\n%s", res, err, combined)
 	}
@@ -249,7 +252,8 @@ func TestInvokeKimiCLI0361PreservesEMFILEStderr(t *testing.T) {
 	}
 	cfg := kimiCLITestConfig(t, bin)
 	task := &Task{ID: "kimi-0361-emfile", Model: "opus", Type: typeSequence, Dir: dir}
-	res, combined, runErr := invokeKimiCLI(context.Background(), testRoot(t), cfg, task, "read only")
+	root := admitDirectInvoke(t, "", task)
+	res, combined, runErr := invokeKimiCLI(context.Background(), root, cfg, task, "read only")
 	if runErr == nil || res == nil || !res.IsError ||
 		!strings.Contains(errorSummary(res, combined, runErr), "EMFILE: too many open files, watch") {
 		t.Fatalf("EMFILE stderr must survive version metadata: res=%+v err=%v\n%s", res, runErr, combined)
@@ -363,7 +367,8 @@ func TestKimiCLIRealCanary(t *testing.T) {
 		ID: "kimi-real-canary", Type: typeSequence, Dir: t.TempDir(), Model: "opus",
 		Prompts: []string{"run pwd"}, PreferRunner: "codex",
 	}
-	res, _, err := invokeKimiCLI(context.Background(), testRoot(t), cfg, task,
+	root := admitDirectInvoke(t, "", task)
+	res, _, err := invokeKimiCLI(context.Background(), root, cfg, task,
 		"这是 Cardex Kimi CLI 原生执行器测试。运行 pwd，不做任何写入，然后只回复 KIMI_CARDEX_NATIVE_OK。")
 	if err != nil {
 		t.Fatal(err)
@@ -393,6 +398,7 @@ func TestKimiCLIRealReviewCanary(t *testing.T) {
 		Prompts: []string{"review pwd"}, PreferRunner: "codex",
 	}
 	root := testRoot(t)
+	admitDirectInvoke(t, root, task)
 	res, combined, err := invokeKimiCLI(context.Background(), root, cfg, task,
 		"这是 Cardex Kimi CLI 只读复盘执行器测试。运行 pwd，不做任何写入，然后只回复 KIMI_CARDEX_REVIEW_OK。")
 	if err != nil {

@@ -298,6 +298,87 @@ func TestPinnedAndRemoteManualCommandsUseFrozenRunnerIdentity(t *testing.T) {
 	}
 }
 
+func TestManualGrokDispatchCommandWriteCapableNoPlan(t *testing.T) {
+	cfg := policyTestConfig()
+	leg := policyLeg{Runner: grokBuildRunnerName, Model: "grok-4.6", Effort: "xhigh"}
+	prompt := "prompt"
+	promptTail := "--prompt-file <(printf %s " + shellQuote(prompt) + ")"
+	tests := []struct {
+		name       string
+		task       *Task
+		sandbox    string
+		permission string
+		wantNoPlan bool
+	}{
+		{
+			name:       "sequence",
+			task:       &Task{Type: typeSequence, Dir: t.TempDir()},
+			sandbox:    "workspace",
+			permission: "auto",
+			wantNoPlan: true,
+		},
+		{
+			name:       "skip-permissions",
+			task:       &Task{Type: typeReview, SkipPermissions: true, Dir: t.TempDir()},
+			sandbox:    "workspace",
+			permission: "auto",
+			wantNoPlan: true,
+		},
+		{
+			name:       "ordinary review",
+			task:       &Task{Type: typeReview, Dir: t.TempDir()},
+			sandbox:    "read-only",
+			permission: "plan",
+			wantNoPlan: false,
+		},
+		{
+			name:       "crosscheck",
+			task:       &Task{Type: typeCrossCheck, Dir: t.TempDir()},
+			sandbox:    "read-only",
+			permission: "plan",
+			wantNoPlan: false,
+		},
+		{
+			name:       "crosscheck skip-permissions",
+			task:       &Task{Type: typeCrossCheck, SkipPermissions: true, Dir: t.TempDir()},
+			sandbox:    "read-only",
+			permission: "plan",
+			wantNoPlan: false,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if grokBuildWriteCapable(tc.task) != tc.wantNoPlan {
+				t.Fatalf("write-capable helper=%v want=%v type=%s skip=%v",
+					grokBuildWriteCapable(tc.task), tc.wantNoPlan, tc.task.Type, tc.task.SkipPermissions)
+			}
+			command, ok := manualDispatchCommandForLeg(cfg, tc.task, prompt, leg)
+			if !ok {
+				t.Fatal("manual Grok command did not resolve")
+			}
+			if !strings.Contains(command, "--sandbox "+tc.sandbox+" --permission-mode "+tc.permission) {
+				t.Fatalf("manual Grok sandbox/permission want %s/%s: %s", tc.sandbox, tc.permission, command)
+			}
+			gotNoPlan := strings.Count(command, "--no-plan")
+			if tc.wantNoPlan {
+				if gotNoPlan != 1 {
+					t.Fatalf("write-capable manual Grok command must include exactly one --no-plan, got %d: %s",
+						gotNoPlan, command)
+				}
+				if !strings.Contains(command, "--verbatim --no-plan "+promptTail) {
+					t.Fatalf("--no-plan must sit after verbatim and immediately before --prompt-file: %s", command)
+				}
+			} else if gotNoPlan != 0 {
+				t.Fatalf("read-only manual Grok command must not include --no-plan, got %d: %s",
+					gotNoPlan, command)
+			}
+			if !strings.HasSuffix(command, promptTail) {
+				t.Fatalf("--prompt-file must remain the final flag/value expression: %s", command)
+			}
+		})
+	}
+}
+
 func TestOwnerRouteConfigRejectsIdentityDrift(t *testing.T) {
 	base := policyTestConfig()
 	if err := validateGrokBuild(base); err != nil {

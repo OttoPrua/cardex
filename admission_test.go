@@ -2,7 +2,9 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -200,6 +202,130 @@ func TestAdmissionClosedV1SchemaRejectsDuplicatesUnknownAndNonObject(t *testing.
 				t.Fatal("closed version-1 admission should fail closed")
 			}
 		})
+	}
+}
+
+func TestAdmissionRejectsNoncanonicalFieldAliases(t *testing.T) {
+	const ts = "2026-01-01T00:00:00.000000000Z"
+	cases := []struct {
+		name string
+		body string
+		key  string
+	}{
+		{
+			name: "version unicode simple-fold alias",
+			body: `{"ver\u017fion":1,"epoch":0,"paused":false,"updated_at":"` + ts + `"}`,
+			key:  "ver\u017fion",
+		},
+		{
+			name: "epoch ascii alias",
+			body: `{"version":1,"Epoch":0,"paused":false,"updated_at":"` + ts + `"}`,
+			key:  "Epoch",
+		},
+		{
+			name: "paused ascii alias",
+			body: `{"version":1,"epoch":0,"Paused":false,"updated_at":"` + ts + `"}`,
+			key:  "Paused",
+		},
+		{
+			name: "actor ascii alias",
+			body: `{"version":1,"epoch":0,"paused":false,"Actor":"ops","updated_at":"` + ts + `"}`,
+			key:  "Actor",
+		},
+		{
+			name: "reason ascii alias",
+			body: `{"version":1,"epoch":0,"paused":false,"Reason":"drain","updated_at":"` + ts + `"}`,
+			key:  "Reason",
+		},
+		{
+			name: "updated_at ascii alias",
+			body: `{"version":1,"epoch":0,"paused":false,"UPDATED_AT":"` + ts + `"}`,
+			key:  "UPDATED_AT",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(controlDir(root), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(admissionPath(root), []byte(tc.body+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := loadAdmissionState(root)
+			if err == nil {
+				t.Fatal("noncanonical field alias should fail load")
+			}
+			want := fmt.Sprintf("admission state: unknown field %q", tc.key)
+			if err.Error() != want {
+				t.Fatalf("error = %q, want %q", err.Error(), want)
+			}
+			if strings.Contains(err.Error(), "missing") {
+				t.Fatalf("alias must fail as unknown field, not missing required key: %v", err)
+			}
+			if admissionAllowsScheduling(root) {
+				t.Fatal("noncanonical field alias should fail closed")
+			}
+		})
+	}
+}
+
+func TestAdmissionRejectsNullActorAndReason(t *testing.T) {
+	const ts = "2026-01-01T00:00:00.000000000Z"
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "actor null",
+			body: `{"version":1,"epoch":0,"paused":false,"actor":null,"updated_at":"` + ts + `"}`,
+		},
+		{
+			name: "reason null",
+			body: `{"version":1,"epoch":0,"paused":false,"reason":null,"updated_at":"` + ts + `"}`,
+		},
+		{
+			name: "actor and reason null",
+			body: `{"version":1,"epoch":0,"paused":false,"actor":null,"reason":null,"updated_at":"` + ts + `"}`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(controlDir(root), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(admissionPath(root), []byte(tc.body+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadAdmissionState(root); err == nil {
+				t.Fatal("null actor/reason should fail load")
+			}
+			if admissionAllowsScheduling(root) {
+				t.Fatal("null actor/reason should fail closed")
+			}
+		})
+	}
+}
+
+func TestAdmissionEmptyActorAndReasonStringsLoad(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(controlDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"version":1,"epoch":0,"paused":false,"actor":"","reason":"","updated_at":"2026-01-01T00:00:00.000000000Z"}` + "\n"
+	if err := os.WriteFile(admissionPath(root), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := loadAdmissionState(root)
+	if err != nil {
+		t.Fatalf("empty actor/reason strings should load: %v", err)
+	}
+	if st.Actor != "" || st.Reason != "" {
+		t.Fatalf("empty actor/reason = %q/%q", st.Actor, st.Reason)
+	}
+	if !admissionAllowsScheduling(root) {
+		t.Fatal("open admission with empty actor/reason strings should allow scheduling")
 	}
 }
 

@@ -8,7 +8,6 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 )
 
@@ -25,8 +24,8 @@ type admissionStateWire struct {
 	Version   *int    `json:"version"`
 	Epoch     *uint64 `json:"epoch"`
 	Paused    *bool   `json:"paused"`
-	Actor     string  `json:"actor,omitempty"`
-	Reason    string  `json:"reason,omitempty"`
+	Actor     *string `json:"actor,omitempty"`
+	Reason    *string `json:"reason,omitempty"`
 	UpdatedAt *string `json:"updated_at"`
 }
 
@@ -64,14 +63,19 @@ func loadAdmissionState(root string) (admissionState, error) {
 	if _, err := time.Parse(time.RFC3339Nano, *wire.UpdatedAt); err != nil {
 		return admissionState{}, fmt.Errorf("admission state: invalid updated_at: %w", err)
 	}
-	return admissionState{
+	st := admissionState{
 		Version:   *wire.Version,
 		Epoch:     *wire.Epoch,
 		Paused:    *wire.Paused,
-		Actor:     wire.Actor,
-		Reason:    wire.Reason,
 		UpdatedAt: *wire.UpdatedAt,
-	}, nil
+	}
+	if wire.Actor != nil {
+		st.Actor = *wire.Actor
+	}
+	if wire.Reason != nil {
+		st.Reason = *wire.Reason
+	}
+	return st, nil
 }
 
 func decodeClosedAdmissionV1(data []byte) (admissionStateWire, error) {
@@ -125,19 +129,9 @@ func decodeClosedAdmissionV1(data []byte) (admissionStateWire, error) {
 }
 
 func canonicalAdmissionField(name string) (string, bool) {
-	switch {
-	case strings.EqualFold(name, "version"):
-		return "version", true
-	case strings.EqualFold(name, "epoch"):
-		return "epoch", true
-	case strings.EqualFold(name, "paused"):
-		return "paused", true
-	case strings.EqualFold(name, "actor"):
-		return "actor", true
-	case strings.EqualFold(name, "reason"):
-		return "reason", true
-	case strings.EqualFold(name, "updated_at"):
-		return "updated_at", true
+	switch name {
+	case "version", "epoch", "paused", "actor", "reason", "updated_at":
+		return name, true
 	default:
 		return "", false
 	}
@@ -154,8 +148,14 @@ func decodeAdmissionField(dec *json.Decoder, wire *admissionStateWire, field str
 		err = dec.Decode(&wire.Paused)
 	case "actor":
 		err = dec.Decode(&wire.Actor)
+		if err == nil && wire.Actor == nil {
+			return fmt.Errorf("admission state: actor must be a json string")
+		}
 	case "reason":
 		err = dec.Decode(&wire.Reason)
+		if err == nil && wire.Reason == nil {
+			return fmt.Errorf("admission state: reason must be a json string")
+		}
 	case "updated_at":
 		err = dec.Decode(&wire.UpdatedAt)
 	default:

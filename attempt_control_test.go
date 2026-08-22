@@ -1504,6 +1504,262 @@ func TestJournalRenameParentDirSyncFailureBlocksCommit(t *testing.T) {
 	retryTerminalDone(t, root, &snapshot)
 }
 
+func recoverTaskTransitions(t *testing.T, root, taskID string) error {
+	t.Helper()
+	return withTaskControlLock(root, taskID, func() error {
+		return recoverTaskTransitionsLocked(root, taskID)
+	})
+}
+
+func assertAttemptOpen(t *testing.T, root, taskID, attemptID string) {
+	t.Helper()
+	rec, err := loadAttempt(root, taskID, attemptID)
+	if err != nil || rec == nil {
+		t.Fatalf("attempt %s missing: %v", attemptID, err)
+	}
+	if rec.State == attemptExited || rec.State == attemptRevoked {
+		t.Fatalf("attempt %s closed as %s", attemptID, rec.State)
+	}
+}
+
+func assertNoTerminalTaskOrEvent(t *testing.T, root string, tk *Task, tid string) {
+	t.Helper()
+	fresh, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status == statusDone || fresh.effectiveControlState() == controlTerminal {
+		t.Fatalf("terminal task visibility status=%s control=%s", fresh.Status, fresh.effectiveControlState())
+	}
+	if tid != "" && fresh.LastCommittedTransitionID == tid {
+		t.Fatalf("projected last_committed_transition_id=%q", fresh.LastCommittedTransitionID)
+	}
+	if fresh.ActiveAttemptID != tk.ActiveAttemptID {
+		t.Fatalf("active attempt mutated: got %q want %q", fresh.ActiveAttemptID, tk.ActiveAttemptID)
+	}
+	if tid != "" && countTransitionEvents(readAllEventsRaw(t, root, tk.ID), evDone, tid) != 0 {
+		t.Fatal("terminal event visible before exact attempt close")
+	}
+	assertNoD1ProductionEffects(t, root)
+}
+
+func writePreparedDoneJournal(t *testing.T, root string, tk *Task, attemptID string) *TransitionRecord {
+	t.Helper()
+	tid := newTransitionID()
+	rec := &TransitionRecord{
+		TransitionID:     tid,
+		TaskID:           tk.ID,
+		ExpectedRevision: tk.Revision,
+		NewRevision:      tk.Revision + 1,
+		ControlEpoch:     tk.ControlEpoch,
+		AttemptID:        attemptID,
+		EventType:        evDone,
+		Status:           statusDone,
+		Actor:            "runner",
+		State:            transitionPrepared,
+		CreatedAt:        time.Now().Format(time.RFC3339Nano),
+	}
+	if err := writeTransition(root, rec); err != nil {
+		t.Fatal(err)
+	}
+	return rec
+}
+
+func writeForeignAttempt(t *testing.T, root string, tk *Task, attemptID string) {
+	t.Helper()
+	now := time.Now().Format(time.RFC3339Nano)
+	rec := &AttemptRecord{
+		TaskID:           tk.ID,
+		AttemptID:        attemptID,
+		ExpectedRevision: tk.Revision,
+		ControlEpoch:     tk.ControlEpoch,
+		State:            attemptReserved,
+		CreatedAt:        now,
+		UpdatedAt:        now,
+	}
+	if err := writeAttempt(root, rec); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestPreparedTerminalJournalAttemptIdentityBlocksCommit(t *testing.T) {
+	t.Run("omitted_attempt_id", func(t *testing.T) {
+		root := testRoot(t)
+		tk := seedRunningReservedAttempt(t, root)
+		active := tk.ActiveAttemptID
+		journal := writePreparedDoneJournal(t, root, tk, "")
+		if err := recoverTaskTransitions(t, root, tk.ID); err == nil {
+			t.Fatal("prepared journal omitting active attempt must fail closed")
+		}
+		assertNoCommittedTerminalVisibility(t, root, tk)
+		assertNoTerminalTaskOrEvent(t, root, tk, journal.TransitionID)
+		assertAttemptOpen(t, root, tk.ID, active)
+		reconcilePreparedTransitions(root)
+		assertNoCommittedTerminalVisibility(t, root, tk)
+		assertNoTerminalTaskOrEvent(t, root, tk, journal.TransitionID)
+		assertAttemptOpen(t, root, tk.ID, active)
+	})
+	t.Run("mismatched_attempt_id", func(t *testing.T) {
+		root := testRoot(t)
+		tk := seedRunningReservedAttempt(t, root)
+		active := tk.ActiveAttemptID
+		foreign := "atffffffffffffffff"
+		writeForeignAttempt(t, root, tk, foreign)
+		journal := writePreparedDoneJournal(t, root, tk, foreign)
+		if err := recoverTaskTransitions(t, root, tk.ID); err == nil {
+			t.Fatal("prepared journal bound to a foreign attempt must fail closed")
+		}
+		assertNoCommittedTerminalVisibility(t, root, tk)
+		assertNoTerminalTaskOrEvent(t, root, tk, journal.TransitionID)
+		assertAttemptOpen(t, root, tk.ID, active)
+		assertAttemptOpen(t, root, tk.ID, foreign)
+		reconcilePreparedTransitions(root)
+		assertNoCommittedTerminalVisibility(t, root, tk)
+		assertNoTerminalTaskOrEvent(t, root, tk, journal.TransitionID)
+		assertAttemptOpen(t, root, tk.ID, active)
+		assertAttemptOpen(t, root, tk.ID, foreign)
+	})
+}
+
+func TestCommittedTerminalJournalAttemptFailureBlocksProjection(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(t *testing.T, root string, tk *Task)
+	}{
+		{
+			name: "missing_attempt",
+			mut: func(t *testing.T, root string, tk *Task) {
+				if err := os.Remove(attemptPath(root, tk.ID, tk.ActiveAttemptID)); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "unreadable_attempt",
+			mut: func(t *testing.T, root string, tk *Task) {
+				if err := os.WriteFile(attemptPath(root, tk.ID, tk.ActiveAttemptID), []byte("{"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name: "identity_mismatched_attempt",
+			mut: func(t *testing.T, root string, tk *Task) {
+				p := attemptPath(root, tk.ID, tk.ActiveAttemptID)
+				data, err := os.ReadFile(p)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var rec AttemptRecord
+				if err := json.Unmarshal(data, &rec); err != nil {
+					t.Fatal(err)
+				}
+				rec.AttemptID = "at-mismatched-identity"
+				out, err := json.MarshalIndent(&rec, "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(p, append(out, '\n'), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			tk := seedRunningReservedAttempt(t, root)
+			snapshot := *tk
+			tid := newTransitionID()
+			writeDoneTransition(t, root, tk, tid, transitionCommitted)
+			original, err := os.ReadFile(attemptPath(root, tk.ID, snapshot.ActiveAttemptID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.mut(t, root, &snapshot)
+			if err := recoverTaskTransitions(t, root, snapshot.ID); err == nil {
+				t.Fatal("committed journal must not project while exact attempt close is unproven")
+			}
+			assertNoTerminalTaskOrEvent(t, root, &snapshot, tid)
+			reconcilePreparedTransitions(root)
+			assertNoTerminalTaskOrEvent(t, root, &snapshot, tid)
+			if err := os.WriteFile(attemptPath(root, snapshot.ID, snapshot.ActiveAttemptID), original, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := recoverTaskTransitions(t, root, snapshot.ID); err != nil {
+				t.Fatalf("recovery after restoring attempt: %v", err)
+			}
+			assertRecoveredTerminalDone(t, root, &snapshot, tid)
+		})
+	}
+}
+
+func TestAttemptCloseRenameParentDirSyncFailureBlocksCommit(t *testing.T) {
+	restoreAttemptControlSeams(t)
+	root := testRoot(t)
+	tk := seedRunningReservedAttempt(t, root)
+	snapshot := *tk
+	attemptsParent := attemptsDir(root, snapshot.ID)
+	failSync := true
+	var attemptDirSyncs int
+	syncDirAfterRename = func(dir string) error {
+		if filepath.Clean(dir) == filepath.Clean(attemptsParent) {
+			attemptDirSyncs++
+			if failSync {
+				return errors.New("injected attempt-close parent directory sync failure")
+			}
+		}
+		return syncContainingDirectory(dir)
+	}
+	tk.Status = statusDone
+	err := persistTaskEvent(root, tk, evDone, "runner", statusDone, tk.Step, withCostTelemetry(nil, tk))
+	if err == nil {
+		t.Fatal("attempt-close parent-directory sync failure must block durable journal commit")
+	}
+	if attemptDirSyncs == 0 {
+		t.Fatal("test never reached the attempt-close directory sync")
+	}
+	assertNoCommittedTerminalVisibility(t, root, &snapshot)
+	att, attErr := loadAttempt(root, snapshot.ID, snapshot.ActiveAttemptID)
+	if attErr != nil || att == nil {
+		t.Fatalf("attempt-close rename should remain visible: %v", attErr)
+	}
+	if att.State != attemptExited && att.State != attemptRevoked {
+		t.Fatalf("attempt-close rename did not survive, state=%s", att.State)
+	}
+	syncsBeforeRecover := attemptDirSyncs
+	if recErr := recoverTaskTransitions(t, root, snapshot.ID); recErr == nil {
+		t.Fatal("recovery must not treat unsynced attempt-close rename as durable")
+	}
+	if attemptDirSyncs == syncsBeforeRecover {
+		t.Fatal("recovery never re-established attempt-directory durability")
+	}
+	assertNoCommittedTerminalVisibility(t, root, &snapshot)
+	prepared, listErr := listTaskTransitions(root, snapshot.ID)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(prepared) != 1 {
+		t.Fatalf("want one prepared journal while dir sync fails, got %d", len(prepared))
+	}
+	assertNoTerminalTaskOrEvent(t, root, &snapshot, prepared[0].TransitionID)
+	reconcilePreparedTransitions(root)
+	assertNoCommittedTerminalVisibility(t, root, &snapshot)
+	assertNoTerminalTaskOrEvent(t, root, &snapshot, prepared[0].TransitionID)
+	failSync = false
+	if recErr := recoverTaskTransitions(t, root, snapshot.ID); recErr != nil {
+		t.Fatalf("recovery after successful directory sync: %v", recErr)
+	}
+	recs, listErr := listTaskTransitions(root, snapshot.ID)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("want exactly one journal after recovery, got %d", len(recs))
+	}
+	assertRecoveredTerminalDone(t, root, &snapshot, recs[0].TransitionID)
+}
+
 func TestLiveTerminalCrashInjectionRecovers(t *testing.T) {
 	points := []string{
 		transitionCrashAfterPrepare,

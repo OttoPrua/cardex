@@ -848,7 +848,8 @@ func closeAttemptRecord(root, taskID, attemptID, state string) error {
 		return fmt.Errorf("missing attempt %s/%s", taskID, attemptID)
 	}
 	if rec.State == state {
-		return nil
+		// Visible close is not durable until the directory entry is synced.
+		return syncDirAfterRename(filepath.Dir(attemptPath(root, taskID, attemptID)))
 	}
 	if rec.State == attemptExited && state != attemptExited && state != attemptRevoked {
 		return nil
@@ -1269,6 +1270,44 @@ func recoverTaskTransitionsLockedFiltered(root, taskID string, terminalOnly bool
 	return nil
 }
 
+func terminalTransitionAttemptID(t *Task, rec *TransitionRecord) (string, error) {
+	if rec == nil {
+		return "", fmt.Errorf("nil transition")
+	}
+	taskAttempt := ""
+	if t != nil {
+		taskAttempt = t.ActiveAttemptID
+	}
+	journalAttempt := rec.AttemptID
+	if taskAttempt == "" && journalAttempt == "" {
+		return "", nil
+	}
+	if rec.State != transitionCommitted {
+		if journalAttempt != taskAttempt {
+			return "", fmt.Errorf("terminal transition %s attempt %q is not bound to active attempt %q", rec.TransitionID, journalAttempt, taskAttempt)
+		}
+		return journalAttempt, nil
+	}
+	if taskAttempt != "" && journalAttempt != taskAttempt {
+		return "", fmt.Errorf("terminal transition %s attempt %q is not bound to active attempt %q", rec.TransitionID, journalAttempt, taskAttempt)
+	}
+	if journalAttempt == "" {
+		return "", fmt.Errorf("committed terminal transition %s omitted active attempt %q", rec.TransitionID, taskAttempt)
+	}
+	return journalAttempt, nil
+}
+
+func proveExactAttemptClosedForTerminal(root string, t *Task, rec *TransitionRecord) error {
+	attemptID, err := terminalTransitionAttemptID(t, rec)
+	if err != nil {
+		return err
+	}
+	if attemptID == "" {
+		return nil
+	}
+	return closeAttemptRecord(root, rec.TaskID, attemptID, attemptExited)
+}
+
 func finishTransitionRecordLocked(root string, rec *TransitionRecord) error {
 	if rec == nil {
 		return nil
@@ -1290,8 +1329,12 @@ func finishTransitionRecordLocked(root string, rec *TransitionRecord) error {
 		return nil
 	}
 	if rec.State != transitionCommitted {
-		if rec.AttemptID != "" {
-			att, loadErr := loadAttempt(root, rec.TaskID, rec.AttemptID)
+		attemptID, idErr := terminalTransitionAttemptID(t, rec)
+		if idErr != nil {
+			return idErr
+		}
+		if attemptID != "" {
+			att, loadErr := loadAttempt(root, rec.TaskID, attemptID)
 			if loadErr != nil {
 				return loadErr
 			}
@@ -1299,7 +1342,7 @@ func finishTransitionRecordLocked(root string, rec *TransitionRecord) error {
 				return nil
 			}
 		}
-		if err := closeAttemptForTransitionRecord(root, rec); err != nil {
+		if err := proveExactAttemptClosedForTerminal(root, t, rec); err != nil {
 			return err
 		}
 		rec.State = transitionCommitted
@@ -1320,6 +1363,9 @@ func projectCommittedTerminalFromRecordLocked(root string, rec *TransitionRecord
 	}
 	if terminalTransitionSuperseded(t, rec) {
 		return nil
+	}
+	if err := proveExactAttemptClosedForTerminal(root, t, rec); err != nil {
+		return err
 	}
 	if t.LastCommittedTransitionID != rec.TransitionID {
 		if t.Revision != rec.ExpectedRevision {
@@ -1348,7 +1394,7 @@ func projectCommittedTerminalFromRecordLocked(root string, rec *TransitionRecord
 	if err := recordRecoveredTransitionEvent(root, rec, t); err != nil {
 		return err
 	}
-	return closeAttemptForTransitionRecord(root, rec)
+	return nil
 }
 
 func finishPreparedNonterminal(root string, rec *TransitionRecord) error {

@@ -294,6 +294,7 @@ type Task struct {
 	// Fail-closed defaults never make held/canceled/done/failed cards schedulable.
 	Revision                  int64  `json:"revision,omitempty"`
 	ControlEpoch              int64  `json:"control_epoch,omitempty"`
+	AdmissionEpoch            uint64 `json:"admission_epoch,omitempty"`
 	SchedulingEligible        *bool  `json:"scheduling_eligible,omitempty"`
 	ActiveAttemptID           string `json:"active_attempt_id,omitempty"`
 	LastCommittedTransitionID string `json:"last_committed_transition_id,omitempty"`

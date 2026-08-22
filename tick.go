@@ -122,7 +122,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		//  - claude 正常时其余任务走 claude；
 		//  - claude 被冷却/红线拦住时，按 fallback_order 逐个找第一个可用出路
 		//    （codex 沿用五道闸，引擎各查自己的 cooldown-<名>.json；默认链只有 codex）。
-		if len(activeIDs) < maxPar && schedulerWriteAllowed(root) {
+		if len(activeIDs) < maxPar && schedulerWriteAllowed(root) && admissionAllowsScheduling(root) {
 			tasks, err := loadTasks(root)
 			if err != nil {
 				if len(activeIDs) == 0 {

@@ -1428,6 +1428,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 	}
 	defer lg.Close()
 
+	providerAdmitted := false
 	for {
 		now := time.Now()
 		// 多步任务在步骤之间复查红线：越线则回到排队（会话与进度保留），等窗口滑走。
@@ -1612,6 +1613,12 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			// 墓碑关心"是否已发起注入"而非"注入产物是否成功",inject 的 err 是"墓碑本身写不下"的
 			// IO 错误载体,与 LLM 侧错误正交(LLM 报错也算注入完成,该落 final)。
 			return nil
+		}
+		if !providerAdmitted {
+			if err := requireAdmissionToInvoke(root, t); err != nil {
+				return finishIfStopped(abandonReservedAttemptForAdmission(root, t))
+			}
+			providerAdmitted = true
 		}
 		if resuming {
 			// CG-4:limit_paused/mid_step 续跑走 resume 提示是"至多一次注入"点。inject 前落 pending,
@@ -2221,6 +2228,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				if err := saveAuthorizedTask(root, t); err != nil {
 					return err
 				}
+				if !admissionAllowsFollowOn(root, t) || producerInvalidated(t) {
+					return nil
+				}
 				childCfg := configForGeneratedChildren(root, cfg, lg)
 				rv, err := ensureReviewAfterTask(root, childCfg, t, lg)
 				if err != nil || rv == nil {
@@ -2729,6 +2739,9 @@ func ensureReviewAfterTaskWithEvidence(root string, cfg *Config, t *Task, priorE
 	if t == nil || !t.ReviewAfter || !reviewAfterEligibleType(t) {
 		return nil, nil
 	}
+	if !admissionAllowsFollowOn(root, t) || producerInvalidated(t) || !schedulerWriteAllowed(root) {
+		return nil, nil
+	}
 	stage := pendingRequiredReviewStage(t)
 	if stage == "" {
 		return ensureLegacyReviewAfterTask(root, cfg, t, lg)
@@ -2846,6 +2859,9 @@ func appendCompletedReview(t *Task, stage string) error {
 
 func advancePlannedReview(root string, cfg *Config, review *Task, result string, lg *os.File) {
 	if review == nil || review.ReviewPlanRoot == "" || !closedReviewStages[review.ReviewPlanStage] {
+		return
+	}
+	if !admissionAllowsFollowOn(root, review) {
 		return
 	}
 	parent, err := findTaskAnywhere(root, review.ReviewPlanRoot)
@@ -3012,6 +3028,9 @@ func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task
 		if t == nil || activeIDs[t.ID] || t.Status != statusHeld || !t.ReviewObligationPending ||
 			(!t.SolMaxAdversarialReview && pendingRequiredReviewStage(t) == "") ||
 			!t.ReviewAfter || !reviewAfterEligibleType(t) {
+			continue
+		}
+		if !admissionAllowsFollowOn(root, t) || producerInvalidated(t) || !schedulerWriteAllowed(root) {
 			continue
 		}
 		lg, _ := openTaskLog(root, t.ID)
@@ -3405,6 +3424,9 @@ func truncateRunes(s string, n int) string {
 //     强制按类闭合纪律，effort 缺省抬到 high——修复是最该多想的环节）；
 //   - 超轮限 → 挂 held 升级卡：大概率是规格歧义/契约冲突，继续在实现层打转是浪费，交人裁。
 func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *os.File) {
+	if t == nil || !admissionAllowsFollowOn(root, t) {
+		return
+	}
 	v := parseReviewVerdict(result)
 	if v == nil {
 		logBlock(lg, "FIXLOOP", "审核输出中未找到 verdict json（旧格式或审核未按模板收尾），闭环跳过")
@@ -3808,6 +3830,9 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 //
 // 链任一步断裂把母卡置 failed（list 对 failed 显示 LastError 且不折叠，故断裂可见），绝不让单腿结果冒充成功。
 func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
+	if t == nil || !admissionAllowsFollowOn(root, t) {
+		return
+	}
 	// breakChain 把母卡从 done 改判为 failed + 写断裂原因。runTask 在 postComplete 后 saveTask 落盘；
 	// 置 failed 而非仅写 LastError 是因为 list/cmdList 只对 failed 卡渲染 LastError，done 卡从不显示它
 	// （否则断裂母卡与成功卡视觉全等——round-1 的"已可见"是空头承诺）。
@@ -4193,6 +4218,9 @@ func crossEngineLabel(eng CrossEngine) string {
 }
 
 func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]string, error) {
+	if parent == nil || !admissionAllowsFollowOn(root, parent) {
+		return nil, nil
+	}
 	tasks, err := extractEmitTasks(result, parent.Dir)
 	if err != nil {
 		return nil, err

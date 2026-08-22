@@ -24,6 +24,8 @@ const (
 
 	transitionPrepared  = "prepared"
 	transitionCommitted = "committed"
+
+	evAdmissionDenied = "admission_denied"
 )
 
 var (
@@ -36,6 +38,7 @@ var (
 	errProducerStillAlive   = errors.New("attempt producer is still alive")
 	errProducerInvalidated  = errors.New("producer writes stopped after rejected CAS")
 	errTransitionCrash      = errors.New("injected transition crash")
+	errAdmissionDenied      = errors.New("admission denied")
 	terminalizeWaitTimeout  = 45 * time.Second
 	reservedAttemptFreshFor = 30 * time.Second
 )
@@ -51,10 +54,11 @@ const (
 // Test-only seams. Production callers must leave crash/hook values empty/nil
 // and must not replace syncDirAfterRename; the default is required durability.
 var (
-	transitionCrashAt  string
-	attemptLoadHook    func(root, taskID, attemptID string) error
-	attemptWriteHook   func(*AttemptRecord) error
-	syncDirAfterRename = syncContainingDirectory
+	transitionCrashAt      string
+	attemptLoadHook        func(root, taskID, attemptID string) error
+	attemptWriteHook       func(*AttemptRecord) error
+	admissionPreInvokeHook func()
+	syncDirAfterRename     = syncContainingDirectory
 )
 
 func crashTransitionIf(point string) error {
@@ -69,6 +73,7 @@ type AttemptRecord struct {
 	AttemptID        string `json:"attempt_id"`
 	ExpectedRevision int64  `json:"expected_revision"`
 	ControlEpoch     int64  `json:"control_epoch"`
+	AdmissionEpoch   uint64 `json:"admission_epoch,omitempty"`
 	RunnerID         string `json:"runner_id,omitempty"`
 	PID              int    `json:"pid,omitempty"`
 	PGID             int    `json:"pgid,omitempty"`
@@ -181,7 +186,8 @@ func producerWriteStopped(err error) bool {
 		errors.Is(err, errNotSchedulable) ||
 		errors.Is(err, errAttemptConflict) ||
 		errors.Is(err, errProducerInvalidated) ||
-		errors.Is(err, errAlreadyTerminal)
+		errors.Is(err, errAlreadyTerminal) ||
+		errors.Is(err, errAdmissionDenied)
 }
 
 func finishIfStopped(err error) error {
@@ -819,6 +825,9 @@ func transitionAttemptDisposition(req transitionRequest) (closeAttempt, terminal
 	if req.EventType == evNeedsOwner {
 		return false, false, false
 	}
+	if req.EventType == evAdmissionDenied {
+		return true, false, true
+	}
 	switch req.Status {
 	case statusDone, statusFailed, statusHeld, statusCanceled:
 		return true, true, true
@@ -899,6 +908,13 @@ func reserveDispatchAttempt(root string, t *Task) error {
 		if !schedulerWriteAllowed(root) {
 			return errSchedulerLockLost
 		}
+		st, err := loadAdmissionState(root)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAdmissionDenied, err)
+		}
+		if st.Paused {
+			return errAdmissionDenied
+		}
 		current, err := loadTask(root, t.ID)
 		if err != nil {
 			return err
@@ -924,6 +940,7 @@ func reserveDispatchAttempt(root string, t *Task) error {
 			AttemptID:        id,
 			ExpectedRevision: current.Revision,
 			ControlEpoch:     current.ControlEpoch,
+			AdmissionEpoch:   st.Epoch,
 			RunnerID:         currentRunnerID(),
 			State:            attemptReserved,
 			CreatedAt:        now,
@@ -935,6 +952,7 @@ func reserveDispatchAttempt(root string, t *Task) error {
 		}
 		t.ActiveAttemptID = id
 		t.ControlEpoch = current.ControlEpoch
+		t.AdmissionEpoch = st.Epoch
 		t.Revision = current.Revision
 		t.ControlState = controlEligible
 		if t.SchedulingEligible == nil {
@@ -956,7 +974,71 @@ func saveAuthorizedTask(root string, t *Task) error {
 }
 
 func followOnWritesAllowed(root string, t *Task) bool {
-	return t != nil && !producerInvalidated(t) && !diskControlRevoked(root, t.ID) && schedulerWriteAllowed(root)
+	return t != nil && !producerInvalidated(t) && !diskControlRevoked(root, t.ID) &&
+		schedulerWriteAllowed(root) && admissionAllowsFollowOn(root, t)
+}
+
+func admissionAllowsFollowOn(root string, t *Task) bool {
+	if t == nil {
+		return false
+	}
+	st, err := loadAdmissionState(root)
+	if err != nil || st.Paused {
+		return false
+	}
+	return t.AdmissionEpoch == st.Epoch
+}
+
+func requireAdmissionToInvoke(root string, t *Task) error {
+	if hook := admissionPreInvokeHook; hook != nil {
+		hook()
+	}
+	if t == nil || t.ID == "" || t.ActiveAttemptID == "" {
+		return errAdmissionDenied
+	}
+	return withTaskControlLock(root, t.ID, func() error {
+		st, err := loadAdmissionState(root)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAdmissionDenied, err)
+		}
+		if st.Paused {
+			return errAdmissionDenied
+		}
+		current, err := loadTask(root, t.ID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAdmissionDenied, err)
+		}
+		if current.ActiveAttemptID != t.ActiveAttemptID {
+			return errAdmissionDenied
+		}
+		rec, err := loadAttempt(root, t.ID, t.ActiveAttemptID)
+		if err != nil || rec == nil {
+			return errAdmissionDenied
+		}
+		if rec.State != attemptReserved && rec.State != attemptBound {
+			return errAdmissionDenied
+		}
+		if rec.AdmissionEpoch != st.Epoch || current.AdmissionEpoch != st.Epoch {
+			return errAdmissionDenied
+		}
+		return nil
+	})
+}
+
+func abandonReservedAttemptForAdmission(root string, t *Task) error {
+	if t == nil {
+		return errAdmissionDenied
+	}
+	t.Status = statusQueued
+	t.LastError = "admission denied before provider invoke"
+	t.touch()
+	if err := persistTaskEvent(root, t, evAdmissionDenied, "runner:admission", statusQueued, t.Step,
+		withCostTelemetry(map[string]any{
+			"reason": "admission_denied", "reason_class": "admission_denied",
+		}, t)); err != nil {
+		return err
+	}
+	return errAdmissionDenied
 }
 
 func currentRunnerID() string {

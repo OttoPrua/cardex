@@ -1428,7 +1428,6 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 	}
 	defer lg.Close()
 
-	providerAdmitted := false
 	for {
 		now := time.Now()
 		// 多步任务在步骤之间复查红线：越线则回到排队（会话与进度保留），等窗口滑走。
@@ -1614,11 +1613,13 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			// IO 错误载体,与 LLM 侧错误正交(LLM 报错也算注入完成,该落 final)。
 			return nil
 		}
-		if !providerAdmitted {
-			if err := requireAdmissionToInvoke(root, t); err != nil {
-				return finishIfStopped(abandonReservedAttemptForAdmission(root, t))
+		if t.Step > 0 {
+			if hook := admissionBetweenStepsHook; hook != nil {
+				hook()
 			}
-			providerAdmitted = true
+		}
+		if err := requireAdmissionToInvoke(root, t); err != nil {
+			return finishIfStopped(abandonReservedAttemptForAdmission(root, t))
 		}
 		if resuming {
 			// CG-4:limit_paused/mid_step 续跑走 resume 提示是"至多一次注入"点。inject 前落 pending,
@@ -1647,6 +1648,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			}
 		} else {
 			_ = invoke()
+		}
+		if errors.Is(runErr, errAdmissionDenied) {
+			return finishIfStopped(abandonReservedAttemptForAdmission(root, t))
 		}
 
 		// 0) 取消：tick 对账发现盘上已标 canceled 后取消 ctx 击杀进程组；也可能进程

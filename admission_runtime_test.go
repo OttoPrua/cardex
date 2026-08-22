@@ -598,3 +598,146 @@ func TestLegacyMissingAdmissionEpochZeroCompatible(t *testing.T) {
 		t.Fatalf("legacy status=%s, want done", done.Status)
 	}
 }
+
+func TestPauseBetweenValidationAndStartNoProvider(t *testing.T) {
+	root := testRoot(t)
+	counter := filepath.Join(t.TempDir(), "calls")
+	cfg := runTaskCfg(t, countingClaudeBin(t, counter, mkOKResultJSON("sess-pause-prestart")))
+	ws := t.TempDir()
+	tk := queuedSequence(t, root, cfg, "pause between validate and start", ws)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	admissionPreStartHook = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() {
+		admissionPreStartHook = nil
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		fresh, err := loadTask(root, tk.ID)
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- runTask(context.Background(), root, cfg, fresh, false)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("did not reach pre-start hook")
+	}
+	running, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID := running.ActiveAttemptID
+	if _, err := setAdmissionPaused(root, true, "ops", "drain"); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("runner did not return after pause")
+	}
+	if n := providerCallCount(t, counter); n != 0 {
+		t.Fatalf("provider stub call count=%d, want 0", n)
+	}
+	if attemptID != "" {
+		assertAttemptClosed(t, root, tk.ID, attemptID)
+	}
+	assertNoSemanticCompletion(t, root, tk.ID)
+}
+
+func TestPauseBetweenStep1AndStep2NoSecondProvider(t *testing.T) {
+	root := testRoot(t)
+	counter := filepath.Join(t.TempDir(), "calls")
+	cfg := runTaskCfg(t, countingClaudeBin(t, counter, mkOKResultJSON("sess-pause-step2")))
+	ws := t.TempDir()
+	tk := newTask(root, cfg, typeSequence, "pause between steps", ws, []string{"step one", "step two"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	admissionBetweenStepsHook = func() {
+		close(entered)
+		<-release
+	}
+	t.Cleanup(func() {
+		admissionBetweenStepsHook = nil
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	})
+
+	done := make(chan error, 1)
+	go func() {
+		fresh, err := loadTask(root, tk.ID)
+		if err != nil {
+			done <- err
+			return
+		}
+		done <- runTask(context.Background(), root, cfg, fresh, false)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(8 * time.Second):
+		t.Fatal("did not reach between-steps hook")
+	}
+	running, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	attemptID := running.ActiveAttemptID
+	if _, err := setAdmissionPaused(root, true, "ops", "drain"); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	close(release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("runner: %v", err)
+		}
+	case <-time.After(8 * time.Second):
+		t.Fatal("runner did not return after pause")
+	}
+	if n := providerCallCount(t, counter); n != 1 {
+		t.Fatalf("provider stub call count=%d, want 1", n)
+	}
+	if attemptID != "" {
+		assertAttemptClosed(t, root, tk.ID, attemptID)
+	}
+	got, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status == statusDone {
+		t.Fatalf("status=%s, want not done after pause between steps", got.Status)
+	}
+	events := readAllEventsRaw(t, root, tk.ID)
+	for _, ev := range events {
+		if ev.Type == evDone {
+			t.Fatalf("unexpected done event in %v", eventTypes(events))
+		}
+	}
+}

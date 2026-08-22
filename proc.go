@@ -278,7 +278,36 @@ func runCmdRegisteredHarvestForTaskWorkspace(cmd *exec.Cmd, resultInBuf func() b
 	if leaseErr != nil {
 		return leaseErr
 	}
+	taskAware := taskID != ""
+	holdingGate := false
+	var launchRoot string
+	if taskAware {
+		if hook := admissionPreStartHook; hook != nil {
+			hook()
+		}
+		if v, ok := taskExecRoot.Load(taskID); ok {
+			launchRoot, _ = v.(string)
+		}
+		admissionLaunchGate.RLock()
+		holdingGate = true
+	}
+	releaseGate := func() {
+		if holdingGate {
+			admissionLaunchGate.RUnlock()
+			holdingGate = false
+		}
+	}
+	if taskAware && launchRoot != "" {
+		if err := revalidateTaskAttemptAdmission(launchRoot, taskID); err != nil {
+			releaseGate()
+			if lease != nil && lease.abort != nil {
+				lease.abort()
+			}
+			return err
+		}
+	}
 	if err := cmd.Start(); err != nil {
+		releaseGate()
 		if lease != nil && lease.abort != nil {
 			lease.abort()
 		}
@@ -292,13 +321,21 @@ func runCmdRegisteredHarvestForTaskWorkspace(cmd *exec.Cmd, resultInBuf func() b
 	procGroups[pid] = true
 	procMu.Unlock()
 	registerTaskInvoke(taskID, pid)
-	if taskID != "" {
-		if v, ok := taskExecRoot.Load(taskID); ok {
-			if root, _ := v.(string); root != "" {
-				bindAttemptProcess(root, taskID, pid)
+	if taskAware && launchRoot != "" {
+		if err := bindAttemptProcess(launchRoot, taskID, pid); err != nil {
+			releaseGate()
+			_ = killProcGroup(pid)
+			if p, findErr := os.FindProcess(pid); findErr == nil {
+				_ = p.Kill()
 			}
+			procMu.Lock()
+			delete(procGroups, pid)
+			procMu.Unlock()
+			unregisterTaskInvoke(taskID, pid)
+			return err
 		}
 	}
+	releaseGate()
 	defer func() {
 		procMu.Lock()
 		delete(procGroups, pid)

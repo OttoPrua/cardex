@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -172,7 +173,11 @@ func admissionAllowsScheduling(root string) bool {
 	return err == nil && !st.Paused
 }
 
+var admissionLaunchGate sync.RWMutex
+
 func setAdmissionPaused(root string, paused bool, actor, reason string) (admissionState, error) {
+	admissionLaunchGate.Lock()
+	defer admissionLaunchGate.Unlock()
 	var out admissionState
 	err := withTaskControlLock(root, "global-admission", func() error {
 		st, err := loadAdmissionState(root)

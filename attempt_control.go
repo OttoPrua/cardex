@@ -54,11 +54,13 @@ const (
 // Test-only seams. Production callers must leave crash/hook values empty/nil
 // and must not replace syncDirAfterRename; the default is required durability.
 var (
-	transitionCrashAt      string
-	attemptLoadHook        func(root, taskID, attemptID string) error
-	attemptWriteHook       func(*AttemptRecord) error
-	admissionPreInvokeHook func()
-	syncDirAfterRename     = syncContainingDirectory
+	transitionCrashAt         string
+	attemptLoadHook           func(root, taskID, attemptID string) error
+	attemptWriteHook          func(*AttemptRecord) error
+	admissionPreInvokeHook    func()
+	admissionPreStartHook     func()
+	admissionBetweenStepsHook func()
+	syncDirAfterRename        = syncContainingDirectory
 )
 
 func crashTransitionIf(point string) error {
@@ -997,32 +999,49 @@ func requireAdmissionToInvoke(root string, t *Task) error {
 		return errAdmissionDenied
 	}
 	return withTaskControlLock(root, t.ID, func() error {
-		st, err := loadAdmissionState(root)
-		if err != nil {
-			return fmt.Errorf("%w: %v", errAdmissionDenied, err)
-		}
-		if st.Paused {
-			return errAdmissionDenied
-		}
-		current, err := loadTask(root, t.ID)
-		if err != nil {
-			return fmt.Errorf("%w: %v", errAdmissionDenied, err)
-		}
-		if current.ActiveAttemptID != t.ActiveAttemptID {
-			return errAdmissionDenied
-		}
-		rec, err := loadAttempt(root, t.ID, t.ActiveAttemptID)
-		if err != nil || rec == nil {
-			return errAdmissionDenied
-		}
-		if rec.State != attemptReserved && rec.State != attemptBound {
-			return errAdmissionDenied
-		}
-		if rec.AdmissionEpoch != st.Epoch || current.AdmissionEpoch != st.Epoch {
-			return errAdmissionDenied
-		}
-		return nil
+		return checkExactTaskAttemptAdmissionLocked(root, t.ID, t.ActiveAttemptID)
 	})
+}
+
+func revalidateTaskAttemptAdmission(root, taskID string) error {
+	if root == "" || taskID == "" {
+		return errAdmissionDenied
+	}
+	return withTaskControlLock(root, taskID, func() error {
+		current, err := loadTask(root, taskID)
+		if err != nil {
+			return fmt.Errorf("%w: %v", errAdmissionDenied, err)
+		}
+		return checkExactTaskAttemptAdmissionLocked(root, taskID, current.ActiveAttemptID)
+	})
+}
+
+func checkExactTaskAttemptAdmissionLocked(root, taskID, attemptID string) error {
+	st, err := loadAdmissionState(root)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAdmissionDenied, err)
+	}
+	if st.Paused {
+		return errAdmissionDenied
+	}
+	current, err := loadTask(root, taskID)
+	if err != nil {
+		return fmt.Errorf("%w: %v", errAdmissionDenied, err)
+	}
+	if attemptID == "" || current.ActiveAttemptID != attemptID {
+		return errAdmissionDenied
+	}
+	rec, err := loadAttempt(root, taskID, attemptID)
+	if err != nil || rec == nil {
+		return errAdmissionDenied
+	}
+	if rec.State != attemptReserved && rec.State != attemptBound {
+		return errAdmissionDenied
+	}
+	if rec.AdmissionEpoch != st.Epoch || current.AdmissionEpoch != st.Epoch {
+		return errAdmissionDenied
+	}
+	return nil
 }
 
 func abandonReservedAttemptForAdmission(root string, t *Task) error {
@@ -1083,11 +1102,11 @@ func attemptProducerAlive(rec *AttemptRecord) bool {
 	return verifyAttemptProcess(rec)
 }
 
-func bindAttemptProcess(root, taskID string, pid int) {
+func bindAttemptProcess(root, taskID string, pid int) error {
 	if root == "" || taskID == "" || pid <= 0 {
-		return
+		return nil
 	}
-	_ = withTaskControlLock(root, taskID, func() error {
+	return withTaskControlLock(root, taskID, func() error {
 		t, err := loadTask(root, taskID)
 		if err != nil || t.ActiveAttemptID == "" {
 			return nil

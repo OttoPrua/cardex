@@ -1,12 +1,63 @@
 package main
 
 import (
+	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func parseManagerWakeProgramArgumentsCLI(t *testing.T, argv []string) (action, root string) {
+	t.Helper()
+	if len(argv) < 3 {
+		t.Fatalf("ProgramArguments too short for cardex manager-wake: %q", argv)
+	}
+	if argv[1] != "manager-wake" {
+		t.Fatalf("ProgramArguments must invoke manager-wake, got %q", argv)
+	}
+	action = argv[2]
+	switch action {
+	case "once", "status", "install", "uninstall":
+	default:
+		t.Fatalf("cmdManagerWake rejects action %q; want positional once|status|install|uninstall: %q", action, argv)
+	}
+	fs := flag.NewFlagSet("manager-wake", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	rootFlag := fs.String("root", "", "数据目录")
+	if err := fs.Parse(argv[3:]); err != nil {
+		t.Fatalf("cmdManagerWake flag parse failed for %q: %v", argv, err)
+	}
+	if fs.NArg() > 0 {
+		t.Fatalf("cmdManagerWake unexpected arguments %q from %q", fs.Args(), argv)
+	}
+	for _, a := range argv {
+		if a == "--once" || a == "-once" {
+			t.Fatalf("flag-form once is not cmdManagerWake grammar: %q", argv)
+		}
+	}
+	return action, *rootFlag
+}
+
+func assertManagerWakePlistMatchesCLI(t *testing.T, plist, exe, root string) {
+	t.Helper()
+	argv := managerWakePlistProgramArguments(plist)
+	want := managerWakeLaunchdArgv(exe, root)
+	if len(argv) != len(want) {
+		t.Fatalf("ProgramArguments %q want %q", argv, want)
+	}
+	for i := range want {
+		if argv[i] != want[i] {
+			t.Fatalf("ProgramArguments %q want %q", argv, want)
+		}
+	}
+	action, parsedRoot := parseManagerWakeProgramArgumentsCLI(t, argv)
+	if action != "once" || parsedRoot != root {
+		t.Fatalf("CLI grammar action=%q root=%q want once %q from %q", action, parsedRoot, root, argv)
+	}
+}
 
 func TestRenderManagerWakePlistWatchPathsAndInterval(t *testing.T) {
 	root := "/tmp/cardex-wake-root"
@@ -17,9 +68,7 @@ func TestRenderManagerWakePlistWatchPathsAndInterval(t *testing.T) {
 	if !strings.Contains(plist, "<string>"+managerWakeLaunchdLabel+"</string>") {
 		t.Fatalf("missing label:\n%s", plist)
 	}
-	if !strings.Contains(plist, "<string>manager-wake</string>") || !strings.Contains(plist, "<string>--once</string>") {
-		t.Fatalf("missing command:\n%s", plist)
-	}
+	assertManagerWakePlistMatchesCLI(t, plist, "/opt/homebrew/bin/cardex", root)
 	paths := managerWakePlistWatchPaths(plist)
 	wantPath := managerWakeOutboxPath(root)
 	if len(paths) != 1 || paths[0] != wantPath {
@@ -68,6 +117,7 @@ func TestRenderManagerWakePlistXMLEscapesText(t *testing.T) {
 	if !strings.Contains(plist, exeXML) || !strings.Contains(plist, rootXML) {
 		t.Fatalf("escaped exe/root missing:\n%s", plist)
 	}
+	assertManagerWakePlistMatchesCLI(t, plist, exe, root)
 	outbox := managerWakeOutboxPath(root)
 	outboxXML, err := plistXMLText(outbox)
 	if err != nil {
@@ -293,9 +343,11 @@ func TestInstallManagerWakeSuccessDurablePlist(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(got), "<string>manager-wake</string>") {
-		t.Fatalf("installed plist missing command:\n%s", got)
+	exe, err := resolveManagerWakeExecutable()
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertManagerWakePlistMatchesCLI(t, string(got), exe, root)
 	if _, err := os.Stat(pp + ".tmp"); !os.IsNotExist(err) {
 		t.Fatal("durable write must not leave tmp")
 	}

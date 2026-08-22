@@ -165,10 +165,14 @@ func writerClaimsConflict(a, b liveWriterClaim) bool {
 		}
 		return false
 	}
-	if !a.explicit && !b.explicit {
-		return a.dir == b.dir
+	return legacyWritersShareBoundary(a, b)
+}
+
+func legacyWritersShareBoundary(a, b liveWriterClaim) bool {
+	if a.repoKey != "" && a.repoKey == b.repoKey {
+		return true
 	}
-	return a.dirKey == b.dirKey
+	return a.dirKey != "" && a.dirKey == b.dirKey
 }
 
 func writerConflictsWithActive(candidate *Task, active []*Task) bool {

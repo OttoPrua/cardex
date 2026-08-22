@@ -75,14 +75,6 @@ func renderManagerWakePlist(exe, root string, watchdogSec int, logOut string) (s
 	if err != nil {
 		return "", err
 	}
-	exeXML, err := plistXMLText(exe)
-	if err != nil {
-		return "", err
-	}
-	rootXML, err := plistXMLText(root)
-	if err != nil {
-		return "", err
-	}
 	outboxXML, err := plistXMLText(outbox)
 	if err != nil {
 		return "", err
@@ -90,6 +82,15 @@ func renderManagerWakePlist(exe, root string, watchdogSec int, logOut string) (s
 	logXML, err := plistXMLText(logOut)
 	if err != nil {
 		return "", err
+	}
+	argv := managerWakeLaunchdArgv(exe, root)
+	argvXML := make([]string, 0, len(argv))
+	for _, a := range argv {
+		s, err := plistXMLText(a)
+		if err != nil {
+			return "", err
+		}
+		argvXML = append(argvXML, s)
 	}
 	var b strings.Builder
 	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
@@ -101,16 +102,13 @@ func renderManagerWakePlist(exe, root string, watchdogSec int, logOut string) (s
 	b.WriteString(`</string>
     <key>ProgramArguments</key>
     <array>
-        <string>`)
-	b.WriteString(exeXML)
-	b.WriteString(`</string>
-        <string>manager-wake</string>
-        <string>--once</string>
-        <string>--root</string>
-        <string>`)
-	b.WriteString(rootXML)
-	b.WriteString(`</string>
-    </array>
+`)
+	for _, s := range argvXML {
+		b.WriteString("        <string>")
+		b.WriteString(s)
+		b.WriteString("</string>\n")
+	}
+	b.WriteString(`    </array>
     <key>WatchPaths</key>
     <array>
         <string>`)
@@ -135,6 +133,33 @@ func renderManagerWakePlist(exe, root string, watchdogSec int, logOut string) (s
 </plist>
 `)
 	return b.String(), nil
+}
+
+func managerWakeLaunchdArgv(exe, root string) []string {
+	return []string{exe, "manager-wake", "once", "--root", root}
+}
+
+func managerWakePlistProgramArguments(plist string) []string {
+	var args []string
+	in := false
+	for _, line := range strings.Split(plist, "\n") {
+		trim := strings.TrimSpace(line)
+		if strings.Contains(trim, "<key>ProgramArguments</key>") {
+			in = true
+			continue
+		}
+		if !in {
+			continue
+		}
+		if strings.Contains(trim, "</array>") {
+			break
+		}
+		if strings.HasPrefix(trim, "<string>") && strings.HasSuffix(trim, "</string>") {
+			raw := strings.TrimSuffix(strings.TrimPrefix(trim, "<string>"), "</string>")
+			args = append(args, html.UnescapeString(raw))
+		}
+	}
+	return args
 }
 
 func managerWakePlistWatchPaths(plist string) []string {

@@ -150,9 +150,11 @@ func TestCmdManagerWakeInstallLaunchdWatchPathsAndInterval(t *testing.T) {
 		t.Fatal(err)
 	}
 	plist := string(data)
-	if !strings.Contains(plist, "<string>manager-wake</string>") || !strings.Contains(plist, "<string>--once</string>") {
-		t.Fatalf("plist missing once command: %s", plist)
+	exe, err := resolveManagerWakeExecutable()
+	if err != nil {
+		t.Fatal(err)
 	}
+	assertManagerWakePlistMatchesCLI(t, plist, exe, root)
 	if paths := managerWakePlistWatchPaths(plist); len(paths) != 1 || paths[0] != managerWakeOutboxPath(root) {
 		t.Fatalf("WatchPaths=%v", paths)
 	}

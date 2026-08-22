@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -442,6 +444,128 @@ func TestHardWatchdogDeltaZeroNoQueue(t *testing.T) {
 	sec, err := managerWakePlistStartInterval(plist)
 	if err != nil || sec != managerWakeWatchdogSec {
 		t.Fatalf("plist interval=%d err=%v", sec, err)
+	}
+}
+
+func TestManagerWakeOnceOverlappingCallsSerialize(t *testing.T) {
+	root := testRoot(t)
+	thread := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaa01"
+	bin, _ := fakeCodexQueueBin(t, 0)
+	mw := testWakeCfg(bin, "wake-proj", thread, "mgr")
+	writeWakeConfig(t, root, bin, "wake-proj", thread, "mgr", true)
+	_ = heldCommittedTask(t, root, "wake-proj", "once-lock")
+	rows := countWakeRows(t, root)
+	if len(rows) != 1 || rows[0].WakeEventID == "" {
+		t.Fatalf("need one committed wake row, got %+v", rows)
+	}
+
+	var queues atomic.Int32
+	firstQueued := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseQueue := func() { releaseOnce.Do(func() { close(release) }) }
+	origQ := managerWakeQueue
+	origEnter := managerWakeOnceEntered
+	t.Cleanup(func() {
+		releaseQueue()
+		managerWakeQueue = origQ
+		managerWakeOnceEntered = origEnter
+	})
+	entered := make(chan struct{}, 2)
+	managerWakeOnceEntered = func() { entered <- struct{}{} }
+	managerWakeQueue = func(bin, threadID, message string) error {
+		if queues.Add(1) == 1 {
+			close(firstQueued)
+			<-release
+		}
+		return nil
+	}
+
+	err1 := make(chan error, 1)
+	go func() { err1 <- managerWakeOnce(root, mw) }()
+	select {
+	case <-entered:
+	case err := <-err1:
+		t.Fatalf("first once returned before enter: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("first once did not enter")
+	}
+	select {
+	case <-firstQueued:
+	case err := <-err1:
+		t.Fatalf("first once returned before queue: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("first once did not queue")
+	}
+
+	err2 := make(chan error, 1)
+	go func() { err2 <- managerWakeOnce(root, mw) }()
+	select {
+	case <-entered:
+	case err := <-err2:
+		t.Fatalf("second once returned before enter: %v", err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("second once did not enter")
+	}
+
+	overlapUntil := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(overlapUntil) {
+		if queues.Load() > 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	releaseQueue()
+
+	if err := <-err1; err != nil {
+		t.Fatalf("first once: %v", err)
+	}
+	if err := <-err2; err != nil {
+		t.Fatalf("second once: %v", err)
+	}
+	if got := queues.Load(); got != 1 {
+		t.Fatalf("overlapping once queued %d times, want at most 1", got)
+	}
+
+	if _, err := os.Stat(controlLockPath(root, managerWakeOnceLockID)); err != nil {
+		t.Fatalf("dedicated once lock missing: %v", err)
+	}
+	if managerWakeOnceLockID == managerWakeOutboxLockID {
+		t.Fatal("once lock reused the outbox lock")
+	}
+	if controlLockPath(root, managerWakeOnceLockID) == lockPath(root) {
+		t.Fatal("once lock reused the scheduler lock")
+	}
+
+	cur, class, err := loadManagerWakeCursor(root, "mgr")
+	if err != nil || class != "" || cur == nil || cur.OutboxSeq < 1 || cur.LastWakeID == "" {
+		t.Fatalf("cursor after serialized once: class=%q err=%v cur=%+v", class, err, cur)
+	}
+	ids, class, err := loadManagerWakeReceiptIDs(root, "mgr")
+	if err != nil || class != "" || !ids[rows[0].WakeEventID] {
+		t.Fatalf("receipt missing wake %q class=%q err=%v ids=%v", rows[0].WakeEventID, class, err, ids)
+	}
+	if _, err := os.Stat(managerWakeInflightPath(root, "mgr")); !os.IsNotExist(err) {
+		t.Fatal("inflight must be cleared after serialized success")
+	}
+
+	metricsBefore := loadManagerWakeMetrics(root)
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatal(err)
+	}
+	if queues.Load() != 1 {
+		t.Fatalf("serialized follow-up queued again: %d", queues.Load())
+	}
+	metrics := loadManagerWakeMetrics(root)
+	if metrics.QueueAttempts != 1 || metrics.QueueSuccesses != 1 {
+		t.Fatalf("queue metrics: %+v", metrics)
+	}
+	if metrics.NoDeltaScans <= metricsBefore.NoDeltaScans {
+		t.Fatalf("follow-up must be a no-delta scan: before=%+v after=%+v", metricsBefore, metrics)
+	}
+	cur2, _, _ := loadManagerWakeCursor(root, "mgr")
+	if cur2.OutboxSeq != cur.OutboxSeq || cur2.LastWakeID != cur.LastWakeID {
+		t.Fatalf("follow-up mutated cursor: %+v -> %+v", cur, cur2)
 	}
 }
 

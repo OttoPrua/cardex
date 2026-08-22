@@ -160,6 +160,82 @@ func TestLegacyWriterSerializesWithExplicitSameDir(t *testing.T) {
 	}
 }
 
+func linkedGitWorktrees(t *testing.T) (mainDir, worktreeDir string) {
+	t.Helper()
+	mainDir = t.TempDir()
+	mustWriteFile(t, filepath.Join(mainDir, ".git", "HEAD"), "ref: refs/heads/main\n")
+	mustWriteFile(t, filepath.Join(mainDir, "internal", "auth", "token.go"), "package auth\n")
+	mustWriteFile(t, filepath.Join(mainDir, "internal", "billing", "bill.go"), "package billing\n")
+	worktreeDir = t.TempDir()
+	mustWriteFile(t, filepath.Join(mainDir, ".git", "worktrees", "lane", "commondir"), "gitdir\n")
+	mustWriteFile(t, worktreeDir+"/.git", "gitdir: "+filepath.Join(mainDir, ".git", "worktrees", "lane")+"\n")
+	mustWriteFile(t, filepath.Join(worktreeDir, "internal", "auth", "token.go"), "package auth\n")
+	mustWriteFile(t, filepath.Join(worktreeDir, "internal", "billing", "bill.go"), "package billing\n")
+	return mainDir, worktreeDir
+}
+
+func TestLegacyWritersSerializeOnSharedRepoCanonicalAliasAndStayConcurrentWhenUnrelated(t *testing.T) {
+	mainDir, wtDir := linkedGitWorktrees(t)
+	legacyMain := &Task{ID: "legacy-main", Dir: mainDir, Type: typeSequence}
+	legacyWT := &Task{ID: "legacy-wt", Dir: wtDir, Type: typeSequence}
+	if !writerConflictsWithActive(legacyWT, []*Task{legacyMain}) || !writerConflictsWithActive(legacyMain, []*Task{legacyWT}) {
+		t.Fatal("legacy writers in linked worktrees of the same git common dir must serialize")
+	}
+
+	explicitMain := &Task{ID: "explicit-main", Dir: mainDir, Type: typeSequence, WriteDomain: &WriteDomain{
+		ID: "auth-tokens", Lineage: "auth-tokens-lineage", Component: "auth", Paths: []string{"internal/auth"},
+	}}
+	if !writerConflictsWithActive(explicitMain, []*Task{legacyWT}) || !writerConflictsWithActive(legacyWT, []*Task{explicitMain}) {
+		t.Fatal("mixed explicit/legacy writers sharing a git common dir must serialize")
+	}
+
+	explicitBilling := &Task{ID: "explicit-bill", Dir: wtDir, Type: typeSequence, WriteDomain: &WriteDomain{
+		ID: "billing-core", Lineage: "billing-core-lineage", Component: "billing", Paths: []string{"internal/billing"},
+	}}
+	if writerConflictsWithActive(explicitBilling, []*Task{explicitMain}) {
+		t.Fatal("disjoint explicit claims across linked worktrees must stay concurrent")
+	}
+
+	realRoot := t.TempDir()
+	mustWriteFile(t, filepath.Join(realRoot, "internal", "auth", "token.go"), "package auth\n")
+	alias := filepath.Join(t.TempDir(), "repo-alias")
+	if err := os.Symlink(realRoot, alias); err != nil {
+		t.Fatal(err)
+	}
+	legacyReal := &Task{ID: "legacy-real", Dir: realRoot, Type: typeSequence}
+	legacyAlias := &Task{ID: "legacy-alias", Dir: alias, Type: typeSequence}
+	if !writerConflictsWithActive(legacyAlias, []*Task{legacyReal}) {
+		t.Fatal("legacy writers on canonical symlink aliases must serialize")
+	}
+	explicitAlias := &Task{ID: "explicit-alias", Dir: alias, Type: typeSequence, WriteDomain: &WriteDomain{
+		ID: "auth-alias", Lineage: "auth-alias-lineage", Component: "auth", Paths: []string{"internal/auth/token.go"},
+	}}
+	if !writerConflictsWithActive(explicitAlias, []*Task{legacyReal}) {
+		t.Fatal("mixed explicit/legacy canonical aliases must serialize")
+	}
+
+	spelling := &Task{ID: "legacy-dot", Dir: realRoot + string(filepath.Separator) + ".", Type: typeSequence}
+	if !writerConflictsWithActive(spelling, []*Task{legacyReal}) {
+		t.Fatal("legacy writers with equivalent directory spellings must serialize")
+	}
+
+	other := t.TempDir()
+	unrelated := &Task{ID: "legacy-other-dir", Dir: other, Type: typeSequence}
+	if writerConflictsWithActive(unrelated, []*Task{legacyReal}) || writerConflictsWithActive(unrelated, []*Task{legacyMain}) {
+		t.Fatal("legacy writers in unrelated directories must stay concurrent")
+	}
+
+	cloneA := t.TempDir()
+	cloneB := t.TempDir()
+	mustWriteFile(t, filepath.Join(cloneA, ".git", "HEAD"), "ref: refs/heads/main\n")
+	mustWriteFile(t, filepath.Join(cloneB, ".git", "HEAD"), "ref: refs/heads/main\n")
+	legacyCloneA := &Task{ID: "legacy-clone-a", Dir: cloneA, Type: typeSequence}
+	legacyCloneB := &Task{ID: "legacy-clone-b", Dir: cloneB, Type: typeSequence}
+	if writerConflictsWithActive(legacyCloneB, []*Task{legacyCloneA}) {
+		t.Fatal("legacy writers in independent repositories must stay concurrent")
+	}
+}
+
 func TestLiveDAGFailClosedReadiness(t *testing.T) {
 	cardexRoot := testRoot(t)
 	dir := t.TempDir()

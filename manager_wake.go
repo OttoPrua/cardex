@@ -23,6 +23,8 @@ const (
 	errorSchemaV1              = "cardex.manager_wake.error.v1"
 	receiptSchemaV1            = "cardex.manager_wake.receipt.v1"
 	inflightSchemaV1           = "cardex.manager_wake.inflight.v1"
+	managerWakeOnceLockID      = "_manager-wake-once"
+	managerWakeOutboxLockID    = "_manager-wake-outbox"
 )
 
 // ManagerWakeSubscription is a closed, scoped delivery target. IDs must be
@@ -62,6 +64,9 @@ var (
 	// managerWakePersistReceipts is the sender receipt fsync. Tests inject a
 	// crash after queue success and before this write.
 	managerWakePersistReceipts = rememberManagerWakeReceipts
+	// managerWakeOnceEntered fires at the start of managerWakeOnce so tests can
+	// overlap a second once while the first still holds the exclusive section.
+	managerWakeOnceEntered func()
 )
 
 type managerWakeOutboxRow struct {
@@ -418,7 +423,7 @@ func appendOutboxRow(root string, t *Task, ev TaskEvent) error {
 	if t == nil || root == "" || !committedWakeEligible(root, t, ev) {
 		return nil
 	}
-	return withTaskControlLock(root, "_manager-wake-outbox", func() error {
+	return withTaskControlLock(root, managerWakeOutboxLockID, func() error {
 		return appendOutboxRowLocked(root, t, ev)
 	})
 }
@@ -1218,6 +1223,17 @@ func emptyDash(s string) string {
 }
 
 func managerWakeOnce(root string, mw *ManagerWakeConfig) error {
+	if fn := managerWakeOnceEntered; fn != nil {
+		fn()
+	}
+	// Dedicated control-lock identity, acquired before per-task reconcile
+	// locks and the outbox append lock, and never the scheduler lock.
+	return withTaskControlLock(root, managerWakeOnceLockID, func() error {
+		return managerWakeOnceLocked(root, mw)
+	})
+}
+
+func managerWakeOnceLocked(root string, mw *ManagerWakeConfig) error {
 	reconcileControlPlane(root)
 	if err := reconcileManagerWakeOutbox(root); err != nil {
 		metrics := loadManagerWakeMetrics(root)

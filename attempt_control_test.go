@@ -1322,6 +1322,188 @@ func TestTerminalCrashPointDiskStatesRecover(t *testing.T) {
 	}
 }
 
+func restoreAttemptControlSeams(t *testing.T) {
+	t.Helper()
+	prevLoad := attemptLoadHook
+	prevWrite := attemptWriteHook
+	prevSync := syncDirAfterRename
+	t.Cleanup(func() {
+		attemptLoadHook = prevLoad
+		attemptWriteHook = prevWrite
+		syncDirAfterRename = prevSync
+		transitionCrashAt = ""
+	})
+}
+
+func assertNoCommittedTerminalVisibility(t *testing.T, root string, tk *Task) {
+	t.Helper()
+	fresh, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status == statusDone || fresh.effectiveControlState() == controlTerminal {
+		t.Fatalf("pre-commit terminal visibility status=%s control=%s", fresh.Status, fresh.effectiveControlState())
+	}
+	if fresh.LastCommittedTransitionID != tk.LastCommittedTransitionID {
+		t.Fatalf("pre-commit last_committed_transition_id=%q", fresh.LastCommittedTransitionID)
+	}
+	recs, err := listTaskTransitions(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rec := range recs {
+		if rec != nil && rec.State == transitionCommitted {
+			t.Fatalf("journal %s committed without durable attempt close", rec.TransitionID)
+		}
+	}
+	for _, ev := range readAllEventsRaw(t, root, tk.ID) {
+		if ev.Type == evDone {
+			t.Fatalf("terminal event visible before durable close: %+v", ev)
+		}
+	}
+	assertNoD1ProductionEffects(t, root)
+}
+
+func retryTerminalDone(t *testing.T, root string, snapshot *Task) string {
+	t.Helper()
+	retry, err := loadTask(root, snapshot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	retry.Status = statusDone
+	if err := persistTaskEvent(root, retry, evDone, "runner", statusDone, retry.Step, withCostTelemetry(nil, retry)); err != nil {
+		t.Fatal(err)
+	}
+	reconcilePreparedTransitions(root)
+	reconcilePreparedTransitions(root)
+	recs, err := listTaskTransitions(root, snapshot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recs) != 1 {
+		t.Fatalf("want exactly one journal after recovery, got %d", len(recs))
+	}
+	assertRecoveredTerminalDone(t, root, snapshot, recs[0].TransitionID)
+	return recs[0].TransitionID
+}
+
+func TestAttemptClosePersistenceFailuresBlockCommit(t *testing.T) {
+	t.Run("load_failure", func(t *testing.T) {
+		restoreAttemptControlSeams(t)
+		root := testRoot(t)
+		tk := seedRunningReservedAttempt(t, root)
+		snapshot := *tk
+		attemptLoadHook = func(string, string, string) error {
+			return errors.New("injected attempt load failure")
+		}
+		tk.Status = statusDone
+		err := persistTaskEvent(root, tk, evDone, "runner", statusDone, tk.Step, withCostTelemetry(nil, tk))
+		attemptLoadHook = nil
+		if err == nil {
+			t.Fatal("attempt load failure must block terminal commit")
+		}
+		assertNoCommittedTerminalVisibility(t, root, &snapshot)
+		att, attErr := loadAttempt(root, snapshot.ID, snapshot.ActiveAttemptID)
+		if attErr != nil || att == nil {
+			t.Fatalf("load failure must leave the on-disk attempt inspectable: %v", attErr)
+		}
+		if att.State == attemptExited || att.State == attemptRevoked {
+			t.Fatalf("load failure must not close the attempt, got %s", att.State)
+		}
+		retryTerminalDone(t, root, &snapshot)
+	})
+	t.Run("write_failure", func(t *testing.T) {
+		restoreAttemptControlSeams(t)
+		root := testRoot(t)
+		tk := seedRunningReservedAttempt(t, root)
+		snapshot := *tk
+		attemptWriteHook = func(*AttemptRecord) error {
+			return errors.New("injected attempt write failure")
+		}
+		tk.Status = statusDone
+		err := persistTaskEvent(root, tk, evDone, "runner", statusDone, tk.Step, withCostTelemetry(nil, tk))
+		if err == nil {
+			t.Fatal("attempt write failure must block terminal commit")
+		}
+		assertNoCommittedTerminalVisibility(t, root, &snapshot)
+		att, attErr := loadAttempt(root, snapshot.ID, snapshot.ActiveAttemptID)
+		if attErr != nil || att == nil {
+			t.Fatalf("write failure must leave the attempt readable: %v", attErr)
+		}
+		if att.State == attemptExited || att.State == attemptRevoked {
+			t.Fatalf("write failure must not persist attempt close, got %s", att.State)
+		}
+		attemptWriteHook = nil
+		retryTerminalDone(t, root, &snapshot)
+	})
+}
+
+func TestArchivedCommittedRecoveryPreservesArchiveResidency(t *testing.T) {
+	root := testRoot(t)
+	tk := seedRunningReservedAttempt(t, root)
+	if err := recordEvent(root, tk.ID, TaskEvent{
+		Type: evQueued, Actor: "test", Status: statusQueued, AttemptID: tk.ActiveAttemptID,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	tid := newTransitionID()
+	writeDoneTransition(t, root, tk, tid, transitionCommitted)
+	attemptID := tk.ActiveAttemptID
+	tk.Status = statusDone
+	tk.ControlState = controlTerminal
+	tk.SchedulingEligible = boolPtr(false)
+	tk.LastCommittedTransitionID = tid
+	tk.ActiveAttemptID = attemptID
+	if err := writeTaskFile(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := archiveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(taskPath(root, tk.ID)); !os.IsNotExist(err) {
+		t.Fatal("setup must start from an archived task with no live file")
+	}
+	reconcilePreparedTransitions(root)
+	reconcilePreparedTransitions(root)
+	if _, err := os.Stat(taskPath(root, tk.ID)); !os.IsNotExist(err) {
+		t.Fatal("archived recovery resurrected a live tasks/ file")
+	}
+	if _, err := os.Stat(filepath.Join(archiveDir(root), tk.ID+".json")); err != nil {
+		t.Fatalf("archived task missing after recovery: %v", err)
+	}
+	live, err := loadTasks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, got := range live {
+		if got != nil && got.ID == tk.ID {
+			t.Fatal("archived recovery resurrected the task onto the active board")
+		}
+	}
+	if n := countTransitionEvents(readAllEventsRaw(t, root, tk.ID), evDone, tid); n != 1 {
+		t.Fatalf("archived recovery done events=%d", n)
+	}
+	assertNoD1ProductionEffects(t, root)
+}
+
+func TestJournalRenameParentDirSyncFailureBlocksCommit(t *testing.T) {
+	restoreAttemptControlSeams(t)
+	root := testRoot(t)
+	tk := seedRunningReservedAttempt(t, root)
+	snapshot := *tk
+	syncDirAfterRename = func(string) error {
+		return errors.New("injected parent directory sync failure")
+	}
+	tk.Status = statusDone
+	err := persistTaskEvent(root, tk, evDone, "runner", statusDone, tk.Step, withCostTelemetry(nil, tk))
+	if err == nil {
+		t.Fatal("parent-directory sync failure must block durable journal commit")
+	}
+	assertNoCommittedTerminalVisibility(t, root, &snapshot)
+	syncDirAfterRename = syncContainingDirectory
+	retryTerminalDone(t, root, &snapshot)
+}
+
 func TestLiveTerminalCrashInjectionRecovers(t *testing.T) {
 	points := []string{
 		transitionCrashAfterPrepare,

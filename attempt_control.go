@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -47,8 +48,14 @@ const (
 	transitionCrashAfterEventProjection = "after_event_projection"
 )
 
-// transitionCrashAt is a test-only seam. Production callers must leave it empty.
-var transitionCrashAt string
+// Test-only seams. Production callers must leave crash/hook values empty/nil
+// and must not replace syncDirAfterRename; the default is required durability.
+var (
+	transitionCrashAt  string
+	attemptLoadHook    func(root, taskID, attemptID string) error
+	attemptWriteHook   func(*AttemptRecord) error
+	syncDirAfterRename = syncContainingDirectory
+)
 
 func crashTransitionIf(point string) error {
 	if transitionCrashAt != "" && transitionCrashAt == point {
@@ -207,7 +214,31 @@ func atomicWriteSync(path string, data []byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	return syncDirAfterRename(filepath.Dir(path))
+}
+
+func syncContainingDirectory(dir string) error {
+	if dir == "" {
+		dir = "."
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		if runtime.GOOS == "windows" {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	if err := f.Sync(); err != nil {
+		if runtime.GOOS == "windows" {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func withTaskControlLock(root, taskID string, fn func() error) error {
@@ -399,6 +430,11 @@ func writeAttempt(root string, rec *AttemptRecord) error {
 	if rec == nil || rec.TaskID == "" || rec.AttemptID == "" {
 		return fmt.Errorf("empty attempt record")
 	}
+	if hook := attemptWriteHook; hook != nil {
+		if err := hook(rec); err != nil {
+			return err
+		}
+	}
 	rec.UpdatedAt = time.Now().Format(time.RFC3339Nano)
 	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
@@ -408,6 +444,11 @@ func writeAttempt(root string, rec *AttemptRecord) error {
 }
 
 func loadAttempt(root, taskID, attemptID string) (*AttemptRecord, error) {
+	if hook := attemptLoadHook; hook != nil {
+		if err := hook(root, taskID, attemptID); err != nil {
+			return nil, err
+		}
+	}
 	data, err := os.ReadFile(attemptPath(root, taskID, attemptID))
 	if err != nil {
 		return nil, err
@@ -415,6 +456,9 @@ func loadAttempt(root, taskID, attemptID string) (*AttemptRecord, error) {
 	var rec AttemptRecord
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, err
+	}
+	if rec.TaskID != taskID || rec.AttemptID != attemptID {
+		return nil, fmt.Errorf("attempt identity mismatch: have %s/%s want %s/%s", rec.TaskID, rec.AttemptID, taskID, attemptID)
 	}
 	return &rec, nil
 }
@@ -532,7 +576,11 @@ func commitTaskTransitionLocked(root string, t *Task, req transitionRequest) err
 
 	var rec *AttemptRecord
 	if closingAttemptID != "" {
-		rec, _ = loadAttempt(root, t.ID, closingAttemptID)
+		loaded, loadErr := loadAttempt(root, t.ID, closingAttemptID)
+		if loadErr != nil {
+			return loadErr
+		}
+		rec = loaded
 	}
 	if !terminal && closeAttempt && req.EventType != evNeedsOwner && !producerGone(t, rec) {
 		return errProducerStillAlive
@@ -604,12 +652,14 @@ func commitTaskTransitionLocked(root string, t *Task, req transitionRequest) err
 		fmt.Fprintf(os.Stderr, "警告: 事件账本写入失败 %s(%s): %v\n", t.ID, req.EventType, err)
 		return err
 	}
+	if closeAttempt && closingAttemptID != "" {
+		if err := closeAttemptForDisposition(root, t.ID, closingAttemptID, rec, false); err != nil {
+			return err
+		}
+	}
 	journal.State = transitionCommitted
 	if err := writeTransition(root, journal); err != nil {
 		return err
-	}
-	if closeAttempt && closingAttemptID != "" {
-		closeAttemptForDisposition(root, t.ID, closingAttemptID, rec, false)
 	}
 	return nil
 }
@@ -619,15 +669,22 @@ func commitPreparedTerminalLocked(root string, t *Task, req transitionRequest, j
 		return err
 	}
 	if closingAttemptID != "" {
-		if fresh, err := loadAttempt(root, t.ID, closingAttemptID); err == nil && fresh != nil {
-			rec = fresh
+		fresh, err := loadAttempt(root, t.ID, closingAttemptID)
+		if err != nil {
+			return err
 		}
+		if fresh == nil {
+			return fmt.Errorf("missing attempt %s/%s", t.ID, closingAttemptID)
+		}
+		rec = fresh
 	}
 	if req.EventType != evNeedsOwner && !producerGone(t, rec) {
 		return errProducerStillAlive
 	}
 	if closingAttemptID != "" {
-		closeAttemptForDisposition(root, t.ID, closingAttemptID, rec, true)
+		if err := closeAttemptForDisposition(root, t.ID, closingAttemptID, rec, true); err != nil {
+			return err
+		}
 	}
 	if err := crashTransitionIf(transitionCrashAfterAttemptClose); err != nil {
 		return err
@@ -690,15 +747,15 @@ func recordLiveTransitionEventOnce(root string, t *Task, req transitionRequest, 
 	return nil
 }
 
-func closeAttemptForDisposition(root, taskID, attemptID string, rec *AttemptRecord, terminal bool) {
+func closeAttemptForDisposition(root, taskID, attemptID string, rec *AttemptRecord, terminal bool) error {
 	if taskID == "" || attemptID == "" {
-		return
+		return nil
 	}
 	state := attemptExited
 	if rec != nil && rec.State == attemptRevoked && !terminal {
 		state = attemptRevoked
 	}
-	closeAttemptRecord(root, taskID, attemptID, state)
+	return closeAttemptRecord(root, taskID, attemptID, state)
 }
 
 // persistTaskEvent is the runner-facing CAS path. A rejected terminal CAS is a
@@ -726,7 +783,11 @@ func persistTaskEvent(root string, t *Task, evType, actor, status string, step i
 	if (closeAttempt || terminal) && evType != evNeedsOwner {
 		var rec *AttemptRecord
 		if t.ActiveAttemptID != "" {
-			rec, _ = loadAttempt(root, t.ID, t.ActiveAttemptID)
+			loaded, loadErr := loadAttempt(root, t.ID, t.ActiveAttemptID)
+			if loadErr != nil {
+				return loadErr
+			}
+			rec = loaded
 		}
 		if waitErr := waitProducerExit(root, t, rec, terminalizeWaitTimeout); waitErr != nil {
 			if errors.Is(waitErr, errCustodyTimeout) {
@@ -775,22 +836,25 @@ func transitionAttemptDisposition(req transitionRequest) (closeAttempt, terminal
 	return false, false, false
 }
 
-func closeAttemptRecord(root, taskID, attemptID, state string) {
+func closeAttemptRecord(root, taskID, attemptID, state string) error {
 	if taskID == "" || attemptID == "" {
-		return
+		return nil
 	}
 	rec, err := loadAttempt(root, taskID, attemptID)
-	if err != nil || rec == nil {
-		return
+	if err != nil {
+		return err
+	}
+	if rec == nil {
+		return fmt.Errorf("missing attempt %s/%s", taskID, attemptID)
 	}
 	if rec.State == state {
-		return
+		return nil
 	}
 	if rec.State == attemptExited && state != attemptExited && state != attemptRevoked {
-		return
+		return nil
 	}
 	rec.State = state
-	_ = writeAttempt(root, rec)
+	return writeAttempt(root, rec)
 }
 
 func transitionDurablyCommitted(root, taskID, transitionID string) bool {
@@ -848,7 +912,9 @@ func reserveDispatchAttempt(root string, t *Task) error {
 			return errAttemptConflict
 		}
 		if current.ActiveAttemptID != "" {
-			closeAttemptRecord(root, current.ID, current.ActiveAttemptID, attemptExited)
+			if err := closeAttemptRecord(root, current.ID, current.ActiveAttemptID, attemptExited); err != nil {
+				return err
+			}
 		}
 		id := newAttemptID()
 		now := time.Now().Format(time.RFC3339Nano)
@@ -1210,12 +1276,11 @@ func finishTransitionRecordLocked(root string, rec *TransitionRecord) error {
 	if !isTerminalTransitionStatus(rec.Status) {
 		if rec.State == transitionCommitted {
 			if transitionRecordClosesAttempt(rec) {
-				ensureAttemptClosedForTransition(root, rec)
+				return ensureAttemptClosedForTransition(root, rec)
 			}
 			return nil
 		}
-		finishPreparedNonterminal(root, rec)
-		return nil
+		return finishPreparedNonterminal(root, rec)
 	}
 	t, err := loadTaskOrArchived(root, rec.TaskID)
 	if err != nil || t == nil {
@@ -1225,14 +1290,18 @@ func finishTransitionRecordLocked(root string, rec *TransitionRecord) error {
 		return nil
 	}
 	if rec.State != transitionCommitted {
-		var att *AttemptRecord
 		if rec.AttemptID != "" {
-			att, _ = loadAttempt(root, rec.TaskID, rec.AttemptID)
+			att, loadErr := loadAttempt(root, rec.TaskID, rec.AttemptID)
+			if loadErr != nil {
+				return loadErr
+			}
+			if !producerGone(t, att) {
+				return nil
+			}
 		}
-		if rec.AttemptID != "" && !producerGone(t, att) {
-			return nil
+		if err := closeAttemptForTransitionRecord(root, rec); err != nil {
+			return err
 		}
-		closeAttemptForTransitionRecord(root, rec)
 		rec.State = transitionCommitted
 		if err := writeTransition(root, rec); err != nil {
 			return err
@@ -1245,7 +1314,7 @@ func projectCommittedTerminalFromRecordLocked(root string, rec *TransitionRecord
 	if !transitionDurablyCommitted(root, rec.TaskID, rec.TransitionID) {
 		return nil
 	}
-	t, err := loadTaskOrArchived(root, rec.TaskID)
+	t, residency, err := loadTaskWithResidency(root, rec.TaskID)
 	if err != nil || t == nil {
 		return nil
 	}
@@ -1265,31 +1334,30 @@ func projectCommittedTerminalFromRecordLocked(root string, rec *TransitionRecord
 		t.LastCommittedTransitionID = rec.TransitionID
 		applyControlDefaults(t)
 		t.touch()
-		if err := writeTaskFile(root, t); err != nil {
+		if err := writeTaskPreservingResidency(root, t, residency); err != nil {
 			return err
 		}
 	} else if t.ActiveAttemptID != "" {
 		markControlTerminal(t)
 		applyControlDefaults(t)
 		t.touch()
-		if err := writeTaskFile(root, t); err != nil {
+		if err := writeTaskPreservingResidency(root, t, residency); err != nil {
 			return err
 		}
 	}
 	if err := recordRecoveredTransitionEvent(root, rec, t); err != nil {
 		return err
 	}
-	closeAttemptForTransitionRecord(root, rec)
-	return nil
+	return closeAttemptForTransitionRecord(root, rec)
 }
 
-func finishPreparedNonterminal(root string, rec *TransitionRecord) {
+func finishPreparedNonterminal(root string, rec *TransitionRecord) error {
 	t, err := loadTaskOrArchived(root, rec.TaskID)
 	if err != nil || t == nil {
-		return
+		return nil
 	}
 	if t.LastCommittedTransitionID != rec.TransitionID {
-		return
+		return nil
 	}
 	if !hasTransitionEvent(root, rec.TaskID, rec.TransitionID) {
 		ev := TaskEvent{
@@ -1306,56 +1374,105 @@ func finishPreparedNonterminal(root string, rec *TransitionRecord) {
 			},
 		}
 		if err := recordEvent(root, rec.TaskID, ev); err != nil {
-			return
+			return err
 		}
 	}
-	rec.State = transitionCommitted
-	if err := writeTransition(root, rec); err != nil {
-		return
+	if err := ensureAttemptClosedForTransition(root, rec); err != nil {
+		return err
 	}
-	ensureAttemptClosedForTransition(root, rec)
+	rec.State = transitionCommitted
+	return writeTransition(root, rec)
 }
 
 func finishPreparedTransition(root string, rec *TransitionRecord) {
 	_ = finishTransitionRecordLocked(root, rec)
 }
 
-func ensureAttemptClosedForTransition(root string, rec *TransitionRecord) {
+func ensureAttemptClosedForTransition(root string, rec *TransitionRecord) error {
 	if rec == nil || rec.AttemptID == "" {
-		return
+		return nil
 	}
 	t, err := loadTaskOrArchived(root, rec.TaskID)
 	if err != nil || t == nil {
-		return
+		return nil
 	}
 	if t.LastCommittedTransitionID != rec.TransitionID {
-		return
+		return nil
 	}
-	closeAttemptForTransitionRecord(root, rec)
+	return closeAttemptForTransitionRecord(root, rec)
 }
 
-func closeAttemptForTransitionRecord(root string, rec *TransitionRecord) {
+func closeAttemptForTransitionRecord(root string, rec *TransitionRecord) error {
 	if rec == nil || rec.AttemptID == "" {
-		return
+		return nil
 	}
 	state := attemptExited
-	if loaded, lerr := loadAttempt(root, rec.TaskID, rec.AttemptID); lerr == nil && loaded != nil && loaded.State == attemptRevoked {
-		if !isTerminalTransitionStatus(rec.Status) {
-			state = attemptRevoked
-		}
+	loaded, lerr := loadAttempt(root, rec.TaskID, rec.AttemptID)
+	if lerr != nil {
+		return lerr
 	}
-	closeAttemptRecord(root, rec.TaskID, rec.AttemptID, state)
+	if loaded != nil && loaded.State == attemptRevoked && !isTerminalTransitionStatus(rec.Status) {
+		state = attemptRevoked
+	}
+	return closeAttemptRecord(root, rec.TaskID, rec.AttemptID, state)
+}
+
+const (
+	taskResidencyLive    = "live"
+	taskResidencyArchive = "archive"
+)
+
+func loadArchivedTaskFile(root, taskID string) (*Task, error) {
+	data, err := os.ReadFile(filepath.Join(archiveDir(root), taskID+".json"))
+	if err != nil {
+		return nil, err
+	}
+	var t Task
+	if err := json.Unmarshal(data, &t); err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func loadTaskWithResidency(root, taskID string) (*Task, string, error) {
+	t, err := loadTask(root, taskID)
+	if err == nil {
+		return t, taskResidencyLive, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, "", err
+	}
+	archived, aerr := loadArchivedTaskFile(root, taskID)
+	if aerr != nil {
+		return nil, "", err
+	}
+	return archived, taskResidencyArchive, nil
+}
+
+func writeArchivedTaskFile(root string, t *Task) error {
+	if t == nil || t.ID == "" {
+		return fmt.Errorf("empty task")
+	}
+	data, err := json.MarshalIndent(t, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(archiveDir(root), 0o755); err != nil {
+		return err
+	}
+	return atomicWrite(filepath.Join(archiveDir(root), t.ID+".json"), append(data, '\n'))
+}
+
+func writeTaskPreservingResidency(root string, t *Task, residency string) error {
+	if residency == taskResidencyArchive {
+		return writeArchivedTaskFile(root, t)
+	}
+	return writeTaskFile(root, t)
 }
 
 func loadTaskOrArchived(root, taskID string) (*Task, error) {
-	t, err := loadTask(root, taskID)
-	if err == nil {
-		return t, nil
-	}
-	if archived, aerr := findTaskAnywhere(root, taskID); aerr == nil {
-		return archived, nil
-	}
-	return nil, err
+	t, _, err := loadTaskWithResidency(root, taskID)
+	return t, err
 }
 
 func isTerminalTransitionStatus(status string) bool {

@@ -32,6 +32,7 @@ var (
 	procMu          sync.Mutex
 	procGroups      = map[int]bool{}
 	killHandlerOnce sync.Once
+	taskExecRoot    sync.Map // taskID -> cardex root, for durable attempt PID bind
 )
 
 // taskPGIDs 是"任务→当前活着的执行器 pid 集合"的映射,供 CG-5 巡逻查任务进程组存活。
@@ -211,6 +212,30 @@ func anyTaskProcAlive(taskID string) bool {
 	return false
 }
 
+// signalRegisteredTaskProcs kills in-process executor groups for taskID.
+// Cross-process hold/cancel still requires a bound attempt record; this covers
+// the bind window and tests that call runTask without a tick cancel func.
+func signalRegisteredTaskProcs(taskID string) {
+	if taskID == "" {
+		return
+	}
+	taskPGMu.Lock()
+	pids := make([]int, 0, len(taskPG[taskID]))
+	for pid := range taskPG[taskID] {
+		pids = append(pids, pid)
+	}
+	taskPGMu.Unlock()
+	for _, pid := range pids {
+		if pid <= 0 || !processAlive(pid) {
+			continue
+		}
+		_ = killProcGroup(pid)
+		if p, err := os.FindProcess(pid); err == nil {
+			_ = p.Kill()
+		}
+	}
+}
+
 // runCmdRegistered 代替 cmd.Run：把子进程登记在册，供信号处理器连坐击杀。
 func runCmdRegistered(cmd *exec.Cmd) error {
 	return runCmdRegisteredHarvest(cmd, nil)
@@ -267,6 +292,13 @@ func runCmdRegisteredHarvestForTaskWorkspace(cmd *exec.Cmd, resultInBuf func() b
 	procGroups[pid] = true
 	procMu.Unlock()
 	registerTaskInvoke(taskID, pid)
+	if taskID != "" {
+		if v, ok := taskExecRoot.Load(taskID); ok {
+			if root, _ := v.(string); root != "" {
+				bindAttemptProcess(root, taskID, pid)
+			}
+		}
+	}
 	defer func() {
 		procMu.Lock()
 		delete(procGroups, pid)

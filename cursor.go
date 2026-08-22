@@ -459,8 +459,7 @@ func prepareCursorFableFallback(root string, cfg *Config, t *Task, reason string
 		"workspace_fingerprint_after": auth.afterDigest, "semantic_events": 0,
 		"model_events": 0, "tool_events": 0, "process_residue": false,
 	}
-	emitTaskEvent(root, t.ID, evRetry, "runner:cursor", statusQueued, 0, detail)
-	return nil
+	return persistTaskEvent(root, t, evRetry, "runner:cursor", statusQueued, 0, detail)
 }
 
 func validateCursor(cfg *Config) error {

@@ -9,6 +9,9 @@ import "os"
 // 不能用 proc.Signal(syscall.Signal(0))——Windows 对非 Kill 信号一律返回
 // "not supported by windows"，会把存活进程误判为已死、破坏单实例锁。
 func processAlive(pid int) bool {
+	if pid <= 0 {
+		return false
+	}
 	proc, err := os.FindProcess(pid)
 	if err != nil {
 		return false

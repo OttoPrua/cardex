@@ -136,6 +136,9 @@ func noteTaskDone(root string, cfg *Config, t *Task) (string, error) {
 // 【为什么不让错误上抛】卡已经 done 了，复盘是附加动作；因为算不动账就把一张跑成功的卡判成
 // 执行出错，是把次要机制的故障放大成主链故障。
 func noteTaskDoneLogged(root string, cfg *Config, t *Task, lg *os.File) {
+	if !followOnWritesAllowed(root, t) {
+		return
+	}
 	id, err := noteTaskDone(root, cfg, t)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "警告: 复盘计数器更新失败（%s）: %v\n", t.ID, err)

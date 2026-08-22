@@ -289,12 +289,114 @@ type Task struct {
 	CostUSD   float64 `json:"cost_usd,omitempty"`
 	// LastSummary 是最近一步执行输出的一行摘要，供 list 看板展示“最新进度概述”。
 	LastSummary string `json:"last_summary,omitempty"`
+
+	// Control-plane CAS identities. Omitted on older task JSON so load stays compatible.
+	// Fail-closed defaults never make held/canceled/done/failed cards schedulable.
+	Revision                  int64  `json:"revision,omitempty"`
+	ControlEpoch              int64  `json:"control_epoch,omitempty"`
+	SchedulingEligible        *bool  `json:"scheduling_eligible,omitempty"`
+	ActiveAttemptID           string `json:"active_attempt_id,omitempty"`
+	LastCommittedTransitionID string `json:"last_committed_transition_id,omitempty"`
+	ControlState              string `json:"control_state,omitempty"`
 }
 
 func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }
 
 func (t *Task) terminal() bool {
 	return t.Status == statusDone || t.Status == statusFailed || t.Status == statusCanceled
+}
+
+const (
+	controlEligible = "eligible"
+	controlRevoking = "revoking"
+	controlTerminal = "terminal"
+)
+
+func boolPtr(v bool) *bool { return &v }
+
+func (t *Task) effectiveControlState() string {
+	if t == nil {
+		return controlTerminal
+	}
+	switch t.ControlState {
+	case controlEligible, controlRevoking, controlTerminal:
+		return t.ControlState
+	}
+	switch t.Status {
+	case statusHeld, statusCanceled, statusDone, statusFailed:
+		return controlTerminal
+	default:
+		return controlEligible
+	}
+}
+
+// schedulingAllowed is the fail-closed scheduler admission bit. Legacy JSON without the
+// field remains eligible only for queued/running/limit_paused; held/canceled/done/failed
+// never become schedulable by omission.
+func (t *Task) schedulingAllowed() bool {
+	if t == nil {
+		return false
+	}
+	switch t.effectiveControlState() {
+	case controlRevoking, controlTerminal:
+		return false
+	}
+	if t.SchedulingEligible != nil {
+		return *t.SchedulingEligible
+	}
+	switch t.Status {
+	case statusHeld, statusCanceled, statusDone, statusFailed:
+		return false
+	default:
+		return true
+	}
+}
+
+func applyControlDefaults(t *Task) {
+	if t == nil {
+		return
+	}
+	if t.ControlState == "" {
+		t.ControlState = t.effectiveControlState()
+	}
+	switch t.Status {
+	case statusHeld, statusCanceled, statusDone, statusFailed:
+		if t.ControlState == controlEligible {
+			t.ControlState = controlTerminal
+		}
+		t.SchedulingEligible = boolPtr(false)
+	}
+	if t.SchedulingEligible == nil {
+		t.SchedulingEligible = boolPtr(t.schedulingAllowed())
+	}
+}
+
+func revokeScheduling(t *Task) {
+	if t == nil {
+		return
+	}
+	t.ControlEpoch++
+	t.SchedulingEligible = boolPtr(false)
+	t.ControlState = controlRevoking
+}
+
+func restoreScheduling(t *Task) {
+	if t == nil {
+		return
+	}
+	t.ControlEpoch++
+	t.SchedulingEligible = boolPtr(true)
+	t.ControlState = controlEligible
+	t.ActiveAttemptID = ""
+}
+
+func markControlTerminal(t *Task) {
+	if t == nil {
+		return
+	}
+	t.SchedulingEligible = boolPtr(false)
+	t.ControlState = controlTerminal
+	t.ActiveAttemptID = ""
 }
 
 // newCrossKey 生成交叉验证链的不透明谱系键：随机、与 A 卡 ID 无关——故 B 无法据它推出 A 的
@@ -386,12 +488,16 @@ func findTaskAnywhere(root, id string) (*Task, error) {
 
 func taskPath(root, id string) string { return filepath.Join(tasksDir(root), id+".json") }
 
-func saveTask(root string, t *Task) error {
+func writeTaskFile(root string, t *Task) error {
 	data, err := json.MarshalIndent(t, "", "  ")
 	if err != nil {
 		return err
 	}
 	return atomicWrite(taskPath(root, t.ID), append(data, '\n'))
+}
+
+func saveTask(root string, t *Task) error {
+	return persistTaskCAS(root, t)
 }
 
 func loadTask(root, id string) (*Task, error) {

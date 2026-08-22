@@ -7,6 +7,9 @@ import (
 
 // eligible 判断任务此刻是否可以被派发。
 func eligible(t *Task, now time.Time) bool {
+	if t == nil || !t.schedulingAllowed() {
+		return false
+	}
 	switch t.Status {
 	case statusQueued:
 		return t.NotBeforeEpoch == 0 || now.Unix() >= t.NotBeforeEpoch

@@ -375,9 +375,10 @@ func TestReconcileCrossChainsGuardsAtMostOnce(t *testing.T) {
 		t.Fatalf("首轮应 1 条孤儿 failed 事件,got %d, all=%+v", orphanCnt, events)
 	}
 
-	// 次轮:手工把 status 改回 done 冒充"未清墓碑就复发"的畸形。
+	// 次轮:绕过 CAS 把盘面改回 done，模拟未走 cli retry 清墓碑的畸形复发。
+	// D0 拒绝 failed→done 的合法 CAS；这里写的是盘面异常，不是 runner 权威。
 	a1.Status = statusDone
-	if err := saveTask(root, a1); err != nil {
+	if err := writeTaskFile(root, a1); err != nil {
 		t.Fatal(err)
 	}
 	tasks2 := []*Task{a1}
@@ -538,8 +539,8 @@ func TestRunTaskHoldsWhenRunningSideTombstoneExhausted(t *testing.T) {
 	work := t.TempDir()
 	tk := newTask(root, cfg, typeSequence, "崩溃残留-running", work, []string{"p1", "p2"}, 5)
 	tk.MidStep = true
-	tk.SessionID = "sess-A"         // 让 resuming=true
-	tk.Status = statusRunning       // 关键:running 侧入场——模拟"上一轮 runTask 中途崩溃遗留"
+	tk.SessionID = "sess-A"   // 让 resuming=true
+	tk.Status = statusRunning // 关键:running 侧入场——模拟"上一轮 runTask 中途崩溃遗留"
 	if err := saveTask(root, tk); err != nil {
 		t.Fatal(err)
 	}
@@ -1356,15 +1357,36 @@ func TestReconcileSkippedHeldEmitsBeforeSave(t *testing.T) {
 	if err := os.MkdirAll(tp, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// 触发 reconcile: skipped=true → 进 held 分支 → 新顺序应先 emit, 后 saveTask (失败 continue).
+	// Journal-first: a projection failure must not append a held event. The card
+	// stays done on disk so the next tick can retry and commit exactly once.
 	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
-	// 关键断言: 即便 saveTask 失败, evHeld 已在事件账本. 若代码回退 R2 顺序 (save 先 emit 后),
-	// save 失败 continue 掉 emit 调用, 账本无 evHeld → 断言直接红.
 	events := readAllEventsRaw(t, root, a.ID)
+	for _, ev := range events {
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			t.Fatalf("uncommitted persist must not append held: %v", eventTypes(events))
+		}
+	}
+	if err := os.Remove(tp); err != nil {
+		t.Fatal(err)
+	}
+	a.Status = statusDone
+	a.Revision = 0
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileCrossChains(root, []*Task{fresh}, map[string]bool{})
+	events = readAllEventsRaw(t, root, a.ID)
 	sawHeld := false
 	for _, ev := range events {
 		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
 			sawHeld = true
+			if ev.TransitionID == "" {
+				t.Fatal("held event must carry a committed transition id")
+			}
 			if reason, _ := ev.Detail["reason"].(string); reason != "reconcile_cross_tombstone_exhausted" {
 				t.Fatalf("held.reason 应 reconcile_cross_tombstone_exhausted, got %q", reason)
 			}
@@ -1374,7 +1396,7 @@ func TestReconcileSkippedHeldEmitsBeforeSave(t *testing.T) {
 		}
 	}
 	if !sawHeld {
-		t.Fatalf("emit 必须先于 saveTask, 使 save 失败也不吞事件, got 事件序列=%v", eventTypes(events))
+		t.Fatalf("retry after projection repair must commit held, got 事件序列=%v", eventTypes(events))
 	}
 }
 
@@ -1411,8 +1433,9 @@ func TestReconcileHeldDedupesOnPersistentSaveFailure(t *testing.T) {
 	if err := os.MkdirAll(tp, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	// 连调两次 reconcileCrossChains——第一次 emit(账本无同因末条), 第二次去重跳过 emit.
+	a.Status = statusDone
 	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
+	a.Status = statusDone
 	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
 	events := readAllEventsRaw(t, root, a.ID)
 	held := 0
@@ -1423,8 +1446,38 @@ func TestReconcileHeldDedupesOnPersistentSaveFailure(t *testing.T) {
 			}
 		}
 	}
+	if held != 0 {
+		t.Fatalf("projection failure must not append held, got %d, 事件序列=%v", held, eventTypes(events))
+	}
+	if err := os.Remove(tp); err != nil {
+		t.Fatal(err)
+	}
+	a.Status = statusDone
+	a.Revision = 0
+	if err := saveTask(root, a); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, a.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reconcileCrossChains(root, []*Task{fresh}, map[string]bool{})
+	fresh.Status = statusDone
+	if disk, err := loadTask(root, a.ID); err == nil {
+		fresh = disk
+	}
+	reconcileCrossChains(root, []*Task{fresh}, map[string]bool{})
+	events = readAllEventsRaw(t, root, a.ID)
+	held = 0
+	for _, ev := range events {
+		if ev.Type == evHeld && ev.Actor == "runner:reconcile-tombstone" {
+			if reason, _ := ev.Detail["reason"].(string); reason == "reconcile_cross_tombstone_exhausted" {
+				held++
+			}
+		}
+	}
 	if held != 1 {
-		t.Fatalf("持续 saveTask 失败下两次 reconcile 应仅留 1 条 evHeld(去重), got %d, 事件序列=%v", held, eventTypes(events))
+		t.Fatalf("successful reconcile must commit exactly 1 evHeld, got %d, 事件序列=%v", held, eventTypes(events))
 	}
 }
 
@@ -1455,18 +1508,13 @@ func TestReconcileFailedEmitsBeforeSave(t *testing.T) {
 		t.Fatal(err)
 	}
 	reconcileCrossChains(root, []*Task{a}, map[string]bool{})
-	// 关键断言: 即便 saveTask 失败, evFailed 已在事件账本 (证明 emit 先于 save 落).
 	events := readAllEventsRaw(t, root, a.ID)
-	sawFailed := false
 	for _, ev := range events {
 		if ev.Type == evFailed {
 			if r, _ := ev.Detail["reason"].(string); r == "cross_chain_orphan" {
-				sawFailed = true
+				t.Fatalf("uncommitted persist must not append evFailed: %v", eventTypes(events))
 			}
 		}
-	}
-	if !sawFailed {
-		t.Fatalf("emit 必须先于 saveTask, 使 save 失败也不吞 evFailed, got 事件序列=%v", eventTypes(events))
 	}
 	// 二次防御: pending 已 +1 (证明 inject 被真的调过, 不是被墓碑挡在门外).
 	// saveTask 失败 → inject 返回 err → 阶段 3 未触发 → 墓碑停 pending(1), 未落 final.
@@ -1496,26 +1544,9 @@ func TestResumeHeldSourceOrder(t *testing.T) {
 	src := string(data)
 	// resume 侧 held 分支的 emit actor "runner:tombstone" 全仓唯一 (grep 已验证):
 	// reconcile 侧用 "runner:reconcile-tombstone", 不冲突.
-	anchor := `evHeld, "runner:tombstone"`
+	anchor := `return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:tombstone"`
 	idx := strings.Index(src, anchor)
 	if idx < 0 {
-		t.Fatalf("找不到 resume 侧 held emit 锚点 %q", anchor)
-	}
-	// 从 emit 之后往后扫首个 `return saveTask(root, t)` —— 属于同一段代码.
-	tail := src[idx:]
-	saveIdx := strings.Index(tail, "return saveTask(root, t)")
-	if saveIdx < 0 {
-		t.Fatalf("resume 侧 held emit 之后应有 return saveTask(root, t)")
-	}
-	// 关键断言: emit 与 return saveTask 之间不应再有 saveTask 调用——防"emit 在两次 save 之间"
-	// 的奇葩变体; 更本质是防 emit 被挪到 saveTask 之后 (那样 saveIdx 会指向 emit 之前另一处 save).
-	between := tail[:saveIdx]
-	if strings.Contains(between, "saveTask(root, t)") {
-		t.Fatalf("resume 侧 held 分支 emit 与 return saveTask 之间不应再有 saveTask, got between=%q", between)
-	}
-	// 二次防御: emit 锚点之后 300 字符内应命中 return saveTask —— 若代码回退把 emit 挪去分支
-	// 尾部 (emit 与 return saveTask 距离拉远/顺序颠倒), 此距离会显著变大或找不到.
-	if saveIdx > 300 {
-		t.Fatalf("resume 侧 held emit 与 return saveTask 距离异常 (%d 字符), 疑似顺序被挪, got tail head=%q", saveIdx, tail[:min(300, len(tail))])
+		t.Fatalf("找不到 resume 侧 held persistTaskEvent 锚点 %q", anchor)
 	}
 }

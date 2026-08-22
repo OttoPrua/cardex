@@ -519,7 +519,7 @@ func TestAddHoldMarksUnavailable(t *testing.T) {
 // 【它不守什么】它只认 emitTaskEvent 这一条写事件的通道（recordEvent 的唯一调用方就是它，见
 // events.go），也不校验 withCostTelemetry 拿到的是不是"对的那张卡"——后者由上面各条行为测试负责。
 func TestEveryTerminalEmitSiteWrapsCostTelemetry(t *testing.T) {
-	const evTypeArg, detailArg = 2, 6 // emitTaskEvent(root, taskID, evType, actor, status, step, detail)
+	const evTypeArg, detailArg = 2, 6 // emitTaskEvent/persistTaskEvent(root, id|task, evType, actor, status, step, detail)
 
 	fset := token.NewFileSet()
 	pkgs, err := parser.ParseDir(fset, ".", func(fi os.FileInfo) bool {
@@ -529,6 +529,7 @@ func TestEveryTerminalEmitSiteWrapsCostTelemetry(t *testing.T) {
 		t.Fatalf("解析本包源码失败: %v", err)
 	}
 	terminal := map[string]bool{"evDone": true, "evFailed": true, "evCanceled": true, "evHeld": true}
+	writers := map[string]bool{"emitTaskEvent": true, "persistTaskEvent": true}
 
 	checked := 0
 	for _, pkg := range pkgs {
@@ -539,7 +540,7 @@ func TestEveryTerminalEmitSiteWrapsCostTelemetry(t *testing.T) {
 					return true
 				}
 				fn, ok := call.Fun.(*ast.Ident)
-				if !ok || fn.Name != "emitTaskEvent" || len(call.Args) <= detailArg {
+				if !ok || !writers[fn.Name] || len(call.Args) <= detailArg {
 					return true
 				}
 				evIdent, ok := call.Args[evTypeArg].(*ast.Ident)

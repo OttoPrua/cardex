@@ -4,8 +4,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 )
+
+// schedulerOwned records roots this process successfully acquired. A writer
+// that once owned the lock and then lost the file/contents is fail-closed;
+// CLI/tests that never acquired a given root remain able to write.
+var schedulerOwned sync.Map // root -> struct{}
 
 // Cooldown 是全局限额冷却：5 小时窗口用尽后，所有 claude 调用都会失败，
 // 所以冷却是全局的，而不是单个任务的属性。
@@ -72,6 +78,7 @@ func acquireLock(root string, ttl time.Duration) bool {
 		err := os.Link(tmp, path)
 		_ = os.Remove(tmp)
 		if err == nil {
+			schedulerOwned.Store(root, struct{}{})
 			return true
 		}
 		if !staleLock(path, ttl) {
@@ -95,30 +102,59 @@ func acquireLock(root string, ttl time.Duration) bool {
 	return false
 }
 
-// staleLock 判据与 events.go:staleEventLock 严格同源:仅当(可解析&&!processAlive)或 mtime>TTL 判 stale.
-// 【为什么内容空/不可解析 + mtime 未超 TTL 也判非 stale】与 events 锁同类闭合(P1-1):防御纵深——
-// 即便 tmp+Link 已消除空文件窗口,若日后维护回退到 O_EXCL 两步式,此判据仍能挡"空内容→立即强夺"的
-// bootstrap 竞态回归. 强夺允收边界收窄至"确定持有者已死"或"锁真的过期"两条, 内容尚不完整的窗口
-// 一律等待, 不强夺.
+// staleLock reports whether path may be stolen. A live scheduler owner is never
+// displaced merely because mtime exceeds TTL. Dead-owner recovery remains
+// bounded: an unreadable/unparseable lock is stale only after TTL, and a
+// parseable lock is stale only when its PID is dead (or invalid).
 func staleLock(path string, ttl time.Duration) bool {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return true
 	}
-	if time.Since(fi.ModTime()) > ttl {
-		return true
-	}
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return time.Since(fi.ModTime()) > ttl
 	}
 	var li lockInfo
 	if json.Unmarshal(data, &li) != nil || li.PID <= 0 {
-		// 内容空/不可解析但 mtime 未超 TTL:视为合法写者尚未收尾, 不判 stale.
-		// mtime>TTL 兜底了"永远收不完"的场景, 走上面的 return true.
-		return false
+		return time.Since(fi.ModTime()) > ttl
 	}
 	return !processAlive(li.PID)
+}
+
+func schedulerLockOwnerPID(root string) (int, bool) {
+	data, err := os.ReadFile(lockPath(root))
+	if err != nil {
+		return 0, false
+	}
+	var li lockInfo
+	if json.Unmarshal(data, &li) != nil || li.PID <= 0 {
+		return 0, false
+	}
+	return li.PID, true
+}
+
+func holdsSchedulerLock(root string) bool {
+	pid, ok := schedulerLockOwnerPID(root)
+	return ok && pid == os.Getpid()
+}
+
+// schedulerWriteAllowed is the runner-write predicate.
+// Exact ownership is required. A lock file that is missing, unreadable, dead,
+// replaced, or owned by another PID is fail-closed for a process that already
+// owned this root; recovery is acquireLock creating a new explicit owner.
+// CLI/tests that never acquired this root may write only when no lock file is present.
+func schedulerWriteAllowed(root string) bool {
+	if holdsSchedulerLock(root) {
+		return true
+	}
+	if _, err := os.Stat(lockPath(root)); err == nil {
+		return false
+	}
+	if _, had := schedulerOwned.Load(root); had {
+		return false
+	}
+	return true
 }
 
 // releaseLock 只删属于本进程的锁文件:核 PID 匹配才 Remove。

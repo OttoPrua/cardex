@@ -21,6 +21,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		return nil
 	}
 	defer releaseLock(root)
+	reconcileControlPlane(root)
 
 	maxPar := cfg.MaxParallel
 	if maxPar < 1 {
@@ -88,7 +89,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		// ssh 至少释放本地槽位）。runTask 归档返回后经 doneMsg 回收槽位与目录互斥，
 		// 同目录后续任务下一轮即可派发——否则该 dir 被吊到步骤超时，实测饿死近 1 小时。
 		for id, cancelRun := range activeCancels {
-			if diskCanceled(root, id) {
+			if diskCanceled(root, id) || diskControlRevoked(root, id) {
 				cancelRun()
 			}
 		}
@@ -121,7 +122,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		//  - claude 正常时其余任务走 claude；
 		//  - claude 被冷却/红线拦住时，按 fallback_order 逐个找第一个可用出路
 		//    （codex 沿用五道闸，引擎各查自己的 cooldown-<名>.json；默认链只有 codex）。
-		if len(activeIDs) < maxPar {
+		if len(activeIDs) < maxPar && schedulerWriteAllowed(root) {
 			tasks, err := loadTasks(root)
 			if err != nil {
 				if len(activeIDs) == 0 {
@@ -239,17 +240,16 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							t.Status = statusHeld
 							t.LastError = reason
 							t.touch()
-							if err := saveTask(root, t); err != nil {
+							if err := persistTaskEvent(root, t, evHeld, "runner:automatic-codex-budget", statusHeld, t.Step, withCostTelemetry(map[string]any{
+								"reason": reason, "route_stage": t.OwnerRouteStage,
+								"budget_source": evidence.Source, "used_percent": evidence.UsedPercent,
+								"evidence_available": evidence.Available,
+							}, t)); err != nil {
 								if !quiet {
 									fmt.Fprintf(os.Stderr, "警告: automatic Codex budget hold persist failed for %s: %v\n", t.ID, err)
 								}
 								continue
 							}
-							emitTaskEvent(root, t.ID, evHeld, "runner:automatic-codex-budget", statusHeld, t.Step, withCostTelemetry(map[string]any{
-								"reason": reason, "route_stage": t.OwnerRouteStage,
-								"budget_source": evidence.Source, "used_percent": evidence.UsedPercent,
-								"evidence_available": evidence.Available,
-							}, t))
 							continue
 						}
 					}

@@ -1246,6 +1246,19 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 	}
 	// 守门：pickNext 之后、开跑之前任务可能刚被 cancel（非运行态 cancel 直接归档移走文件），
 	// 别把已取消的任务写回 tasks/ 复活成 running。
+	// A dispatch that does not already own the scheduler lock must create a new
+	// explicit owner/lease. Mid-flight writes still require that exact owner;
+	// a lost lock is fail-closed and is never treated as permission.
+	if !holdsSchedulerLock(root) {
+		if !acquireLock(root, lockTTL(cfg)) {
+			return errSchedulerLockLost
+		}
+		defer releaseLock(root)
+	}
+	if t.ID != "" {
+		taskExecRoot.Store(t.ID, root)
+		defer taskExecRoot.Delete(t.ID)
+	}
 	if diskCanceled(root, t.ID) {
 		t.Status = statusCanceled
 		// 事件账本自洽:盘上 canceled 但账本无 canceled 事件时(cli:cancel 后 emit 失败/崩溃),
@@ -1263,9 +1276,8 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		t.Status = statusHeld
 		t.LastError = reason
 		t.touch()
-		emitTaskEvent(root, t.ID, evHeld, "runner:owner-policy", statusHeld, t.Step,
-			withCostTelemetry(map[string]any{"reason": "closed_owner_task_state_invalid", "detail": reason}, t))
-		return saveTask(root, t)
+		return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:owner-policy", statusHeld, t.Step,
+			withCostTelemetry(map[string]any{"reason": "closed_owner_task_state_invalid", "detail": reason}, t)))
 	}
 	// CG-4 幂等墓碑 reset-at-entry:上一轮盘上状态非 running(即 queued/limit_paused/held)才 reset
 	// 当前步的 resume 墓碑——这是"编排层认可的新一轮尝试"信号(合法限额恢复/人工 release),让新一轮
@@ -1279,34 +1291,31 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.Status = statusHeld
 			t.LastError = "automatic Sol route identity drifted away from Codex; held before invocation"
 			t.touch()
-			emitTaskEvent(root, t.ID, evHeld, "runner:automatic-sol", statusHeld, t.Step,
-				withCostTelemetry(map[string]any{"reason": "automatic_sol_provider_drift"}, t))
-			return saveTask(root, t)
+			return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:automatic-sol", statusHeld, t.Step,
+				withCostTelemetry(map[string]any{"reason": "automatic_sol_provider_drift"}, t)))
 		}
 		evidence := currentAutomaticCodexBudgetEvidence(cfg, time.Now())
 		if allowed, reason := automaticCodexBudgetAllowed(t, evidence, cfg.AutomaticCodexBudgetStopPercent); !allowed {
 			t.Status = statusHeld
 			t.LastError = reason
 			t.touch()
-			emitTaskEvent(root, t.ID, evHeld, "runner:automatic-codex-budget", statusHeld, t.Step,
+			return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:automatic-codex-budget", statusHeld, t.Step,
 				withCostTelemetry(map[string]any{
 					"reason": reason, "route_stage": t.OwnerRouteStage,
 					"budget_source": evidence.Source, "used_percent": evidence.UsedPercent,
 					"evidence_available": evidence.Available,
-				}, t))
-			return saveTask(root, t)
+				}, t)))
 		}
 		if err := beginAutomaticSolInvocation(t); err != nil {
 			t.Status = statusHeld
 			t.LastError = err.Error()
 			t.touch()
-			emitTaskEvent(root, t.ID, evHeld, "runner:automatic-sol", statusHeld, t.Step,
+			return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:automatic-sol", statusHeld, t.Step,
 				withCostTelemetry(map[string]any{
 					"reason": "automatic_sol_invocation_limit", "detail": err.Error(),
 					"automatic_sol_calls":       t.AutomaticSolCalls,
 					"automatic_sol_invocations": t.AutomaticSolInvocations,
-				}, t))
-			return saveTask(root, t)
+				}, t)))
 		}
 	}
 	if useGrokBuild {
@@ -1402,13 +1411,17 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 	}
 	beginRouteAttemptReadback(cfg, t, remote)
 	t.touch()
-	if err := saveTask(root, t); err != nil {
-		return err
+	// Every dispatch reserves a fresh attempt identity. A crash-left
+	// ActiveAttemptID must never be rebound to a new PID/PGID.
+	if err := reserveDispatchAttempt(root, t); err != nil {
+		return finishIfStopped(err)
 	}
 	// 派发事件:tick 已把卡从 queued/limit_paused 拉进 running。actor=runner,detail 记录执行器身份
 	// (远端/codex/引擎/claude)与当前步序号——恢复限额后续跑与首次派发在这条事件上会有 step/mid_step 差异。
-	emitTaskEvent(root, t.ID, evDispatched, "runner", statusRunning, t.Step,
-		dispatchEventDetail(cfg, t, useCodex, remote))
+	if err := persistTaskEvent(root, t, evDispatched, "runner", statusRunning, t.Step,
+		dispatchEventDetail(cfg, t, useCodex, remote)); err != nil {
+		return finishIfStopped(err)
+	}
 	lg, err := openTaskLog(root, t.ID)
 	if err != nil {
 		return err
@@ -1427,10 +1440,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				logBlock(lg, "BUDGET", reason)
 				// 事件缺则活动流呈现 dispatched→dispatched 静默断档且无 seq 缺口可测,漏了"红线让位"
 				// 这条真历史;必须记 evRetry(状态回到 queued 等窗口滑走,语义与"错误退避回排队"同类)。
-				emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, map[string]any{
+				return finishIfStopped(persistTaskEvent(root, t, evRetry, "runner", statusQueued, t.Step, map[string]any{
 					"reason": "budget_redline", "not_before": t.NotBeforeEpoch, "detail": reason,
-				})
-				return saveTask(root, t)
+				}))
 			}
 		}
 		var prompt string
@@ -1449,10 +1461,12 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.Status = statusDone
 			t.touch()
 			// 无 prompt 可跑的空转 done(如 retry 后 Step 已越界的兜底路径):也是"终态"必须留事件。
-			emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step,
-				withCostTelemetry(map[string]any{"reason": "no_more_prompts"}, t))
+			if err := persistTaskEvent(root, t, evDone, "runner", statusDone, t.Step,
+				withCostTelemetry(map[string]any{"reason": "no_more_prompts"}, t)); err != nil {
+				return finishIfStopped(err)
+			}
 			noteTaskDoneLogged(root, cfg, t, lg) // 复盘计数器:两条 done 出口都要记,漏一条 N 就永远偏小
-			return saveTask(root, t)
+			return nil
 		}
 
 		runnerTag := ""
@@ -1619,11 +1633,10 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.touch()
 				// 墓碑耗尽挂 held 是 runner 内真实的提前退出点：这张卡此前已跑过若干步，卡面有累计
 				// cost/turns。不接遥测的话，一条崩溃风暴链的开销在事件账本里彻底查不到（本轮复审证伪点）。
-				emitTaskEvent(root, t.ID, evHeld, "runner:tombstone", statusHeld, t.Step,
+				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:tombstone", statusHeld, t.Step,
 					withCostTelemetry(map[string]any{
 						"reason": "resume_tombstone_exhausted", "kind": resumeKind(t.Step),
-					}, t))
-				return saveTask(root, t)
+					}, t)))
 			}
 		} else {
 			_ = invoke()
@@ -1634,7 +1647,16 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		// 产物丢弃（远端"结果在手即成功"的救援同样让位），不再把内存态写回任务文件。
 		// 残余竞态窗口：cancel 恰落在本检查与本步 saveTask 之间的微秒级间隙会被盖掉，
 		// 由 tick 的周期对账兜底不了（文件已非 canceled），接受——窗口从整步时长缩到微秒。
-		if ctx.Err() != nil || diskCanceled(root, t.ID) {
+		if diskCanceled(root, t.ID) {
+			return finalizeCanceled(root, t, lg)
+		}
+		if diskControlRevoked(root, t.ID) {
+			return nil
+		}
+		if ctx.Err() != nil {
+			if diskControlRevoked(root, t.ID) {
+				return nil
+			}
 			return finalizeCanceled(root, t, lg)
 		}
 		recordRouteAttemptObservation(t, res)
@@ -1661,13 +1683,12 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.Status = statusHeld
 				t.LastError = fmt.Sprintf("Cursor Fable ineligible semantic/terminal failure held (fallback not started): %s", kind)
 				t.touch()
-				emitTaskEvent(root, t.ID, evHeld, "runner:policy-fallback", statusHeld, t.Step, withCostTelemetry(withRouteAttempt(map[string]any{
+				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:policy-fallback", statusHeld, t.Step, withCostTelemetry(withRouteAttempt(map[string]any{
 					"reason": "fable_ineligible_failure_held", "failure_kind": string(kind),
 					"observation_complete": observationComplete, "semantic_events": semanticEvents,
 					"model_events": modelEvents, "tool_events": toolEvents,
 					"process_residue": residue,
-				}, t), t))
-				return saveTask(root, t)
+				}, t), t)))
 			}
 			var fallbackAfter *policyWorkspaceFingerprint
 			fallbackAfterErr := fallbackBeforeErr
@@ -1738,7 +1759,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					t.FallbackReason = string(kind)
 					t.LastError = fmt.Sprintf("eligible serial transition held: %v; global Codex fallback disabled", err)
 					t.touch()
-					emitTaskEvent(root, t.ID, evHeld, "runner:policy-fallback", statusHeld, t.Step,
+					return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:policy-fallback", statusHeld, t.Step,
 						withCostTelemetry(withRouteAttempt(map[string]any{
 							"reason": "no_resolver_proven_next_leg", "failure_kind": string(kind),
 							"detail": err.Error(), "previous_runner": previousRunner,
@@ -1746,19 +1767,17 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 							"workspace_fingerprint_after":  auth.afterDigest,
 							"semantic_events":              0, "model_events": 0, "tool_events": 0,
 							"process_residue": false,
-						}, t), t))
-					return saveTask(root, t)
+						}, t), t)))
 				}
-				if err := saveTask(root, t); err != nil {
-					return err
-				}
-				emitTaskEvent(root, t.ID, evRetry, "runner:"+previousRunner, statusQueued, t.Step, withRouteAttempt(map[string]any{
+				if err := persistTaskEvent(root, t, evRetry, "runner:"+previousRunner, statusQueued, t.Step, withRouteAttempt(map[string]any{
 					"reason": string(kind), "previous_runner": previousRunner, "next_runner": t.PreferRunner,
 					"fallback_runner": t.PreferRunner, "fallback_model": policyFallbackResolvedModel(cfg, t),
 					"fallback_reasoning":           policyFallbackResolvedEffort(cfg, t),
 					"workspace_fingerprint_before": auth.beforeDigest, "workspace_fingerprint_after": auth.afterDigest,
 					"semantic_events": 0, "model_events": 0, "tool_events": 0, "process_residue": false,
-				}, t))
+				}, t)); err != nil {
+					return finishIfStopped(err)
+				}
 				logBlock(lg, "SAFE_FALLBACK", fmt.Sprintf(
 					"%s proof passed (fingerprint=%s, semantic=0, model=0, tools=0, residue=false); queued runner=%s",
 					kind, auth.beforeDigest, t.PreferRunner))
@@ -1798,10 +1817,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("gemini 车道挂起（%s），%s 后恢复（%s）\n%s",
 				kind, fmtIn(until, now), fmtClock(until), reason))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
 				"engine": "gemini", "kind": kind, "resume_at": until, "mid_step": t.MidStep,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// 1e) 原生 Kimi CLI 车道限额。策略卡的安全接力已由上方统一证明闸处理；走到这里
@@ -1825,10 +1843,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("Kimi CLI 车道命中限额，%s 后恢复（%s）\n%s",
 				fmtIn(until, now), fmtClock(until), reason))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner:kimi-cli", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner:kimi-cli", statusLimitPaused, t.Step, map[string]any{
 				"engine": kimiCLIRunnerName, "resume_at": until, "mid_step": t.MidStep,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// 1g) Grok Build 车道限额。策略卡的下一腿同样只能从统一证明闸进入；证明未通过
@@ -1852,10 +1869,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("Grok Build 车道命中限额，%s 后恢复（%s）\n%s",
 				fmtIn(until, now), fmtClock(until), reason))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner:grok-build", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner:grok-build", statusLimitPaused, t.Step, map[string]any{
 				"engine": grokBuildRunnerName, "resume_at": until, "mid_step": t.MidStep,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// 1i) Cursor Fable 车道：安全三腿链只能由统一证明闸创建。到这里说明证明失败
@@ -1872,10 +1888,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.Status = statusHeld
 				t.LastError = "Cursor Fable 需要用户在 Cursor 中确认数据保留政策: " + reason
 				t.touch()
-				emitTaskEvent(root, t.ID, evHeld, "runner:cursor", statusHeld, t.Step, withCostTelemetry(map[string]any{
+				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:cursor", statusHeld, t.Step, withCostTelemetry(map[string]any{
 					"reason": "cursor_data_policy_gate", "detail": reason,
-				}, t))
-				return saveTask(root, t)
+				}, t)))
 			}
 			until := cursorResetEpoch(cfg, res, combined, now)
 			setEngineCooldown(root, cursorCooldownName, until, reason)
@@ -1884,10 +1899,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.MidStep = t.SessionID != ""
 			t.LastError = "Cursor 车道用量限额: " + reason
 			t.touch()
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner:cursor", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner:cursor", statusLimitPaused, t.Step, map[string]any{
 				"engine": cursorRunnerName, "resume_at": until, "mid_step": t.MidStep,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// 1f) OpenCode 车道限额。显式 provider 钉定永不改写；Owner 六行强制模式下旧夜间
@@ -1911,12 +1925,11 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				logBlock(lg, "LIMIT_FALLBACK", fmt.Sprintf(
 					"OpenCode 命中限额，车道冷却至 %s；本卡立即转 Codex Sol/xhigh\n%s",
 					fmtClock(until), reason))
-				emitTaskEvent(root, t.ID, evRetry, "runner:opencode", statusQueued, t.Step, map[string]any{
+				return finishIfStopped(persistTaskEvent(root, t, evRetry, "runner:opencode", statusQueued, t.Step, map[string]any{
 					"engine": "opencode", "reason": "limit_fallback", "fallback_runner": "codex",
 					"fallback_model":     resolveCodexModel(cfg, t),
 					"fallback_reasoning": resolveCodexReasoning(cfg, t), "cooldown_until": until,
-				})
-				return saveTask(root, t)
+				}))
 			}
 			t.Status = statusLimitPaused
 			t.ResumeAtEpoch = until
@@ -1925,10 +1938,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("OpenCode 车道命中限额，%s 后恢复（%s）\n%s",
 				fmtIn(until, now), fmtClock(until), reason))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner:opencode", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner:opencode", statusLimitPaused, t.Step, map[string]any{
 				"engine": "opencode", "resume_at": until,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// 1c) 引擎限额：只写该引擎自己的 cooldown-<name>.json，**绝不写 claude 全局冷却**
@@ -1953,10 +1965,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("引擎 %s 命中用量限额，%s 后恢复（%s）\n%s",
 				engineName, fmtIn(until, now), fmtClock(until), firstLine(strings.TrimSpace(scan))))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
 				"engine": engineName, "resume_at": until, "mid_step": t.MidStep,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		claudeLimit := engineName == "" && !useCodex && !useGemini && !useOpenCode &&
@@ -1982,10 +1993,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.LastError = "usage limit: " + firstLine(combined)
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("命中用量限额，%s 后恢复（%s）\n%s", fmtIn(until, now), fmtClock(until), firstLine(combined)))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
 				"engine": "claude", "resume_at": until, "mid_step": t.MidStep,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// 1a) 本机 codex 撞自己的 ChatGPT 用量限额：按本任务 resume_at 挂起，绝不写全局
@@ -2001,10 +2011,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.LastError = "codex 用量限额: " + firstLine(resultText(res))
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("codex 用量限额，%s 后恢复（%s）", fmtIn(until, now), fmtClock(until)))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
 				"engine": "codex", "resume_at": until,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// 1b) 远端撞该主机账号限额（远端机器自己的 claude/GPT 账号）：按本任务 resume_at 挂起，
@@ -2022,10 +2031,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.LastError = "远端账号限额: " + firstLine(resultText(res))
 			t.touch()
 			logBlock(lg, "LIMIT", fmt.Sprintf("远端账号限额，%s 后恢复（%s）", fmtIn(until, now), fmtClock(until)))
-			emitTaskEvent(root, t.ID, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
+			return finishIfStopped(persistTaskEvent(root, t, evLimitPaused, "runner", statusLimitPaused, t.Step, map[string]any{
 				"engine": "remote", "host": t.RemoteHost, "resume_at": until,
-			})
-			return saveTask(root, t)
+			}))
 		}
 
 		// Grok 认证熔断在首张卡已经留下 held 根因。并发派发中已经进入 runTask 的跟随卡只退回
@@ -2047,9 +2055,11 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			if cd != nil {
 				detail["cooldown_until"] = cd.UntilEpoch
 			}
-			emitTaskEvent(root, t.ID, evRetry, "runner:grok-build", statusQueued, t.Step, withRouteAttempt(detail, t))
+			if err := persistTaskEvent(root, t, evRetry, "runner:grok-build", statusQueued, t.Step, withRouteAttempt(detail, t)); err != nil {
+				return finishIfStopped(err)
+			}
 			logBlock(lg, "AUTH_CIRCUIT", res.Result)
-			return saveTask(root, t)
+			return nil
 		}
 
 		// 2) 其他失败：CG-3 分类分流决定策略——认证/权限直接 held 升级人工；输入超长直接 failed
@@ -2092,20 +2102,22 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.Status = statusHeld
 				t.LastError = annotatedError(cls, msg)
 				logBlock(lg, "CLASS_HELD", fmt.Sprintf("[%s] 不烧 attempts 直接挂 held(升级人工): %s", cls, msg))
-				emitTaskEvent(root, t.ID, evHeld, "runner:classifier", statusHeld, t.Step,
+				t.touch()
+				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:classifier", statusHeld, t.Step,
 					withCostTelemetry(withRouteAttempt(map[string]any{
 						"err": msg, "failure_class": string(cls), "reason": policy.Reason,
-					}, t), t))
+					}, t), t)))
 			case statusFailed:
 				// 输入超长：同样 prompt 再送必然再超长，直接 failed 不烧 attempts；人工按 retry 时
 				// 可裁剪 prompt 或换更大窗口的模型。
 				t.Status = statusFailed
 				t.LastError = annotatedError(cls, msg)
 				logBlock(lg, "CLASS_FAILED", fmt.Sprintf("[%s] 不可重试类直接 failed: %s", cls, msg))
-				emitTaskEvent(root, t.ID, evFailed, "runner:classifier", statusFailed, t.Step,
+				t.touch()
+				return finishIfStopped(persistTaskEvent(root, t, evFailed, "runner:classifier", statusFailed, t.Step,
 					withCostTelemetry(withRouteAttempt(map[string]any{
 						"err": msg, "failure_class": string(cls), "reason": policy.Reason,
-					}, t), t))
+					}, t), t)))
 			default:
 				// 现行 retry_backoff：超时/执行器崩溃/未知类。回归基线纪律——未知类的 LastError 与
 				// 事件字段结构与旧版逐字节一致（annotatedError 对 unknown 返回原 msg，不加前缀）；
@@ -2129,29 +2141,28 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 						detail["softened_from_terminal"] = true
 						detail["reason"] = "softened_transcript_derived"
 					}
-					emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step, withCostTelemetry(withRouteAttempt(detail, t), t))
-				} else {
-					t.Status = statusQueued
-					backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
-					if transientRe.MatchString(msg) {
-						backoff = time.Duration(cfg.RetryBackoffMin) * time.Minute
-					} else {
-						backoff *= time.Duration(t.Attempts)
-					}
-					t.NotBeforeEpoch = now.Add(backoff).Unix()
-					detail := map[string]any{
-						"err": msg, "attempts": t.Attempts, "not_before": t.NotBeforeEpoch,
-						"failure_class": string(cls),
-					}
-					if softenedFromTranscript {
-						detail["softened_from_terminal"] = true
-						detail["reason"] = "softened_transcript_derived"
-					}
-					emitTaskEvent(root, t.ID, evRetry, "runner", statusQueued, t.Step, withRouteAttempt(detail, t))
+					t.touch()
+					return finishIfStopped(persistTaskEvent(root, t, evFailed, "runner", statusFailed, t.Step, withCostTelemetry(withRouteAttempt(detail, t), t)))
 				}
+				t.Status = statusQueued
+				backoff := time.Duration(cfg.RetryBackoffMin) * time.Minute
+				if transientRe.MatchString(msg) {
+					backoff = time.Duration(cfg.RetryBackoffMin) * time.Minute
+				} else {
+					backoff *= time.Duration(t.Attempts)
+				}
+				t.NotBeforeEpoch = now.Add(backoff).Unix()
+				detail := map[string]any{
+					"err": msg, "attempts": t.Attempts, "not_before": t.NotBeforeEpoch,
+					"failure_class": string(cls),
+				}
+				if softenedFromTranscript {
+					detail["softened_from_terminal"] = true
+					detail["reason"] = "softened_transcript_derived"
+				}
+				t.touch()
+				return finishIfStopped(persistTaskEvent(root, t, evRetry, "runner", statusQueued, t.Step, withRouteAttempt(detail, t)))
 			}
-			t.touch()
-			return saveTask(root, t)
 		}
 
 		// 3) 成功：推进步骤（codex/gemini/远端/引擎成功不代表 claude 限额解除，全局冷却只由
@@ -2207,7 +2218,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.ReviewObligationPending = true
 				t.LastError = "implementation complete; waiting for mandatory review obligation to persist"
 				t.touch()
-				if err := saveTask(root, t); err != nil {
+				if err := saveAuthorizedTask(root, t); err != nil {
 					return err
 				}
 				childCfg := configForGeneratedChildren(root, cfg, lg)
@@ -2218,11 +2229,10 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					}
 					t.LastError = "mandatory review obligation was not persisted: " + err.Error()
 					t.touch()
-					if saveErr := saveTask(root, t); saveErr != nil {
+					if saveErr := persistTaskEvent(root, t, evHeld, "runner:review-obligation", statusHeld, t.Step,
+						withCostTelemetry(map[string]any{"reason": "mandatory_review_persist_failed", "err": err.Error()}, t)); saveErr != nil {
 						return errors.Join(err, saveErr)
 					}
-					emitTaskEvent(root, t.ID, evHeld, "runner:review-obligation", statusHeld, t.Step,
-						withCostTelemetry(map[string]any{"reason": "mandatory_review_persist_failed", "err": err.Error()}, t))
 					logBlock(lg, "REVIEW", t.LastError)
 					return nil
 				}
@@ -2232,15 +2242,16 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					t.Status = statusHeld
 					t.LastError = "required Owner review gate queued: " + plannedReviewStage
 					t.touch()
-					emitTaskEvent(root, t.ID, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+					if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, map[string]any{
 						"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
-					})
-					emitTaskEvent(root, t.ID, evHeld, "runner:owner-review-plan", statusHeld, t.Step,
+					}); err != nil {
+						return finishIfStopped(err)
+					}
+					return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:owner-review-plan", statusHeld, t.Step,
 						withCostTelemetry(map[string]any{
 							"reason": "required_review_pending", "review_stage": plannedReviewStage,
 							"review_child": rv.ID,
-						}, t))
-					return saveTask(root, t)
+						}, t)))
 				}
 				t.LastError = ""
 			}
@@ -2266,29 +2277,35 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			}
 			t.touch()
 			// 最后一步的 step_ok 事件先记(与中间步一致语义),再据终局标 done 或交叉契约违规的 failed。
-			emitTaskEvent(root, t.ID, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+			if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, map[string]any{
 				"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
-			})
+			}); err != nil {
+				return finishIfStopped(err)
+			}
 			if t.Status == statusDone {
-				emitTaskEvent(root, t.ID, evDone, "runner", statusDone, t.Step, withCostTelemetry(nil, t))
+				if err := persistTaskEvent(root, t, evDone, "runner", statusDone, t.Step, withCostTelemetry(nil, t)); err != nil {
+					return finishIfStopped(err)
+				}
 				// 复盘计数器：只数真 done。上面交叉 C 契约违规改判 failed 的分支不该计入
 				// "产能"，否则复盘窗口里混进从未交付的卡。
 				noteTaskDoneLogged(root, cfg, t, lg)
 			} else if t.Status == statusHeld {
-				emitTaskEvent(root, t.ID, evHeld, "runner:fable-terminal-merge", statusHeld, t.Step,
+				if err := persistTaskEvent(root, t, evHeld, "runner:fable-terminal-merge", statusHeld, t.Step,
 					withCostTelemetry(map[string]any{
 						"reason": "fable_owner_hold", "route_stage": routeStageFableMerge,
-					}, t))
-			} else {
-				emitTaskEvent(root, t.ID, evFailed, "runner", statusFailed, t.Step,
-					withCostTelemetry(map[string]any{
-						"err": t.LastError, "reason": "cross_merge_contract_violation",
-					}, t))
-			}
-			if err := saveTask(root, t); err != nil {
-				return err
+					}, t)); err != nil {
+					return finishIfStopped(err)
+				}
+			} else if err := persistTaskEvent(root, t, evFailed, "runner", statusFailed, t.Step,
+				withCostTelemetry(map[string]any{
+					"err": t.LastError, "reason": "cross_merge_contract_violation",
+				}, t)); err != nil {
+				return finishIfStopped(err)
 			}
 			if t.Status == statusHeld {
+				return nil
+			}
+			if producerInvalidated(t) || diskControlRevoked(root, t.ID) {
 				return nil
 			}
 			postComplete(root, cfg, t, res, lg)
@@ -2297,15 +2314,14 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			if diskCanceled(root, t.ID) {
 				return nil
 			}
-			return saveTask(root, t)
+			return saveAuthorizedTask(root, t)
 		}
 		t.touch()
 		// 中间步成功事件:每推进一步一条,是"步数一致"验收的锚点(枚举遗漏就红)。
-		emitTaskEvent(root, t.ID, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+		if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, map[string]any{
 			"turns": res.NumTurns, "cost_usd": res.TotalCostUSD,
-		})
-		if err := saveTask(root, t); err != nil {
-			return err
+		}); err != nil {
+			return finishIfStopped(err)
 		}
 	}
 }
@@ -2330,6 +2346,7 @@ func finalizeCanceled(root string, t *Task, lg *os.File) error {
 	// 记录磁盘态供 detail 溯源:若盘=canceled 但账本无事件, 是"cli cancel 后 emit 失败"的补写场景.
 	cliRecordedOnDisk := diskCanceled(root, t.ID)
 	t.Status = statusCanceled
+	markControlTerminal(t)
 	logBlock(lg, "CANCELED", "任务已取消：终止执行进程，丢弃本步产物并归档。")
 	if !alreadyEmitted {
 		// 事件必须在 archiveTask 前落：archive 会把 events.jsonl 搬去 archive/events/，
@@ -2342,7 +2359,11 @@ func finalizeCanceled(root string, t *Task, lg *os.File) error {
 		}
 		// 取消是 retro-77 点名的遥测缺口首位：卡被杀时已烧掉的 turns/cost 必须随终态事件落盘，
 		// 否则这部分开销在复盘里彻底消失（卡文件虽有累计值，但复盘按事件账本算账）。
-		emitTaskEvent(root, t.ID, evCanceled, "runner", statusCanceled, t.Step, withCostTelemetry(detail, t))
+		if err := persistTaskEvent(root, t, evCanceled, "runner", statusCanceled, t.Step, withCostTelemetry(detail, t)); err != nil {
+			fmt.Fprintf(os.Stderr, "警告: cancel 收尾写盘失败 %s: %v\n", t.ID, err)
+		}
+	} else if err := saveAuthorizedTask(root, t); err != nil && !errors.Is(err, errStaleTaskWrite) && !errors.Is(err, errSchedulerLockLost) {
+		fmt.Fprintf(os.Stderr, "警告: cancel 收尾写盘失败 %s: %v\n", t.ID, err)
 	}
 	if err := archiveTask(root, t); err != nil && !os.IsNotExist(err) {
 		return err
@@ -2737,7 +2758,7 @@ func ensureReviewAfterTaskWithEvidence(root string, cfg *Config, t *Task, priorE
 	if err := pinPlannedReviewIdentity(cfg, t, rv, stage); err != nil {
 		return nil, err
 	}
-	if err := saveTask(root, rv); err != nil {
+	if err := saveAuthorizedTask(root, rv); err != nil {
 		return nil, fmt.Errorf("persist planned review task: %w", err)
 	}
 	emitTaskEvent(root, t.ID, evCloseout, "runner:owner-review-plan", t.Status, t.Step, map[string]any{
@@ -2800,7 +2821,7 @@ func ensureLegacyReviewAfterTask(root string, cfg *Config, t *Task, lg *os.File)
 		rv.Model = t.Model
 	}
 	pinGrokOpusAdversarialReview(cfg, t, rv)
-	if err := saveTask(root, rv); err != nil {
+	if err := saveAuthorizedTask(root, rv); err != nil {
 		return nil, fmt.Errorf("persist review task: %w", err)
 	}
 	emitTaskEvent(root, t.ID, evCloseout, "runner:review", t.Status, t.Step, map[string]any{
@@ -2845,7 +2866,7 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 		parent.Status = statusHeld
 		parent.LastError = fmt.Sprintf("Owner review stage order mismatch: completed=%s pending=%s", stage, pending)
 		parent.touch()
-		_ = saveTask(root, parent)
+		_ = saveAuthorizedTask(root, parent)
 		return
 	}
 	verdict := parseReviewVerdict(result)
@@ -2853,8 +2874,7 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 		parent.Status = statusHeld
 		parent.LastError = "Owner review gate " + stage + " did not emit a closed pass|concerns|block verdict"
 		parent.touch()
-		_ = saveTask(root, parent)
-		emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
+		_ = persistTaskEvent(root, parent, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
 			"reason": "invalid_review_terminal", "review_stage": stage, "review_child": review.ID,
 		}, parent))
 		return
@@ -2863,7 +2883,7 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 		parent.Status = statusHeld
 		parent.LastError = err.Error()
 		parent.touch()
-		_ = saveTask(root, parent)
+		_ = saveAuthorizedTask(root, parent)
 		return
 	}
 	// An ordinary Kimi adversarial review that finds acceptance failures does not release the stale
@@ -2879,8 +2899,7 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 			parent.LastError = appendErr.Error()
 		}
 		parent.touch()
-		_ = saveTask(root, parent)
-		emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
+		_ = persistTaskEvent(root, parent, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
 			"reason": "kimi_acceptance_failed", "review_stage": stage, "verdict": verdict.Verdict,
 			"review_child": review.ID,
 		}, parent))
@@ -2903,10 +2922,6 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 			parent.LastError = appendErr.Error()
 		}
 		parent.touch()
-		if err := saveTask(root, parent); err != nil {
-			logBlock(lg, "REVIEW", "failed to persist Grok-Kimi disagreement escalation: "+err.Error())
-			return
-		}
 		detail := map[string]any{
 			"reason": "grok_kimi_disagreement", "review_stage": stage, "verdict": verdict.Verdict,
 			"review_child": review.ID, "owner_route_name": parent.OwnerRouteName,
@@ -2916,8 +2931,11 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 			detail["workspace_fingerprint_before"] = review.LastRouteAttempt.WorkspaceBefore
 			detail["workspace_fingerprint_after"] = review.LastRouteAttempt.WorkspaceAfter
 		}
-		emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step,
-			withCostTelemetry(detail, parent))
+		if err := persistTaskEvent(root, parent, evHeld, "runner:owner-review-plan", statusHeld, parent.Step,
+			withCostTelemetry(detail, parent)); err != nil {
+			logBlock(lg, "REVIEW", "failed to persist Grok-Kimi disagreement escalation: "+err.Error())
+			return
+		}
 		gate, err := ensureReviewAfterTaskWithEvidence(root, cfg, parent, result, lg)
 		if err != nil || gate == nil {
 			if err == nil {
@@ -2925,14 +2943,14 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 			}
 			parent.LastError = "disagreement Sol/xhigh gate was not persisted: " + err.Error()
 			parent.touch()
-			_ = saveTask(root, parent)
+			_ = saveAuthorizedTask(root, parent)
 			return
 		}
 		parent.ReviewTaskID = gate.ID
 		parent.ReviewObligationPending = false
 		parent.LastError = "Grok-Kimi disagreement escalated to the conditional Sol/xhigh gate: " + gate.ID
 		parent.touch()
-		_ = saveTask(root, parent)
+		_ = saveAuthorizedTask(root, parent)
 		return
 	}
 	if stage == reviewStageSolXHigh || stage == reviewStageSolMax {
@@ -2941,8 +2959,7 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 			parent.LastError = fmt.Sprintf("%s release gate returned %s with %d P0/%d P1; held for Owner",
 				stage, verdict.Verdict, len(verdict.P0), len(verdict.P1))
 			parent.touch()
-			_ = saveTask(root, parent)
-			emitTaskEvent(root, parent.ID, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
+			_ = persistTaskEvent(root, parent, evHeld, "runner:owner-review-plan", statusHeld, parent.Step, withCostTelemetry(map[string]any{
 				"reason": "sol_release_gate_blocked", "review_stage": stage, "verdict": verdict.Verdict,
 				"review_child": review.ID,
 			}, parent))
@@ -2954,7 +2971,7 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 		parent.ReviewObligationPending = true
 		parent.LastError = "waiting for required Owner review stage " + next
 		parent.touch()
-		if err := saveTask(root, parent); err != nil {
+		if err := saveAuthorizedTask(root, parent); err != nil {
 			logBlock(lg, "REVIEW", "failed to persist next Owner review obligation: "+err.Error())
 			return
 		}
@@ -2965,14 +2982,14 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 			}
 			parent.LastError = "next Owner review gate was not persisted: " + err.Error()
 			parent.touch()
-			_ = saveTask(root, parent)
+			_ = saveAuthorizedTask(root, parent)
 			return
 		}
 		parent.ReviewTaskID = nextReview.ID
 		parent.ReviewObligationPending = false
 		parent.LastError = "required Owner review gate queued: " + next
 		parent.touch()
-		_ = saveTask(root, parent)
+		_ = saveAuthorizedTask(root, parent)
 		return
 	}
 	parent.Status = statusDone
@@ -2980,15 +2997,14 @@ func advancePlannedReview(root string, cfg *Config, review *Task, result string,
 	parent.LastError = ""
 	parent.OwnerRouteStage = routeStageTerminal
 	parent.touch()
-	if err := saveTask(root, parent); err != nil {
-		logBlock(lg, "REVIEW", "failed to release Owner review root: "+err.Error())
-		return
-	}
-	emitTaskEvent(root, parent.ID, evDone, "runner:owner-review-plan", statusDone, parent.Step,
+	if err := persistTaskEvent(root, parent, evDone, "runner:owner-review-plan", statusDone, parent.Step,
 		withCostTelemetry(map[string]any{
 			"review_child": review.ID, "review_stage": stage,
 			"required_reviews": parent.RequiredReviews, "completed_reviews": parent.CompletedReviews,
-		}, parent))
+		}, parent)); err != nil {
+		logBlock(lg, "REVIEW", "failed to release Owner review root: "+err.Error())
+		return
+	}
 }
 
 func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task, activeIDs map[string]bool) {
@@ -3006,7 +3022,7 @@ func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task
 			}
 			t.LastError = "独立 Sol/max 对抗复审义务仍未落盘: " + err.Error()
 			t.touch()
-			_ = saveTask(root, t)
+			_ = saveAuthorizedTask(root, t)
 			if lg != nil {
 				logBlock(lg, "REVIEW", t.LastError)
 				_ = lg.Close()
@@ -3019,11 +3035,11 @@ func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task
 			t.Status = statusHeld
 			t.LastError = "required Owner review gate queued: " + stage
 			t.touch()
-			if err := saveTask(root, t); err != nil {
+			if err := saveAuthorizedTask(root, t); err != nil {
 				t.ReviewObligationPending = true
 				t.LastError = "review gate persisted but root update failed: " + err.Error()
 				t.touch()
-				_ = saveTask(root, t)
+				_ = saveAuthorizedTask(root, t)
 			}
 			if lg != nil {
 				_ = lg.Close()
@@ -3033,19 +3049,18 @@ func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task
 		t.Status = statusDone
 		t.LastError = ""
 		t.touch()
-		if err := saveTask(root, t); err != nil {
+		if err := persistTaskEvent(root, t, evDone, "runner:review-obligation", statusDone, t.Step,
+			withCostTelemetry(map[string]any{"review_child": rv.ID, "reconciled": true}, t)); err != nil {
 			t.Status = statusHeld
 			t.ReviewObligationPending = true
 			t.LastError = "复审卡已落盘，但父卡完成状态回写失败: " + err.Error()
 			t.touch()
-			_ = saveTask(root, t)
+			_ = saveAuthorizedTask(root, t)
 			if lg != nil {
 				_ = lg.Close()
 			}
 			continue
 		}
-		emitTaskEvent(root, t.ID, evDone, "runner:review-obligation", statusDone, t.Step,
-			withCostTelemetry(map[string]any{"review_child": rv.ID, "reconciled": true}, t))
 		if lg != nil {
 			noteTaskDoneLogged(root, cfg, t, lg)
 			_ = lg.Close()
@@ -3055,6 +3070,9 @@ func reconcileMandatoryReviewObligations(root string, cfg *Config, tasks []*Task
 
 // postComplete 处理任务链：进度报告落盘；装配/协调任务产出的新任务入队；review_after 自动入队设计审核。
 func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.File) {
+	if !followOnWritesAllowed(root, t) {
+		return
+	}
 	cfg = configForGeneratedChildren(root, cfg, lg)
 	// C 存在即意味 B→C 已成，甲结论侧车使命完成——清理（兜住 B→C 在删侧车前崩溃的残留）。
 	if t.XRole == "C" {
@@ -3069,6 +3087,9 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 		logBlock(lg, "CROSS", t.LastError)
 		return
 	}
+	if !followOnWritesAllowed(root, t) {
+		return
+	}
 	if t.EmitProgress {
 		if key, err := saveProgressFromResult(root, t, res.Result); err != nil {
 			t.LastError = "进度报告落盘失败: " + err.Error()
@@ -3079,7 +3100,7 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 				// 前面在 runTask 完成路径已 emit evDone(runner.go:815-817);此处终局又改判 failed 却不 emit,
 				// 事件账本终局为 done、盘上为 failed——活动流按事件流会展示"已完成"的假历史。
 				// 补一条 evFailed(actor=runner:postComplete)让终局改判有对应迁移事件,禁反推伪造。
-				emitTaskEvent(root, t.ID, evFailed, "runner:postComplete", statusFailed, t.Step,
+				_ = persistTaskEvent(root, t, evFailed, "runner:postComplete", statusFailed, t.Step,
 					withCostTelemetry(map[string]any{
 						"reason": "progress_persist_failed", "err": err.Error(), "role": t.XRole,
 					}, t))
@@ -3087,6 +3108,9 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 		} else {
 			logBlock(lg, "PROGRESS", "进度报告已写入: "+progressPath(root, key))
 		}
+	}
+	if !followOnWritesAllowed(root, t) {
+		return
 	}
 	if t.EmitTasks {
 		created, err := enqueueEmitted(root, cfg, t, res.Result)
@@ -3106,7 +3130,13 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 	}
 	// Fable 5 限额后的异构接力不把候选方案当成既定方向：无论候选最终由 Grok 还是
 	// 最终 Sol 产出，都追加且只追加一张本地 Sol/max 第一性顾问审查卡。
+	if !followOnWritesAllowed(root, t) {
+		return
+	}
 	ensureFableFirstPrinciplesReview(root, cfg, t, res.Result, lg)
+	if !followOnWritesAllowed(root, t) {
+		return
+	}
 	// 运行期再守一次，覆盖升级前已入队的旧卡或人工直接改 JSON 的旁路；非实现卡即使盘上
 	// 残留 review_after=true，也不得生成“审核: 审核…”任务。
 	if t.ReviewAfter && reviewAfterEligibleType(t) {
@@ -3120,16 +3150,25 @@ func postComplete(root string, cfg *Config, t *Task, res *claudeResult, lg *os.F
 	// Planned Owner gates update their implementation root and may serially materialize the next gate.
 	// Each gate has review_after=false, so this cannot create a review-of-review.
 	if t.Type == typeReview && t.ReviewPlanStage != "" {
+		if !followOnWritesAllowed(root, t) {
+			return
+		}
 		advancePlannedReview(root, cfg, t, res.Result, lg)
 	}
 	// 修复闭环：对抗审核完成后消费 verdict——pass 收口；concerns/block 自动派下一轮修复卡；
 	// 超轮限挂 held 升级卡交人工。这是"实现→审核→修复→再审"循环的自动闭合点。
 	if t.Type == typeReview && !t.AdvisoryReview {
+		if !followOnWritesAllowed(root, t) {
+			return
+		}
 		handleReviewVerdict(root, cfg, t, res.Result, lg)
 	}
 	// 交叉验证链：A 完成 → 派独立引擎乙的 B 卡（不注入 A）；B 完成 → 派引擎乙交叉查漏的 C 卡（注入 A+B）。
 	// C 是终点，交编排者综合（C 的 json 结论经 EmitProgress 落进度报告）。
 	if t.XRole == "A" || t.XRole == "B" {
+		if !followOnWritesAllowed(root, t) {
+			return
+		}
 		handleCrossStage(root, cfg, t, res, lg)
 	}
 }
@@ -3384,7 +3423,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 				co.EmittedBy = t.ID       // 谱系标：系统派生卡，进度预估的派生耦合系数依赖（boardestimate.go）
 				co.SkipPermissions = orig.SkipPermissions
 				co.RemoteHost = orig.RemoteHost
-				if saveTask(root, co) == nil {
+				if saveAuthorizedTask(root, co) == nil {
 					// 父审核卡记 closeout：pass 触发的收口卡是"完成后派生动作"，在父账本留一条明确指针。
 					emitTaskEvent(root, t.ID, evCloseout, "runner:closeout", statusDone, t.Step, map[string]any{
 						"kind": "closeout", "child": co.ID, "review_of": t.ReviewOf,
@@ -3461,7 +3500,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		esc.ChainTurnsUsed = chainTurns
 		esc.AutomaticSolCalls = orig.AutomaticSolCalls
 		esc.AutomaticSolInvocations = orig.AutomaticSolInvocations
-		if saveTask(root, esc) == nil {
+		if saveAuthorizedTask(root, esc) == nil {
 			// 父审核卡 closeout：超轮限 held 卡是审核链的显式终点，父卡账本必须留指针。
 			emitTaskEvent(root, t.ID, evCloseout, "runner:escalation", statusDone, t.Step, map[string]any{
 				"kind": "escalation", "child": esc.ID, "round": round, "verdict": v.Verdict,
@@ -3475,7 +3514,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 			// 复盘要回答的是"这条链撞墙前烧了多少"，而不是"这张刚出生的壳卡花了多少"。两组键分开，
 			// 谁也不冒充谁——按卡求和时只取 cost_total，链账另算。
 			// 链账覆盖实现卡 + 各轮修复卡 + 各轮审核卡；旁支与存量卡降级见 task.go:ChainCostUSD。
-			emitTaskEvent(root, esc.ID, evHeld, "runner:escalation", statusHeld, 0,
+			_ = persistTaskEvent(root, esc, evHeld, "runner:escalation", statusHeld, 0,
 				withCostTelemetry(map[string]any{
 					"reason": "over_max_fix_rounds", "max_rounds": maxRounds,
 					"chain_cost_total": chainCost, "chain_turns_total": chainTurns,
@@ -3536,7 +3575,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	if nt.Effort == "" {
 		nt.Effort = "high"
 	}
-	if err := saveTask(root, nt); err != nil {
+	if err := saveAuthorizedTask(root, nt); err != nil {
 		logBlock(lg, "FIXLOOP", "修复卡保存失败: "+err.Error())
 		return
 	}
@@ -3778,7 +3817,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		_ = os.Remove(crossPeerPath(root, t.XKey)) // 断裂时清理侧车,不留甲结论长期残驻
 		// 断裂前先记 failed 事件：postComplete 后 runTask 会 saveTask 但不再进 failed 分支，
 		// 若不在此处记事件，"交叉链断裂"这条关键状态迁移会在事件账本里彻底缺席。
-		emitTaskEvent(root, t.ID, evFailed, "runner:cross", statusFailed, t.Step,
+		_ = persistTaskEvent(root, t, evFailed, "runner:cross", statusFailed, t.Step,
 			withCostTelemetry(map[string]any{
 				"reason": "cross_chain_break", "role": t.XRole, "detail": reason,
 			}, t))
@@ -3862,7 +3901,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 				breakChain("Fable reviewer-merger frozen identity is not fresh Sol/ultra")
 				return
 			}
-			if err := saveTask(root, c); err != nil {
+			if err := saveAuthorizedTask(root, c); err != nil {
 				breakChain("Fable reviewer-merger card persist failed: " + err.Error())
 				return
 			}
@@ -3895,7 +3934,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		b.XEngineB = t.XEngineB // 冻结规格随链传递
 		b.XEngineC = t.XEngineC // 可选的独立合并引擎同样冻结并随链传递
 		applyFrozenEngine(b, t.XEngineB)
-		if err := saveTask(root, b); err != nil {
+		if err := saveAuthorizedTask(root, b); err != nil {
 			breakChain("B 卡落盘失败: " + err.Error())
 			return
 		}
@@ -3938,7 +3977,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 			mergeEngine = t.XEngineC
 		}
 		applyFrozenEngine(c, mergeEngine)
-		if err := saveTask(root, c); err != nil {
+		if err := saveAuthorizedTask(root, c); err != nil {
 			breakChain("C 卡落盘失败: " + err.Error())
 			return
 		}
@@ -4015,11 +4054,15 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 			t.LastError = fmt.Sprintf("交叉链在 %s 完成后崩溃中断（无后继 %s 卡），单腿结果不可采信", t.XRole, nextRole)
 			_ = os.Remove(crossPeerPath(root, t.XKey))
 			// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
-			emitTaskEvent(root, t.ID, evFailed, "runner:reconcile", statusFailed, t.Step,
-				withCostTelemetry(map[string]any{
+			return commitTaskTransition(root, t, transitionRequest{
+				EventType: evFailed,
+				Actor:     "runner:reconcile",
+				Status:    statusFailed,
+				Step:      t.Step,
+				Detail: withCostTelemetry(map[string]any{
 					"reason": "cross_chain_orphan", "role": t.XRole, "missing_next": nextRole,
-				}, t))
-			return saveTask(root, t)
+				}, t),
+			})
 		})
 		if tombErr != nil {
 			fmt.Fprintf(os.Stderr, "警告: reconcile 墓碑写入失败 %s: %v\n", t.ID, tombErr)
@@ -4071,14 +4114,20 @@ func reconcileCrossChains(root string, tasks []*Task, active map[string]bool) {
 				}
 			}
 			if shouldEmit {
-				// R3 P1-1 修复:emit 先于 saveTask (详见上方注释), 崩溃落两者之间盘上仍 done, 下轮再撞收敛.
-				emitTaskEvent(root, t.ID, evHeld, "runner:reconcile-tombstone", statusHeld, t.Step,
-					withCostTelemetry(map[string]any{
+				if err := commitTaskTransition(root, t, transitionRequest{
+					EventType: evHeld,
+					Actor:     "runner:reconcile-tombstone",
+					Status:    statusHeld,
+					Step:      t.Step,
+					Detail: withCostTelemetry(map[string]any{
 						"reason": "reconcile_cross_tombstone_exhausted", "kind": reconcileCrossKind(),
 						"role": t.XRole, "missing_next": nextRole,
-					}, t))
-			}
-			if err := saveTask(root, t); err != nil {
+					}, t),
+				}); err != nil {
+					fmt.Fprintf(os.Stderr, "警告: reconcile 挂 held 落盘失败 %s: %v\n", t.ID, err)
+					continue
+				}
+			} else if err := saveAuthorizedTask(root, t); err != nil {
 				fmt.Fprintf(os.Stderr, "警告: reconcile 挂 held 落盘失败 %s: %v\n", t.ID, err)
 				continue
 			}
@@ -4249,7 +4298,7 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		if parent.EmitHold {
 			nt.Status = statusHeld
 		}
-		if err := saveTask(root, nt); err != nil {
+		if err := saveAuthorizedTask(root, nt); err != nil {
 			return ids, err
 		}
 		// emit 出的每张子卡都记 queued 起点，parent 指针留在 detail 里。
@@ -4262,10 +4311,12 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 			// EmitHold 意味着新卡立即置 held——先 queued 后 held 忠实反映状态起点与人工待放行的实际语义。
 			// 新生子卡零用量是**真实的**（还没跑过），但仍走 withCostTelemetry 落显式标记：
 			// 终态事件二选一没有第三种，静默缺字段与"确实没花钱"在账面上不可区分。
-			emitTaskEvent(root, nt.ID, evHeld, "runner:emit", statusHeld, 0,
+			if err := persistTaskEvent(root, nt, evHeld, "runner:emit", statusHeld, 0,
 				withCostTelemetry(map[string]any{
 					"reason": "emit_hold", "parent": parent.ID,
-				}, nt))
+				}, nt)); err != nil {
+				return ids, err
+			}
 		}
 		ids = append(ids, nt.ID)
 	}

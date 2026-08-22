@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -140,7 +141,7 @@ func printUsage() {
             只读 Web 看板：项目/阶段/任务三层视图 + 额度燃尽曲线（默认只听本机回环）
 
 任务管理
-  hold/release <id>                # 挂起 / 恢复排队
+  hold/release <id>                # 挂起 / 恢复排队（hold 先撤销调度再监护进程）
   retry <id>                       # 失败任务重新入队（保留会话与进度）
   cancel <id>                      # 取消并归档（运行中的任务会先终止其执行进程）
   clean                            # 把 done/failed/canceled 归档到 archive/
@@ -311,6 +312,7 @@ func cmdAdd(args []string) error {
 	}
 	if *hold {
 		t.Status = statusHeld
+		markControlTerminal(t)
 	}
 	if *skipPerms {
 		t.SkipPermissions = true
@@ -490,8 +492,15 @@ func cmdAdd(args []string) error {
 	})
 	if *hold {
 		// 新生卡零用量是真实的，但仍落显式 cost_unavailable 标记：终态事件二选一没有第三种。
-		emitTaskEvent(root, t.ID, evHeld, "cli:add", statusHeld, t.Step,
-			withCostTelemetry(map[string]any{"reason": "add -hold"}, t))
+		if err := commitTaskTransition(root, t, transitionRequest{
+			EventType: evHeld,
+			Actor:     "cli:add",
+			Status:    statusHeld,
+			Step:      t.Step,
+			Detail:    withCostTelemetry(map[string]any{"reason": "add -hold"}, t),
+		}); err != nil {
+			return err
+		}
 	}
 	fmt.Printf("已入队 %s [%s] %s（%d 步，优先级 %d，stakes=%s%s%s%s）\n",
 		t.ID, t.Type, t.Title, len(t.Prompts), t.Priority, t.Stakes,
@@ -1870,14 +1879,16 @@ func cmdSetStatus(args []string, action string) error {
 	}
 	switch action {
 	case "hold":
-		if t.Status == statusRunning {
-			return fmt.Errorf("%s 正在运行，无法挂起", t.ID)
+		if err := terminalize(root, t.ID, statusHeld, "cli:hold", "cli hold", map[string]any{"reason": "cli hold"}); err != nil {
+			return err
 		}
-		t.Status = statusHeld
+		fmt.Printf("%s -> %s\n", t.ID, zhStatus(statusHeld))
+		return nil
 	case "release":
 		if t.Status != statusHeld {
 			return fmt.Errorf("%s 不在挂起状态（当前: %s）", t.ID, t.Status)
 		}
+		restoreScheduling(t)
 		t.Status = statusQueued
 		t.NotBeforeEpoch = 0
 		// CG-4 Round-1 修复(同类闭合):release 分支也须清 reconcile:cross 墓碑——否则
@@ -1890,6 +1901,7 @@ func cmdSetStatus(args []string, action string) error {
 		if !t.terminal() && t.Status != statusLimitPaused {
 			return fmt.Errorf("%s 当前状态 %s 无需 retry", t.ID, t.Status)
 		}
+		restoreScheduling(t)
 		t.Status = statusQueued
 		t.Attempts = 0
 		t.NotBeforeEpoch = 0
@@ -1909,24 +1921,17 @@ func cmdSetStatus(args []string, action string) error {
 		_ = resetTombstoneKind(root, t.ID, reconcileCrossKind())
 	case "cancel":
 		wasRunning := t.Status == statusRunning
-		t.Status = statusCanceled
-		t.touch()
-		if err := saveTask(root, t); err != nil {
+		if err := terminalize(root, t.ID, statusCanceled, "cli:cancel", "cli cancel", map[string]any{"was_running": wasRunning}); err != nil {
+			if errors.Is(err, errCustodyTimeout) {
+				fmt.Printf("%s 取消已撤销调度，但进程未在时限内退出，仍为 needs-owner。\n", t.ID)
+			}
 			return err
 		}
-		// cancel 事件先落再决定是否归档:即便随后 archive 失败,事件已记留痕。
-		// 成本遥测随终态落盘(retro-77 建议二):人工取消是账面开销最容易凭空蒸发的一条路——
-		// 卡上累计的 turns/cost 若不写进终态事件,复盘按事件账本算账时这笔开销就查不到了。
-		emitTaskEvent(root, t.ID, evCanceled, "cli:cancel", statusCanceled, t.Step,
-			withCostTelemetry(map[string]any{"was_running": wasRunning}, t))
-		if wasRunning {
-			// 进程还活着，先别归档：drain 每个重扫周期对账任务文件，见 canceled 即
-			// 击杀其执行进程组、释放槽位与目录互斥，然后归档（调度进程不在场时由
-			// 下次 tick 收尾归档）。立即归档会让对账无处读状态，且进程会一直吊着。
-			fmt.Printf("%s 已标记取消，运行中的进程将在一个重扫周期内被终止并归档。\n", t.ID)
-			return nil
+		fresh, loadErr := loadTask(root, t.ID)
+		if loadErr != nil {
+			return loadErr
 		}
-		if err := archiveTask(root, t); err != nil {
+		if err := archiveTask(root, fresh); err != nil {
 			return err
 		}
 		fmt.Printf("%s 已取消并归档。\n", t.ID)
@@ -1936,13 +1941,8 @@ func cmdSetStatus(args []string, action string) error {
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
-	// hold/release/retry 事件:诚实历史需要人工介入的每次动作都留痕。
+	// hold 走 terminalize（已落 held 事件）；release/retry 在这里留入队痕迹。
 	switch action {
-	case "hold":
-		// hold 只禁 running：一张 limit_paused/queued 且**已烧过钱**的卡可被人工 hold，
-		// 裸 nil detail 会让这笔累计开销在事件账本里消失（本轮同类位点普查发现）。
-		emitTaskEvent(root, t.ID, evHeld, "cli:hold", statusHeld, t.Step,
-			withCostTelemetry(map[string]any{"reason": "cli hold"}, t))
 	case "release":
 		// release 是 held→queued 的"重新入队":用 evQueued 保持类型枚举与状态一致(活动流才能标"入队")。
 		emitTaskEvent(root, t.ID, evQueued, "cli:release", statusQueued, t.Step, map[string]any{"reason": "release"})

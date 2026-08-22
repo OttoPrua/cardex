@@ -38,13 +38,16 @@ import (
 // Status/Step: 迁移后的状态快照（便于事件流阅读时快速理解上下文）。
 // Detail: 迁移特定的附加信息（限额恢复时间、重试次数、错误摘要、下游派生的卡 ID 等）。
 type TaskEvent struct {
-	Seq    int64          `json:"seq"`
-	TS     string         `json:"ts"`
-	Type   string         `json:"type"`
-	Actor  string         `json:"actor,omitempty"`
-	Status string         `json:"status,omitempty"`
-	Step   int            `json:"step,omitempty"`
-	Detail map[string]any `json:"detail,omitempty"`
+	Seq          int64          `json:"seq"`
+	TS           string         `json:"ts"`
+	Type         string         `json:"type"`
+	Actor        string         `json:"actor,omitempty"`
+	Status       string         `json:"status,omitempty"`
+	Step         int            `json:"step,omitempty"`
+	Detail       map[string]any `json:"detail,omitempty"`
+	TransitionID string         `json:"transition_id,omitempty"`
+	Revision     int64          `json:"revision,omitempty"`
+	AttemptID    string         `json:"attempt_id,omitempty"`
 }
 
 // 事件类型枚举——必须与验收清单"入队/派发/步成功/limit_paused/held/retry/canceled/终态/closeout"逐一对应。
@@ -63,15 +66,21 @@ const (
 	// (状态仍是 running);随后的 evCanceled(由 finalizeCanceled 落)才是"被巡逻杀了"的真状态迁移。
 	// 两条事件的时间戳与 detail 组合出完整因果链:dispatched→stalled(诊断)→canceled(收尾)。
 	evStalled = "stalled"
+	// evNeedsOwner is an attention signal, not a fabricated terminal. Custody timeout
+	// stays visible without claiming held/done/failed.
+	evNeedsOwner = "needs_owner"
+	// evStaleAttemptWrite is a diagnostic: a runner/CAS write lost authority. At most
+	// one is appended per attempt; it never restores scheduling eligibility.
+	evStaleAttemptWrite = "stale_attempt_write_rejected"
 )
 
 // 缺口标记：不是被写入的事件，而是活动流读者见 seq 跳号时插入的显式披露。
 // 保留在事件类型枚举里的原因：让活动流序列化字段一致（前端拿到 Type=event_gap 明确渲染红条）。
 const evGap = "event_gap"
 
-func eventsDir(root string) string            { return filepath.Join(root, "events") }
-func archivedEventsDir(root string) string    { return filepath.Join(root, "archive", "events") }
-func eventsPath(root, id string) string       { return filepath.Join(eventsDir(root), id+".jsonl") }
+func eventsDir(root string) string         { return filepath.Join(root, "events") }
+func archivedEventsDir(root string) string { return filepath.Join(root, "archive", "events") }
+func eventsPath(root, id string) string    { return filepath.Join(eventsDir(root), id+".jsonl") }
 func archivedEventsPath(root, id string) string {
 	return filepath.Join(archivedEventsDir(root), id+".jsonl")
 }
@@ -271,12 +280,14 @@ func releaseEventLock(path string) {
 // staleEventLock 是事件锁本地的更保守判据:严格执行"仅当(可解析&&!processAlive)或 mtime>TTL 才判 stale".
 // 【为什么内容空/不可解析且 mtime 未超 TTL 一律不判 stale】审查(CG-2 R2 concerns P1-1):即便 tmp+os.Link
 // 已消除空文件窗口, 仍必须在 TTL 全窗口豁免"内容尚不完整"的锁——理由有二:
-//   (1) 防御纵深:未来维护若把 tmp+Link 改回 O_EXCL, 空文件窗口重现, 只要 mtime<=TTL 就不强夺,
-//       就能挡"读到空内容→立即强夺"的 bootstrap 竞态回归; 1s 阈值太窄, GC/swap/系统忙时
-//       合法写者可能超 1s 才补上内容, 被误判 stale;
-//   (2) 强夺允收边界收窄至"确定持有者已死"或"锁真的过期"两条:内容可解析但 PID 进程不在,
-//       是明确的进程已死; mtime>TTL 是"任何持有者都不可能占这么久"的硬边界. 两条之外
-//       (含内容尚不完整但 mtime<=TTL 的所有情况)一律等待, 不强夺.
+//
+//	(1) 防御纵深:未来维护若把 tmp+Link 改回 O_EXCL, 空文件窗口重现, 只要 mtime<=TTL 就不强夺,
+//	    就能挡"读到空内容→立即强夺"的 bootstrap 竞态回归; 1s 阈值太窄, GC/swap/系统忙时
+//	    合法写者可能超 1s 才补上内容, 被误判 stale;
+//	(2) 强夺允收边界收窄至"确定持有者已死"或"锁真的过期"两条:内容可解析但 PID 进程不在,
+//	    是明确的进程已死; mtime>TTL 是"任何持有者都不可能占这么久"的硬边界. 两条之外
+//	    (含内容尚不完整但 mtime<=TTL 的所有情况)一律等待, 不强夺.
+//
 // 反例注入:把此处的"mtime<=TTL 不 stale"改回 1s 阈值或直接判 stale,
 // TestAcquireEventLockWaitsOnFreshEmptyLock 会报红——预置空锁+新鲜 mtime 场景会被误判强夺.
 func staleEventLock(path string, ttl time.Duration) bool {

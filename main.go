@@ -66,6 +66,8 @@ func main() {
 		err = cmdSetStatus(os.Args[2:], "retry")
 	case "cancel":
 		err = cmdSetStatus(os.Args[2:], "cancel")
+	case "admission":
+		err = cmdAdmission(os.Args[2:])
 	case "log":
 		err = cmdLog(os.Args[2:])
 	case "clean":
@@ -144,6 +146,8 @@ func printUsage() {
   hold/release <id>                # 挂起 / 恢复排队（hold 先撤销调度再监护进程）
   retry <id>                       # 失败任务重新入队（保留会话与进度）
   cancel <id>                      # 取消并归档（运行中的任务会先终止其执行进程）
+  admission pause|resume|status [-root ROOT] [-actor ACTOR] [-reason REASON]
+            全局准入闸门：pause 拒绝调度；resume 只恢复准入，不派发任务
   clean                            # 把 done/failed/canceled 归档到 archive/
 
 系统
@@ -1952,6 +1956,48 @@ func cmdSetStatus(args []string, action string) error {
 	}
 	fmt.Printf("%s -> %s\n", t.ID, zhStatus(t.Status))
 	return nil
+}
+
+func cmdAdmission(args []string) error {
+	usage := "用法: cardex admission pause|resume|status [-root ROOT] [-actor ACTOR] [-reason REASON]"
+	if len(args) < 1 {
+		return fmt.Errorf("%s", usage)
+	}
+	action := args[0]
+	switch action {
+	case "pause", "resume", "status":
+	default:
+		return fmt.Errorf("%s", usage)
+	}
+	fs := flag.NewFlagSet("admission", flag.ExitOnError)
+	rootFlag := fs.String("root", "", "数据目录")
+	actorFlag := fs.String("actor", "cli:admission", "操作者")
+	reasonFlag := fs.String("reason", action, "原因")
+	_ = fs.Parse(args[1:])
+	root := resolveRoot(*rootFlag)
+	var st admissionState
+	var err error
+	switch action {
+	case "pause":
+		st, err = setAdmissionPaused(root, true, *actorFlag, *reasonFlag)
+	case "resume":
+		st, err = setAdmissionPaused(root, false, *actorFlag, *reasonFlag)
+	case "status":
+		st, err = loadAdmissionState(root)
+	}
+	if err != nil {
+		return err
+	}
+	return printAdmissionStateJSON(st)
+}
+
+func printAdmissionStateJSON(st admissionState) error {
+	data, err := json.Marshal(st)
+	if err != nil {
+		return err
+	}
+	_, err = fmt.Println(string(data))
+	return err
 }
 
 // ---- log / clean ----

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"sync"
 	"testing"
@@ -81,6 +82,74 @@ func TestAdmissionPausePersistsAndEpochMonotonic(t *testing.T) {
 	}
 	if !admissionAllowsScheduling(root) {
 		t.Fatal("scheduling should be allowed after resume")
+	}
+}
+
+func TestAdmissionVersion1RequiresExplicitFields(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+	}{
+		{name: "version only", body: `{"version":1}`},
+		{name: "missing epoch", body: `{"version":1,"paused":false,"updated_at":"2026-01-01T00:00:00.000000000Z"}`},
+		{name: "missing paused", body: `{"version":1,"epoch":0,"updated_at":"2026-01-01T00:00:00.000000000Z"}`},
+		{name: "paused null", body: `{"version":1,"epoch":0,"paused":null,"updated_at":"2026-01-01T00:00:00.000000000Z"}`},
+		{name: "missing updated_at", body: `{"version":1,"epoch":0,"paused":false}`},
+		{name: "invalid updated_at", body: `{"version":1,"epoch":0,"paused":false,"updated_at":"not-rfc3339"}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(controlDir(root), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(admissionPath(root), []byte(tc.body+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadAdmissionState(root); err == nil {
+				t.Fatal("load should fail for incomplete version-1 admission")
+			}
+			if admissionAllowsScheduling(root) {
+				t.Fatal("incomplete version-1 admission should fail closed")
+			}
+		})
+	}
+}
+
+func TestAdmissionPauseDeniesScheduling(t *testing.T) {
+	root := t.TempDir()
+	if _, err := setAdmissionPaused(root, true, "ops", "drain"); err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	if admissionAllowsScheduling(root) {
+		t.Fatal("scheduling should be denied after durable pause")
+	}
+}
+
+func TestAdmissionIdempotentPreservesTransitionMetadata(t *testing.T) {
+	root := t.TempDir()
+	first, err := setAdmissionPaused(root, true, "ops", "drain")
+	if err != nil {
+		t.Fatalf("pause: %v", err)
+	}
+	before, err := os.ReadFile(admissionPath(root))
+	if err != nil {
+		t.Fatalf("read after first pause: %v", err)
+	}
+
+	second, err := setAdmissionPaused(root, true, "other", "again")
+	if err != nil {
+		t.Fatalf("idempotent pause: %v", err)
+	}
+	if second != first {
+		t.Fatalf("idempotent pause returned %+v, want %+v", second, first)
+	}
+	after, err := os.ReadFile(admissionPath(root))
+	if err != nil {
+		t.Fatalf("read after second pause: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("idempotent pause rewrote admission file:\nbefore=%q\nafter=%q", before, after)
 	}
 }
 

@@ -299,6 +299,9 @@ func TestHardWatchdogDeltaZeroNoQueue(t *testing.T) {
 		data, _ := os.ReadFile(logPath)
 		t.Fatalf("delta=0 must not spawn queue, log=%q", data)
 	}
+	if _, err := os.Stat(managerWakeInflightPath(root, "mgr")); !os.IsNotExist(err) {
+		t.Fatal("delta=0 with no inflight must not mint a claim")
+	}
 	metrics := loadManagerWakeMetrics(root)
 	if metrics.WatchdogSec != managerWakeWatchdogSec {
 		t.Fatalf("watchdog_sec=%d want %d", metrics.WatchdogSec, managerWakeWatchdogSec)
@@ -309,6 +312,9 @@ func TestHardWatchdogDeltaZeroNoQueue(t *testing.T) {
 	rb := managerWakeReadback(root, mw)
 	if rb["watchdog_sec"] != managerWakeWatchdogSec {
 		t.Fatalf("readback watchdog: %+v", rb)
+	}
+	if rb["queue_attempts"] != 0 {
+		t.Fatalf("delta=0 with no inflight must stay at zero model calls: %+v", rb)
 	}
 	diag := rb["diagnosis"].([]string)
 	if !containsString(diag, "watchdog_sec_rejected") {
@@ -326,29 +332,17 @@ func TestHardWatchdogDeltaZeroNoQueue(t *testing.T) {
 
 func TestAdapterRestartAndCorruption(t *testing.T) {
 	root := testRoot(t)
-	failBin, _ := fakeCodexQueueBin(t, 1)
 	okBin, okLog := fakeCodexQueueBin(t, 0)
 	thread := "22222222-2222-2222-2222-222222222222"
-	mw := testWakeCfg(failBin, "wake-proj", thread, "mgr")
-	tk := heldCommittedTask(t, root, "wake-proj", "queue fail")
-	if err := managerWakeOnce(root, mw); err == nil {
-		t.Fatal("failed queue must surface")
+	mw := testWakeCfg(okBin, "wake-proj", thread, "mgr")
+	tk := heldCommittedTask(t, root, "wake-proj", "queue ok")
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatal(err)
 	}
 	cur, _, err := loadManagerWakeCursor(root, "mgr")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cur.OutboxSeq != 0 {
-		t.Fatalf("cursor advanced on failure: %+v", cur)
-	}
-	if cur.LastErrorClass != "queue_failed" {
-		t.Fatalf("want durable queue_failed, got %+v", cur)
-	}
-	mw.CodexBin = okBin
-	if err := managerWakeOnce(root, mw); err != nil {
-		t.Fatal(err)
-	}
-	cur, _, _ = loadManagerWakeCursor(root, "mgr")
 	if cur.OutboxSeq < 1 {
 		t.Fatalf("cursor not advanced after success: %+v", cur)
 	}
@@ -920,4 +914,396 @@ func containsString(in []string, want string) bool {
 		}
 	}
 	return false
+}
+
+func fakeCodexQueueSignalBin(t *testing.T) (bin, logPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath = filepath.Join(dir, "argv.log")
+	bin = filepath.Join(dir, "codex")
+	script := "#!/bin/sh\n" +
+		"log=" + shSingleQuote(logPath) + "\n" +
+		"printf '%s\\n' \"$0\" \"$@\" >> \"$log\"\n" +
+		"kill -TERM $$\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return bin, logPath
+}
+
+func queueThreadCount(logPath string) int {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return 0
+	}
+	return strings.Count(string(data), "--thread")
+}
+
+func inflightRaw(t *testing.T, root, subID string) []byte {
+	t.Helper()
+	data, err := os.ReadFile(managerWakeInflightPath(root, subID))
+	if err != nil {
+		t.Fatalf("inflight missing: %v", err)
+	}
+	return data
+}
+
+func writeInflightRaw(t *testing.T, root, subID string, data []byte) {
+	t.Helper()
+	path := managerWakeInflightPath(root, subID)
+	if path == "" {
+		t.Fatal("inflight path rejected")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertUncertainNoRetry(t *testing.T, root string, mw *ManagerWakeConfig, logPath string, before []byte) {
+	t.Helper()
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("want delivery_uncertain, got %v", err)
+	}
+	if loadManagerWakeErrorClass(root) != "delivery_uncertain" {
+		t.Fatalf("durable class=%q", loadManagerWakeErrorClass(root))
+	}
+	got := inflightRaw(t, root, "mgr")
+	if before != nil && string(got) != string(before) {
+		t.Fatalf("inflight overwritten:\n%s\nvs\n%s", before, got)
+	}
+	cur, _, _ := loadManagerWakeCursor(root, "mgr")
+	if cur != nil && cur.OutboxSeq != 0 {
+		t.Fatalf("cursor advanced over unresolved inflight: %+v", cur)
+	}
+	firstCalls := queueThreadCount(logPath)
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("restart want delivery_uncertain, got %v", err)
+	}
+	if queueThreadCount(logPath) != firstCalls {
+		t.Fatalf("must not auto-requeue: before=%d after=%d", firstCalls, queueThreadCount(logPath))
+	}
+	metrics := loadManagerWakeMetrics(root)
+	if metrics.WatchdogSec != managerWakeWatchdogSec {
+		t.Fatalf("watchdog_sec=%d want %d", metrics.WatchdogSec, managerWakeWatchdogSec)
+	}
+	rb := managerWakeReadback(root, mw)
+	if rb["last_err_class"] != "delivery_uncertain" {
+		t.Fatalf("readback last_err_class=%v", rb["last_err_class"])
+	}
+	if rb["watchdog_sec"] != managerWakeWatchdogSec {
+		t.Fatalf("readback watchdog: %+v", rb)
+	}
+}
+
+func TestQueueNonzeroRetainsInflightNoRetry(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 1)
+	mw := testWakeCfg(bin, "wake-proj", "13131313-1313-1313-1313-131313131313", "mgr")
+	_ = heldCommittedTask(t, root, "wake-proj", "queue-nonzero")
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("nonzero queue is ambiguous success, got %v", err)
+	}
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("queue calls=%d want 1", queueThreadCount(logPath))
+	}
+	before := inflightRaw(t, root, "mgr")
+	assertUncertainNoRetry(t, root, mw, logPath, before)
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("nonzero queue retried: %d", queueThreadCount(logPath))
+	}
+}
+
+func TestQueueSignalRetainsInflightNoRetry(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueSignalBin(t)
+	mw := testWakeCfg(bin, "wake-proj", "14141414-1414-1414-1414-141414141414", "mgr")
+	_ = heldCommittedTask(t, root, "wake-proj", "queue-signal")
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("signaled queue is ambiguous success, got %v", err)
+	}
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("queue calls=%d want 1", queueThreadCount(logPath))
+	}
+	before := inflightRaw(t, root, "mgr")
+	assertUncertainNoRetry(t, root, mw, logPath, before)
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("signal queue retried: %d", queueThreadCount(logPath))
+	}
+}
+
+func TestQueueTimeoutRetainsInflightNoRetry(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	mw := testWakeCfg(bin, "wake-proj", "15151515-1515-1515-1515-151515151515", "mgr")
+	_ = heldCommittedTask(t, root, "wake-proj", "queue-timeout")
+	var calls int
+	orig := managerWakeQueue
+	t.Cleanup(func() { managerWakeQueue = orig })
+	managerWakeQueue = func(bin, thread, message string) error {
+		calls++
+		return fmt.Errorf("queue_timeout")
+	}
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("timed-out queue is ambiguous success, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("queue calls=%d want 1", calls)
+	}
+	before := inflightRaw(t, root, "mgr")
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("restart want delivery_uncertain, got %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("timeout queue retried: calls=%d", calls)
+	}
+	if string(inflightRaw(t, root, "mgr")) != string(before) {
+		t.Fatal("timeout must retain inflight")
+	}
+	rb := managerWakeReadback(root, mw)
+	if rb["last_err_class"] != "delivery_uncertain" {
+		t.Fatalf("readback last_err_class=%v", rb["last_err_class"])
+	}
+}
+
+func TestPreSpawnInflightCrashDeltaZeroFailClosed(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "16161616-1616-1616-1616-161616161616"
+	mw := testWakeCfg(bin, "wake-proj", thread, "mgr")
+	rec := managerWakeInflight{
+		Schema:         inflightSchemaV1,
+		SubscriptionID: "mgr",
+		ThreadID:       thread,
+		WakeEventIDs:   []string{"pre-spawn:1:tid"},
+		UpdatedAt:      "2026-01-01T00:00:00Z",
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeInflightRaw(t, root, "mgr", append(data, '\n'))
+	before := inflightRaw(t, root, "mgr")
+	assertUncertainNoRetry(t, root, mw, logPath, before)
+	if queueThreadCount(logPath) != 0 {
+		t.Fatal("pre-spawn claim must not spawn on delta=0")
+	}
+	metrics := loadManagerWakeMetrics(root)
+	if metrics.QueueAttempts != 0 {
+		t.Fatalf("delta=0 with unresolved inflight must not queue: %+v", metrics)
+	}
+}
+
+func TestPreSpawnInflightCrashStaleScanFailClosed(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "17171717-1717-1717-1717-171717171717"
+	mw := testWakeCfg(bin, "wake-proj", thread, "mgr")
+	tk := heldCommittedTask(t, root, "wake-proj", "pre-spawn-stale")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+	if err := saveManagerWakeInflight(root, "mgr", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSetStatus([]string{"-root", root, tk.ID}, "release"); err != nil {
+		t.Fatal(err)
+	}
+	before := inflightRaw(t, root, "mgr")
+	assertUncertainNoRetry(t, root, mw, logPath, before)
+	if queueThreadCount(logPath) != 0 {
+		data, _ := os.ReadFile(logPath)
+		t.Fatalf("stale scan must not queue or overwrite inflight: %s", data)
+	}
+}
+
+func TestInflightRecordsFailClosedNoRetry(t *testing.T) {
+	thread := "18181818-1818-1818-1818-181818181818"
+	otherThread := "19191919-1919-1919-1919-191919191919"
+	cases := []struct {
+		name     string
+		raw      string
+		receipts []string
+	}{
+		{
+			name: "empty",
+			raw: `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "mgr",
+  "thread_id": "` + thread + `",
+  "wake_event_ids": [],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`,
+		},
+		{
+			name: "mismatched_subscription_id",
+			raw: `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "other",
+  "thread_id": "` + thread + `",
+  "wake_event_ids": ["forged:1:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`,
+		},
+		{
+			name: "mismatched_thread_id",
+			raw: `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "mgr",
+  "thread_id": "` + otherThread + `",
+  "wake_event_ids": ["forged:1:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`,
+		},
+		{
+			name: "tampered_schema",
+			raw: `{
+  "schema": "cardex.manager_wake.inflight.v0",
+  "subscription_id": "mgr",
+  "thread_id": "` + thread + `",
+  "wake_event_ids": ["forged:1:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`,
+		},
+		{
+			name: "tampered_unknown_field",
+			raw: `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "mgr",
+  "thread_id": "` + thread + `",
+  "wake_event_ids": ["forged:1:tid"],
+  "injected": true,
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`,
+		},
+		{
+			name: "duplicate_ids",
+			raw: `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "mgr",
+  "thread_id": "` + thread + `",
+  "wake_event_ids": ["dup:1:tid", "dup:1:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`,
+		},
+		{
+			name: "partial_receipts",
+			raw: `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "mgr",
+  "thread_id": "` + thread + `",
+  "wake_event_ids": ["keep:1:tid", "drop:2:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`,
+			receipts: []string{"keep:1:tid"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			bin, logPath := fakeCodexQueueBin(t, 0)
+			mw := testWakeCfg(bin, "wake-proj", thread, "mgr")
+			_ = heldCommittedTask(t, root, "wake-proj", "inflight-"+tc.name)
+			writeInflightRaw(t, root, "mgr", []byte(tc.raw))
+			if len(tc.receipts) > 0 {
+				rec := managerWakeReceipt{
+					Schema:         receiptSchemaV1,
+					SubscriptionID: "mgr",
+					WakeEventIDs:   tc.receipts,
+					UpdatedAt:      "2026-01-01T00:00:00Z",
+				}
+				data, err := json.MarshalIndent(rec, "", "  ")
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := managerWakeReceiptPath(root, "mgr")
+				if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, append(data, '\n'), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			before := inflightRaw(t, root, "mgr")
+			assertUncertainNoRetry(t, root, mw, logPath, before)
+			if queueThreadCount(logPath) != 0 {
+				data, _ := os.ReadFile(logPath)
+				t.Fatalf("%s spawned queue: %s", tc.name, data)
+			}
+		})
+	}
+}
+
+func TestInflightDirectoryDurability(t *testing.T) {
+	thread := "1a1a1a1a-1a1a-1a1a-1a1a-1a1a1a1a1a1a"
+	t.Run("create_syncs_inflight_and_manager_wake_parent", func(t *testing.T) {
+		root := testRoot(t)
+		var synced []string
+		orig := syncDirAfterRename
+		t.Cleanup(func() { syncDirAfterRename = orig })
+		syncDirAfterRename = func(dir string) error {
+			synced = append(synced, dir)
+			return orig(dir)
+		}
+		if err := saveManagerWakeInflight(root, "mgr", thread, []managerWakeOutboxRow{{WakeEventID: "dur:1:tid"}}, 1); err != nil {
+			t.Fatal(err)
+		}
+		if !containsString(synced, managerWakeInflightDir(root)) {
+			t.Fatalf("inflight dir not synced: %v", synced)
+		}
+		if !containsString(synced, managerWakeDir(root)) {
+			t.Fatalf("manager-wake parent not synced: %v", synced)
+		}
+	})
+	t.Run("unlink_syncs_containing_dir", func(t *testing.T) {
+		root := testRoot(t)
+		if err := saveManagerWakeInflight(root, "mgr", thread, []managerWakeOutboxRow{{WakeEventID: "dur:1:tid"}}, 1); err != nil {
+			t.Fatal(err)
+		}
+		var synced []string
+		orig := syncDirAfterRename
+		t.Cleanup(func() { syncDirAfterRename = orig })
+		syncDirAfterRename = func(dir string) error {
+			synced = append(synced, dir)
+			return orig(dir)
+		}
+		if err := clearManagerWakeInflight(root, "mgr"); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(managerWakeInflightPath(root, "mgr")); !os.IsNotExist(err) {
+			t.Fatal("inflight file must be unlinked")
+		}
+		if !containsString(synced, managerWakeInflightDir(root)) {
+			t.Fatalf("unlink did not sync inflight dir: %v", synced)
+		}
+	})
+	t.Run("parent_sync_failure_blocks_claim_and_queue", func(t *testing.T) {
+		root := testRoot(t)
+		bin, logPath := fakeCodexQueueBin(t, 0)
+		mw := testWakeCfg(bin, "wake-proj", thread, "mgr")
+		_ = heldCommittedTask(t, root, "wake-proj", "dir-sync-fail")
+		orig := syncDirAfterRename
+		t.Cleanup(func() { syncDirAfterRename = orig })
+		syncDirAfterRename = func(dir string) error {
+			if dir == managerWakeDir(root) {
+				return fmt.Errorf("injected_parent_dir_sync_failure")
+			}
+			return orig(dir)
+		}
+		if err := managerWakeOnce(root, mw); err == nil {
+			t.Fatal("parent dir sync failure must block the inflight claim")
+		}
+		if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+			data, _ := os.ReadFile(logPath)
+			t.Fatalf("must not queue after inflight dir durability failure: %s", data)
+		}
+	})
 }

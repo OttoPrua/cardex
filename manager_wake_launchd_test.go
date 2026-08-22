@@ -233,6 +233,54 @@ func TestInstallManagerWakeLoadFailureRemovesNewPlistWhenNoPrior(t *testing.T) {
 	}
 }
 
+func TestUninstallManagerWakeUnloadFailureSurfaces(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	if err := os.WriteFile(pp, []byte("PLIST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withIsolatedManagerWakeLaunchd(t, pp)
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) > 0 && args[0] == "unload" {
+			return fmt.Errorf("boom")
+		}
+		return nil
+	}
+	if err := uninstallManagerWakeLaunchd(); err == nil {
+		t.Fatal("unload failure must surface")
+	} else if err.Error() != "launchctl_unload_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := os.Stat(pp); err != nil {
+		t.Fatalf("failed unload must not unlink plist: %v", err)
+	}
+}
+
+func TestUninstallManagerWakeDurablePlistUnlink(t *testing.T) {
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	if err := os.WriteFile(pp, []byte("PLIST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withIsolatedManagerWakeLaunchd(t, pp)
+	managerWakeLaunchctlRun = func(args ...string) error { return nil }
+	var synced []string
+	orig := syncDirAfterRename
+	t.Cleanup(func() { syncDirAfterRename = orig })
+	syncDirAfterRename = func(d string) error {
+		synced = append(synced, d)
+		return orig(d)
+	}
+	if err := uninstallManagerWakeLaunchd(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(pp); !os.IsNotExist(err) {
+		t.Fatalf("plist must be unlinked: %v", err)
+	}
+	if !containsString(synced, dir) {
+		t.Fatalf("plist unlink must sync containing dir: %v", synced)
+	}
+}
+
 func TestInstallManagerWakeSuccessDurablePlist(t *testing.T) {
 	root := testRoot(t)
 	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")

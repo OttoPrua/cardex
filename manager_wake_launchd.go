@@ -185,10 +185,7 @@ func restoreManagerWakeLaunchd(pp string, prior []byte, priorOK bool) error {
 		return nil
 	}
 	_ = managerWakeLaunchctlRun("unload", pp)
-	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
-		return err
-	}
-	return nil
+	return durableUnlinkFile(pp)
 }
 
 func resolveManagerWakeExecutable() (string, error) {
@@ -250,8 +247,16 @@ func uninstallManagerWakeLaunchd() error {
 	if pp == "" {
 		return fmt.Errorf("launchd_path_unresolved")
 	}
-	_ = managerWakeLaunchctlRun("unload", pp)
-	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
+	if _, err := os.Stat(pp); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := managerWakeLaunchctlRun("unload", pp); err != nil {
+		return fmt.Errorf("launchctl_unload_failed")
+	}
+	if err := durableUnlinkFile(pp); err != nil {
 		return err
 	}
 	fmt.Println("已卸载 manager-wake launchd:", pp)

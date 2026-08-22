@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func fakeCodexQueueBin(t *testing.T, exit int) (bin, logPath string) {
@@ -1031,6 +1032,134 @@ func TestQueueSignalRetainsInflightNoRetry(t *testing.T) {
 	assertUncertainNoRetry(t, root, mw, logPath, before)
 	if queueThreadCount(logPath) != 1 {
 		t.Fatalf("signal queue retried: %d", queueThreadCount(logPath))
+	}
+}
+
+func fakeCodexQueueHangBin(t *testing.T) (bin, logPath, startedPath, pidPath, descPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath = filepath.Join(dir, "argv.log")
+	startedPath = filepath.Join(dir, "started")
+	pidPath = filepath.Join(dir, "pid")
+	descPath = filepath.Join(dir, "desc")
+	bin = filepath.Join(dir, "codex")
+	script := "#!/bin/sh\n" +
+		"started=" + shSingleQuote(startedPath) + "\n" +
+		"pidfile=" + shSingleQuote(pidPath) + "\n" +
+		"descfile=" + shSingleQuote(descPath) + "\n" +
+		"log=" + shSingleQuote(logPath) + "\n" +
+		"echo $$ > \"$pidfile\"\n" +
+		"sleep 3600 &\n" +
+		"echo $! > \"$descfile\"\n" +
+		": > \"$started\"\n" +
+		"printf '%s\\n' \"$0\" \"$@\" >> \"$log\"\n" +
+		"trap '' TERM INT\n" +
+		"wait\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if data, err := os.ReadFile(pidPath); err == nil {
+			if pid, convErr := strconv.Atoi(strings.TrimSpace(string(data))); convErr == nil && pid > 0 {
+				_ = killProcGroup(pid)
+			}
+		}
+	})
+	return bin, logPath, startedPath, pidPath, descPath
+}
+
+func readPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("pid in %s: %q", path, data)
+	}
+	return pid
+}
+
+func waitGone(t *testing.T, pid int, d time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(d)
+	for processAlive(pid) || processGroupAlive(pid) {
+		if !time.Now().Before(deadline) {
+			t.Fatalf("pid %d still alive after %s", pid, d)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestDefaultManagerWakeQueueHungChildDeadlineRetainsInflight(t *testing.T) {
+	origTimeout := managerWakeQueueTimeout
+	t.Cleanup(func() { managerWakeQueueTimeout = origTimeout })
+	managerWakeQueueTimeout = 2 * time.Second
+
+	bin, logPath, startedPath, pidPath, descPath := fakeCodexQueueHangBin(t)
+	msg := "cardex-wake v1 n=1 high_water=1 sub=mgr\n" +
+		"t1 type=held project=p status=held reason=user_hold transition=tid wake=t1:1:tid"
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- defaultManagerWakeQueue(bin, "15151515-1515-1515-1515-151515151515", msg)
+	}()
+	startedDeadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		}
+		select {
+		case runErr := <-errCh:
+			dump := ""
+			if data, err := os.ReadFile(logPath); err == nil {
+				dump = string(data)
+			}
+			entries, _ := os.ReadDir(filepath.Dir(startedPath))
+			names := make([]string, 0, len(entries))
+			for _, e := range entries {
+				names = append(names, e.Name())
+			}
+			t.Fatalf("queue returned before child started: %v log=%q files=%v", runErr, dump, names)
+		default:
+		}
+		if !time.Now().Before(startedDeadline) {
+			t.Fatalf("timed out waiting for %s", startedPath)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	leader := readPIDFile(t, pidPath)
+	desc := readPIDFile(t, descPath)
+	startedAt := time.Now()
+	var runErr error
+	select {
+	case runErr = <-errCh:
+	case <-time.After(5 * time.Second):
+		t.Fatal("defaultManagerWakeQueue hung past the test deadline")
+	}
+	elapsed := time.Since(startedAt)
+	if runErr == nil {
+		t.Fatal("hung queue must return an error")
+	}
+	if elapsed > 5*time.Second {
+		t.Fatalf("queue return was unbounded: %s", elapsed)
+	}
+	waitGone(t, leader, 2*time.Second)
+	waitGone(t, desc, 2*time.Second)
+
+	root := testRoot(t)
+	mw := testWakeCfg(bin, "wake-proj", "15151515-1515-1515-1515-151515151515", "mgr")
+	_ = heldCommittedTask(t, root, "wake-proj", "queue-timeout-prod")
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("timed-out production queue is ambiguous success, got %v", err)
+	}
+	if queueThreadCount(logPath) != 2 {
+		t.Fatalf("queue calls=%d want 2 (direct + once)", queueThreadCount(logPath))
+	}
+	before := inflightRaw(t, root, "mgr")
+	assertUncertainNoRetry(t, root, mw, logPath, before)
+	if queueThreadCount(logPath) != 2 {
+		t.Fatalf("timeout queue retried: %d", queueThreadCount(logPath))
 	}
 }
 

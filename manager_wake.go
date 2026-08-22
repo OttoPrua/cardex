@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,12 +16,13 @@ import (
 )
 
 const (
-	managerWakeWatchdogSec = 1200
-	outboxSchemaV1         = "cardex.manager_wake.outbox.v1"
-	cursorSchemaV1         = "cardex.manager_wake.cursor.v1"
-	errorSchemaV1          = "cardex.manager_wake.error.v1"
-	receiptSchemaV1        = "cardex.manager_wake.receipt.v1"
-	inflightSchemaV1       = "cardex.manager_wake.inflight.v1"
+	managerWakeWatchdogSec     = 1200
+	managerWakeQueueTimeoutSec = 90
+	outboxSchemaV1             = "cardex.manager_wake.outbox.v1"
+	cursorSchemaV1             = "cardex.manager_wake.cursor.v1"
+	errorSchemaV1              = "cardex.manager_wake.error.v1"
+	receiptSchemaV1            = "cardex.manager_wake.receipt.v1"
+	inflightSchemaV1           = "cardex.manager_wake.inflight.v1"
 )
 
 // ManagerWakeSubscription is a closed, scoped delivery target. IDs must be
@@ -50,6 +52,9 @@ var (
 	managerWakeSubIDRE  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	managerWakeReasonRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	managerWakeQueue    = defaultManagerWakeQueue
+	// managerWakeQueueTimeout is the production enqueue deadline. Tests may
+	// shrink it; it must stay well below managerWakeWatchdogSec.
+	managerWakeQueueTimeout = time.Duration(managerWakeQueueTimeoutSec) * time.Second
 	// managerWakeCommitCursor is the post-queue ack. Tests inject a one-shot
 	// save failure to prove receipts suppress a second queue spawn.
 	managerWakeCommitCursor = saveManagerWakeCursor
@@ -1097,8 +1102,11 @@ func defaultManagerWakeQueue(bin, thread, message string) error {
 		return fmt.Errorf("queue_idempotency_unsupported")
 	}
 	args := managerWakeQueueArgv(bin, thread, message)
-	cmd := exec.Command(args[0], args[1:]...)
+	ctx, cancel := context.WithTimeout(context.Background(), managerWakeQueueTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Stdin = nil
+	setupProcGroup(cmd)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("queue_failed")
 	}

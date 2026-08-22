@@ -669,6 +669,7 @@ func commitTaskTransitionLocked(root string, t *Task, req transitionRequest) err
 	if err := writeTransition(root, journal); err != nil {
 		return err
 	}
+	projectWakeAfterCommitted(root, t, tid)
 	return nil
 }
 
@@ -731,6 +732,7 @@ func projectCommittedTerminalLocked(root string, t *Task, req transitionRequest,
 	if err := recordLiveTransitionEventOnce(root, t, req, journal, closingAttemptID); err != nil {
 		return err
 	}
+	projectWakeAfterCommitted(root, t, journal.TransitionID)
 	return crashTransitionIf(transitionCrashAfterEventProjection)
 }
 
@@ -1422,6 +1424,9 @@ func finishTransitionRecordLocked(root string, rec *TransitionRecord) error {
 	}
 	if !isTerminalTransitionStatus(rec.Status) {
 		if rec.State == transitionCommitted {
+			if t, lerr := loadTaskOrArchived(root, rec.TaskID); lerr == nil {
+				projectWakeAfterCommitted(root, t, rec.TransitionID)
+			}
 			if transitionRecordClosesAttempt(rec) {
 				return ensureAttemptClosedForTransition(root, rec)
 			}
@@ -1502,6 +1507,7 @@ func projectCommittedTerminalFromRecordLocked(root string, rec *TransitionRecord
 	if err := recordRecoveredTransitionEvent(root, rec, t); err != nil {
 		return err
 	}
+	projectWakeAfterCommitted(root, t, rec.TransitionID)
 	return nil
 }
 
@@ -1535,7 +1541,11 @@ func finishPreparedNonterminal(root string, rec *TransitionRecord) error {
 		return err
 	}
 	rec.State = transitionCommitted
-	return writeTransition(root, rec)
+	if err := writeTransition(root, rec); err != nil {
+		return err
+	}
+	projectWakeAfterCommitted(root, t, rec.TransitionID)
+	return nil
 }
 
 func finishPreparedTransition(root string, rec *TransitionRecord) {

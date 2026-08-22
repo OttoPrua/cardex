@@ -8,10 +8,11 @@ import (
 )
 
 var (
-	errDAGMalformedID       = errors.New("dependency dag malformed identifier")
-	errDAGDuplicateNode     = errors.New("dependency dag duplicate node")
-	errDAGCycle             = errors.New("dependency dag cycle")
-	errDAGMissingDependency = errors.New("dependency dag missing dependency")
+	errDAGMalformedID          = errors.New("dependency dag malformed identifier")
+	errDAGDuplicateNode        = errors.New("dependency dag duplicate node")
+	errDAGCycle                = errors.New("dependency dag cycle")
+	errDAGMissingDependency    = errors.New("dependency dag missing dependency")
+	errDAGUnknownDomainBinding = errors.New("dependency dag unknown domain binding")
 )
 
 // DependencyNode is one closed DAG vertex. Lineage is required integration
@@ -134,6 +135,27 @@ func AnalyzeDependencyDAG(nodes []DependencyNode) (DAGDiagnosis, error) {
 	}
 
 	return DAGDiagnosis{Ready: ready}, nil
+}
+
+// BindDependencyDomains fail-closes when a node names a DomainID that is not
+// the exact identifier of a provided write domain. Empty DomainID is unbound.
+func BindDependencyDomains(nodes []DependencyNode, domains []WriteDomain) error {
+	known := map[string]bool{}
+	for _, d := range domains {
+		if !validIntegrationID(d.ID) {
+			return fmt.Errorf("%w: %s", errDAGUnknownDomainBinding, d.ID)
+		}
+		known[d.ID] = true
+	}
+	for _, n := range nodes {
+		if n.DomainID == "" {
+			continue
+		}
+		if !known[n.DomainID] {
+			return fmt.Errorf("%w: %s", errDAGUnknownDomainBinding, n.DomainID)
+		}
+	}
+	return nil
 }
 
 func validateDependencyNode(n DependencyNode) error {

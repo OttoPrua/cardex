@@ -68,6 +68,8 @@ func main() {
 		err = cmdSetStatus(os.Args[2:], "cancel")
 	case "admission":
 		err = cmdAdmission(os.Args[2:])
+	case "manager-wake":
+		err = cmdManagerWake(os.Args[2:])
 	case "log":
 		err = cmdLog(os.Args[2:])
 	case "clean":
@@ -110,10 +112,13 @@ func printUsage() {
 	          [-route-class general|backend] [-risk-class ordinary|high-risk|critical|production]
 	          [-quality-sensitive] [-specialized-frontend] [-owner-critical-bypass-reason REASON]
             [-stakes low|normal|high] [-review-after] [-emit] [-hold] [-skip-permissions]
-            [-tools "A,B"] "prompt..."
+            [-tools "A,B"] [-write-domain-id ID] [-write-domain-lineage L]
+            [-write-domain-component C] [-write-paths p1,p2] [-write-resources kind:id]
+            [-depends-on TASK_ID] "prompt..."
             -file 中用单独一行 --- 分隔多个步骤（预设 prompt 序列）
             -stakes 查 config.stakes_policy 决定复核深度（low 不配复审 / high 强制复审+抬思考档），
                     入队即固化到卡面，运行期不再回查
+            显式 write-domain 只互斥重叠路径/资源；未声明写域的写卡仍按整目录串行
   assemble  [-dir D] [-priority N] [-model M] [-session S] "目标描述"
             prompt 装配：调研后产出任务序列并自动入队；-session 挂到既有装配角色会话
   review    [-dir D] [-priority N] [-model M] [-session S] ["关注点"]
@@ -148,6 +153,8 @@ func printUsage() {
   cancel <id>                      # 取消并归档（运行中的任务会先终止其执行进程）
   admission pause|resume|status [-root ROOT] [-actor ACTOR] [-reason REASON]
             全局准入闸门：pause 拒绝调度；resume 只恢复准入，不派发任务
+  manager-wake once|status|install|uninstall [-root ROOT]
+            管理卡唤醒：默认关闭；WatchPaths 即时唤醒，StartInterval=1200 仅作丢事件看门狗
   clean                            # 把 done/failed/canceled 归档到 archive/
 
 系统
@@ -253,6 +260,12 @@ func cmdAdd(args []string) error {
 	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
 	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
 	reviewSync := fs.String("review-sync", "", "派审核卡前本地执行的同步命令（sh -c，如把改动 rsync 到审核主机）；失败则回退本地审核")
+	writeDomainID := fs.String("write-domain-id", "", "显式写域 ID（与 lineage/component/paths 成套）")
+	writeDomainLineage := fs.String("write-domain-lineage", "", "显式写域谱系（同一谱系同时只允许一个写者）")
+	writeDomainComponent := fs.String("write-domain-component", "", "显式写域组件（同组件互斥路径仍可并行）")
+	writePaths := fs.String("write-paths", "", "逗号分隔的仓相对写路径")
+	writeResources := fs.String("write-resources", "", "逗号分隔的封闭资源 kind:id")
+	dependsOn := fs.String("depends-on", "", "逗号分隔的前置任务 ID；仅 durably done 才算满足")
 	_ = fs.Parse(args)
 
 	root := resolveRoot(*rootFlag)
@@ -482,6 +495,12 @@ func cmdAdd(args []string) error {
 	t.ReviewHost = *reviewHost
 	t.ReviewDir = *reviewDir
 	t.ReviewSync = *reviewSync
+	if err := applyTaskWriteDomain(t, *writeDomainID, *writeDomainLineage, *writeDomainComponent, *writePaths, *writeResources); err != nil {
+		return err
+	}
+	if err := applyTaskDependsOn(t, *dependsOn); err != nil {
+		return err
+	}
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
@@ -1962,6 +1981,50 @@ func cmdSetStatus(args []string, action string) error {
 	return nil
 }
 
+func cmdManagerWake(args []string) error {
+	usage := "用法: cardex manager-wake once|status|install|uninstall [-root ROOT]"
+	if len(args) < 1 {
+		return fmt.Errorf("%s", usage)
+	}
+	action := args[0]
+	switch action {
+	case "once", "status", "install", "uninstall":
+	default:
+		return fmt.Errorf("%s", usage)
+	}
+	fs := flag.NewFlagSet("manager-wake", flag.ExitOnError)
+	rootFlag := fs.String("root", "", "数据目录")
+	_ = fs.Parse(args[1:])
+	if fs.NArg() > 0 {
+		return fmt.Errorf("manager-wake %s: unexpected arguments %q", action, strings.Join(fs.Args(), " "))
+	}
+	root := resolveRoot(*rootFlag)
+	switch action {
+	case "uninstall":
+		return uninstallManagerWakeLaunchd()
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	mw := managerWakeFromConfig(cfg)
+	switch action {
+	case "once":
+		return managerWakeOnce(root, mw)
+	case "status":
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(managerWakeReadback(root, mw))
+	case "install":
+		if issues := managerWakeConfigBlocking(root, mw); len(issues) > 0 {
+			return fmt.Errorf("%s", strings.Join(issues, ","))
+		}
+		return installManagerWakeLaunchd(root, mw)
+	default:
+		return fmt.Errorf("%s", usage)
+	}
+}
+
 func cmdAdmission(args []string) error {
 	usage := "用法: cardex admission pause|resume|status [-root ROOT] [-actor ACTOR] [-reason REASON]"
 	if len(args) < 1 {
@@ -2270,6 +2333,32 @@ func cmdDoctor(args []string) error {
 		}
 		fmt.Printf("  - 任务: %d 排队, %d 限额暂停, %d 运行中, %d 完成, %d 失败\n",
 			counts[statusQueued], counts[statusLimitPaused], counts[statusRunning], counts[statusDone], counts[statusFailed])
+	}
+	if cfg != nil {
+		mw := managerWakeFromConfig(cfg)
+		rb := managerWakeReadback(root, mw)
+		diag, _ := rb["diagnosis"].([]string)
+		if !managerWakeEnabled(mw) {
+			fmt.Println("  - manager-wake 未启用")
+		} else if issues := managerWakeConfigBlocking(root, mw); len(issues) > 0 {
+			check("manager-wake 配置", fmt.Errorf("%s", strings.Join(issues, ",")),
+				"修正 config.json 的 manager_wake 后重试；enabled 不完整时 fail closed")
+		} else {
+			fmt.Printf("  ✔ manager-wake（watchdog=%v, pending=%v）\n", rb["watchdog_sec"], rb["pending"])
+		}
+		if last, _ := rb["last_err_class"].(string); last != "" {
+			fmt.Printf("  - manager-wake last_err_class=%s\n", last)
+		}
+		for _, d := range diag {
+			if d == "" || d == "manager_wake_disabled" {
+				continue
+			}
+			fmt.Printf("  - manager-wake diagnosis=%s\n", d)
+		}
+		lane := NewMultiLaneMetrics().Snapshot()
+		if MultiLaneTriggersModelWork(lane) {
+			check("multilane metrics", fmt.Errorf("model work"), "counts-only observer must never start a model turn")
+		}
 	}
 	if !ok {
 		return fmt.Errorf("存在需要处理的问题")

@@ -58,6 +58,111 @@ func heldCommittedTask(t *testing.T, root, project, title string) *Task {
 	return fresh
 }
 
+func countWakeRows(t *testing.T, root string) []managerWakeOutboxRow {
+	t.Helper()
+	rows, class, err := loadManagerWakeOutbox(root)
+	if err != nil || class != "" {
+		t.Fatalf("outbox load: class=%q err=%v", class, err)
+	}
+	return rows
+}
+
+func TestProductionCommittedTransitionWakeSeam(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	writeWakeConfig(t, root, bin, "wake-proj", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "mgr", true)
+	cfg := testCfg()
+
+	queued := newTask(root, cfg, typeSequence, "queued no wake", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, queued); err != nil {
+		t.Fatal(err)
+	}
+	emitTaskEvent(root, queued.ID, evHeld, "runner", statusHeld, queued.Step, map[string]any{"reason": "unjournaled"})
+	if rows := countWakeRows(t, root); len(rows) != 0 {
+		t.Fatalf("unjournaled event emitted wake rows: %+v", rows)
+	}
+
+	prepared := newTask(root, cfg, typeSequence, "prepared no wake", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, prepared); err != nil {
+		t.Fatal(err)
+	}
+	tid := newTransitionID()
+	rec := &TransitionRecord{
+		TransitionID:     tid,
+		TaskID:           prepared.ID,
+		ExpectedRevision: prepared.Revision,
+		NewRevision:      prepared.Revision + 1,
+		EventType:        evHeld,
+		Status:           statusHeld,
+		Actor:            "cli:hold",
+		State:            transitionPrepared,
+		CreatedAt:        time.Now().Format(time.RFC3339Nano),
+	}
+	if err := writeTransition(root, rec); err != nil {
+		t.Fatal(err)
+	}
+	fake := TaskEvent{Type: evHeld, Status: statusHeld, Seq: 1, TransitionID: tid}
+	if err := appendManagerWakeFromCommitted(root, prepared, fake); err != nil {
+		t.Fatal(err)
+	}
+	if rows := countWakeRows(t, root); len(rows) != 0 {
+		t.Fatalf("prepared transition emitted wake rows: %+v", rows)
+	}
+
+	held := newTask(root, cfg, typeSequence, "committed held wake", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, held); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSetStatus([]string{"-root", root, held.ID}, "hold"); err != nil {
+		t.Fatal(err)
+	}
+	heldRows := countWakeRows(t, root)
+	if len(heldRows) != 1 || heldRows[0].EventType != evHeld || heldRows[0].TaskID != held.ID {
+		t.Fatalf("committed held must emit exactly one wake row, got %+v", heldRows)
+	}
+	if err := cmdSetStatus([]string{"-root", root, held.ID}, "hold"); err != nil {
+		t.Fatal(err)
+	}
+	if rows := countWakeRows(t, root); len(rows) != 1 {
+		t.Fatalf("duplicate committed held must stay one row, got %+v", rows)
+	}
+
+	owner := newTask(root, cfg, typeSequence, "committed needs-owner wake", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, owner); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := commitTaskTransition(root, fresh, transitionRequest{
+		EventType:  evNeedsOwner,
+		Actor:      "runner",
+		Status:     fresh.Status,
+		Step:       fresh.Step,
+		Detail:     map[string]any{"reason": "custody_timeout", "reason_class": "needs_owner"},
+		NeedsOwner: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	rows := countWakeRows(t, root)
+	ownerRows := 0
+	heldStill := 0
+	for _, row := range rows {
+		switch {
+		case row.TaskID == owner.ID && row.EventType == evNeedsOwner:
+			ownerRows++
+		case row.TaskID == held.ID && row.EventType == evHeld:
+			heldStill++
+		default:
+			t.Fatalf("unexpected wake row: %+v", row)
+		}
+	}
+	if ownerRows != 1 || heldStill != 1 {
+		t.Fatalf("committed needs-owner must add exactly one row beside held, got owner=%d held=%d rows=%+v", ownerRows, heldStill, rows)
+	}
+}
+
 func TestCrashWindowWakeDedupeDeterministicIdentity(t *testing.T) {
 	root := testRoot(t)
 	cfg := testCfg()
@@ -152,12 +257,21 @@ func TestStaleNeedsOwnerSupersededByCommittedTerminal(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	currentHeld := 0
 	for _, row := range rows {
-		if row.EventType == evNeedsOwner {
-			t.Fatalf("stale needs_owner must not remain current in outbox: %+v", rows)
+		tk, _ := findTaskAnywhere(root, row.TaskID)
+		rebuilt, kind := bindCommittedWakeRow(root, tk, row)
+		if kind != wakeBindOK {
+			continue
+		}
+		if rebuilt.EventType == evNeedsOwner {
+			t.Fatalf("stale needs_owner must not remain current: %+v", rebuilt)
+		}
+		if rebuilt.EventType == evHeld {
+			currentHeld++
 		}
 	}
-	if len(rows) != 1 || rows[0].EventType != evHeld {
+	if currentHeld != 1 {
 		t.Fatalf("want current held projection, got %+v", rows)
 	}
 	data, err := os.ReadFile(logPath)

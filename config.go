@@ -320,6 +320,11 @@ type Config struct {
 	// 远端 codex 复审受同键控制:默认放开为 workspace-write(远端镜像本身已是 sync-lane
 	// 分发的隔离副本,原仓保护语义等价);"readonly" 时仍强制 read-only。
 	CodexReviewSandbox string `json:"codex_review_sandbox,omitempty"`
+
+	// ManagerWake is disabled by default. Enabled incomplete configuration fails
+	// closed at delivery/install and is visible in doctor/readback; it never
+	// authorizes a management model turn on its own.
+	ManagerWake *ManagerWakeConfig `json:"manager_wake,omitempty"`
 }
 
 // StakesRule 是一个 stakes 档位的复核深度规则（config.stakes_policy 的值）。

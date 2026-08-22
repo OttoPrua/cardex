@@ -163,7 +163,9 @@ type TaskBrief struct {
 	// KindSource 交代这次判定靠什么得出（review_of / fix_round / type / title / override / default）。
 	// 必须与 Kind 成对出现：结构信号是盘上事实、标题关键词是猜的，
 	// 只发 kind 会让两者在界面上长得一模一样，等于把猜测伪装成事实。
-	KindSource string `json:"kind_source"`
+	KindSource  string       `json:"kind_source"`
+	WriteDomain *WriteDomain `json:"write_domain,omitempty"`
+	DependsOn   []string     `json:"depends_on,omitempty"`
 }
 
 // TaskDetail 是 TaskBrief 加上单项目页才需要的重字段（prompt 摘录等）。
@@ -1410,6 +1412,8 @@ func toBrief(cfg *Config, t *Task, now time.Time) TaskBrief {
 		XRole:                     t.XRole,
 		RemoteHost:                t.RemoteHost,
 		BlockedReason:             blockedReason(t),
+		WriteDomain:               secretFreeWriteDomain(t.WriteDomain),
+		DependsOn:                 append([]string{}, t.DependsOn...),
 	}
 	if t.Status == statusRunning {
 		if ts, ok := parseRFC3339(t.UpdatedAt); ok {

@@ -299,6 +299,12 @@ type Task struct {
 	ActiveAttemptID           string `json:"active_attempt_id,omitempty"`
 	LastCommittedTransitionID string `json:"last_committed_transition_id,omitempty"`
 	ControlState              string `json:"control_state,omitempty"`
+
+	// WriteDomain is an explicit, omitempty claim of repository-relative paths and
+	// closed resources. Absent claims keep legacy whole-directory writer exclusivity.
+	WriteDomain *WriteDomain `json:"write_domain,omitempty"`
+	// DependsOn lists other task IDs that must be durably done before this task is Ready.
+	DependsOn []string `json:"depends_on,omitempty"`
 }
 
 func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }

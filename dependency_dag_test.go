@@ -154,3 +154,21 @@ func TestAnalyzeDependencyDAGRejectsMalformedAndDuplicateIdentifiers(t *testing.
 		})
 	}
 }
+
+func TestBindDependencyDomainsFailClosedOnUnknownDomain(t *testing.T) {
+	nodes := []DependencyNode{
+		{ID: "auth-tokens", Lineage: "auth-tokens-lineage", DomainID: "auth-tokens"},
+		{ID: "docs", Lineage: "docs-lineage"},
+	}
+	domains := []WriteDomain{{ID: "auth-tokens", Lineage: "auth-tokens-lineage", Component: "auth", Paths: []string{"internal/auth"}}}
+	if err := BindDependencyDomains(nodes, domains); err != nil {
+		t.Fatalf("bound domain: %v", err)
+	}
+	if err := BindDependencyDomains(nodes, nil); !errors.Is(err, errDAGUnknownDomainBinding) {
+		t.Fatalf("unknown domain must fail closed: %v", err)
+	}
+	unknown := []DependencyNode{{ID: "cutover", Lineage: "cutover-lineage", DomainID: "ghost-domain"}}
+	if err := BindDependencyDomains(unknown, domains); !errors.Is(err, errDAGUnknownDomainBinding) {
+		t.Fatalf("ghost domain must fail closed: %v", err)
+	}
+}

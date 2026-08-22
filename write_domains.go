@@ -55,18 +55,18 @@ var closedResourceKinds = map[string]bool{
 // claims and optional exclusive runtime resources. It is an auditable core
 // value; task/runner/dispatch integration is a residual seam.
 type WriteDomain struct {
-	ID        string
-	Lineage   string
-	Component string
-	Paths     []string
-	Resources []ResourceClaim
+	ID        string          `json:"id"`
+	Lineage   string          `json:"lineage"`
+	Component string          `json:"component"`
+	Paths     []string        `json:"paths"`
+	Resources []ResourceClaim `json:"resources,omitempty"`
 }
 
 // ResourceClaim is a closed exclusive resource. Kind must be one of the
 // resource* constants; ID is a lowercase identifier.
 type ResourceClaim struct {
-	Kind string
-	ID   string
+	Kind string `json:"kind"`
+	ID   string `json:"id"`
 }
 
 // WriteDomainConflict is one deterministic overlap between two domains.

@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+// tickRunTask is the drain launch seam. Tests replace it; production calls runTaskVia.
+var tickRunTask = runTaskVia
+
 // tick 是调度的最小单元：抢锁 → 排空队列（drain）。
 // 每轮循环在冷却/红线允许的前提下，把就绪任务派发到并行槽位（最多 max_parallel 个），
 // 全部跑完或没有可派发任务时才返回。同一工作目录同一时刻只跑一个任务，
@@ -39,15 +42,17 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	type doneMsg struct{ t *Task }
 	ch := make(chan doneMsg)
 	activeIDs := map[string]bool{}
-	activeDirs := map[string]bool{}
-	claimedDir := map[string]bool{}                  // 哪些在跑任务占用了目录互斥（只读类型不占用）
+	var activeWriters []*Task
 	activeCancels := map[string]context.CancelFunc{} // 取消对账命中时击杀该任务的执行进程组
 	// CG-5 巡逻累积状态:同一 drain 周期内跨轮记住 pgSeenAlive/日志 size/上次 stall 时间。
 	// 生命周期 = 一次 drain(tick 函数体);任务离开 activeIDs 后由 patrolOnce 内部清理。
 	patrolStates := map[string]*patrolState{}
-	// 只读类型（审核/进度回收）不写文件：既不占用同目录互斥，也不被互斥挡住——
-	// 审核卡可与同仓下一批并行（依赖护栏在排批层：批内叶组互不依赖、不消费未过审契约）。
-	readOnly := func(t *Task) bool { return t.Type == typeReview || t.Type == typeProgressPull }
+	// 只读类型（审核/进度回收）不写文件：既不占用写域互斥，也不被互斥挡住——
+	// 审核卡可与同仓下一批并行（依赖仍走 fail-closed DAG）。
+	laneMetrics := NewMultiLaneMetrics()
+	if MultiLaneTriggersModelWork(laneMetrics.Snapshot()) {
+		return fmt.Errorf("multilane metrics must not trigger model work")
+	}
 	launched := 0
 	lastConfigReloadErr := ""
 
@@ -140,7 +145,15 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						}
 						continue
 					}
-					if activeIDs[t.ID] || (activeDirs[t.Dir] && !readOnly(t)) {
+					if activeIDs[t.ID] {
+						continue
+					}
+					if !dagAllowsTask(root, tasks, t.ID) {
+						laneMetrics.AddWaits(1)
+						continue
+					}
+					if writerConflictsWithActive(t, activeWriters) {
+						laneMetrics.AddConflicts(1)
 						continue
 					}
 					if ownerRoutingPolicyWaitReason(cfg, t) != "" {
@@ -258,9 +271,9 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 				if next := pickNext(cfg, cands, now); next != nil {
 					via := viaRunner[next.ID]
 					activeIDs[next.ID] = true
-					if !readOnly(next) {
-						activeDirs[next.Dir] = true
-						claimedDir[next.ID] = true
+					if !taskIsReadOnlyType(next) {
+						activeWriters = append(activeWriters, next)
+						laneMetrics.AddThroughput(1)
 					}
 					runCtx, cancelRun := context.WithCancel(context.Background())
 					activeCancels[next.ID] = cancelRun
@@ -275,7 +288,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 					}
 					runCfg := cfg
 					go func(t *Task, via string, taskCfg *Config) {
-						if err := runTaskVia(runCtx, root, taskCfg, t, via); err != nil && !quiet {
+						if err := tickRunTask(runCtx, root, taskCfg, t, via); err != nil && !quiet {
 							fmt.Printf("✖ %s 执行出错: %v\n", t.ID, err)
 						}
 						ch <- doneMsg{t}
@@ -310,10 +323,13 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		select {
 		case msg := <-ch:
 			delete(activeIDs, msg.t.ID)
-			if claimedDir[msg.t.ID] {
-				delete(activeDirs, msg.t.Dir)
-				delete(claimedDir, msg.t.ID)
+			filtered := activeWriters[:0]
+			for _, w := range activeWriters {
+				if w != nil && w.ID != msg.t.ID {
+					filtered = append(filtered, w)
+				}
 			}
+			activeWriters = filtered
 			if cancelRun := activeCancels[msg.t.ID]; cancelRun != nil {
 				cancelRun() // 正常完成也要释放 ctx，别泄漏
 				delete(activeCancels, msg.t.ID)

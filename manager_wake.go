@@ -37,9 +37,10 @@ type ManagerWakeSubscription struct {
 	Enabled     bool     `json:"enabled"`
 }
 
-// ManagerWakeConfig is the self-contained wake core config. It is not a field
-// on Config: this lane cannot patch shared files. WatchdogSec is diagnostic
-// only; the running policy is hard-coded to managerWakeWatchdogSec.
+// ManagerWakeConfig is the self-contained wake core config. It is stored on
+// Config.manager_wake as an omitempty field and stays disabled by default.
+// WatchdogSec is diagnostic only; the running policy is hard-coded to
+// managerWakeWatchdogSec.
 type ManagerWakeConfig struct {
 	Enabled       bool                      `json:"enabled"`
 	CodexBin      string                    `json:"codex_bin,omitempty"`
@@ -348,8 +349,73 @@ func appendManagerWakeFromCommitted(root string, t *Task, ev TaskEvent) error {
 	return projectCommittedWake(root, t, ev)
 }
 
+// projectWakeAfterCommitted appends a wake row only after the exact committed
+// task event exists. Uncommitted or unjournaled state is a no-op. Disabled
+// (default) configuration emits no outbox files.
+func projectWakeAfterCommitted(root string, t *Task, transitionID string) {
+	if t == nil || root == "" || transitionID == "" || !managerWakeProjectionEnabled(root) {
+		return
+	}
+	events, _, err := loadTaskEvents(root, t.ID)
+	if err != nil {
+		return
+	}
+	for _, ev := range events {
+		if ev.TransitionID != transitionID {
+			continue
+		}
+		_ = appendManagerWakeFromCommitted(root, t, ev)
+		return
+	}
+}
+
+func managerWakeProjectionEnabled(root string) bool {
+	cfg, err := loadConfig(root)
+	if err != nil || cfg == nil {
+		return false
+	}
+	return managerWakeEnabled(cfg.ManagerWake)
+}
+
+func managerWakeFromConfig(cfg *Config) *ManagerWakeConfig {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.ManagerWake
+}
+
+func managerWakeConfigBlocking(root string, mw *ManagerWakeConfig) []string {
+	if !managerWakeEnabled(mw) {
+		return []string{"manager_wake_disabled"}
+	}
+	var out []string
+	seen := map[string]bool{}
+	add := func(s string) {
+		if s == "" || seen[s] {
+			return
+		}
+		seen[s] = true
+		out = append(out, s)
+	}
+	if len(mw.Subscriptions) == 0 {
+		add("unscoped_subscription")
+	}
+	for _, d := range diagnoseManagerWake(root, mw) {
+		switch d {
+		case "watchdog_sec_rejected", "invalid_subscription_id", "duplicate_subscription",
+			"invalid_thread_id", "unscoped_subscription", "empty_project", "missing_codex_bin":
+			add(d)
+		default:
+			if strings.HasPrefix(d, "subscription_") {
+				add(d)
+			}
+		}
+	}
+	return out
+}
+
 func appendOutboxRow(root string, t *Task, ev TaskEvent) error {
-	if t == nil || root == "" {
+	if t == nil || root == "" || !committedWakeEligible(root, t, ev) {
 		return nil
 	}
 	return withTaskControlLock(root, "_manager-wake-outbox", func() error {

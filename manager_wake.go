@@ -18,6 +18,7 @@ const (
 	outboxSchemaV1         = "cardex.manager_wake.outbox.v1"
 	cursorSchemaV1         = "cardex.manager_wake.cursor.v1"
 	errorSchemaV1          = "cardex.manager_wake.error.v1"
+	receiptSchemaV1        = "cardex.manager_wake.receipt.v1"
 )
 
 // ManagerWakeSubscription is a closed, scoped delivery target. IDs must be
@@ -47,6 +48,9 @@ var (
 	managerWakeSubIDRE  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 	managerWakeReasonRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,63}$`)
 	managerWakeQueue    = defaultManagerWakeQueue
+	// managerWakeCommitCursor is the post-queue ack. Tests inject a one-shot
+	// save failure to prove receipts suppress a second queue spawn.
+	managerWakeCommitCursor = saveManagerWakeCursor
 )
 
 type managerWakeOutboxRow struct {
@@ -95,6 +99,21 @@ type managerWakeErrorState struct {
 	At     string `json:"at"`
 }
 
+type managerWakeReceipt struct {
+	Schema         string   `json:"schema"`
+	SubscriptionID string   `json:"subscription_id"`
+	WakeEventIDs   []string `json:"wake_event_ids"`
+	UpdatedAt      string   `json:"updated_at"`
+}
+
+type wakeBindKind int
+
+const (
+	wakeBindOK wakeBindKind = iota
+	wakeBindStale
+	wakeBindMismatch
+)
+
 func managerWakeDir(root string) string {
 	return filepath.Join(controlDir(root), "manager-wake")
 }
@@ -113,6 +132,27 @@ func managerWakeMetricsPath(root string) string {
 
 func managerWakeErrorPath(root string) string {
 	return filepath.Join(managerWakeDir(root), "error.json")
+}
+
+func managerWakeReceiptDir(root string) string {
+	return filepath.Join(managerWakeDir(root), "receipts")
+}
+
+func managerWakeReceiptPath(root, subID string) string {
+	id, ok := closedManagerWakeSubID(subID)
+	if !ok {
+		return ""
+	}
+	dir := managerWakeReceiptDir(root)
+	path := filepath.Join(dir, id+".json")
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || rel == "" || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+		return ""
+	}
+	if filepath.Base(path) != id+".json" {
+		return ""
+	}
+	return path
 }
 
 func closedManagerWakeSubID(id string) (string, bool) {
@@ -241,27 +281,54 @@ func committedWakeEligible(root string, t *Task, ev TaskEvent) bool {
 	return committedEventIdentity(root, t, ev)
 }
 
-func backfillWakeForTask(root string, t *Task) {
+func allowlistedWakeError(err error, fallback string) string {
+	if err != nil {
+		c := strings.TrimSpace(err.Error())
+		if managerWakeReasonRE.MatchString(c) {
+			return c
+		}
+	}
+	if managerWakeReasonRE.MatchString(fallback) {
+		return fallback
+	}
+	return "outbox_append_failed"
+}
+
+func failWakeProjection(root string, err error) error {
+	class := allowlistedWakeError(err, "outbox_append_failed")
+	metrics := loadManagerWakeMetrics(root)
+	noteManagerWakeError(root, &metrics, class)
+	return fmt.Errorf("%s", class)
+}
+
+func projectCommittedWake(root string, t *Task, ev TaskEvent) error {
+	if root == "" || t == nil || !committedWakeEligible(root, t, ev) {
+		return nil
+	}
+	if err := appendOutboxRow(root, t, ev); err != nil {
+		return failWakeProjection(root, err)
+	}
+	return nil
+}
+
+func backfillWakeForTask(root string, t *Task) error {
 	if t == nil || root == "" {
-		return
+		return nil
 	}
 	events, _, err := loadTaskEvents(root, t.ID)
 	if err != nil {
-		return
+		return failWakeProjection(root, err)
 	}
 	for _, ev := range events {
-		if !committedWakeEligible(root, t, ev) {
-			continue
+		if err := projectCommittedWake(root, t, ev); err != nil {
+			return err
 		}
-		_ = appendOutboxRow(root, t, ev)
 	}
+	return nil
 }
 
-func appendManagerWakeFromCommitted(root string, t *Task, ev TaskEvent) {
-	if root == "" || t == nil || !committedWakeEligible(root, t, ev) {
-		return
-	}
-	_ = appendOutboxRow(root, t, ev)
+func appendManagerWakeFromCommitted(root string, t *Task, ev TaskEvent) error {
+	return projectCommittedWake(root, t, ev)
 }
 
 func appendOutboxRow(root string, t *Task, ev TaskEvent) error {
@@ -411,6 +478,74 @@ func saveManagerWakeCursor(root string, cur *managerWakeCursor) error {
 		return fmt.Errorf("invalid_subscription_id")
 	}
 	data, err := json.MarshalIndent(cur, "", "  ")
+	if err != nil {
+		return err
+	}
+	return atomicWriteSync(path, append(data, '\n'))
+}
+
+func failCursorSave(root string, metrics *managerWakeMetrics, err error) error {
+	class := allowlistedWakeError(err, "cursor_save_failed")
+	noteManagerWakeError(root, metrics, class)
+	return fmt.Errorf("%s", class)
+}
+
+func loadManagerWakeReceiptIDs(root, subID string) (map[string]bool, string, error) {
+	path := managerWakeReceiptPath(root, subID)
+	if path == "" {
+		return nil, "invalid_subscription_id", fmt.Errorf("invalid_subscription_id")
+	}
+	ids := map[string]bool{}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ids, "", nil
+		}
+		return nil, "receipt_unreadable", fmt.Errorf("receipt_unreadable")
+	}
+	var rec managerWakeReceipt
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, "receipt_corrupt", fmt.Errorf("receipt_corrupt")
+	}
+	for _, id := range rec.WakeEventIDs {
+		id = strings.TrimSpace(id)
+		if id != "" {
+			ids[id] = true
+		}
+	}
+	return ids, "", nil
+}
+
+func rememberManagerWakeReceipts(root, subID string, rows []managerWakeOutboxRow) error {
+	path := managerWakeReceiptPath(root, subID)
+	if path == "" {
+		return fmt.Errorf("invalid_subscription_id")
+	}
+	ids, class, err := loadManagerWakeReceiptIDs(root, subID)
+	if class != "" {
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%s", class)
+	}
+	for _, row := range rows {
+		if row.WakeEventID != "" {
+			ids[row.WakeEventID] = true
+		}
+	}
+	list := make([]string, 0, len(ids))
+	for id := range ids {
+		list = append(list, id)
+	}
+	sort.Strings(list)
+	id, _ := closedManagerWakeSubID(subID)
+	rec := managerWakeReceipt{
+		Schema:         receiptSchemaV1,
+		SubscriptionID: id,
+		WakeEventIDs:   list,
+		UpdatedAt:      time.Now().Format(time.RFC3339Nano),
+	}
+	data, err := json.MarshalIndent(rec, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -646,14 +781,21 @@ func subscriptionMatches(sub ManagerWakeSubscription, t *Task, row managerWakeOu
 	return matched
 }
 
-func reconcileManagerWakeOutbox(root string) {
+func reconcileManagerWakeOutbox(root string) error {
 	seen := map[string]bool{}
+	var first error
 	walk := func(dir string) {
+		if first != nil {
+			return
+		}
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return
 		}
 		for _, e := range entries {
+			if first != nil {
+				return
+			}
 			if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
 				continue
 			}
@@ -666,15 +808,31 @@ func reconcileManagerWakeOutbox(root string) {
 			if err != nil {
 				continue
 			}
-			backfillWakeForTask(root, t)
+			if err := backfillWakeForTask(root, t); err != nil {
+				first = err
+				return
+			}
 		}
 	}
 	walk(tasksDir(root))
 	walk(archiveDir(root))
+	return first
+}
+
+// Local Codex 0.149.0 `queue` grammar is only `--thread` and `--message`.
+// `--idempotency-key`, `--id`, `--client-request-id`, `--request-id`, and
+// `--dedupe-key` are unexpected arguments. Do not invent a flag. Receiver
+// idempotency is the `wake=<WakeEventID>` coordinate inside `--message`.
+func managerWakeQueueArgv(bin, thread, message string) []string {
+	return []string{bin, "queue", "--thread", thread, "--message", message}
 }
 
 func defaultManagerWakeQueue(bin, thread, message string) error {
-	cmd := exec.Command(bin, "queue", "--thread", thread, "--message", message)
+	if !wakeMessageCarriesEventIDs(message) {
+		return fmt.Errorf("queue_idempotency_unsupported")
+	}
+	args := managerWakeQueueArgv(bin, thread, message)
+	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = nil
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("queue_failed")
@@ -687,10 +845,30 @@ func compactWakeMessage(sub ManagerWakeSubscription, rows []managerWakeOutboxRow
 	b.WriteString("cardex-wake v1")
 	fmt.Fprintf(&b, " n=%d high_water=%d sub=%s", len(rows), highWater, sub.ID)
 	for _, row := range rows {
-		fmt.Fprintf(&b, "\n%s type=%s project=%s status=%s reason=%s transition=%s",
-			row.TaskID, row.EventType, emptyDash(row.Project), row.Status, row.ReasonClass, emptyDash(row.TransitionID))
+		fmt.Fprintf(&b, "\n%s type=%s project=%s status=%s reason=%s transition=%s wake=%s",
+			row.TaskID, row.EventType, emptyDash(row.Project), row.Status, row.ReasonClass, emptyDash(row.TransitionID), row.WakeEventID)
 	}
 	return b.String()
+}
+
+func wakeMessageCarriesEventIDs(msg string) bool {
+	for _, line := range strings.Split(msg, "\n") {
+		if strings.HasPrefix(line, "cardex-wake ") {
+			continue
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.Contains(line, " wake=") {
+			return false
+		}
+		id := strings.TrimSpace(line[strings.LastIndex(line, " wake=")+len(" wake="):])
+		if id == "" || id == "-" {
+			return false
+		}
+	}
+	return strings.Contains(msg, " wake=")
 }
 
 func emptyDash(s string) string {
@@ -702,7 +880,14 @@ func emptyDash(s string) string {
 
 func managerWakeOnce(root string, mw *ManagerWakeConfig) error {
 	reconcileControlPlane(root)
-	reconcileManagerWakeOutbox(root)
+	if err := reconcileManagerWakeOutbox(root); err != nil {
+		metrics := loadManagerWakeMetrics(root)
+		metrics.WatchdogSec = managerWakeWatchdogSec
+		metrics.Enabled = managerWakeEnabled(mw)
+		class := allowlistedWakeError(err, "outbox_append_failed")
+		noteManagerWakeError(root, &metrics, class)
+		return fmt.Errorf("%s", class)
+	}
 	metrics := loadManagerWakeMetrics(root)
 	metrics.WatchdogSec = managerWakeWatchdogSec
 	metrics.Enabled = managerWakeEnabled(mw)
@@ -764,7 +949,8 @@ func managerWakeOnce(root string, mw *ManagerWakeConfig) error {
 				continue
 			}
 			t, _ := findTaskAnywhere(root, row.TaskID)
-			if subscriptionMatches(sub, t, row) && wakeRowDeliverable(root, t, row) {
+			rebuilt, kind := bindCommittedWakeRow(root, t, row)
+			if kind == wakeBindOK && subscriptionMatches(sub, t, rebuilt) {
 				pending++
 			}
 		}
@@ -777,13 +963,47 @@ func managerWakeOnce(root string, mw *ManagerWakeConfig) error {
 	return nil
 }
 
-func wakeRowDeliverable(root string, t *Task, row managerWakeOutboxRow) bool {
-	if t == nil || !outboxRowIdentityConsistent(row) {
-		return false
+func rebuildOutboxRowFromCommitted(seq int64, t *Task, ev TaskEvent) managerWakeOutboxRow {
+	status := ev.Status
+	if status == "" && t != nil {
+		status = t.Status
+	}
+	ts := ev.TS
+	if ts == "" {
+		ts = time.Now().Format(time.RFC3339Nano)
+	}
+	project := ""
+	taskID := ""
+	if t != nil {
+		project = t.Project
+		taskID = t.ID
+	}
+	return managerWakeOutboxRow{
+		Schema:       outboxSchemaV1,
+		Seq:          seq,
+		WakeEventID:  wakeEventID(taskID, ev.Seq, ev.TransitionID),
+		TaskID:       taskID,
+		TaskEventSeq: ev.Seq,
+		TransitionID: ev.TransitionID,
+		Project:      project,
+		EventType:    ev.Type,
+		Status:       status,
+		NeedsOwner:   ev.Type == evNeedsOwner,
+		ReasonClass:  closedWakeReasonClass(ev.Actor, ev.Type, ev.Detail),
+		TS:           ts,
+	}
+}
+
+func bindCommittedWakeRow(root string, t *Task, row managerWakeOutboxRow) (managerWakeOutboxRow, wakeBindKind) {
+	if !outboxRowIdentityConsistent(row) {
+		return managerWakeOutboxRow{}, wakeBindMismatch
+	}
+	if t == nil || t.ID != row.TaskID {
+		return managerWakeOutboxRow{}, wakeBindStale
 	}
 	events, _, err := loadTaskEvents(root, t.ID)
 	if err != nil {
-		return false
+		return managerWakeOutboxRow{}, wakeBindMismatch
 	}
 	var ev TaskEvent
 	found := false
@@ -795,12 +1015,28 @@ func wakeRowDeliverable(root string, t *Task, row managerWakeOutboxRow) bool {
 		}
 	}
 	if !found {
-		return false
+		return managerWakeOutboxRow{}, wakeBindMismatch
 	}
 	if ev.TransitionID != row.TransitionID || ev.Type != row.EventType {
-		return false
+		return managerWakeOutboxRow{}, wakeBindMismatch
 	}
-	return committedWakeEligible(root, t, ev)
+	wantStatus := ev.Status
+	if wantStatus == "" {
+		wantStatus = t.Status
+	}
+	if row.Status != wantStatus {
+		return managerWakeOutboxRow{}, wakeBindMismatch
+	}
+	if row.Project != t.Project {
+		return managerWakeOutboxRow{}, wakeBindMismatch
+	}
+	if row.WakeEventID != wakeEventID(t.ID, ev.Seq, ev.TransitionID) {
+		return managerWakeOutboxRow{}, wakeBindMismatch
+	}
+	if !committedWakeEligible(root, t, ev) {
+		return managerWakeOutboxRow{}, wakeBindStale
+	}
+	return rebuildOutboxRowFromCommitted(row.Seq, t, ev), wakeBindOK
 }
 
 func deliverSubscription(root string, sub ManagerWakeSubscription, rows []managerWakeOutboxRow, bin string, metrics *managerWakeMetrics) error {
@@ -864,20 +1100,21 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		if row.Seq > scanHigh {
 			scanHigh = row.Seq
 		}
-		if !outboxRowIdentityConsistent(row) {
+		t, _ := findTaskAnywhere(root, row.TaskID)
+		rebuilt, kind := bindCommittedWakeRow(root, t, row)
+		switch kind {
+		case wakeBindMismatch:
 			metrics.LastErrorClass = "outbox_identity_mismatch"
 			noteManagerWakeError(root, metrics, "outbox_identity_mismatch")
 			return fmt.Errorf("outbox_identity_mismatch")
-		}
-		t, _ := findTaskAnywhere(root, row.TaskID)
-		if !wakeRowDeliverable(root, t, row) {
+		case wakeBindStale:
 			stale++
 			continue
 		}
-		if !subscriptionMatches(sub, t, row) {
+		if !subscriptionMatches(sub, t, rebuilt) {
 			continue
 		}
-		delta = append(delta, row)
+		delta = append(delta, rebuilt)
 	}
 	metrics.StaleSuppressed += stale
 	if len(delta) == 0 {
@@ -885,7 +1122,7 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		if scanHigh > cur.OutboxSeq {
 			cur.OutboxSeq = scanHigh
 			if err := saveManagerWakeCursor(root, cur); err != nil {
-				return err
+				return failCursorSave(root, metrics, err)
 			}
 		}
 		return nil
@@ -903,7 +1140,41 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		}
 	}
 	sort.Slice(delta, func(i, j int) bool { return delta[i].Seq < delta[j].Seq })
-	msg := compactWakeMessage(sub, delta, scanHigh)
+	receipts, class, err := loadManagerWakeReceiptIDs(root, sub.ID)
+	if class != "" {
+		metrics.LastErrorClass = class
+		noteManagerWakeError(root, metrics, class)
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("%s", class)
+	}
+	var toSend []managerWakeOutboxRow
+	for _, row := range delta {
+		if receipts[row.WakeEventID] {
+			continue
+		}
+		toSend = append(toSend, row)
+	}
+	commit := func() error {
+		cur.OutboxSeq = scanHigh
+		cur.LastWakeID = delta[len(delta)-1].WakeEventID
+		cur.LastErrorClass = ""
+		cur.LastDeliveryAt = time.Now().Format(time.RFC3339Nano)
+		if err := managerWakeCommitCursor(root, cur); err != nil {
+			return failCursorSave(root, metrics, err)
+		}
+		return nil
+	}
+	if len(toSend) == 0 {
+		return commit()
+	}
+	msg := compactWakeMessage(sub, toSend, scanHigh)
+	if !wakeMessageCarriesEventIDs(msg) {
+		metrics.LastErrorClass = "queue_idempotency_unsupported"
+		noteManagerWakeError(root, metrics, "queue_idempotency_unsupported")
+		return fmt.Errorf("queue_idempotency_unsupported")
+	}
 	if secretfulWakeMessage(msg) {
 		metrics.LastErrorClass = "payload_rejected"
 		noteManagerWakeError(root, metrics, "payload_rejected")
@@ -919,11 +1190,13 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		return fmt.Errorf("queue_failed")
 	}
 	metrics.QueueSuccesses++
-	cur.OutboxSeq = scanHigh
-	cur.LastWakeID = delta[len(delta)-1].WakeEventID
-	cur.LastErrorClass = ""
-	cur.LastDeliveryAt = time.Now().Format(time.RFC3339Nano)
-	return saveManagerWakeCursor(root, cur)
+	if err := rememberManagerWakeReceipts(root, sub.ID, toSend); err != nil {
+		class := allowlistedWakeError(err, "receipt_append_failed")
+		metrics.LastErrorClass = class
+		noteManagerWakeError(root, metrics, class)
+		return fmt.Errorf("%s", class)
+	}
+	return commit()
 }
 
 func secretfulWakeMessage(msg string) bool {
@@ -964,7 +1237,8 @@ func managerWakeReadback(root string, mw *ManagerWakeConfig) map[string]any {
 					continue
 				}
 				t, _ := findTaskAnywhere(root, row.TaskID)
-				if subscriptionMatches(sub, t, row) && wakeRowDeliverable(root, t, row) {
+				rebuilt, kind := bindCommittedWakeRow(root, t, row)
+				if kind == wakeBindOK && subscriptionMatches(sub, t, rebuilt) {
 					subPending++
 				}
 			}

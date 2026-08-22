@@ -1,6 +1,9 @@
 package main
 
 import (
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -36,6 +39,28 @@ func TestRenderManagerWakePlistWatchPathsAndInterval(t *testing.T) {
 	}
 }
 
+func TestRenderManagerWakePlistXMLEscapesText(t *testing.T) {
+	exe := `/opt/bin/cardex & "tool"`
+	root := `/tmp/cardex & root/<wake>`
+	logOut := `/tmp/wake & <err>.log`
+	plist := renderManagerWakePlist(exe, root, 0, logOut)
+	if strings.Contains(plist, `cardex & root`) || strings.Contains(plist, `<wake>`) ||
+		strings.Contains(plist, `cardex & "tool"`) || strings.Contains(plist, `wake & <err>`) {
+		t.Fatalf("unescaped XML special characters:\n%s", plist)
+	}
+	if !strings.Contains(plist, plistXMLText(exe)) || !strings.Contains(plist, plistXMLText(root)) {
+		t.Fatalf("escaped exe/root missing:\n%s", plist)
+	}
+	outbox := managerWakeOutboxPath(root)
+	if !strings.Contains(plist, plistXMLText(outbox)) || !strings.Contains(plist, plistXMLText(logOut)) {
+		t.Fatalf("escaped outbox/log missing:\n%s", plist)
+	}
+	paths := managerWakePlistWatchPaths(plist)
+	if len(paths) != 1 || paths[0] != outbox {
+		t.Fatalf("WatchPaths unescape=%v want [%s]", paths, outbox)
+	}
+}
+
 func TestTickPlistUnchangedNoWatchPaths(t *testing.T) {
 	got := renderLaunchdPlist("/opt/homebrew/bin/cardex", "/tmp/cardex-root", 300, "/tmp/cardex.log")
 	if strings.Contains(got, "WatchPaths") {
@@ -56,5 +81,111 @@ func TestInstallManagerWakeRefusedWhenDisabled(t *testing.T) {
 	}
 	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: false}); err == nil {
 		t.Fatal("enabled=false must refuse install")
+	}
+}
+
+func withIsolatedManagerWakeLaunchd(t *testing.T, plistPath string) {
+	t.Helper()
+	origPath := managerWakePlistPathFn
+	origExec := managerWakeExecutable
+	origCtl := managerWakeLaunchctlRun
+	exe := filepath.Join(t.TempDir(), "cardex")
+	if err := os.WriteFile(exe, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	managerWakePlistPathFn = func() string { return plistPath }
+	managerWakeExecutable = func() (string, error) { return exe, nil }
+	t.Cleanup(func() {
+		managerWakePlistPathFn = origPath
+		managerWakeExecutable = origExec
+		managerWakeLaunchctlRun = origCtl
+	})
+}
+
+func TestInstallManagerWakeDurableWriteAndLoadFailureRestoresPrior(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	prior := []byte("PRIOR PLIST & <unit>\n")
+	if err := os.WriteFile(pp, prior, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withIsolatedManagerWakeLaunchd(t, pp)
+	loads := 0
+	unloads := 0
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
+		}
+		switch args[0] {
+		case "unload":
+			unloads++
+			return nil
+		case "load":
+			loads++
+			if loads == 1 {
+				return fmt.Errorf("boom")
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
+	}
+	mw := &ManagerWakeConfig{Enabled: true, CodexBin: "codex"}
+	if err := installManagerWakeLaunchd(root, mw); err == nil {
+		t.Fatal("load failure must surface")
+	} else if err.Error() != "launchctl_load_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	got, err := os.ReadFile(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(prior) {
+		t.Fatalf("prior plist not restored: %q", got)
+	}
+	if loads < 2 {
+		t.Fatalf("restore must reload prior unit, loads=%d unloads=%d", loads, unloads)
+	}
+	if _, err := os.Stat(pp + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("durable write must not leave tmp")
+	}
+}
+
+func TestInstallManagerWakeLoadFailureRemovesNewPlistWhenNoPrior(t *testing.T) {
+	root := testRoot(t)
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withIsolatedManagerWakeLaunchd(t, pp)
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) > 0 && args[0] == "load" {
+			return fmt.Errorf("boom")
+		}
+		return nil
+	}
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
+		t.Fatal("load failure must surface")
+	}
+	if _, err := os.Stat(pp); !os.IsNotExist(err) {
+		t.Fatalf("new plist must be removed when no prior unit: %v", err)
+	}
+}
+
+func TestInstallManagerWakeSuccessDurablePlist(t *testing.T) {
+	root := testRoot(t)
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withIsolatedManagerWakeLaunchd(t, pp)
+	managerWakeLaunchctlRun = func(args ...string) error { return nil }
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(got), "<string>manager-wake</string>") {
+		t.Fatalf("installed plist missing command:\n%s", got)
+	}
+	if _, err := os.Stat(pp + ".tmp"); !os.IsNotExist(err) {
+		t.Fatal("durable write must not leave tmp")
 	}
 }

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -359,6 +360,14 @@ func TestAdapterRestartAndCorruption(t *testing.T) {
 	if !strings.Contains(got, "--message") {
 		t.Fatalf("missing --message: %q", got)
 	}
+	if strings.Contains(got, "--idempotency-key") || strings.Contains(got, "--client-request-id") ||
+		strings.Contains(got, "--request-id") || strings.Contains(got, "--dedupe-key") ||
+		strings.Contains("\n"+got+"\n", "\n--id\n") {
+		t.Fatalf("invented queue identity flag: %q", got)
+	}
+	if !strings.Contains(got, "wake=") {
+		t.Fatalf("message missing wake_event_id contract: %q", got)
+	}
 	if !strings.Contains(got, tk.ID) {
 		t.Fatalf("payload missing task id: %q", got)
 	}
@@ -615,6 +624,187 @@ func TestManagerWakeReadbackSecretFree(t *testing.T) {
 	}
 	if rb["enabled"] != true {
 		t.Fatalf("enabled missing: %+v", rb)
+	}
+}
+
+func TestQueueOkCursorFailRestartNoDuplicateWake(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	mw := testWakeCfg(bin, "wake-proj", "99999999-9999-9999-9999-999999999999", "mgr")
+	tk := heldCommittedTask(t, root, "wake-proj", "queue-ok cursor-fail")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+
+	var calls []string
+	origQ := managerWakeQueue
+	origC := managerWakeCommitCursor
+	defer func() {
+		managerWakeQueue = origQ
+		managerWakeCommitCursor = origC
+	}()
+	managerWakeQueue = func(bin, thread, message string) error {
+		calls = append(calls, message)
+		if !strings.Contains(message, "wake="+wantID) {
+			t.Fatalf("receiver contract missing wake id %q in %q", wantID, message)
+		}
+		argv := managerWakeQueueArgv(bin, thread, message)
+		joined := strings.Join(argv, "\n")
+		for _, bad := range []string{"--idempotency-key", "--client-request-id", "--request-id", "--dedupe-key"} {
+			if strings.Contains(joined, bad) {
+				t.Fatalf("invented flag %s: %q", bad, argv)
+			}
+		}
+		return nil
+	}
+	saves := 0
+	managerWakeCommitCursor = func(root string, cur *managerWakeCursor) error {
+		saves++
+		if saves == 1 {
+			return fmt.Errorf("cursor_save_failed")
+		}
+		return saveManagerWakeCursor(root, cur)
+	}
+
+	if err := managerWakeOnce(root, mw); err == nil {
+		t.Fatal("queue-ok/cursor-fail must surface")
+	}
+	if loadManagerWakeErrorClass(root) != "cursor_save_failed" {
+		t.Fatalf("durable class=%q", loadManagerWakeErrorClass(root))
+	}
+	if len(calls) != 1 {
+		t.Fatalf("queue calls=%d want 1", len(calls))
+	}
+	cur, _, err := loadManagerWakeCursor(root, "mgr")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.OutboxSeq != 0 {
+		t.Fatalf("cursor advanced after failed save: %+v", cur)
+	}
+
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 1 {
+		t.Fatalf("restart duplicated manager wake: calls=%d second=%q", len(calls), calls)
+	}
+	cur, _, _ = loadManagerWakeCursor(root, "mgr")
+	if cur.OutboxSeq < 1 {
+		t.Fatalf("restart must ack without re-queue: %+v", cur)
+	}
+	if cur.LastWakeID != wantID {
+		t.Fatalf("last_wake_id=%q want %q", cur.LastWakeID, wantID)
+	}
+}
+
+func TestAppendOutboxRowFailureImmediateAndReconcile(t *testing.T) {
+	blockOutboxWrite := func(t *testing.T, root string) {
+		t.Helper()
+		if err := os.MkdirAll(managerWakeDir(root), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		path := managerWakeOutboxPath(root)
+		if err := os.WriteFile(path, nil, 0o444); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0o444); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o644) })
+	}
+	t.Run("immediate", func(t *testing.T) {
+		root := testRoot(t)
+		tk := heldCommittedTask(t, root, "wake-proj", "immediate-append-fail")
+		blockOutboxWrite(t, root)
+		err := appendManagerWakeFromCommitted(root, tk, mustHeldEvent(t, root, tk.ID))
+		if err == nil {
+			t.Fatal("immediate append I/O must fail closed")
+		}
+		if err.Error() != "outbox_append_failed" {
+			t.Fatalf("allowlisted class=%q", err.Error())
+		}
+		if loadManagerWakeErrorClass(root) != "outbox_append_failed" {
+			t.Fatalf("durable class=%q", loadManagerWakeErrorClass(root))
+		}
+		raw, err := os.ReadFile(managerWakeErrorPath(root))
+		if err != nil {
+			t.Fatal(err)
+		}
+		low := strings.ToLower(string(raw))
+		for _, bad := range []string{"permission denied", "is a directory", "no such file", "operation not permitted"} {
+			if strings.Contains(low, bad) {
+				t.Fatalf("error state leaked prose %q: %s", bad, raw)
+			}
+		}
+	})
+	t.Run("reconcile", func(t *testing.T) {
+		root := testRoot(t)
+		bin, logPath := fakeCodexQueueBin(t, 0)
+		mw := testWakeCfg(bin, "wake-proj", "abababab-abab-abab-abab-abababababab", "mgr")
+		_ = heldCommittedTask(t, root, "wake-proj", "reconcile-append-fail")
+		blockOutboxWrite(t, root)
+		if err := managerWakeOnce(root, mw); err == nil {
+			t.Fatal("reconcile append I/O must fail closed")
+		}
+		if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+			t.Fatal("failed projection must not queue")
+		}
+		if loadManagerWakeErrorClass(root) != "outbox_append_failed" {
+			t.Fatalf("durable class=%q", loadManagerWakeErrorClass(root))
+		}
+	})
+}
+
+func TestForgedOutboxProjectTypeStatusFailClosed(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(*managerWakeOutboxRow)
+	}{
+		{"project", func(row *managerWakeOutboxRow) { row.Project = "forged-project" }},
+		{"type", func(row *managerWakeOutboxRow) { row.EventType = evDone }},
+		{"status", func(row *managerWakeOutboxRow) { row.Status = statusDone }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			bin, logPath := fakeCodexQueueBin(t, 0)
+			mw := testWakeCfg(bin, "wake-proj", "cdcdecdc-dcdc-dcdc-dcdc-dcdcdcdcdcdc", "mgr")
+			tk := heldCommittedTask(t, root, "wake-proj", "forged-"+tc.name)
+			if err := appendManagerWakeFromCommitted(root, tk, mustHeldEvent(t, root, tk.ID)); err != nil {
+				t.Fatal(err)
+			}
+			rows, class, err := loadManagerWakeOutbox(root)
+			if err != nil || class != "" || len(rows) != 1 {
+				t.Fatalf("seed row: class=%q err=%v %+v", class, err, rows)
+			}
+			forged := rows[0]
+			tc.mutate(&forged)
+			if forged.WakeEventID != rowWakeIdentity(forged) {
+				t.Fatalf("test must keep formula-consistent identity: %+v", forged)
+			}
+			data, err := json.Marshal(forged)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(managerWakeOutboxPath(root), append(data, '\n'), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := managerWakeOnce(root, mw); err == nil {
+				t.Fatal("forged committed fields must fail closed, not stale-ack")
+			}
+			if _, err := os.Stat(logPath); !os.IsNotExist(err) {
+				payload, _ := os.ReadFile(logPath)
+				t.Fatalf("forged %s must not queue: %s", tc.name, payload)
+			}
+			cur, _, _ := loadManagerWakeCursor(root, "mgr")
+			if cur != nil && cur.OutboxSeq != 0 {
+				t.Fatalf("mismatch must not ack cursor: %+v", cur)
+			}
+			rb := managerWakeReadback(root, mw)
+			if rb["last_err_class"] != "outbox_identity_mismatch" {
+				t.Fatalf("want outbox_identity_mismatch, got %+v", rb)
+			}
+		})
 	}
 }
 

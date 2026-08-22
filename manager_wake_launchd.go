@@ -1,7 +1,9 @@
 package main
 
 import (
+	"encoding/xml"
 	"fmt"
+	"html"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -10,38 +12,17 @@ import (
 )
 
 const (
-	managerWakeLaunchdLabel  = "com.cardex.manager-wake"
-	managerWakePlistTemplate = `<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>%s</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>%s</string>
-        <string>manager-wake</string>
-        <string>--once</string>
-        <string>--root</string>
-        <string>%s</string>
-    </array>
-    <key>WatchPaths</key>
-    <array>
-        <string>%s</string>
-    </array>
-    <key>StartInterval</key><integer>%d</integer>
-    <key>RunAtLoad</key><true/>
-    <key>StandardOutPath</key><string>%s</string>
-    <key>StandardErrorPath</key><string>%s</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
-    </dict>
-</dict>
-</plist>
-`
+	managerWakeLaunchdLabel = "com.cardex.manager-wake"
 )
 
-func managerWakeLaunchdPlistPath() string {
+var (
+	managerWakePlistPathFn  = defaultManagerWakeLaunchdPlistPath
+	managerWakeExecutable   = os.Executable
+	managerWakeLaunchctlRun = defaultManagerWakeLaunchctlRun
+	managerWakeWritePlist   = atomicWriteSync
+)
+
+func defaultManagerWakeLaunchdPlistPath() string {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return ""
@@ -49,10 +30,69 @@ func managerWakeLaunchdPlistPath() string {
 	return filepath.Join(home, "Library", "LaunchAgents", managerWakeLaunchdLabel+".plist")
 }
 
+func defaultManagerWakeLaunchctlRun(args ...string) error {
+	return exec.Command("launchctl", args...).Run()
+}
+
+func managerWakeLaunchdPlistPath() string {
+	return managerWakePlistPathFn()
+}
+
+func plistXMLText(s string) string {
+	var b strings.Builder
+	if err := xml.EscapeText(&b, []byte(s)); err != nil {
+		return ""
+	}
+	return b.String()
+}
+
 func renderManagerWakePlist(exe, root string, watchdogSec int, logOut string) string {
 	_ = watchdogSec
 	outbox := managerWakeOutboxPath(root)
-	return fmt.Sprintf(managerWakePlistTemplate, managerWakeLaunchdLabel, exe, root, outbox, managerWakeWatchdogSec, logOut, logOut)
+	var b strings.Builder
+	b.WriteString(`<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>`)
+	b.WriteString(plistXMLText(managerWakeLaunchdLabel))
+	b.WriteString(`</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>`)
+	b.WriteString(plistXMLText(exe))
+	b.WriteString(`</string>
+        <string>manager-wake</string>
+        <string>--once</string>
+        <string>--root</string>
+        <string>`)
+	b.WriteString(plistXMLText(root))
+	b.WriteString(`</string>
+    </array>
+    <key>WatchPaths</key>
+    <array>
+        <string>`)
+	b.WriteString(plistXMLText(outbox))
+	b.WriteString(`</string>
+    </array>
+    <key>StartInterval</key><integer>`)
+	b.WriteString(strconv.Itoa(managerWakeWatchdogSec))
+	b.WriteString(`</integer>
+    <key>RunAtLoad</key><true/>
+    <key>StandardOutPath</key><string>`)
+	b.WriteString(plistXMLText(logOut))
+	b.WriteString(`</string>
+    <key>StandardErrorPath</key><string>`)
+	b.WriteString(plistXMLText(logOut))
+	b.WriteString(`</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>
+`)
+	return b.String()
 }
 
 func managerWakePlistWatchPaths(plist string) []string {
@@ -69,7 +109,8 @@ func managerWakePlistWatchPaths(plist string) []string {
 				break
 			}
 			if strings.HasPrefix(trim, "<string>") && strings.HasSuffix(trim, "</string>") {
-				paths = append(paths, strings.TrimSuffix(strings.TrimPrefix(trim, "<string>"), "</string>"))
+				raw := strings.TrimSuffix(strings.TrimPrefix(trim, "<string>"), "</string>")
+				paths = append(paths, html.UnescapeString(raw))
 			}
 		}
 	}
@@ -90,15 +131,39 @@ func managerWakePlistStartInterval(plist string) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(rest[:j]))
 }
 
+func restoreManagerWakeLaunchd(pp string, prior []byte, priorOK bool) error {
+	if priorOK {
+		if err := managerWakeWritePlist(pp, prior); err != nil {
+			return err
+		}
+		_ = managerWakeLaunchctlRun("unload", pp)
+		_ = managerWakeLaunchctlRun("load", "-w", pp)
+		return nil
+	}
+	_ = managerWakeLaunchctlRun("unload", pp)
+	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+func resolveManagerWakeExecutable() (string, error) {
+	exe, err := managerWakeExecutable()
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+		return resolved, nil
+	}
+	return exe, nil
+}
+
 func installManagerWakeLaunchd(root string, mw *ManagerWakeConfig) error {
 	if !managerWakeEnabled(mw) {
 		return fmt.Errorf("manager_wake_disabled")
 	}
-	exe, err := os.Executable()
+	exe, err := resolveManagerWakeExecutable()
 	if err != nil {
-		return err
-	}
-	if exe, err = filepath.EvalSymlinks(exe); err != nil {
 		return err
 	}
 	pp := managerWakeLaunchdPlistPath()
@@ -113,11 +178,18 @@ func installManagerWakeLaunchd(root string, mw *ManagerWakeConfig) error {
 	}
 	logOut := filepath.Join(logsDir(root), "manager-wake.log")
 	content := renderManagerWakePlist(exe, root, managerWakeWatchdogSec, logOut)
-	if err := atomicWrite(pp, []byte(content)); err != nil {
+	var prior []byte
+	priorOK := false
+	if data, err := os.ReadFile(pp); err == nil {
+		prior = append([]byte(nil), data...)
+		priorOK = true
+	}
+	if err := managerWakeWritePlist(pp, []byte(content)); err != nil {
 		return err
 	}
-	_ = exec.Command("launchctl", "unload", pp).Run()
-	if err := exec.Command("launchctl", "load", "-w", pp).Run(); err != nil {
+	_ = managerWakeLaunchctlRun("unload", pp)
+	if err := managerWakeLaunchctlRun("load", "-w", pp); err != nil {
+		_ = restoreManagerWakeLaunchd(pp, prior, priorOK)
 		return fmt.Errorf("launchctl_load_failed")
 	}
 	fmt.Printf("已安装 manager-wake launchd（WatchPaths + StartInterval=%d）: %s\n", managerWakeWatchdogSec, pp)
@@ -129,7 +201,7 @@ func uninstallManagerWakeLaunchd() error {
 	if pp == "" {
 		return fmt.Errorf("launchd_path_unresolved")
 	}
-	_ = exec.Command("launchctl", "unload", pp).Run()
+	_ = managerWakeLaunchctlRun("unload", pp)
 	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
 		return err
 	}

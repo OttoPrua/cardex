@@ -45,6 +45,51 @@ func TestCmdAdmissionRejectsUnknownAction(t *testing.T) {
 	}
 }
 
+func TestCmdAdmissionRejectsExtraPositionalArgs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		action string
+	}{
+		{name: "pause extra", action: "pause"},
+		{name: "status extra", action: "status"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := cmdAdmission([]string{tc.action, "-root", root, "extra"}); err == nil {
+				t.Fatalf("cmdAdmission %s extra: want error", tc.action)
+			}
+			assertFreshRootZeroResidue(t, root)
+		})
+	}
+}
+
+func assertFreshRootZeroResidue(t *testing.T, root string) {
+	t.Helper()
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return relErr
+		}
+		lower := strings.ToLower(rel)
+		for _, needle := range []string{"admission", "task", "attempt", "event", "provider"} {
+			if strings.Contains(lower, needle) {
+				t.Errorf("unexpected %s residue: %s", needle, rel)
+			}
+		}
+		t.Errorf("unexpected residue: %s", rel)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func runCmdAdmission(t *testing.T, args []string) admissionState {
 	t.Helper()
 	old := os.Stdout

@@ -1974,6 +1974,9 @@ func cmdAdmission(args []string) error {
 	actorFlag := fs.String("actor", "cli:admission", "操作者")
 	reasonFlag := fs.String("reason", action, "原因")
 	_ = fs.Parse(args[1:])
+	if fs.NArg() > 0 {
+		return fmt.Errorf("admission %s: unexpected arguments %q", action, strings.Join(fs.Args(), " "))
+	}
 	root := resolveRoot(*rootFlag)
 	var st admissionState
 	var err error

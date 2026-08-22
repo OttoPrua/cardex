@@ -1,11 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -39,9 +42,9 @@ func loadAdmissionState(root string) (admissionState, error) {
 		}
 		return admissionState{}, fmt.Errorf("admission state: read: %w", err)
 	}
-	var wire admissionStateWire
-	if err := json.Unmarshal(data, &wire); err != nil {
-		return admissionState{}, fmt.Errorf("admission state: malformed json: %w", err)
+	wire, err := decodeClosedAdmissionV1(data)
+	if err != nil {
+		return admissionState{}, err
 	}
 	if wire.Version == nil {
 		return admissionState{}, fmt.Errorf("admission state: missing version")
@@ -69,6 +72,99 @@ func loadAdmissionState(root string) (admissionState, error) {
 		Reason:    wire.Reason,
 		UpdatedAt: *wire.UpdatedAt,
 	}, nil
+}
+
+func decodeClosedAdmissionV1(data []byte) (admissionStateWire, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	tok, err := dec.Token()
+	if err != nil {
+		return admissionStateWire{}, fmt.Errorf("admission state: malformed json: %w", err)
+	}
+	delim, ok := tok.(json.Delim)
+	if !ok || delim != '{' {
+		return admissionStateWire{}, fmt.Errorf("admission state: top-level value must be an object")
+	}
+
+	var wire admissionStateWire
+	seen := make(map[string]struct{})
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return admissionStateWire{}, fmt.Errorf("admission state: malformed json: %w", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return admissionStateWire{}, fmt.Errorf("admission state: malformed json: non-string field name")
+		}
+		field, ok := canonicalAdmissionField(key)
+		if !ok {
+			return admissionStateWire{}, fmt.Errorf("admission state: unknown field %q", key)
+		}
+		if _, dup := seen[field]; dup {
+			return admissionStateWire{}, fmt.Errorf("admission state: duplicate field %q", key)
+		}
+		seen[field] = struct{}{}
+		if err := decodeAdmissionField(dec, &wire, field); err != nil {
+			return admissionStateWire{}, err
+		}
+	}
+	end, err := dec.Token()
+	if err != nil {
+		return admissionStateWire{}, fmt.Errorf("admission state: malformed json: %w", err)
+	}
+	if delim, ok := end.(json.Delim); !ok || delim != '}' {
+		return admissionStateWire{}, fmt.Errorf("admission state: malformed json: expected end of object")
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		if err == nil {
+			return admissionStateWire{}, fmt.Errorf("admission state: trailing json")
+		}
+		return admissionStateWire{}, fmt.Errorf("admission state: malformed json: %w", err)
+	}
+	return wire, nil
+}
+
+func canonicalAdmissionField(name string) (string, bool) {
+	switch {
+	case strings.EqualFold(name, "version"):
+		return "version", true
+	case strings.EqualFold(name, "epoch"):
+		return "epoch", true
+	case strings.EqualFold(name, "paused"):
+		return "paused", true
+	case strings.EqualFold(name, "actor"):
+		return "actor", true
+	case strings.EqualFold(name, "reason"):
+		return "reason", true
+	case strings.EqualFold(name, "updated_at"):
+		return "updated_at", true
+	default:
+		return "", false
+	}
+}
+
+func decodeAdmissionField(dec *json.Decoder, wire *admissionStateWire, field string) error {
+	var err error
+	switch field {
+	case "version":
+		err = dec.Decode(&wire.Version)
+	case "epoch":
+		err = dec.Decode(&wire.Epoch)
+	case "paused":
+		err = dec.Decode(&wire.Paused)
+	case "actor":
+		err = dec.Decode(&wire.Actor)
+	case "reason":
+		err = dec.Decode(&wire.Reason)
+	case "updated_at":
+		err = dec.Decode(&wire.UpdatedAt)
+	default:
+		return fmt.Errorf("admission state: unknown field %q", field)
+	}
+	if err != nil {
+		return fmt.Errorf("admission state: malformed json: %w", err)
+	}
+	return nil
 }
 
 func admissionAllowsScheduling(root string) bool {

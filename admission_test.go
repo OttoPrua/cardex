@@ -153,6 +153,80 @@ func TestAdmissionIdempotentPreservesTransitionMetadata(t *testing.T) {
 	}
 }
 
+func TestAdmissionClosedV1SchemaRejectsDuplicatesUnknownAndNonObject(t *testing.T) {
+	const ts = "2026-01-01T00:00:00.000000000Z"
+	cases := []struct {
+		name string
+		body string
+	}{
+		{
+			name: "duplicate paused true then false",
+			body: `{"version":1,"epoch":0,"paused":true,"paused":false,"updated_at":"` + ts + `"}`,
+		},
+		{
+			name: "duplicate paused case alias",
+			body: `{"version":1,"epoch":0,"paused":true,"Paused":false,"updated_at":"` + ts + `"}`,
+		},
+		{
+			name: "duplicate epoch",
+			body: `{"version":1,"epoch":0,"epoch":1,"paused":false,"updated_at":"` + ts + `"}`,
+		},
+		{
+			name: "unknown top-level key",
+			body: `{"version":1,"epoch":0,"paused":false,"updated_at":"` + ts + `","extra":true}`,
+		},
+		{
+			name: "non-object",
+			body: `[{"version":1,"epoch":0,"paused":false,"updated_at":"` + ts + `"}]`,
+		},
+		{
+			name: "trailing json value",
+			body: `{"version":1,"epoch":0,"paused":false,"updated_at":"` + ts + `"} false`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := os.MkdirAll(controlDir(root), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(admissionPath(root), []byte(tc.body+"\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := loadAdmissionState(root); err == nil {
+				t.Fatal("closed version-1 admission should fail load")
+			}
+			if admissionAllowsScheduling(root) {
+				t.Fatal("closed version-1 admission should fail closed")
+			}
+		})
+	}
+}
+
+func TestAdmissionCanonicalV1StillLoads(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(controlDir(root), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	body := `{"version":1,"epoch":4,"paused":false,"actor":"ops","reason":"drain","updated_at":"2026-01-01T00:00:00.000000000Z"}` + "\n"
+	if err := os.WriteFile(admissionPath(root), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	st, err := loadAdmissionState(root)
+	if err != nil {
+		t.Fatalf("canonical version-1 admission should load: %v", err)
+	}
+	if st.Version != 1 || st.Epoch != 4 || st.Paused || st.Actor != "ops" || st.Reason != "drain" {
+		t.Fatalf("canonical state = %+v", st)
+	}
+	if _, err := time.Parse(time.RFC3339Nano, st.UpdatedAt); err != nil {
+		t.Fatalf("canonical updated_at: %v", err)
+	}
+	if !admissionAllowsScheduling(root) {
+		t.Fatal("canonical open admission should allow scheduling")
+	}
+}
+
 func TestAdmissionMalformedFailsClosed(t *testing.T) {
 	root := t.TempDir()
 	if err := os.MkdirAll(controlDir(root), 0o755); err != nil {

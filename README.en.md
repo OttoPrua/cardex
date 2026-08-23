@@ -75,6 +75,13 @@ Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs t
 
 **The desktop app is in scope too**: Claude Code's desktop app and the CLI share the `~/.claude/projects` session store and the same subscription quota, so sessions opened in the desktop app can equally be listed, pulled for progress, and taken over with `--resume`.
 
+## Two recommended workflow modes
+
+- **Direct serial**: advance one bounded goal through design → development → independent review → integration → an explicit live gate.
+- **Federated management**: a central manager owns the program DAG and final convergence; multiple module managers each run design → development → independent review → module integration, then join for system integration and final review.
+
+Both modes use Cardex `depends_on`, normalized write-domain/resource claims, separate reviewers, durable task/event/attempt evidence, and held live gates. Management sessions do not write product bytes or bypass Cardex to create duplicate writers. See [recommended workflows](docs/workflows.en.md), including the custody gate that rejects review acceptance or redispatch when attempt, producer, and lease state disagree.
+
 ## How it works
 
 ```
@@ -158,6 +165,7 @@ Prompt templates live in `~/.cardex/templates/*.md` and can be edited directly (
 
 | Doc | Contents |
 |---|---|
+| [Recommended workflows](docs/workflows.en.md) | Direct serial and federated management, path/resource conflict prevention, review custody, evidence gates, and machine-enforcement roadmap |
 | [Advanced guide](docs/guide.en.md) | Coordination loop, file-based state, review divert, cross-verification, web board, quota redline, codex backup executor |
 | [Runtime internals](docs/internals.en.md) | Dispatch rules, limit recovery, failure classification, stall patrol, event ledger, idempotent tombstones, permissions |
 | [Configuration reference](docs/config.en.md) | The full `~/.cardex/config.json` key table + templates |

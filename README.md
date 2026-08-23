@@ -75,6 +75,13 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 
 **桌面端也在管辖范围内**：Claude Code 桌面端与 CLI 共用 `~/.claude/projects` 会话存储和订阅额度，所以桌面端里开的会话同样可以被列出、回收进度、`--resume` 接管。
 
+## 两种推荐工作流
+
+- **直派串联**：一个闭合目标按“设计 → 开发 → 独立审核 → 集成 → 明示 live 门”推进。
+- **联邦多管理线**：中央 manager 管整体 DAG 与最终收口；多个子模块 manager 各自循环“设计 → 开发 → 独立审核 → 模块集成”，再 join 到整体集成与最终复核。
+
+两种模式都用 Cardex 的 `depends_on`、规范化 write-domain/resource claims、独立 reviewer、持久 task/event/attempt 证据和 held live gate；management session 不写 product bytes，也不绕过 Cardex 另派重复 writer。详见[推荐工作流](docs/workflows.md)，其中还定义了 attempt/producer/lease 漂移时禁止审核采信与重派的 custody 门。
+
 ## 怎么做到的
 
 ```
@@ -158,6 +165,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 
 | 文档 | 内容 |
 |---|---|
+| [推荐工作流](docs/workflows.md) | 直派串联、联邦多管理线、写域/资源防冲突、审核 custody、证据门与机器化路线图 |
 | [进阶指南](docs/guide.md) | 分工协调闭环、文件化状态、审核分流、交叉验证、Web 看板、额度红线、codex 备用执行器 |
 | [运行时内核](docs/internals.md) | 派发规则、限额恢复、失败分类、卡死巡逻、事件账本、幂等墓碑、权限与安全 |
 | [配置参考](docs/config.md) | `~/.cardex/config.json` 全量键表 + 模板说明 |

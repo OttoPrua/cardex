@@ -926,3 +926,224 @@ func TestWakeMalformedInflightInventoryFailsClosedBeforeQueue(t *testing.T) {
 		})
 	}
 }
+
+func writeReceiptRaw(t *testing.T, root, subID string, data []byte) {
+	t.Helper()
+	path := managerWakeReceiptPath(root, subID)
+	if path == "" {
+		t.Fatal("receipt path rejected")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWakeMalformedReceiptInventoryFailsClosedBeforeQueue(t *testing.T) {
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b07"
+	cases := []struct {
+		name         string
+		laterEnabled bool
+		includeLater bool
+		write        func(t *testing.T, root, wantID string)
+	}{
+		{
+			name:         "corrupt_later_enabled",
+			laterEnabled: true,
+			includeLater: true,
+			write: func(t *testing.T, root, wantID string) {
+				writeReceiptRaw(t, root, "origin", []byte("{nope\n"))
+			},
+		},
+		{
+			name:         "corrupt_later_disabled",
+			laterEnabled: false,
+			includeLater: true,
+			write: func(t *testing.T, root, wantID string) {
+				writeReceiptRaw(t, root, "origin", []byte("{nope\n"))
+			},
+		},
+		{
+			name:         "corrupt_later_removed",
+			laterEnabled: false,
+			includeLater: false,
+			write: func(t *testing.T, root, wantID string) {
+				writeReceiptRaw(t, root, "origin", []byte("{nope\n"))
+			},
+		},
+		{
+			name:         "foreign_later_removed",
+			laterEnabled: false,
+			includeLater: false,
+			write: func(t *testing.T, root, wantID string) {
+				raw := `{
+  "schema": "cardex.manager_wake.receipt.v1",
+  "subscription_id": "origin",
+  "wake_event_ids": ["` + wantID + `", "forged-receipt:9:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`
+				writeReceiptRaw(t, root, "origin", []byte(raw))
+			},
+		},
+		{
+			name:         "noncanonical_thread",
+			laterEnabled: true,
+			includeLater: true,
+			write: func(t *testing.T, root, wantID string) {
+				raw := `{
+  "schema": "cardex.manager_wake.receipt.v1",
+  "subscription_id": "origin",
+  "thread_id": "{` + thread + `}",
+  "wake_event_ids": ["` + wantID + `"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`
+				writeReceiptRaw(t, root, "origin", []byte(raw))
+			},
+		},
+		{
+			name:         "path_unsafe_name",
+			laterEnabled: false,
+			includeLater: false,
+			write: func(t *testing.T, root, wantID string) {
+				dir := managerWakeReceiptDir(root)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "bad name.json")
+				if err := os.WriteFile(path, []byte(`{"schema":"cardex.manager_wake.receipt.v1"}
+`), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			bin, logPath := fakeCodexQueueBin(t, 0)
+			mw := overlappingStartingDedupeCfg(bin, "wake-proj", thread, thread, tc.laterEnabled, tc.includeLater)
+			tk := heldCommittedTask(t, root, "wake-proj", "malformed-receipt-"+tc.name)
+			held := mustHeldEvent(t, root, tk.ID)
+			wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+			tc.write(t, root, wantID)
+			enteredQueue := false
+			orig := managerWakeBeforeQueue
+			t.Cleanup(func() { managerWakeBeforeQueue = orig })
+			managerWakeBeforeQueue = func() { enteredQueue = true }
+			err := managerWakeOnce(root, mw)
+			if err == nil {
+				t.Fatal("malformed receipt inventory must fail closed")
+			}
+			if enteredQueue {
+				t.Fatal("malformed receipt inventory must fail closed before queue")
+			}
+			if queueThreadCount(logPath) != 0 {
+				data, _ := os.ReadFile(logPath)
+				t.Fatalf("malformed receipt inventory queued: %s", data)
+			}
+			if got := loadManagerWakeErrorClass(root); got == "" {
+				t.Fatal("malformed receipt inventory must leave a durable error")
+			}
+		})
+	}
+}
+
+func TestWakeClaimedOriginRetryAfterSiblingReceiptRemovalDoesNotDuplicate(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b08"
+	alias := "7B7B7B7B-7B7B-7B7B-7B7B-7B7B7B7B7B08"
+	mw := overlappingStartingDedupeCfg(bin, "wake-proj", alias, thread, false, true)
+	tk := heldCommittedTask(t, root, "wake-proj", "claimed-origin-sibling-removed")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+	if err := saveManagerWakeInflightPhase(root, "origin", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseClaimed); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("sibling first delivery must succeed, got %v", err)
+	}
+	data, _ := os.ReadFile(logPath)
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("sibling must deliver exactly once: %d payload=%s", queueThreadCount(logPath), data)
+	}
+	if !strings.Contains(string(data), "wake="+wantID) {
+		t.Fatalf("sibling first delivery missing wake=%s: %s", wantID, data)
+	}
+	if !strings.Contains(string(data), "--thread\n"+alias+"\n") {
+		t.Fatalf("queue argv must keep sibling subscription thread %q: %s", alias, data)
+	}
+	ids, class, err := loadManagerWakeReceiptIDs(root, "first")
+	if err != nil || class != "" || !ids[wantID] {
+		t.Fatalf("sibling destination receipt must persist wake=%s class=%q err=%v ids=%v", wantID, class, err, ids)
+	}
+	rec, iclass, ierr := loadManagerWakeInflight(root, "origin")
+	if ierr != nil || iclass != "" || rec == nil || rec.Phase != inflightPhaseClaimed {
+		t.Fatalf("disabled origin claimed inflight must remain phase=%v class=%q err=%v", rec, iclass, ierr)
+	}
+
+	mw = testWakeCfg(bin, "wake-proj", thread, "origin")
+	enteredQueue := false
+	origHook := managerWakeBeforeQueue
+	t.Cleanup(func() { managerWakeBeforeQueue = origHook })
+	managerWakeBeforeQueue = func() { enteredQueue = true }
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("re-enabled origin after sibling removal must not fail, got %v", err)
+	}
+	data, _ = os.ReadFile(logPath)
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("re-enabled origin queued a duplicate after sibling removal: %d payload=%s", queueThreadCount(logPath), data)
+	}
+	ids, class, err = loadManagerWakeReceiptIDs(root, "first")
+	if err != nil || class != "" || !ids[wantID] {
+		t.Fatalf("destination provenance must survive sibling removal wake=%s class=%q err=%v ids=%v", wantID, class, err, ids)
+	}
+	originIDs, oclass, oerr := loadManagerWakeReceiptIDs(root, "origin")
+	if oerr != nil || oclass != "" || originIDs[wantID] {
+		t.Fatalf("duplicate suppression must not mint a false origin receipt class=%q err=%v ids=%v", oclass, oerr, originIDs)
+	}
+	rec, iclass, ierr = loadManagerWakeInflight(root, "origin")
+	if ierr != nil || iclass != "" || rec != nil {
+		t.Fatalf("claimed origin must be covered/cleared after destination delivery rec=%v class=%q err=%v enteredQueue=%v", rec, iclass, ierr, enteredQueue)
+	}
+}
+
+func TestWakeClaimedOriginWithoutDestinationDeliveryRemainsFirstDeliveryEligible(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b09"
+	mw := testWakeCfg(bin, "wake-proj", thread, "origin")
+	tk := heldCommittedTask(t, root, "wake-proj", "claimed-origin-first-delivery")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+	if err := saveManagerWakeInflightPhase(root, "origin", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseClaimed); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("claimed origin with no destination delivery must remain first-delivery eligible, got %v", err)
+	}
+	data, _ := os.ReadFile(logPath)
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("claimed origin suppressed a required first delivery: %d payload=%s", queueThreadCount(logPath), data)
+	}
+	if !strings.Contains(string(data), "wake="+wantID) {
+		t.Fatalf("first delivery missing wake=%s: %s", wantID, data)
+	}
+	if !strings.Contains(string(data), "--thread\n"+thread+"\n") {
+		t.Fatalf("queue argv must keep origin subscription thread %q: %s", thread, data)
+	}
+	ids, class, err := loadManagerWakeReceiptIDs(root, "origin")
+	if err != nil || class != "" || !ids[wantID] {
+		t.Fatalf("legitimate first delivery must persist origin receipt class=%q err=%v ids=%v", class, err, ids)
+	}
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("restart after first delivery must not fail, got %v", err)
+	}
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("restart duplicated the legitimate first delivery: %d", queueThreadCount(logPath))
+	}
+}

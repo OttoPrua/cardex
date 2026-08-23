@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -976,6 +977,90 @@ func grokBuildWriteCapable(t *Task) bool {
 	return t.Type == typeSequence || t.SkipPermissions
 }
 
+type grokBuildProcessClass string
+
+const (
+	grokBuildProcessClassTransport             grokBuildProcessClass = "transport"
+	grokBuildProcessClassPermissionEnvironment grokBuildProcessClass = "permission_environment"
+	grokBuildProcessClassInvalidInvocation     grokBuildProcessClass = "invalid_invocation"
+	grokBuildProcessClassUnclassified          grokBuildProcessClass = "unclassified"
+
+	grokBuildProcessExitNonExit = "non_exit"
+	// Closed classifier token so existing policyFor(permission) holds the card.
+	// It is not provider stderr and is the only non-class/non-exit token persisted.
+	grokBuildProcessHeldToken = "permission denied"
+)
+
+var grokBuildPlainInvalidInvocationRe = regexp.MustCompile(`(?i)^(?:error:\s*)?(?:invalid (?:option|argument|flag)\b.*|usage:\s.+)$`)
+
+type grokBuildProcessTerminal struct {
+	class      grokBuildProcessClass
+	exitStatus string
+}
+
+func (t grokBuildProcessTerminal) subtype() string {
+	return "grok_build_process_" + string(t.class)
+}
+
+func (t grokBuildProcessTerminal) result() string {
+	return grokBuildProcessHeldToken + "; exit_status=" + t.exitStatus
+}
+
+func grokBuildZeroWorkObservation(res *claudeResult) bool {
+	return res != nil && res.SemanticEvents == 0 && res.ModelEvents == 0 &&
+		res.ToolEvents == 0 && res.TerminalEvents == 0 && res.NumTurns == 0
+}
+
+func grokBuildNormalizedProcessExitStatus(runErr error) string {
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		return strconv.Itoa(exitErr.ExitCode())
+	}
+	return grokBuildProcessExitNonExit
+}
+
+func grokBuildPlainPermissionEnvironmentLine(line string) bool {
+	return permissionClassRe.MatchString(line) || policyPlainGrokReadOnlyDiagnosticRe.MatchString(line)
+}
+
+func classifyGrokBuildProcessStderr(stderr string) (grokBuildProcessClass, bool) {
+	if strings.TrimSpace(stderr) == "" || grokBuildStderrHasAuthOrQuotaEvidence(stderr) {
+		return "", false
+	}
+	line := firstLine(stderr)
+	if line == "" || policyPlainStallDiagnosticRe.MatchString(line) {
+		return "", false
+	}
+	switch {
+	case policyPlainTransportDiagnosticRe.MatchString(line):
+		return grokBuildProcessClassTransport, true
+	case grokBuildPlainPermissionEnvironmentLine(line):
+		return grokBuildProcessClassPermissionEnvironment, true
+	case grokBuildPlainInvalidInvocationRe.MatchString(line):
+		return grokBuildProcessClassInvalidInvocation, true
+	default:
+		return grokBuildProcessClassUnclassified, true
+	}
+}
+
+func grokBuildZeroEventProcessTerminal(stdout, stderr string, runErr error) (grokBuildProcessTerminal, bool) {
+	if runErr == nil {
+		return grokBuildProcessTerminal{}, false
+	}
+	class, ok := classifyGrokBuildProcessStderr(stderr)
+	if !ok {
+		return grokBuildProcessTerminal{}, false
+	}
+	stdoutOnly := parseGrokBuildJSONL(stdout)
+	if !grokBuildZeroWorkObservation(stdoutOnly) || !stdoutOnly.ObservationComplete {
+		return grokBuildProcessTerminal{}, false
+	}
+	return grokBuildProcessTerminal{
+		class:      class,
+		exitStatus: grokBuildNormalizedProcessExitStatus(runErr),
+	}, true
+}
+
 func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
 	if !grokBuildEnabled(cfg) {
 		return nil, "", fmt.Errorf("grok_build_bin/grok_build 未启用")
@@ -1077,6 +1162,11 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 			res.IsError = true
 			res.Subtype = "grok_build_process_auth"
 			res.Result = authLine
+		} else if proc, ok := grokBuildZeroEventProcessTerminal(stdout.String(), stderr.String(), runErr); ok {
+			res.IsError = true
+			res.Subtype = proc.subtype()
+			res.Result = proc.result()
+			combined = stdout.String()
 		}
 	}
 	if runErr != nil && (res == nil || !res.IsError) {

@@ -1695,7 +1695,17 @@ func managerWakeOnceLocked(root string, mw *ManagerWakeConfig) error {
 
 	bin := strings.TrimSpace(mw.CodexBin)
 	pending := 0
-	destSeen := preloadDestinationEventIDs(root, mw)
+	destSeen, destClass, destErr := preloadDestinationEventIDs(root, mw)
+	if destClass != "" {
+		if destClass == "delivery_uncertain" {
+			return failDeliveryUncertain(root, nil, &metrics)
+		}
+		noteManagerWakeError(root, &metrics, destClass)
+		if destErr != nil {
+			return destErr
+		}
+		return fmt.Errorf("%s", destClass)
+	}
 	for _, sub := range mw.Subscriptions {
 		if !sub.Enabled {
 			continue
@@ -1809,48 +1819,119 @@ func bindCommittedWakeRow(root string, t *Task, row managerWakeOutboxRow) (manag
 	return rebuildOutboxRowFromCommitted(row.Seq, t, ev), wakeBindOK
 }
 
-func preloadDestinationEventIDs(root string, mw *ManagerWakeConfig) map[string]map[string]bool {
+func canonicalManagerWakeThreadID(thread string) (string, bool) {
+	thread = strings.TrimSpace(thread)
+	if thread == "" || !managerWakeThreadRE.MatchString(thread) {
+		return "", false
+	}
+	return strings.ToLower(thread), true
+}
+
+func seedDestinationEventIDs(dest map[string]map[string]bool, thread string, ids []string) bool {
+	if dest == nil {
+		return false
+	}
+	key, ok := canonicalManagerWakeThreadID(thread)
+	if !ok {
+		return false
+	}
+	if dest[key] == nil {
+		dest[key] = map[string]bool{}
+	}
+	for _, id := range ids {
+		if id != "" {
+			dest[key][id] = true
+		}
+	}
+	return true
+}
+
+func preloadDestinationEventIDs(root string, mw *ManagerWakeConfig) (map[string]map[string]bool, string, error) {
 	dest := map[string]map[string]bool{}
-	if mw == nil {
-		return dest
-	}
-	ensure := func(thread string) map[string]bool {
-		thread = strings.TrimSpace(thread)
-		if dest[thread] == nil {
-			dest[thread] = map[string]bool{}
-		}
-		return dest[thread]
-	}
-	for _, sub := range mw.Subscriptions {
-		ids, class, _ := loadManagerWakeReceiptIDs(root, sub.ID)
-		if class == "" {
+	enabled := map[string]bool{}
+	if mw != nil {
+		for _, sub := range mw.Subscriptions {
+			if id, ok := closedManagerWakeSubID(sub.ID); ok && sub.Enabled {
+				enabled[id] = true
+			}
+			ids, class, _ := loadManagerWakeReceiptIDs(root, sub.ID)
+			if class != "" {
+				continue
+			}
 			for id := range ids {
-				ensure(sub.ThreadID)[id] = true
-			}
-		}
-		rec, class, _ := loadManagerWakeInflight(root, sub.ID)
-		if class == "" && rec != nil && rec.Phase == inflightPhaseSpawned {
-			for _, id := range rec.WakeEventIDs {
-				ensure(rec.ThreadID)[id] = true
+				_ = seedDestinationEventIDs(dest, sub.ThreadID, []string{id})
 			}
 		}
 	}
-	return dest
+	entries, err := os.ReadDir(managerWakeInflightDir(root))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return dest, "", nil
+		}
+		return dest, "inflight_unreadable", fmt.Errorf("inflight_unreadable")
+	}
+	orphanUncertain := false
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		id := strings.TrimSuffix(e.Name(), ".json")
+		if _, ok := closedManagerWakeSubID(id); !ok {
+			return dest, "delivery_uncertain", fmt.Errorf("delivery_uncertain")
+		}
+		if managerWakeInflightPath(root, id) == "" {
+			return dest, "delivery_uncertain", fmt.Errorf("delivery_uncertain")
+		}
+		rec, class, err := loadManagerWakeInflight(root, id)
+		if class != "" {
+			if err != nil {
+				return dest, class, err
+			}
+			return dest, class, fmt.Errorf("%s", class)
+		}
+		if rec == nil {
+			continue
+		}
+		if rec.Phase == inflightPhaseClaimed {
+			continue
+		}
+		if rec.Phase != inflightPhaseStarting && rec.Phase != inflightPhaseSpawned {
+			return dest, "delivery_uncertain", fmt.Errorf("delivery_uncertain")
+		}
+		if _, ok := canonicalManagerWakeThreadID(rec.ThreadID); !ok {
+			return dest, "delivery_uncertain", fmt.Errorf("delivery_uncertain")
+		}
+		receipts, rclass, rerr := loadManagerWakeReceiptIDs(root, id)
+		if rclass != "" {
+			if rerr != nil {
+				return dest, rclass, rerr
+			}
+			return dest, rclass, fmt.Errorf("%s", rclass)
+		}
+		if !seedDestinationEventIDs(dest, rec.ThreadID, rec.WakeEventIDs) {
+			return dest, "delivery_uncertain", fmt.Errorf("delivery_uncertain")
+		}
+		if !receiptsCoverInflight(receipts, rec.WakeEventIDs) && !enabled[id] {
+			orphanUncertain = true
+		}
+	}
+	if orphanUncertain {
+		return dest, "delivery_uncertain", fmt.Errorf("delivery_uncertain")
+	}
+	return dest, "", nil
 }
 
 func markDestinationEventIDs(dest map[string]map[string]bool, thread string, rows []managerWakeOutboxRow) {
 	if dest == nil {
 		return
 	}
-	thread = strings.TrimSpace(thread)
-	if dest[thread] == nil {
-		dest[thread] = map[string]bool{}
-	}
+	ids := make([]string, 0, len(rows))
 	for _, row := range rows {
 		if row.WakeEventID != "" {
-			dest[thread][row.WakeEventID] = true
+			ids = append(ids, row.WakeEventID)
 		}
 	}
+	_ = seedDestinationEventIDs(dest, thread, ids)
 }
 
 func deliverSubscription(root string, sub ManagerWakeSubscription, rows []managerWakeOutboxRow, bin string, metrics *managerWakeMetrics, destSeen map[string]map[string]bool) error {
@@ -2041,7 +2122,12 @@ func queueWakeRows(root string, sub ManagerWakeSubscription, delta []managerWake
 			}
 			return fmt.Errorf("%s", class)
 		}
-		already := destSeen[strings.TrimSpace(sub.ThreadID)]
+		var already map[string]bool
+		if destSeen != nil {
+			if key, ok := canonicalManagerWakeThreadID(sub.ThreadID); ok {
+				already = destSeen[key]
+			}
+		}
 		var toSend []managerWakeOutboxRow
 		for _, row := range delta {
 			if receipts[row.WakeEventID] || (already != nil && already[row.WakeEventID]) {

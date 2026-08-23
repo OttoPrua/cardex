@@ -694,3 +694,235 @@ func assertNoNewOrEscapedLocks(t *testing.T, root string, before map[string]bool
 		t.Fatalf("invalid identity created lock %s", abs)
 	}
 }
+
+func overlappingStartingDedupeCfg(bin, project, firstThread, originThread string, originEnabled, includeOrigin bool) *ManagerWakeConfig {
+	mw := &ManagerWakeConfig{
+		Enabled:     true,
+		CodexBin:    bin,
+		WatchdogSec: managerWakeWatchdogSec,
+		Subscriptions: []ManagerWakeSubscription{{
+			ID:       "first",
+			ThreadID: firstThread,
+			Projects: []string{project},
+			Enabled:  true,
+		}},
+	}
+	if includeOrigin {
+		mw.Subscriptions = append(mw.Subscriptions, ManagerWakeSubscription{
+			ID:       "origin",
+			ThreadID: originThread,
+			Projects: []string{project},
+			Enabled:  originEnabled,
+		})
+	}
+	return mw
+}
+
+func assertStartingInflightDoesNotDuplicateDestination(t *testing.T, root, logPath, originID, wantID string, mw *ManagerWakeConfig) {
+	t.Helper()
+	err := managerWakeOnce(root, mw)
+	data, _ := os.ReadFile(logPath)
+	if queueThreadCount(logPath) != 0 {
+		t.Fatalf("starting inflight destination dedupe leaked a duplicate queue: %d payload=%s", queueThreadCount(logPath), data)
+	}
+	if strings.Contains(string(data), "wake="+wantID) {
+		t.Fatalf("starting inflight destination dedupe leaked wake=%s: %s", wantID, data)
+	}
+	if err == nil || err.Error() != "delivery_uncertain" {
+		t.Fatalf("unresolved starting inflight want delivery_uncertain, got %v", err)
+	}
+	if got := loadManagerWakeErrorClass(root); got != "delivery_uncertain" {
+		t.Fatalf("durable class=%q want delivery_uncertain", got)
+	}
+	rec, class, loadErr := loadManagerWakeInflight(root, originID)
+	if loadErr != nil || class != "" || rec == nil || rec.Phase != inflightPhaseStarting {
+		t.Fatalf("origin starting inflight must remain phase=%v class=%q err=%v", rec, class, loadErr)
+	}
+	ids, rclass, rerr := loadManagerWakeReceiptIDs(root, "first")
+	if rerr != nil || rclass != "" || ids[wantID] {
+		t.Fatalf("overlapping subscription must not mint a duplicate receipt class=%q err=%v ids=%v", rclass, rerr, ids)
+	}
+}
+
+func TestWakeStartingInflightNotSeededIntoDestinationDedupeOverlapOrder(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b01"
+	mw := overlappingStartingDedupeCfg(bin, "wake-proj", thread, thread, true, true)
+	tk := heldCommittedTask(t, root, "wake-proj", "starting-dest-overlap-order")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+	if err := saveManagerWakeInflightPhase(root, "origin", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseStarting); err != nil {
+		t.Fatal(err)
+	}
+	assertStartingInflightDoesNotDuplicateDestination(t, root, logPath, "origin", wantID, mw)
+}
+
+func TestWakeStartingInflightDisabledOriginDestinationDedupe(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b02"
+	mw := overlappingStartingDedupeCfg(bin, "wake-proj", thread, thread, false, true)
+	tk := heldCommittedTask(t, root, "wake-proj", "starting-dest-disabled-origin")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+	if err := saveManagerWakeInflightPhase(root, "origin", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseStarting); err != nil {
+		t.Fatal(err)
+	}
+	assertStartingInflightDoesNotDuplicateDestination(t, root, logPath, "origin", wantID, mw)
+}
+
+func TestWakeStartingInflightRemovedOriginDestinationDedupe(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b03"
+	mw := overlappingStartingDedupeCfg(bin, "wake-proj", thread, thread, false, false)
+	tk := heldCommittedTask(t, root, "wake-proj", "starting-dest-removed-origin")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+	if err := saveManagerWakeInflightPhase(root, "origin", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseStarting); err != nil {
+		t.Fatal(err)
+	}
+	assertStartingInflightDoesNotDuplicateDestination(t, root, logPath, "origin", wantID, mw)
+}
+
+func TestWakeStartingInflightCanonicalThreadAliasDestinationDedupe(t *testing.T) {
+	const canonical = "7b7b7b7b-7b7b-41b4-a1b4-7b7b7b7b7b04"
+	const alias = "7B7B7B7B-7B7B-41B4-A1B4-7B7B7B7B7B04"
+	cases := []struct {
+		name         string
+		firstThread  string
+		originThread string
+	}{
+		{"upper_inflight_lower_first", canonical, alias},
+		{"lower_inflight_upper_first", alias, canonical},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			bin, logPath := fakeCodexQueueBin(t, 0)
+			mw := overlappingStartingDedupeCfg(bin, "wake-proj", tc.firstThread, tc.originThread, true, true)
+			tk := heldCommittedTask(t, root, "wake-proj", "starting-dest-alias-"+tc.name)
+			held := mustHeldEvent(t, root, tk.ID)
+			wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+			if err := saveManagerWakeInflightPhase(root, "origin", tc.originThread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseStarting); err != nil {
+				t.Fatal(err)
+			}
+			assertStartingInflightDoesNotDuplicateDestination(t, root, logPath, "origin", wantID, mw)
+			data, _ := os.ReadFile(logPath)
+			if strings.Contains(string(data), "--thread") && !strings.Contains(string(data), "--thread\n"+tc.firstThread+"\n") {
+				t.Fatalf("queue argv must keep first subscription thread %q: %s", tc.firstThread, data)
+			}
+		})
+	}
+}
+
+func TestWakeClaimedInflightDoesNotSuppressOverlappingFirstDelivery(t *testing.T) {
+	root := testRoot(t)
+	bin, logPath := fakeCodexQueueBin(t, 0)
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b05"
+	alias := "7B7B7B7B-7B7B-7B7B-7B7B-7B7B7B7B7B05"
+	mw := overlappingStartingDedupeCfg(bin, "wake-proj", alias, thread, false, true)
+	tk := heldCommittedTask(t, root, "wake-proj", "claimed-dest-no-suppress")
+	held := mustHeldEvent(t, root, tk.ID)
+	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
+	if err := saveManagerWakeInflightPhase(root, "origin", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseClaimed); err != nil {
+		t.Fatal(err)
+	}
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("claimed inflight must remain first-delivery retryable, got %v", err)
+	}
+	data, _ := os.ReadFile(logPath)
+	if queueThreadCount(logPath) != 1 {
+		t.Fatalf("claimed inflight suppressed a required first delivery: %d payload=%s", queueThreadCount(logPath), data)
+	}
+	if !strings.Contains(string(data), "wake="+wantID) {
+		t.Fatalf("first delivery missing wake=%s: %s", wantID, data)
+	}
+	if !strings.Contains(string(data), "--thread\n"+alias+"\n") {
+		t.Fatalf("queue argv must keep first subscription thread %q: %s", alias, data)
+	}
+	rec, class, err := loadManagerWakeInflight(root, "origin")
+	if err != nil || class != "" || rec == nil || rec.Phase != inflightPhaseClaimed {
+		t.Fatalf("disabled origin claimed inflight must remain phase=%v class=%q err=%v", rec, class, err)
+	}
+}
+
+func TestWakeMalformedInflightInventoryFailsClosedBeforeQueue(t *testing.T) {
+	thread := "7b7b7b7b-7b7b-7b7b-7b7b-7b7b7b7b7b06"
+	cases := []struct {
+		name  string
+		write func(t *testing.T, root string)
+	}{
+		{
+			name: "garbage_json",
+			write: func(t *testing.T, root string) {
+				writeInflightRaw(t, root, "origin", []byte("{nope\n"))
+			},
+		},
+		{
+			name: "foreign_subscription",
+			write: func(t *testing.T, root string) {
+				raw := `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "other",
+  "thread_id": "` + thread + `",
+  "phase": "starting",
+  "wake_event_ids": ["foreign:1:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`
+				writeInflightRaw(t, root, "origin", []byte(raw))
+			},
+		},
+		{
+			name: "noncanonical_thread",
+			write: func(t *testing.T, root string) {
+				raw := `{
+  "schema": "cardex.manager_wake.inflight.v1",
+  "subscription_id": "origin",
+  "thread_id": "{` + thread + `}",
+  "phase": "starting",
+  "wake_event_ids": ["brace:1:tid"],
+  "updated_at": "2026-01-01T00:00:00Z"
+}
+`
+				writeInflightRaw(t, root, "origin", []byte(raw))
+			},
+		},
+		{
+			name: "path_unsafe_name",
+			write: func(t *testing.T, root string) {
+				dir := managerWakeInflightDir(root)
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "bad name.json")
+				if err := os.WriteFile(path, []byte(`{"schema":"cardex.manager_wake.inflight.v1"}
+`), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			bin, logPath := fakeCodexQueueBin(t, 0)
+			mw := overlappingStartingDedupeCfg(bin, "wake-proj", thread, thread, false, false)
+			_ = heldCommittedTask(t, root, "wake-proj", "malformed-inflight-"+tc.name)
+			tc.write(t, root)
+			err := managerWakeOnce(root, mw)
+			if err == nil {
+				t.Fatal("malformed inflight inventory must fail closed")
+			}
+			if queueThreadCount(logPath) != 0 {
+				data, _ := os.ReadFile(logPath)
+				t.Fatalf("malformed inflight inventory queued: %s", data)
+			}
+			if got := loadManagerWakeErrorClass(root); got == "" {
+				t.Fatal("malformed inflight inventory must leave a durable error")
+			}
+		})
+	}
+}

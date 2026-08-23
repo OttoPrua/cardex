@@ -237,6 +237,206 @@ func withIsolatedManagerWakeLaunchd(t *testing.T, plistPath string) {
 	})
 }
 
+const launchctlAbsentUnitDiagnostic = `Could not find service "com.cardex.manager-wake" in domain for user gui: 501`
+
+func withFakeLaunchctl(t *testing.T, script string) {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "launchctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func withRealManagerWakeLaunchctlRunner(t *testing.T, plistPath string) {
+	t.Helper()
+	withIsolatedManagerWakeLaunchd(t, plistPath)
+	managerWakeLaunchctlRun = defaultManagerWakeLaunchctlRun
+}
+
+func TestDefaultManagerWakeLaunchctlRunClassifiesAbsentUnitFromPrintOutput(t *testing.T) {
+	withFakeLaunchctl(t, "#!/bin/sh\nprintf '%s\\n' '"+launchctlAbsentUnitDiagnostic+"' >&2\nexit 113\n")
+	err := defaultManagerWakeLaunchctlRun("print", "gui/501/"+managerWakeLaunchdLabel)
+	if err == nil {
+		t.Fatal("absent print must be nonzero")
+	}
+	if !launchctlServiceAbsent(err) {
+		t.Fatalf("real runner must classify absent-unit diagnostic, got %v", err)
+	}
+	if err.Error() != "not_loaded" {
+		t.Fatalf("closed absence token want not_loaded, got %v", err)
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "could not find") || strings.Contains(msg, managerWakeLaunchdLabel) || strings.Contains(err.Error(), launchctlAbsentUnitDiagnostic) {
+		t.Fatalf("must not expose raw launchctl output: %v", err)
+	}
+}
+
+func TestDefaultManagerWakeLaunchctlRunNonAbsentStaysFailClosed(t *testing.T) {
+	withFakeLaunchctl(t, "#!/bin/sh\nprintf '%s\\n' 'launchctl print failed: input error' >&2\nexit 113\n")
+	err := defaultManagerWakeLaunchctlRun("print", "gui/501/"+managerWakeLaunchdLabel)
+	if err == nil {
+		t.Fatal("nonzero print must fail")
+	}
+	if launchctlServiceAbsent(err) {
+		t.Fatalf("exit 113 without absent diagnostic must not classify as absent: %v", err)
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "could not find") || strings.Contains(msg, "input error") || strings.Contains(msg, managerWakeLaunchdLabel) {
+		t.Fatalf("must not expose raw launchctl output: %v", err)
+	}
+}
+
+func TestUninstallManagerWakeRemovesPlistAfterRealRunnerVerifiesAbsence(t *testing.T) {
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	if err := os.WriteFile(pp, []byte("PLIST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, `#!/bin/sh
+case "$1" in
+bootout)
+	exit 0
+	;;
+print)
+	printf '%s\n' 'Could not find service "com.cardex.manager-wake" in domain for user gui: 501' >&2
+	exit 113
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	if err := uninstallManagerWakeLaunchd(); err != nil {
+		t.Fatalf("verified absence must uninstall, got %v", err)
+	}
+	if _, err := os.Stat(pp); !os.IsNotExist(err) {
+		t.Fatalf("plist must be unlinked after verified absence: %v", err)
+	}
+}
+
+func TestUninstallManagerWakeNonAbsentPrintLeavesPlist(t *testing.T) {
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	if err := os.WriteFile(pp, []byte("PLIST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, `#!/bin/sh
+case "$1" in
+bootout)
+	exit 0
+	;;
+print)
+	printf '%s\n' 'launchctl print failed: input error' >&2
+	exit 113
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	if err := uninstallManagerWakeLaunchd(); err == nil || err.Error() != "launchctl_print_failed" {
+		t.Fatalf("non-absent print must fail closed, got %v", err)
+	}
+	if _, err := os.Stat(pp); err != nil {
+		t.Fatalf("failed print must not unlink plist: %v", err)
+	}
+}
+
+func TestInstallManagerWakeLoadFailureRestoresPriorThroughRealRunner(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	prior := []byte("PRIOR PLIST\n")
+	if err := os.WriteFile(pp, prior, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	loads := filepath.Join(t.TempDir(), "loads")
+	t.Setenv("CARDEX_TEST_LAUNCHCTL_LOADS", loads)
+	withFakeLaunchctl(t, `#!/bin/sh
+loads="${CARDEX_TEST_LAUNCHCTL_LOADS}"
+case "$1" in
+load)
+	n=0
+	if [ -f "$loads" ]; then
+		read n < "$loads" || n=0
+	fi
+	n=$((n+1))
+	echo "$n" > "$loads"
+	if [ "$n" -eq 1 ]; then
+		printf '%s\n' 'Bootstrapping failed' >&2
+		exit 1
+	fi
+	exit 0
+	;;
+bootout)
+	exit 0
+	;;
+print)
+	n=0
+	if [ -f "$loads" ]; then
+		read n < "$loads" || n=0
+	fi
+	if [ "$n" -ge 2 ]; then
+		exit 0
+	fi
+	printf '%s\n' 'Could not find service "com.cardex.manager-wake" in domain for user gui: 501' >&2
+	exit 113
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
+		t.Fatal("load failure must surface")
+	} else if err.Error() != "launchctl_load_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	got, err := os.ReadFile(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(prior) {
+		t.Fatalf("prior plist not restored: %q", got)
+	}
+}
+
+func TestInstallManagerWakeLoadFailureRemovesNewPlistAfterRealRunnerAbsence(t *testing.T) {
+	root := testRoot(t)
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, `#!/bin/sh
+case "$1" in
+load)
+	printf '%s\n' 'Bootstrapping failed' >&2
+	exit 1
+	;;
+bootout)
+	exit 0
+	;;
+print)
+	printf '%s\n' 'Could not find service "com.cardex.manager-wake" in domain for user gui: 501' >&2
+	exit 113
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
+		t.Fatal("load failure must surface")
+	} else if err.Error() != "launchctl_load_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := os.Stat(pp); !os.IsNotExist(err) {
+		t.Fatalf("new plist must be removed after verified absence: %v", err)
+	}
+}
+
 func TestInstallManagerWakeDurableWriteAndLoadFailureRestoresPrior(t *testing.T) {
 	root := testRoot(t)
 	dir := t.TempDir()

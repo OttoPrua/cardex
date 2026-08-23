@@ -31,7 +31,16 @@ func defaultManagerWakeLaunchdPlistPath() string {
 }
 
 func defaultManagerWakeLaunchctlRun(args ...string) error {
-	return exec.Command("launchctl", args...).Run()
+	// launchctl writes the absent-unit diagnostic to stdout/stderr. Run()
+	// would leave only "exit status 113" and misclassify a normal absence.
+	out, err := exec.Command("launchctl", args...).CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if launchctlServiceAbsent(fmt.Errorf("%s", out)) {
+		return fmt.Errorf("not_loaded")
+	}
+	return fmt.Errorf("launchctl_failed")
 }
 
 func managerWakeLaunchdPlistPath() string {

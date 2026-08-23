@@ -944,7 +944,7 @@ func grokBuildJSONObservation(stdout, stderr string, runErr error) string {
 	var out strings.Builder
 	out.WriteString(stdout)
 	scanner := bufio.NewScanner(strings.NewReader(stderr))
-	scanner.Buffer(make([]byte, 0, 64*1024), 8*1024*1024)
+	scanner.Buffer(make([]byte, 0, 64*1024), grokBuildStderrScanMaxToken)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -986,10 +986,12 @@ const (
 	grokBuildProcessClassUnclassified          grokBuildProcessClass = "unclassified"
 
 	grokBuildProcessExitNonExit = "non_exit"
-	// Closed window for process-stderr classification. A later recognized diagnostic is found
-	// only inside this bound; evidence past it cannot type the terminal.
+	// Closed window for positive process-class selection among transport,
+	// permission_environment, invalid_invocation, and unclassified. Fail-closed
+	// stall/JSON/scanner-loss evidence is decided on the full stderr first.
 	grokBuildProcessStderrMaxBytes = 2048
 	grokBuildProcessStderrMaxLines = 8
+	grokBuildStderrScanMaxToken    = 8 * 1024 * 1024
 )
 
 var grokBuildPlainInvalidInvocationRe = regexp.MustCompile(`(?i)^(?:error:\s*)?(?:invalid (?:option|argument|flag)\b.*|usage:\s.+)$`)
@@ -1059,16 +1061,31 @@ func grokBuildProcessStderrBoundedLines(stderr string) []string {
 	return lines
 }
 
+func grokBuildProcessStderrHasFailClosedEvidence(stderr string) bool {
+	scanner := bufio.NewScanner(strings.NewReader(stderr))
+	scanner.Buffer(make([]byte, 0, 64*1024), grokBuildStderrScanMaxToken)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		if policyPlainStallDiagnosticRe.MatchString(line) || grokBuildProcessLineJSONEvidence(line) {
+			return true
+		}
+	}
+	return scanner.Err() != nil
+}
+
 func classifyGrokBuildProcessStderr(stderr string) (grokBuildProcessClass, bool) {
 	if strings.TrimSpace(stderr) == "" || grokBuildStderrHasAuthOrQuotaEvidence(stderr) {
+		return "", false
+	}
+	if grokBuildProcessStderrHasFailClosedEvidence(stderr) {
 		return "", false
 	}
 	lines := grokBuildProcessStderrBoundedLines(stderr)
 	var sawTransport, sawPermission, sawInvalid bool
 	for _, line := range lines {
-		if policyPlainStallDiagnosticRe.MatchString(line) || grokBuildProcessLineJSONEvidence(line) {
-			return "", false
-		}
 		switch {
 		case policyPlainTransportDiagnosticRe.MatchString(line):
 			sawTransport = true

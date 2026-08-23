@@ -5,11 +5,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"sort"
 	"strings"
@@ -25,6 +25,7 @@ const (
 	receiptSchemaV1            = "cardex.manager_wake.receipt.v1"
 	inflightSchemaV1           = "cardex.manager_wake.inflight.v1"
 	inflightPhaseClaimed       = "claimed"
+	inflightPhaseStarting      = "starting"
 	inflightPhaseSpawned       = "spawned"
 	managerWakeOnceLockID      = "_manager-wake-once"
 	managerWakeOutboxLockID    = "_manager-wake-outbox"
@@ -80,10 +81,35 @@ var (
 	// immediately before cmd.Start. Tests inject a definite Start failure or a
 	// competing transition in the post-rebind/pre-Start window.
 	managerWakeBeforeStart func()
-	// errManagerWakeQueueStart is a definite pre-spawn cmd.Start failure.
-	// It is not delivery uncertainty: the OS child was never created.
-	errManagerWakeQueueStart = fmt.Errorf("queue_start_failed")
+	// managerWakeCrashAt is a test-only durable-protocol crash seam. Production
+	// never sets it. Values: after_claimed, after_starting, after_start,
+	// after_spawned, after_start_revert.
+	managerWakeCrashAt string
 )
+
+// wakeQueueStartFailed is the only definite pre-spawn cmd.Start failure.
+// Post-Start hooks and arbitrary errors with the same text must not produce it.
+type wakeQueueStartFailed struct{}
+
+func (wakeQueueStartFailed) Error() string { return "queue_start_failed" }
+
+func isDefiniteWakeQueueStartFailure(err error) bool {
+	_, ok := err.(wakeQueueStartFailed)
+	return ok
+}
+
+func crashWakeIf(point string) {
+	if managerWakeCrashAt != "" && managerWakeCrashAt == point {
+		os.Exit(99)
+	}
+}
+
+func usingDefaultManagerWakeQueue() bool {
+	return reflect.ValueOf(managerWakeQueue).Pointer() == reflect.ValueOf(defaultManagerWakeQueue).Pointer()
+}
+
+// errManagerWakeQueueStart is the typed definite pre-spawn Start failure.
+var errManagerWakeQueueStart error = wakeQueueStartFailed{}
 
 type managerWakeOutboxRow struct {
 	Schema       string `json:"schema"`
@@ -251,13 +277,38 @@ func rowWakeIdentity(row managerWakeOutboxRow) string {
 }
 
 func outboxRowIdentityConsistent(row managerWakeOutboxRow) bool {
-	if row.Schema != outboxSchemaV1 || row.Seq <= 0 || row.TaskID == "" || row.TaskEventSeq <= 0 || row.TransitionID == "" {
+	if row.Schema != outboxSchemaV1 || row.Seq <= 0 || row.TaskEventSeq <= 0 || row.TransitionID == "" {
+		return false
+	}
+	if _, ok := exactCanonicalOutgoingTaskID(row.TaskID); !ok {
 		return false
 	}
 	if !wakeEligibleEventType(row.EventType) {
 		return false
 	}
 	return row.WakeEventID == rowWakeIdentity(row)
+}
+
+func exactCanonicalOutgoingTaskID(id string) (string, bool) {
+	if id == "" || strings.TrimSpace(id) != id {
+		return "", false
+	}
+	closed, ok := closedManagerWakeTaskID(id)
+	if !ok || closed != id {
+		return "", false
+	}
+	if id == managerWakeOnceLockID || id == managerWakeOutboxLockID {
+		return "", false
+	}
+	return id, true
+}
+
+func failOutgoingTaskIdentity(root string, metrics *managerWakeMetrics) error {
+	if metrics != nil {
+		metrics.LastErrorClass = "outbox_identity_mismatch"
+	}
+	noteManagerWakeError(root, metrics, "outbox_identity_mismatch")
+	return fmt.Errorf("outbox_identity_mismatch")
 }
 
 func closedWakeReasonClass(actor, evType string, detail map[string]any) string {
@@ -767,7 +818,7 @@ func parseValidManagerWakeInflight(data []byte, subID string) (*managerWakeInfli
 	if rec.Schema != inflightSchemaV1 || rec.SubscriptionID != id {
 		return nil, false
 	}
-	if rec.Phase != inflightPhaseClaimed && rec.Phase != inflightPhaseSpawned {
+	if rec.Phase != inflightPhaseClaimed && rec.Phase != inflightPhaseStarting && rec.Phase != inflightPhaseSpawned {
 		return nil, false
 	}
 	if rec.ThreadID != strings.TrimSpace(rec.ThreadID) || !managerWakeThreadRE.MatchString(rec.ThreadID) {
@@ -814,7 +865,7 @@ func saveManagerWakeInflightPhase(root, subID, threadID string, rows []managerWa
 	if path == "" {
 		return fmt.Errorf("invalid_subscription_id")
 	}
-	if phase != inflightPhaseClaimed && phase != inflightPhaseSpawned {
+	if phase != inflightPhaseClaimed && phase != inflightPhaseStarting && phase != inflightPhaseSpawned {
 		return fmt.Errorf("inflight_save_failed")
 	}
 	if err := ensureDurableManagerWakeInflightDirs(root); err != nil {
@@ -984,6 +1035,9 @@ func rebindInflightEventIDs(root string, sub ManagerWakeSubscription, rows []man
 		if !ok {
 			return nil, true, false
 		}
+		if _, ok := exactCanonicalOutgoingTaskID(row.TaskID); !ok {
+			return nil, false, true
+		}
 		t, err := findTaskAnywhere(root, row.TaskID)
 		if err != nil && t == nil && !strings.Contains(err.Error(), "不存在") {
 			return nil, false, true
@@ -1006,6 +1060,9 @@ func rebindInflightEventIDs(root string, sub ManagerWakeSubscription, rows []man
 func rebindWakeDelta(root string, sub ManagerWakeSubscription, delta []managerWakeOutboxRow) ([]managerWakeOutboxRow, error) {
 	var out []managerWakeOutboxRow
 	for _, row := range delta {
+		if _, ok := exactCanonicalOutgoingTaskID(row.TaskID); !ok {
+			return nil, fmt.Errorf("outbox_identity_mismatch")
+		}
 		t, err := findTaskAnywhere(root, row.TaskID)
 		if err != nil && t == nil && !strings.Contains(err.Error(), "不存在") {
 			return nil, fmt.Errorf("outbox_identity_mismatch")
@@ -1460,14 +1517,18 @@ func managerWakeQueueArgv(bin, thread, message string) []string {
 	return []string{bin, "queue", "--thread", thread, "--message", message}
 }
 
-func defaultManagerWakeQueue(bin, thread, message string) error {
+type managerWakeQueueChild struct {
+	wait func() error
+	kill func()
+}
+
+func beginDefaultManagerWakeQueue(bin, thread, message string) (*managerWakeQueueChild, error) {
 	killHandlerOnce.Do(installKillHandler)
 	if !wakeMessageCarriesEventIDs(message) {
-		return fmt.Errorf("queue_idempotency_unsupported")
+		return nil, fmt.Errorf("queue_idempotency_unsupported")
 	}
 	args := managerWakeQueueArgv(bin, thread, message)
 	ctx, cancel := context.WithTimeout(context.Background(), managerWakeQueueTimeout)
-	defer cancel()
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Stdin = nil
 	setupProcGroup(cmd)
@@ -1475,7 +1536,15 @@ func defaultManagerWakeQueue(bin, thread, message string) error {
 		fn()
 	}
 	if err := cmd.Start(); err != nil {
-		return errManagerWakeQueueStart
+		cancel()
+		return nil, errManagerWakeQueueStart
+	}
+	if managerWakeCrashAt == "after_start" {
+		if cmd.Process != nil {
+			_ = cmd.Wait()
+		}
+		cancel()
+		os.Exit(99)
 	}
 	pid := 0
 	if cmd.Process != nil {
@@ -1485,11 +1554,14 @@ func defaultManagerWakeQueue(bin, thread, message string) error {
 		procMu.Lock()
 		procGroups[pid] = true
 		procMu.Unlock()
-		defer func() {
+	}
+	unregister := func() {
+		if pid > 0 {
 			procMu.Lock()
 			delete(procGroups, pid)
 			procMu.Unlock()
-		}()
+		}
+		cancel()
 	}
 	if fn := managerWakeQueueSpawned; fn != nil {
 		if err := fn(); err != nil {
@@ -1497,13 +1569,32 @@ func defaultManagerWakeQueue(bin, thread, message string) error {
 				_ = killProcGroup(pid)
 			}
 			_ = cmd.Wait()
-			return err
+			unregister()
+			return nil, err
 		}
 	}
-	if err := rescueWaitDelay(cmd.Wait(), cmd); err != nil {
-		return fmt.Errorf("queue_failed")
+	return &managerWakeQueueChild{
+		wait: func() error {
+			defer unregister()
+			if err := rescueWaitDelay(cmd.Wait(), cmd); err != nil {
+				return fmt.Errorf("queue_failed")
+			}
+			return nil
+		},
+		kill: func() {
+			if pid > 0 {
+				_ = killProcGroup(pid)
+			}
+		},
+	}, nil
+}
+
+func defaultManagerWakeQueue(bin, thread, message string) error {
+	child, err := beginDefaultManagerWakeQueue(bin, thread, message)
+	if err != nil {
+		return err
 	}
-	return nil
+	return child.wait()
 }
 
 func compactWakeMessage(sub ManagerWakeSubscription, rows []managerWakeOutboxRow, highWater int64) string {
@@ -1823,6 +1914,9 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 		if row.Seq > scanHigh {
 			scanHigh = row.Seq
 		}
+		if _, ok := exactCanonicalOutgoingTaskID(row.TaskID); !ok {
+			return failOutgoingTaskIdentity(root, metrics)
+		}
 		t, ferr := findTaskAnywhere(root, row.TaskID)
 		if ferr != nil && t == nil && !strings.Contains(ferr.Error(), "不存在") {
 			metrics.LastErrorClass = "outbox_identity_mismatch"
@@ -1859,18 +1953,21 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 	return queueWakeRows(root, sub, delta, scanHigh, bin, cur, metrics, destSeen)
 }
 
-func taskIDsFromWakeRows(rows []managerWakeOutboxRow) []string {
+func canonicalOutgoingWakeTaskIDs(rows []managerWakeOutboxRow) ([]string, error) {
 	seen := make(map[string]bool, len(rows))
 	var ids []string
 	for _, row := range rows {
-		id := strings.TrimSpace(row.TaskID)
-		if id == "" || seen[id] || id == managerWakeOnceLockID || id == managerWakeOutboxLockID {
+		id, ok := exactCanonicalOutgoingTaskID(row.TaskID)
+		if !ok {
+			return nil, fmt.Errorf("outbox_identity_mismatch")
+		}
+		if seen[id] {
 			continue
 		}
 		seen[id] = true
 		ids = append(ids, id)
 	}
-	return ids
+	return ids, nil
 }
 
 func withSortedTaskControlLocks(root string, taskIDs []string, fn func() error) error {
@@ -1888,18 +1985,41 @@ func withSortedTaskControlLocks(root string, taskIDs []string, fn func() error) 
 	return acquire(0)
 }
 
+func saveWakeInflightOrClass(root, subID, threadID string, rows []managerWakeOutboxRow, highWater int64, phase string, metrics *managerWakeMetrics) error {
+	if err := saveManagerWakeInflightPhase(root, subID, threadID, rows, highWater, phase); err != nil {
+		class := allowlistedWakeError(err, "inflight_save_failed")
+		if metrics != nil {
+			metrics.LastErrorClass = class
+		}
+		noteManagerWakeError(root, metrics, class)
+		return fmt.Errorf("%s", class)
+	}
+	return nil
+}
+
 func queueWakeRows(root string, sub ManagerWakeSubscription, delta []managerWakeOutboxRow, scanHigh int64, bin string, cur *managerWakeCursor, metrics *managerWakeMetrics, destSeen map[string]map[string]bool) error {
 	if fn := managerWakeBeforeQueue; fn != nil {
 		fn()
 	}
-	return withSortedTaskControlLocks(root, taskIDsFromWakeRows(delta), func() error {
+	ids, err := canonicalOutgoingWakeTaskIDs(delta)
+	if err != nil {
+		return failOutgoingTaskIdentity(root, metrics)
+	}
+	type pendingWakeQueue struct {
+		toSend []managerWakeOutboxRow
+		delta  []managerWakeOutboxRow
+		wait   func() error
+	}
+	var pending *pendingWakeQueue
+	lockErr := withSortedTaskControlLocks(root, ids, func() error {
 		rebound, err := rebindWakeDelta(root, sub, delta)
 		if err != nil {
-			metrics.LastErrorClass = "outbox_identity_mismatch"
-			noteManagerWakeError(root, metrics, "outbox_identity_mismatch")
-			return fmt.Errorf("outbox_identity_mismatch")
+			return failOutgoingTaskIdentity(root, metrics)
 		}
 		delta = rebound
+		if _, err := canonicalOutgoingWakeTaskIDs(delta); err != nil {
+			return failOutgoingTaskIdentity(root, metrics)
+		}
 		if strings.TrimSpace(bin) == "" {
 			metrics.LastErrorClass = "missing_codex_bin"
 			noteManagerWakeError(root, metrics, "missing_codex_bin")
@@ -1959,34 +2079,65 @@ func queueWakeRows(root string, sub ManagerWakeSubscription, delta []managerWake
 			noteManagerWakeError(root, metrics, "payload_rejected")
 			return fmt.Errorf("payload_rejected")
 		}
-		if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseClaimed); err != nil {
-			class := allowlistedWakeError(err, "inflight_save_failed")
-			metrics.LastErrorClass = class
-			noteManagerWakeError(root, metrics, class)
-			return fmt.Errorf("%s", class)
+		if err := saveWakeInflightOrClass(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseClaimed, metrics); err != nil {
+			return err
 		}
-		origSpawned := managerWakeQueueSpawned
-		managerWakeQueueSpawned = func() error {
-			if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned); err != nil {
+		crashWakeIf("after_claimed")
+		if err := saveWakeInflightOrClass(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseStarting, metrics); err != nil {
+			return err
+		}
+		crashWakeIf("after_starting")
+		metrics.QueueAttempts++
+		var (
+			wait        func() error
+			kill        func()
+			startFailed bool
+			qerr        error
+		)
+		if usingDefaultManagerWakeQueue() {
+			child, err := beginDefaultManagerWakeQueue(bin, sub.ThreadID, msg)
+			qerr = err
+			startFailed = isDefiniteWakeQueueStartFailure(err)
+			if child != nil {
+				wait = child.wait
+				kill = child.kill
+			}
+		} else {
+			qerr = managerWakeQueue(bin, sub.ThreadID, msg)
+			startFailed = isDefiniteWakeQueueStartFailure(qerr)
+		}
+		if startFailed {
+			metrics.QueueFailures++
+			if err := saveWakeInflightOrClass(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseClaimed, metrics); err != nil {
 				return err
 			}
-			if origSpawned != nil {
-				return origSpawned()
-			}
-			return nil
+			crashWakeIf("after_start_revert")
+			return noteWakeClass(root, cur, metrics, "queue_start_failed")
 		}
-		defer func() { managerWakeQueueSpawned = origSpawned }()
-		metrics.QueueAttempts++
-		if err := managerWakeQueue(bin, sub.ThreadID, msg); err != nil {
+		if qerr != nil {
 			metrics.QueueFailures++
-			if errors.Is(err, errManagerWakeQueueStart) || strings.TrimSpace(err.Error()) == "queue_start_failed" {
-				return noteWakeClass(root, cur, metrics, "queue_start_failed")
-			}
 			_ = saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned)
+			if kill != nil {
+				kill()
+			}
+			if wait != nil {
+				_ = wait()
+			}
 			return failDeliveryUncertain(root, cur, metrics)
 		}
 		if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned); err != nil {
+			if kill != nil {
+				kill()
+			}
+			if wait != nil {
+				_ = wait()
+			}
 			return failDeliveryUncertain(root, cur, metrics)
+		}
+		crashWakeIf("after_spawned")
+		if wait != nil {
+			pending = &pendingWakeQueue{toSend: append([]managerWakeOutboxRow(nil), toSend...), delta: append([]managerWakeOutboxRow(nil), delta...), wait: wait}
+			return nil
 		}
 		metrics.QueueSuccesses++
 		if err := managerWakePersistReceipts(root, sub.ID, toSend); err != nil {
@@ -1996,6 +2147,32 @@ func queueWakeRows(root string, sub ManagerWakeSubscription, delta []managerWake
 		_ = clearManagerWakeInflight(root, sub.ID)
 		return commit()
 	})
+	if lockErr != nil {
+		return lockErr
+	}
+	if pending == nil {
+		return nil
+	}
+	if err := pending.wait(); err != nil {
+		metrics.QueueFailures++
+		return failDeliveryUncertain(root, cur, metrics)
+	}
+	metrics.QueueSuccesses++
+	if err := managerWakePersistReceipts(root, sub.ID, pending.toSend); err != nil {
+		return failDeliveryUncertain(root, cur, metrics)
+	}
+	markDestinationEventIDs(destSeen, sub.ThreadID, pending.toSend)
+	_ = clearManagerWakeInflight(root, sub.ID)
+	cur.OutboxSeq = scanHigh
+	if len(pending.delta) > 0 {
+		cur.LastWakeID = pending.delta[len(pending.delta)-1].WakeEventID
+	}
+	cur.LastErrorClass = ""
+	cur.LastDeliveryAt = time.Now().Format(time.RFC3339Nano)
+	if err := managerWakeCommitCursor(root, cur); err != nil {
+		return failCursorSave(root, metrics, err)
+	}
+	return nil
 }
 
 func secretfulWakeMessage(msg string) bool {

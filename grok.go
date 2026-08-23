@@ -986,9 +986,10 @@ const (
 	grokBuildProcessClassUnclassified          grokBuildProcessClass = "unclassified"
 
 	grokBuildProcessExitNonExit = "non_exit"
-	// Closed classifier token so existing policyFor(permission) holds the card.
-	// It is not provider stderr and is the only non-class/non-exit token persisted.
-	grokBuildProcessHeldToken = "permission denied"
+	// Closed window for process-stderr classification. A later recognized diagnostic is found
+	// only inside this bound; evidence past it cannot type the terminal.
+	grokBuildProcessStderrMaxBytes = 2048
+	grokBuildProcessStderrMaxLines = 8
 )
 
 var grokBuildPlainInvalidInvocationRe = regexp.MustCompile(`(?i)^(?:error:\s*)?(?:invalid (?:option|argument|flag)\b.*|usage:\s.+)$`)
@@ -1003,7 +1004,7 @@ func (t grokBuildProcessTerminal) subtype() string {
 }
 
 func (t grokBuildProcessTerminal) result() string {
-	return grokBuildProcessHeldToken + "; exit_status=" + t.exitStatus
+	return "exit_status=" + t.exitStatus
 }
 
 func grokBuildZeroWorkObservation(res *claudeResult) bool {
@@ -1023,42 +1024,88 @@ func grokBuildPlainPermissionEnvironmentLine(line string) bool {
 	return permissionClassRe.MatchString(line) || policyPlainGrokReadOnlyDiagnosticRe.MatchString(line)
 }
 
+func grokBuildProcessLineJSONEvidence(line string) bool {
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return false
+	}
+	if json.Valid([]byte(line)) {
+		return true
+	}
+	return strings.HasPrefix(line, "{") || strings.HasPrefix(line, "[")
+}
+
+func grokBuildProcessStderrBoundedLines(stderr string) []string {
+	var lines []string
+	used := 0
+	n := 0
+	for _, raw := range strings.Split(stderr, "\n") {
+		if n >= grokBuildProcessStderrMaxLines {
+			break
+		}
+		n++
+		add := len(raw)
+		if n > 1 {
+			add++
+		}
+		if used+add > grokBuildProcessStderrMaxBytes {
+			break
+		}
+		used += add
+		if line := strings.TrimSpace(raw); line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
 func classifyGrokBuildProcessStderr(stderr string) (grokBuildProcessClass, bool) {
 	if strings.TrimSpace(stderr) == "" || grokBuildStderrHasAuthOrQuotaEvidence(stderr) {
 		return "", false
 	}
-	line := firstLine(stderr)
-	if line == "" || policyPlainStallDiagnosticRe.MatchString(line) {
-		return "", false
+	lines := grokBuildProcessStderrBoundedLines(stderr)
+	var sawTransport, sawPermission, sawInvalid bool
+	for _, line := range lines {
+		if policyPlainStallDiagnosticRe.MatchString(line) || grokBuildProcessLineJSONEvidence(line) {
+			return "", false
+		}
+		switch {
+		case policyPlainTransportDiagnosticRe.MatchString(line):
+			sawTransport = true
+		case grokBuildPlainPermissionEnvironmentLine(line):
+			sawPermission = true
+		case grokBuildPlainInvalidInvocationRe.MatchString(line):
+			sawInvalid = true
+		}
 	}
 	switch {
-	case policyPlainTransportDiagnosticRe.MatchString(line):
+	case sawTransport:
 		return grokBuildProcessClassTransport, true
-	case grokBuildPlainPermissionEnvironmentLine(line):
+	case sawPermission:
 		return grokBuildProcessClassPermissionEnvironment, true
-	case grokBuildPlainInvalidInvocationRe.MatchString(line):
+	case sawInvalid:
 		return grokBuildProcessClassInvalidInvocation, true
 	default:
 		return grokBuildProcessClassUnclassified, true
 	}
 }
 
-func grokBuildZeroEventProcessTerminal(stdout, stderr string, runErr error) (grokBuildProcessTerminal, bool) {
+func grokBuildZeroEventProcessTerminal(stdout, stderr string, runErr error) (grokBuildProcessTerminal, *claudeResult, bool) {
 	if runErr == nil {
-		return grokBuildProcessTerminal{}, false
+		return grokBuildProcessTerminal{}, nil, false
 	}
 	class, ok := classifyGrokBuildProcessStderr(stderr)
 	if !ok {
-		return grokBuildProcessTerminal{}, false
+		return grokBuildProcessTerminal{}, nil, false
 	}
 	stdoutOnly := parseGrokBuildJSONL(stdout)
 	if !grokBuildZeroWorkObservation(stdoutOnly) || !stdoutOnly.ObservationComplete {
-		return grokBuildProcessTerminal{}, false
+		return grokBuildProcessTerminal{}, nil, false
 	}
 	return grokBuildProcessTerminal{
 		class:      class,
 		exitStatus: grokBuildNormalizedProcessExitStatus(runErr),
-	}, true
+	}, stdoutOnly, true
 }
 
 func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
@@ -1162,10 +1209,11 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 			res.IsError = true
 			res.Subtype = "grok_build_process_auth"
 			res.Result = authLine
-		} else if proc, ok := grokBuildZeroEventProcessTerminal(stdout.String(), stderr.String(), runErr); ok {
-			res.IsError = true
-			res.Subtype = proc.subtype()
-			res.Result = proc.result()
+		} else if proc, stdoutOnly, ok := grokBuildZeroEventProcessTerminal(stdout.String(), stderr.String(), runErr); ok {
+			stdoutOnly.IsError = true
+			stdoutOnly.Subtype = proc.subtype()
+			stdoutOnly.Result = proc.result()
+			res = stdoutOnly
 			combined = stdout.String()
 		}
 	}

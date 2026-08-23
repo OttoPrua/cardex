@@ -447,12 +447,14 @@ const (
 )
 
 type grokZeroEventProcessFixture struct {
-	name        string
-	stderr      string
-	exitCode    int
-	payload     string
-	wantSubtype string
-	leaks       []string
+	name            string
+	stderr          string
+	exitCode        int
+	payload         string
+	wantSubtype     string
+	wantClass       grokBuildProcessClass
+	wantObsComplete bool
+	leaks           []string
 }
 
 func grokZeroEventProcessFixtures() []grokZeroEventProcessFixture {
@@ -460,33 +462,38 @@ func grokZeroEventProcessFixtures() []grokZeroEventProcessFixture {
 	return []grokZeroEventProcessFixture{
 		{
 			name: "transport", stderr: grokTerminalTransportDiagnostic, exitCode: 1,
-			wantSubtype: "grok_build_process_transport",
-			leaks:       []string{grokTerminalTransportDiagnostic},
+			wantSubtype: "grok_build_process_transport", wantClass: grokBuildProcessClassTransport,
+			wantObsComplete: true, leaks: []string{grokTerminalTransportDiagnostic},
 		},
 		{
 			name: "transport version-only stdout", stderr: grokTerminalTransportDiagnostic, exitCode: 1,
 			payload: versionOnly, wantSubtype: "grok_build_process_transport",
+			wantClass: grokBuildProcessClassTransport, wantObsComplete: true,
 			leaks: []string{grokTerminalTransportDiagnostic},
 		},
 		{
 			name: "permission environment", stderr: grokProcessPermissionEnvDiagnostic, exitCode: 2,
 			wantSubtype: "grok_build_process_permission_environment",
-			leaks:       []string{grokProcessPermissionEnvLeak},
+			wantClass:   grokBuildProcessClassPermissionEnvironment, wantObsComplete: true,
+			leaks: []string{grokProcessPermissionEnvLeak},
 		},
 		{
 			name: "permission environment read-only session store", stderr: grokProcessReadOnlyEnvDiagnostic, exitCode: 5,
 			payload: versionOnly, wantSubtype: "grok_build_process_permission_environment",
+			wantClass: grokBuildProcessClassPermissionEnvironment, wantObsComplete: true,
 			leaks: []string{grokProcessReadOnlyEnvDiagnostic},
 		},
 		{
 			name: "invalid invocation", stderr: grokTerminalInvalidOptionDiag, exitCode: 3,
 			wantSubtype: "grok_build_process_invalid_invocation",
-			leaks:       []string{grokTerminalInvalidOptionDiag, "--foo"},
+			wantClass:   grokBuildProcessClassInvalidInvocation, wantObsComplete: true,
+			leaks: []string{grokTerminalInvalidOptionDiag, "--foo"},
 		},
 		{
 			name: "unknown nonempty stderr", stderr: grokProcessUnknownDiagnostic, exitCode: 4,
-			wantSubtype: "grok_build_process_unclassified",
-			leaks:       []string{grokTerminalFixtureStderrSentinel, "SECRETTOKEN", grokProcessUnknownURLLeak},
+			wantSubtype: "grok_build_process_unclassified", wantClass: grokBuildProcessClassUnclassified,
+			wantObsComplete: true,
+			leaks:           []string{grokTerminalFixtureStderrSentinel, "SECRETTOKEN", grokProcessUnknownURLLeak},
 		},
 	}
 }
@@ -509,6 +516,13 @@ func assertGrokProcessTerminalResult(t *testing.T, res *claudeResult, combined s
 	}
 	if res.Subtype != want.wantSubtype {
 		t.Fatalf("process subtype=%q want %q res=%+v", res.Subtype, want.wantSubtype, res)
+	}
+	if res.ObservationComplete != want.wantObsComplete {
+		t.Fatalf("observation_complete=%v want %v (stdout-only zero-work proof) res=%+v",
+			res.ObservationComplete, want.wantObsComplete, res)
+	}
+	if want.wantClass != "" && !strings.Contains(res.Subtype, string(want.wantClass)) {
+		t.Fatalf("subtype %q missing closed process class %q", res.Subtype, want.wantClass)
 	}
 	if !strings.Contains(res.Result, grokProcessExitStatus(want.exitCode)) {
 		t.Fatalf("normalized exit status %d missing from result %q", want.exitCode, res.Result)
@@ -585,11 +599,16 @@ func assertGrokProcessTerminalHeld(t *testing.T, root string, task *Task, produc
 	if ra.FailureKind == string(fallbackStreamIncomplete) || ra.FailureClass == "unknown_outcome" {
 		t.Fatalf("process terminal masked as stream_incomplete/unknown_outcome: %+v last_error=%q", ra, got.LastError)
 	}
-	if ra.FailureClass != string(failurePermission) {
-		t.Fatalf("existing classifier must hold permission-class process terminals: %+v last_error=%q", ra, got.LastError)
+	if ra.FailureClass != string(want.wantClass) {
+		t.Fatalf("failure_class=%q want truthful process class %q: %+v last_error=%q",
+			ra.FailureClass, want.wantClass, ra, got.LastError)
 	}
 	if ra.SemanticEvents != 0 || ra.ModelEvents != 0 || ra.ToolEvents != 0 {
 		t.Fatalf("counters must stay zero: %+v", ra)
+	}
+	if ra.ObservationOK != want.wantObsComplete {
+		t.Fatalf("last_route_attempt observation_complete=%v want %v ra=%+v",
+			ra.ObservationOK, want.wantObsComplete, ra)
 	}
 	if !strings.Contains(got.LastError, want.wantSubtype) {
 		t.Fatalf("last_error must retain typed process class %q: %q", want.wantSubtype, got.LastError)
@@ -631,8 +650,15 @@ func assertGrokProcessTerminalHeld(t *testing.T, root string, task *Task, produc
 	if held == nil {
 		t.Fatalf("missing runner:classifier held event in %+v", eventTypes(events))
 	}
-	if held.Detail["failure_class"] != string(failurePermission) {
-		t.Fatalf("held failure_class: %+v", held.Detail)
+	if held.Detail["failure_class"] != string(want.wantClass) {
+		t.Fatalf("held failure_class=%v want %q: %+v", held.Detail["failure_class"], want.wantClass, held.Detail)
+	}
+	if held.Detail["failure_kind"] != want.wantSubtype ||
+		held.Detail["reason"] != "grok_zero_event_process_exit_held" {
+		t.Fatalf("held process identity is not truthfully bound: %+v", held.Detail)
+	}
+	if held.Detail["observation_complete"] != want.wantObsComplete {
+		t.Fatalf("held observation_complete: %+v want %v", held.Detail, want.wantObsComplete)
 	}
 	errText, _ := held.Detail["err"].(string)
 	if !strings.Contains(errText, want.wantSubtype) || !strings.Contains(errText, grokProcessExitStatus(want.exitCode)) {
@@ -765,4 +791,192 @@ func TestRunTaskGrokValidEndTurnRemainsSuccessful(t *testing.T) {
 		}
 	}
 	assertNoGrokTerminalLeak(t, root, task.ID, grokTerminalFixtureSemanticText, grokTerminalFixtureStderrSentinel)
+}
+
+const grokProcessLaterLineNoise = "cli: loading module"
+
+func grokProcessLaterLineStderr(recognized string) string {
+	return grokProcessLaterLineNoise + "\n" + recognized
+}
+
+func grokProcessLineBoundStderr(recognized string) string {
+	var b strings.Builder
+	for i := 0; i < grokBuildProcessStderrMaxLines; i++ {
+		b.WriteString(grokProcessLaterLineNoise)
+		b.WriteByte(' ')
+		b.WriteString(strconv.Itoa(i))
+		b.WriteByte('\n')
+	}
+	b.WriteString(recognized)
+	return b.String()
+}
+
+func grokProcessByteBoundStderr(recognized string) string {
+	return strings.Repeat("n", grokBuildProcessStderrMaxBytes) + "\n" + recognized
+}
+
+func TestClassifyGrokBuildProcessStderrClosedMultilinePolicy(t *testing.T) {
+	tests := []struct {
+		name      string
+		stderr    string
+		wantClass grokBuildProcessClass
+		wantOK    bool
+	}{
+		{name: "empty", stderr: "  \n  ", wantOK: false},
+		{name: "first-line transport", stderr: grokTerminalTransportDiagnostic,
+			wantClass: grokBuildProcessClassTransport, wantOK: true},
+		{name: "later-line transport", stderr: grokProcessLaterLineStderr(grokTerminalTransportDiagnostic),
+			wantClass: grokBuildProcessClassTransport, wantOK: true},
+		{name: "later-line permission environment", stderr: grokProcessLaterLineStderr(grokProcessPermissionEnvDiagnostic),
+			wantClass: grokBuildProcessClassPermissionEnvironment, wantOK: true},
+		{name: "later-line invalid invocation", stderr: grokProcessLaterLineStderr(grokTerminalInvalidOptionDiag),
+			wantClass: grokBuildProcessClassInvalidInvocation, wantOK: true},
+		{name: "later-line unclassified noise", stderr: grokProcessLaterLineStderr(grokProcessUnknownDiagnostic),
+			wantClass: grokBuildProcessClassUnclassified, wantOK: true},
+		{name: "later-line transport wins over earlier permission",
+			stderr:    grokProcessPermissionEnvDiagnostic + "\n" + grokTerminalTransportDiagnostic,
+			wantClass: grokBuildProcessClassTransport, wantOK: true},
+		{name: "out-of-line-bound later transport is not typed",
+			stderr:    grokProcessLineBoundStderr(grokTerminalTransportDiagnostic),
+			wantClass: grokBuildProcessClassUnclassified, wantOK: true},
+		{name: "out-of-byte-bound later transport is not typed",
+			stderr:    grokProcessByteBoundStderr(grokTerminalTransportDiagnostic),
+			wantClass: grokBuildProcessClassUnclassified, wantOK: true},
+		{name: "later-line stall remains fail-closed",
+			stderr: grokProcessLaterLineStderr(grokTerminalStallDiagnostic), wantOK: false},
+		{name: "later-line quota remains fail-closed",
+			stderr: grokProcessLaterLineStderr(grokTerminalQuotaDiagnostic), wantOK: false},
+		{name: "later-line auth remains fail-closed",
+			stderr: grokProcessLaterLineStderr(grokBuildExactBareAuthDiagnostic), wantOK: false},
+		{name: "later-line json remains fail-closed",
+			stderr: grokProcessLaterLineStderr(`{"type":"text","data":"semantic-secret"}`), wantOK: false},
+		{name: "later-line malformed json remains fail-closed",
+			stderr: grokProcessLaterLineStderr(`{"type":"text","data":`), wantOK: false},
+		{name: "transport then later stall remains fail-closed",
+			stderr: grokTerminalTransportDiagnostic + "\n" + grokTerminalStallDiagnostic, wantOK: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := classifyGrokBuildProcessStderr(tc.stderr)
+			if ok != tc.wantOK || got != tc.wantClass {
+				t.Fatalf("class=%q ok=%v want class=%q ok=%v", got, ok, tc.wantClass, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestInvokeGrokBuildLaterBoundedProcessDiagnostic(t *testing.T) {
+	laterTransport := grokZeroEventProcessFixture{
+		name: "later-line transport", stderr: grokProcessLaterLineStderr(grokTerminalTransportDiagnostic),
+		exitCode: 1, wantSubtype: "grok_build_process_transport",
+		wantClass: grokBuildProcessClassTransport, wantObsComplete: true,
+		leaks: []string{grokProcessLaterLineNoise, grokTerminalTransportDiagnostic},
+	}
+	outOfBound := grokZeroEventProcessFixture{
+		name:   "out-of-line-bound transport stays unclassified",
+		stderr: grokProcessLineBoundStderr(grokTerminalTransportDiagnostic), exitCode: 1,
+		wantSubtype: "grok_build_process_unclassified", wantClass: grokBuildProcessClassUnclassified,
+		wantObsComplete: true,
+		leaks:           []string{grokProcessLaterLineNoise, grokTerminalTransportDiagnostic},
+	}
+	for _, tc := range []grokZeroEventProcessFixture{laterTransport, outOfBound} {
+		t.Run(tc.name, func(t *testing.T) {
+			bin, productCalls := fakeGrokBuildCounted(t, tc.payload, tc.stderr, tc.exitCode)
+			cfg := grokBuildTestConfig(t, bin)
+			task := &Task{ID: "grok-process-multiline", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
+			root := admitDirectInvoke(t, "", task)
+			res, combined, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt")
+			if n := countProductCalls(t, productCalls); n != 1 {
+				t.Fatalf("models preflight must pass and product must run once, got %d", n)
+			}
+			assertGrokProcessTerminalResult(t, res, combined, err, tc)
+		})
+	}
+}
+
+func TestInvokeGrokBuildLaterLineFailClosedEvidenceIsNotProcessClass(t *testing.T) {
+	tests := []struct {
+		name   string
+		stderr string
+	}{
+		{name: "later stall", stderr: grokProcessLaterLineStderr(grokTerminalStallDiagnostic)},
+		{name: "later quota", stderr: grokProcessLaterLineStderr(grokTerminalQuotaDiagnostic)},
+		{name: "later json", stderr: grokProcessLaterLineStderr(`{"type":"text","data":"semantic-secret"}`)},
+		{name: "later unstructured json", stderr: grokProcessLaterLineStderr(`{"foo":1}`)},
+		{name: "later malformed json", stderr: grokProcessLaterLineStderr(`{"type":"text","data":`)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			bin, productCalls := fakeGrokBuildCounted(t, `{"type":"system.version","version":"1.0.5"}`, tc.stderr, 1)
+			cfg := grokBuildTestConfig(t, bin)
+			task := &Task{ID: "grok-process-fail-closed", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
+			root := admitDirectInvoke(t, "", task)
+			res, _, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt")
+			if n := countProductCalls(t, productCalls); n != 1 {
+				t.Fatalf("expected one product invocation, got %d", n)
+			}
+			if err == nil || res == nil {
+				t.Fatalf("must fail closed: res=%+v err=%v", res, err)
+			}
+			if strings.HasPrefix(res.Subtype, "grok_build_process_") &&
+				res.Subtype != "grok_build_process_error" &&
+				res.Subtype != "grok_build_process_auth" &&
+				res.Subtype != "grok_build_process_auth_exact" {
+				t.Fatalf("fail-closed evidence must not be rewritten as a typed process class: %+v", res)
+			}
+		})
+	}
+}
+
+func TestRunTaskGrokLaterBoundedProcessDiagnosticHeld(t *testing.T) {
+	tc := grokZeroEventProcessFixture{
+		name: "later-line transport", stderr: grokProcessLaterLineStderr(grokTerminalTransportDiagnostic),
+		exitCode: 1, wantSubtype: "grok_build_process_transport",
+		wantClass: grokBuildProcessClassTransport, wantObsComplete: true,
+		leaks: []string{grokProcessLaterLineNoise, grokTerminalTransportDiagnostic},
+	}
+	root := testRoot(t)
+	bin, productCalls := fakeGrokBuildCounted(t, tc.payload, tc.stderr, tc.exitCode)
+	cfg := policyTestConfig()
+	cfg.GrokBuildBin = bin
+	cfg.MaxAttempts = 3
+	task := ownerBackendGrokTask(t, root, cfg, t.TempDir())
+	if err := saveTask(root, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTaskVia(context.Background(), root, cfg, task, grokBuildRunnerName); err != nil {
+		t.Fatal(err)
+	}
+	assertGrokProcessTerminalHeld(t, root, task, productCalls, tc)
+}
+
+func TestRunTaskGrokIncompleteStdoutProcessDiagnosticNotPromoted(t *testing.T) {
+	root := testRoot(t)
+	bin, productCalls := fakeGrokBuildCounted(t, grokTerminalMalformedPayload,
+		grokProcessLaterLineStderr(grokTerminalTransportDiagnostic), 1)
+	cfg := policyTestConfig()
+	cfg.GrokBuildBin = bin
+	cfg.MaxAttempts = 3
+	task := ownerBackendGrokTask(t, root, cfg, t.TempDir())
+	if err := saveTask(root, task); err != nil {
+		t.Fatal(err)
+	}
+	if err := runTaskVia(context.Background(), root, cfg, task, grokBuildRunnerName); err != nil {
+		t.Fatal(err)
+	}
+	got, err := loadTask(root, task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := countProductCalls(t, productCalls); n != 1 {
+		t.Fatalf("expected one product invocation, got %d", n)
+	}
+	if got.LastRouteAttempt == nil || !got.LastRouteAttempt.ObservationSeen || got.LastRouteAttempt.ObservationOK {
+		t.Fatalf("incomplete stdout must not be promoted to a complete process terminal: %+v", got.LastRouteAttempt)
+	}
+	if strings.Contains(got.LastError, "grok_build_process_transport") {
+		t.Fatalf("incomplete observation must not be rewritten as process transport: %q", got.LastError)
+	}
+	assertGrokTerminalUnknownHeld(t, root, task, productCalls, 0, fallbackStreamIncomplete, 0, 0, 0, false,
+		grokTerminalMalformedPayload, grokTerminalTransportDiagnostic, grokProcessLaterLineNoise)
 }

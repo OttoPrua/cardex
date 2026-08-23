@@ -1144,6 +1144,34 @@ func recordRouteAttemptObservation(t *Task, res *claudeResult) {
 	r.ToolEvents = res.ToolEvents
 }
 
+// grokBuildZeroEventProcessFailure returns the closed, value-free process class only
+// when invokeGrokBuild proved a complete zero-work observation. These terminals are
+// actionable infrastructure/invocation failures, but none is safe to retry or route to
+// another writer automatically: the original process may have failed before Cardex could
+// prove whether provider-side work started. Keep this policy beside the runner decision
+// instead of smuggling a generic permission token through classifyFailure.
+func grokBuildZeroEventProcessFailure(res *claudeResult, runErr error) (string, bool) {
+	if runErr == nil || res == nil || !res.IsError || !res.ObservationComplete ||
+		res.SemanticEvents != 0 || res.ModelEvents != 0 || res.ToolEvents != 0 ||
+		res.TerminalEvents != 0 || res.NumTurns != 0 {
+		return "", false
+	}
+	const prefix = "grok_build_process_"
+	class := strings.TrimPrefix(res.Subtype, prefix)
+	if class == res.Subtype {
+		return "", false
+	}
+	switch grokBuildProcessClass(class) {
+	case grokBuildProcessClassTransport,
+		grokBuildProcessClassPermissionEnvironment,
+		grokBuildProcessClassInvalidInvocation,
+		grokBuildProcessClassUnclassified:
+		return class, true
+	default:
+		return "", false
+	}
+}
+
 func withRouteAttempt(detail map[string]any, t *Task) map[string]any {
 	if detail == nil {
 		detail = map[string]any{}
@@ -1690,6 +1718,38 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			return finalizeCanceled(root, t, lg)
 		}
 		recordRouteAttemptObservation(t, res)
+
+		// A non-zero Grok process exit with a complete zero-event observation has a closed,
+		// redacted subtype. Persist that exact class before the fallback and generic retry
+		// machinery: fabricating a permission token makes the ledger lie, while allowing the
+		// generic classifier to consume it schedules another writer. The same card is held,
+		// attempts stay unchanged, and the operator can act on the truthful process class.
+		if via == grokBuildRunnerName {
+			if processClass, hold := grokBuildZeroEventProcessFailure(res, runErr); hold {
+				failureKind := res.Subtype
+				safeErr := failureKind
+				if strings.TrimSpace(res.Result) != "" {
+					safeErr += ": " + strings.TrimSpace(res.Result)
+				}
+				if t.LastRouteAttempt != nil {
+					t.LastRouteAttempt.FailureKind = failureKind
+					t.LastRouteAttempt.FailureClass = processClass
+				}
+				t.Status = statusHeld
+				t.LastError = "Grok zero-event process exit held: " + safeErr
+				t.touch()
+				logBlock(lg, "GROK_PROCESS_HELD", fmt.Sprintf(
+					"zero-event process exit held (class=%s, kind=%s, observation_complete=true)",
+					processClass, failureKind))
+				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:classifier", statusHeld, t.Step,
+					withCostTelemetry(withRouteAttempt(map[string]any{
+						"reason": "grok_zero_event_process_exit_held", "err": safeErr,
+						"failure_class": processClass, "failure_kind": failureKind,
+						"observation_complete": true, "semantic_events": 0,
+						"model_events": 0, "tool_events": 0,
+					}, t), t)))
+			}
+		}
 
 		// Grok stream_incomplete / invalid_terminal_result with semantic/model/tool activity (or an
 		// incomplete observation) is an unknown first outcome: hold the same card without attempts,

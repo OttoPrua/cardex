@@ -77,10 +77,10 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 
 ## 两种推荐工作流
 
-- **直派串联**：一个闭合目标按“设计 → 开发 → 独立审核 → 集成 → 明示 live 门”推进。
-- **联邦多管理线**：中央 manager 管整体 DAG 与最终收口；多个子模块 manager 各自循环“设计 → 开发 → 独立审核 → 模块集成”，再 join 到整体集成与最终复核。
+- **直派串联**：一个闭合目标按“设计 → 开发 → 独立审核 → 默认 held 的集成 → 明示 live 门”推进。
+- **联邦多管理线**：中央 manager 管整体 DAG 与最终收口；多个子模块 manager 各自循环“设计 → 开发 → 独立审核 → 默认 held 的模块集成”，再 join 到默认 held 的整体集成与最终复核。
 
-两种模式都用 Cardex 的 `depends_on`、规范化 write-domain/resource claims、独立 reviewer、持久 task/event/attempt 证据和 held live gate；management session 不写 product bytes，也不绕过 Cardex 另派重复 writer。详见[推荐工作流](docs/workflows.md)，其中还定义了 attempt/producer/lease 漂移时禁止审核采信与重派的 custody 门。
+两种模式都用 Cardex 的 `depends_on`、规范化 write-domain/resource claims、独立 reviewer、持久 task/event/attempt 证据和 held live gate；management session 不写 product bytes，也不绕过 Cardex 另派重复 writer。详见[推荐工作流](docs/workflows.md)。该页把 attempt/producer/lease 漂移时禁止审核采信与重派写成 operator/policy 门（操作员必须遵守），不是当前调度器已机器拒绝审核采信或 redispatch 的宣称。联邦写卡要同 tick 并行须配置 `max_parallel` > 1（默认 1）。工作流管理的独立审核与 `-review-after` / `-stakes high` 自动复审子卡不是同一条路：已有独立 reviewer 时不要再开自动复审。审核终局 JSON 只认 `pass|concerns|block`，不是 ACCEPT/HELD。
 
 ## 怎么做到的
 
@@ -137,7 +137,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 | `resume_first` | true | 被打断任务优先续跑 |
 | `type_order` | 进度回收>协调>审核>序列>装配 | 同优先级时的类型顺序 |
 | `type_defaults.*.model` | 装配/协调/审核 Opus；落地 Sonnet；回收 Haiku | 各类型默认来源档位；Codex 主路由再映射到实际 GPT-5.6 模型；Fable 仅供显式最难裁决 |
-| `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行，只读类型豁免） |
+| `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行，只读类型豁免）。默认 1 时联邦不重叠写域也不会同 tick 并行 |
 | `default_runner` | ""（历史 Claude） | 未显式钉执行器的新卡默认主路由；设为 `codex` 后，手工卡及自动审核/修复/收口/复盘/emit 卡统一烘焙 `runner_pref=codex`。显式 Claude 会话续跑和 cross profile 保留其已声明身份 |
 | `owner_routing_enforced` | `false` | Final Owner 矩阵的加载期硬锁。设为 `true` 后，全部风险/审核分支、精确 provider/runner/model/effort、Fable 单次 Sol/ultra 终局以及显式 Sol gate 任一漂移都会拒绝加载；新 `sequence` 卡必须写 `route_class=backend|general`，backend 还必须明确任务字段 risk_class，缺失/歧义按 high-risk fail closed。受管 board/tick 配合 `CARDEX_REQUIRE_OWNER_ROUTING=1` 防止删键静默降级 |
 | `automatic_codex_budget_stop_percent` / `owner_provider_targets` | `0` / 空 | Final Owner 模式严格要求自动 Codex 在 provider-specific 已用 65% 时停止，证据不可用同样 held；仅带可见持久原因的 Owner-pinned critical 卡可绕过。provider targets 固定为 Grok 70–80%、Kimi/OpenCode 15–25%、direct Sol 5–10%，只做政策读回，不改已有卡 |

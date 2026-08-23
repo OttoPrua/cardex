@@ -77,10 +77,10 @@ Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs t
 
 ## Two recommended workflow modes
 
-- **Direct serial**: advance one bounded goal through design → development → independent review → integration → an explicit live gate.
-- **Federated management**: a central manager owns the program DAG and final convergence; multiple module managers each run design → development → independent review → module integration, then join for system integration and final review.
+- **Direct serial**: advance one bounded goal through design → development → independent review → held integration → an explicit live gate.
+- **Federated management**: a central manager owns the program DAG and final convergence; multiple module managers each run design → development → independent review → held module integration, then join for held system integration and final review.
 
-Both modes use Cardex `depends_on`, normalized write-domain/resource claims, separate reviewers, durable task/event/attempt evidence, and held live gates. Management sessions do not write product bytes or bypass Cardex to create duplicate writers. See [recommended workflows](docs/workflows.en.md), including the custody gate that rejects review acceptance or redispatch when attempt, producer, and lease state disagree.
+Both modes use Cardex `depends_on`, normalized write-domain/resource claims, separate reviewers, durable task/event/attempt evidence, and held live gates. Management sessions do not write product bytes or bypass Cardex to create duplicate writers. See [recommended workflows](docs/workflows.en.md). That page documents the custody rule as an operator/policy gate operators must follow: when attempt, producer, and lease state disagree, review acceptance and redispatch must be refused. It is not a claim that current Cardex already machine-rejects those actions. Federated writers share a tick only when `max_parallel` > 1 (default 1). A workflow-managed independent review is not the same path as a `-review-after` / `-stakes high` automatic review child: do not enable automatic review when an independent reviewer already exists. The review terminal JSON is only `pass|concerns|block`, not ACCEPT/HELD.
 
 ## How it works
 
@@ -137,7 +137,7 @@ The keys you'll actually touch; the full table lives in the [configuration refer
 | `resume_first` | true | interrupted tasks resume before new ones start |
 | `type_order` | progress-pull > coordinate > review > sequence > assembly | type order at equal priority |
 | `type_defaults.*.model` | assembly/coordinate/review Opus; implementation Sonnet; pull Haiku | source tier per type; the Codex primary route maps it to the concrete GPT-5.6 model; Fable is explicit hardest-adjudication only |
-| `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types are exempt) |
+| `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types are exempt). Default 1 means even disjoint federated writers do not share a tick |
 | `default_runner` | "" (legacy Claude) | Primary runner for unpinned new cards. `codex` covers manual cards plus generated reviews, fixes, closeouts, retrospectives, and emitted cards. Explicit Claude session resumes and cross profiles retain their declared identity |
 | `owner_routing_enforced` | `false` | Load-time lock for the final Owner matrix. When `true`, drift in any risk/review branch, exact provider/runner/model/effort, the one-call Fable Sol/ultra terminal, or an explicit Sol gate rejects the config; every new `sequence` card declares `route_class=backend|general`, and backend risk must be explicit or it fails closed to high risk. Managed board/tick units should set `CARDEX_REQUIRE_OWNER_ROUTING=1` so deleting the key fails startup instead of silently downgrading |
 | `automatic_codex_budget_stop_percent` / `owner_provider_targets` | `0` / empty | Final Owner mode requires a provider-specific automatic-Codex stop at 65% used, and missing evidence also holds. Only an Owner-pinned critical card with a visible durable reason may bypass. Reporting-only lineage targets are Grok 70–80%, Kimi/OpenCode 15–25%, and direct Sol 5–10%; they never mutate existing tasks |

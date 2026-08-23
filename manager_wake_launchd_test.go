@@ -237,7 +237,39 @@ func withIsolatedManagerWakeLaunchd(t *testing.T, plistPath string) {
 	})
 }
 
-const observedLaunchctlAbsentUnitDiagnosticUID501 = `Could not find service "com.cardex.manager-wake" in domain for user gui: 501`
+const (
+	observedLaunchctlAbsentUnitDiagnosticUID501  = `Could not find service "com.cardex.manager-wake" in domain for user gui: 501`
+	observedLaunchctlPrintAbsentBadRequestPrefix = "Bad request."
+	observedLaunchctlPrintAbsentTwoLineUID501    = observedLaunchctlPrintAbsentBadRequestPrefix + "\n" + observedLaunchctlAbsentUnitDiagnosticUID501
+	observedLaunchctlBootoutNoSuchProcess        = "Boot-out failed: 3: No such process"
+)
+
+func currentHostLaunchctlPrintAbsentTwoLinePayload() string {
+	return observedLaunchctlPrintAbsentBadRequestPrefix + "\n" + launchctlAbsentUnitDiagnostic()
+}
+
+func fakeLaunchctlBootoutExit3PrintCurrentHostAbsenceScript(loadCase string) string {
+	script := `#!/bin/sh
+case "$1" in
+bootout)
+	printf '%s\n' '` + observedLaunchctlBootoutNoSuchProcess + `' >&2
+	exit 3
+	;;
+print)
+	printf '%s\n%s\n' '` + observedLaunchctlPrintAbsentBadRequestPrefix + `' '` + launchctlAbsentUnitDiagnostic() + `' >&2
+	exit 113
+	;;
+`
+	if loadCase != "" {
+		script += loadCase
+	}
+	script += `*)
+	exit 1
+	;;
+esac
+`
+	return script
+}
 
 func withFakeLaunchctl(t *testing.T, script string) {
 	t.Helper()
@@ -273,6 +305,7 @@ func assertClosedLaunchctlAdapterError(t *testing.T, err error, want string) {
 	msg := err.Error()
 	low := strings.ToLower(msg)
 	if strings.Contains(low, "could not find") || strings.Contains(low, "no such") || strings.Contains(low, "not found") ||
+		strings.Contains(low, "bad request") || strings.Contains(low, "boot-out") ||
 		strings.Contains(msg, managerWakeLaunchdLabel) || strings.Contains(msg, launchctlAbsentUnitDiagnostic()) {
 		t.Fatalf("must not expose raw launchctl output: %v", err)
 	}
@@ -293,6 +326,15 @@ func TestDefaultManagerWakeLaunchctlRunClassifiesAbsentUnitFromPrintOutput(t *te
 	}
 }
 
+func TestDefaultManagerWakeLaunchctlRunClassifiesCurrentHostTwoLinePrintAbsence(t *testing.T) {
+	withFakeLaunchctlCombinedOutput(t, currentHostLaunchctlPrintAbsentTwoLinePayload()+"\n", 113)
+	err := defaultManagerWakeLaunchctlRun("print", managerWakeLaunchdTarget())
+	assertClosedLaunchctlAdapterError(t, err, "not_loaded")
+	if !launchctlServiceAbsent(err) {
+		t.Fatalf("current-host two-line print must classify absent, got %v", err)
+	}
+}
+
 func TestDefaultManagerWakeLaunchctlRunNonAbsentStaysFailClosed(t *testing.T) {
 	withFakeLaunchctlCombinedOutput(t, "launchctl print failed: input error\n", 113)
 	err := defaultManagerWakeLaunchctlRun("print", managerWakeLaunchdTarget())
@@ -306,6 +348,16 @@ func TestObservedLaunchctlAbsentUnitDiagnosticShape(t *testing.T) {
 	got := fmt.Sprintf("Could not find service %q in domain for user gui: %d", managerWakeLaunchdLabel, 501)
 	if got != observedLaunchctlAbsentUnitDiagnosticUID501 {
 		t.Fatalf("observed print diagnostic shape changed: %q", got)
+	}
+	if observedLaunchctlPrintAbsentBadRequestPrefix != "Bad request." {
+		t.Fatalf("observed Bad request prefix changed: %q", observedLaunchctlPrintAbsentBadRequestPrefix)
+	}
+	twoLine := observedLaunchctlPrintAbsentBadRequestPrefix + "\n" + got
+	if twoLine != observedLaunchctlPrintAbsentTwoLineUID501 {
+		t.Fatalf("observed two-line print shape changed: %q", twoLine)
+	}
+	if strings.Count(twoLine, "\n") != 1 {
+		t.Fatalf("current-host print absence must be exactly two lines, got %q", twoLine)
 	}
 }
 
@@ -332,11 +384,19 @@ func TestDefaultManagerWakeLaunchctlRunSurroundingWhitespaceStillAbsent(t *testi
 	assertClosedLaunchctlAdapterError(t, err, "not_loaded")
 }
 
+func TestDefaultManagerWakeLaunchctlRunTwoLineSurroundingWhitespaceStillAbsent(t *testing.T) {
+	withFakeLaunchctlCombinedOutput(t, "\n  "+currentHostLaunchctlPrintAbsentTwoLinePayload()+"  \n", 113)
+	err := defaultManagerWakeLaunchctlRun("print", managerWakeLaunchdTarget())
+	assertClosedLaunchctlAdapterError(t, err, "not_loaded")
+}
+
 func TestDefaultManagerWakeLaunchctlRunMismatchedOutputFailClosed(t *testing.T) {
 	target := managerWakeLaunchdTarget()
 	diagnostic := launchctlAbsentUnitDiagnostic()
+	twoLine := currentHostLaunchctlPrintAbsentTwoLinePayload() + "\n"
 	wrongTarget := fmt.Sprintf("gui/%d/com.cardex.tick", os.Getuid())
 	wrongService := fmt.Sprintf("Could not find service %q in domain for user gui: %d", "com.cardex.tick", os.Getuid())
+	wrongUID := fmt.Sprintf("Could not find service %q in domain for user gui: %d", managerWakeLaunchdLabel, os.Getuid()+1)
 	cases := []struct {
 		name   string
 		args   []string
@@ -344,16 +404,30 @@ func TestDefaultManagerWakeLaunchctlRunMismatchedOutputFailClosed(t *testing.T) 
 		exit   int
 	}{
 		{name: "wrong_exit", args: []string{"print", target}, output: diagnostic + "\n", exit: 1},
+		{name: "diagnostic_only_wrong_exit", args: []string{"print", target}, output: diagnostic + "\n", exit: 3},
 		{name: "wrong_operation_bootout", args: []string{"bootout", target}, output: diagnostic + "\n", exit: 113},
 		{name: "wrong_operation_load", args: []string{"load", "-w", "/tmp/x.plist"}, output: diagnostic + "\n", exit: 113},
 		{name: "wrong_target", args: []string{"print", wrongTarget}, output: diagnostic + "\n", exit: 113},
 		{name: "wrong_service", args: []string{"print", target}, output: wrongService + "\n", exit: 113},
+		{name: "wrong_uid", args: []string{"print", target}, output: wrongUID + "\n", exit: 113},
 		{name: "legacy_could_not_find", args: []string{"print", target}, output: "could not find\n", exit: 113},
 		{name: "legacy_no_such", args: []string{"print", target}, output: "no such process\n", exit: 113},
 		{name: "legacy_not_found", args: []string{"print", target}, output: "not found\n", exit: 113},
+		{name: "generic_bad_request", args: []string{"print", target}, output: "Bad request\n", exit: 113},
 		{name: "extra_semantic_text", args: []string{"print", target}, output: diagnostic + "\nPermission denied\n", exit: 113},
 		{name: "empty_output", args: []string{"print", target}, output: "", exit: 113},
 		{name: "permission_denied", args: []string{"print", target}, output: "Permission denied\n", exit: 1},
+		{name: "two_line_wrong_order", args: []string{"print", target}, output: diagnostic + "\n" + observedLaunchctlPrintAbsentBadRequestPrefix + "\n", exit: 113},
+		{name: "two_line_duplicate_prefix", args: []string{"print", target}, output: observedLaunchctlPrintAbsentBadRequestPrefix + "\n" + observedLaunchctlPrintAbsentBadRequestPrefix + "\n" + diagnostic + "\n", exit: 113},
+		{name: "two_line_prefix_only", args: []string{"print", target}, output: observedLaunchctlPrintAbsentBadRequestPrefix + "\n", exit: 113},
+		{name: "two_line_extra_third_line", args: []string{"print", target}, output: twoLine + "extra\n", exit: 113},
+		{name: "two_line_altered_prefix_no_period", args: []string{"print", target}, output: "Bad request\n" + diagnostic + "\n", exit: 113},
+		{name: "two_line_altered_prefix_capital", args: []string{"print", target}, output: "Bad Request.\n" + diagnostic + "\n", exit: 113},
+		{name: "two_line_wrong_uid", args: []string{"print", target}, output: observedLaunchctlPrintAbsentBadRequestPrefix + "\n" + wrongUID + "\n", exit: 113},
+		{name: "two_line_wrong_service", args: []string{"print", target}, output: observedLaunchctlPrintAbsentBadRequestPrefix + "\n" + wrongService + "\n", exit: 113},
+		{name: "two_line_wrong_target", args: []string{"print", wrongTarget}, output: twoLine, exit: 113},
+		{name: "two_line_wrong_operation_bootout", args: []string{"bootout", target}, output: twoLine, exit: 113},
+		{name: "bootout_exit_3_no_such_process", args: []string{"bootout", target}, output: observedLaunchctlBootoutNoSuchProcess + "\n", exit: 3},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -374,6 +448,80 @@ func TestDefaultManagerWakeLaunchctlRunCommandNotFoundFailClosed(t *testing.T) {
 	if launchctlServiceAbsent(err) {
 		t.Fatalf("command-not-found must not classify as absent: %v", err)
 	}
+}
+
+func TestManagerWakeUnloadServiceBootoutExit3ExactTwoLinePrintAbsence(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, fakeLaunchctlBootoutExit3PrintCurrentHostAbsenceScript(""))
+	if err := managerWakeUnloadService(); err != nil {
+		t.Fatalf("bootout exit 3 plus exact two-line print absence must close unload, got %v", err)
+	}
+}
+
+func TestManagerWakeUnloadServiceBootoutExit3PrintLoadedStaysUnloadFailed(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, `#!/bin/sh
+case "$1" in
+bootout)
+	printf '%s\n' '`+observedLaunchctlBootoutNoSuchProcess+`' >&2
+	exit 3
+	;;
+print)
+	exit 0
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	err := managerWakeUnloadService()
+	assertClosedLaunchctlAdapterError(t, err, "launchctl_unload_failed")
+}
+
+func TestManagerWakeUnloadServiceBootoutExit3PrintAmbiguousStaysUnloadFailed(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, `#!/bin/sh
+case "$1" in
+bootout)
+	printf '%s\n' '`+observedLaunchctlBootoutNoSuchProcess+`' >&2
+	exit 3
+	;;
+print)
+	printf '%s\n' 'launchctl print failed: input error' >&2
+	exit 113
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	err := managerWakeUnloadService()
+	assertClosedLaunchctlAdapterError(t, err, "launchctl_unload_failed")
+}
+
+func TestManagerWakeUnloadServiceBootoutExit3PrintErrorStaysUnloadFailed(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, `#!/bin/sh
+case "$1" in
+bootout)
+	printf '%s\n' '`+observedLaunchctlBootoutNoSuchProcess+`' >&2
+	exit 3
+	;;
+print)
+	printf '%s\n' 'Permission denied' >&2
+	exit 1
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	err := managerWakeUnloadService()
+	assertClosedLaunchctlAdapterError(t, err, "launchctl_unload_failed")
 }
 
 func TestUninstallManagerWakeRemovesPlistAfterRealRunnerVerifiesAbsence(t *testing.T) {
@@ -402,6 +550,51 @@ esac
 	}
 	if _, err := os.Stat(pp); !os.IsNotExist(err) {
 		t.Fatalf("plist must be unlinked after verified absence: %v", err)
+	}
+}
+
+func TestUninstallManagerWakeRemovesPlistAfterBootoutExit3ExactTwoLinePrintAbsence(t *testing.T) {
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	if err := os.WriteFile(pp, []byte("PLIST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, fakeLaunchctlBootoutExit3PrintCurrentHostAbsenceScript(""))
+	if err := uninstallManagerWakeLaunchd(); err != nil {
+		t.Fatalf("bootout exit 3 plus exact two-line print absence must uninstall, got %v", err)
+	}
+	if _, err := os.Stat(pp); !os.IsNotExist(err) {
+		t.Fatalf("plist must be unlinked only after verified absence: %v", err)
+	}
+}
+
+func TestUninstallManagerWakeBootoutExit3NonAbsentPrintLeavesPlist(t *testing.T) {
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	if err := os.WriteFile(pp, []byte("PLIST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, `#!/bin/sh
+case "$1" in
+bootout)
+	printf '%s\n' '`+observedLaunchctlBootoutNoSuchProcess+`' >&2
+	exit 3
+	;;
+print)
+	printf '%s\n' 'launchctl print failed: input error' >&2
+	exit 113
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	err := uninstallManagerWakeLaunchd()
+	assertClosedLaunchctlAdapterError(t, err, "launchctl_unload_failed")
+	if _, err := os.Stat(pp); err != nil {
+		t.Fatalf("failed print must not unlink plist: %v", err)
 	}
 }
 
@@ -494,6 +687,67 @@ esac
 	}
 }
 
+func TestInstallManagerWakeLoadFailureRestoresPriorAfterBootoutExit3ExactPrintAbsence(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	prior := []byte("PRIOR PLIST\n")
+	if err := os.WriteFile(pp, prior, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	loads := filepath.Join(t.TempDir(), "loads")
+	t.Setenv("CARDEX_TEST_LAUNCHCTL_LOADS", loads)
+	withFakeLaunchctl(t, `#!/bin/sh
+loads="${CARDEX_TEST_LAUNCHCTL_LOADS}"
+case "$1" in
+load)
+	n=0
+	if [ -f "$loads" ]; then
+		read n < "$loads" || n=0
+	fi
+	n=$((n+1))
+	echo "$n" > "$loads"
+	if [ "$n" -eq 1 ]; then
+		printf '%s\n' 'Bootstrapping failed' >&2
+		exit 1
+	fi
+	exit 0
+	;;
+bootout)
+	printf '%s\n' '`+observedLaunchctlBootoutNoSuchProcess+`' >&2
+	exit 3
+	;;
+print)
+	n=0
+	if [ -f "$loads" ]; then
+		read n < "$loads" || n=0
+	fi
+	if [ "$n" -ge 2 ]; then
+		exit 0
+	fi
+	printf '%s\n%s\n' '`+observedLaunchctlPrintAbsentBadRequestPrefix+`' '`+launchctlAbsentUnitDiagnostic()+`' >&2
+	exit 113
+	;;
+*)
+	exit 1
+	;;
+esac
+`)
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
+		t.Fatal("load failure must surface")
+	} else if err.Error() != "launchctl_load_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	got, err := os.ReadFile(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(prior) {
+		t.Fatalf("prior plist not restored: %q", got)
+	}
+}
+
 func TestInstallManagerWakeLoadFailureRemovesNewPlistAfterRealRunnerAbsence(t *testing.T) {
 	root := testRoot(t)
 	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
@@ -523,6 +777,25 @@ esac
 	}
 	if _, err := os.Stat(pp); !os.IsNotExist(err) {
 		t.Fatalf("new plist must be removed after verified absence: %v", err)
+	}
+}
+
+func TestInstallManagerWakeLoadFailureRemovesNewPlistAfterBootoutExit3ExactPrintAbsence(t *testing.T) {
+	root := testRoot(t)
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withRealManagerWakeLaunchctlRunner(t, pp)
+	withFakeLaunchctl(t, fakeLaunchctlBootoutExit3PrintCurrentHostAbsenceScript(`load)
+	printf '%s\n' 'Bootstrapping failed' >&2
+	exit 1
+	;;
+`))
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
+		t.Fatal("load failure must surface")
+	} else if err.Error() != "launchctl_load_failed" {
+		t.Fatalf("err=%v", err)
+	}
+	if _, err := os.Stat(pp); !os.IsNotExist(err) {
+		t.Fatalf("new plist must be removed after bootout exit 3 plus exact print absence: %v", err)
 	}
 }
 

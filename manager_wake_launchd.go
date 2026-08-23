@@ -56,7 +56,14 @@ func launchctlPrintProvesCanonicalAbsence(args []string, runErr error, out []byt
 	if !ok || ee.ExitCode() != launchctlPrintAbsentExitCode {
 		return false
 	}
-	return strings.TrimSpace(string(out)) == launchctlAbsentUnitDiagnostic()
+	trimmed := strings.TrimSpace(string(out))
+	diagnostic := launchctlAbsentUnitDiagnostic()
+	switch trimmed {
+	case diagnostic, "Bad request.\n" + diagnostic:
+		return true
+	default:
+		return false
+	}
 }
 
 func managerWakeLaunchdPlistPath() string {
@@ -233,8 +240,12 @@ func launchctlServiceAbsent(err error) bool {
 
 func managerWakeUnloadService() error {
 	target := managerWakeLaunchdTarget()
-	if err := managerWakeLaunchctlRun("bootout", target); err != nil && !launchctlServiceAbsent(err) {
-		return fmt.Errorf("launchctl_unload_failed")
+	if err := managerWakeLaunchctlRun("bootout", target); err != nil {
+		// Nonzero bootout is not absence. Recover only via exact print proof.
+		loaded, perr := managerWakeServiceLoaded()
+		if perr != nil || loaded {
+			return fmt.Errorf("launchctl_unload_failed")
+		}
 	}
 	return nil
 }

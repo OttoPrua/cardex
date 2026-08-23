@@ -12,7 +12,8 @@ import (
 )
 
 const (
-	managerWakeLaunchdLabel = "com.cardex.manager-wake"
+	managerWakeLaunchdLabel      = "com.cardex.manager-wake"
+	launchctlPrintAbsentExitCode = 113
 )
 
 var (
@@ -37,10 +38,25 @@ func defaultManagerWakeLaunchctlRun(args ...string) error {
 	if err == nil {
 		return nil
 	}
-	if launchctlServiceAbsent(fmt.Errorf("%s", out)) {
+	if launchctlPrintProvesCanonicalAbsence(args, err, out) {
 		return fmt.Errorf("not_loaded")
 	}
 	return fmt.Errorf("launchctl_failed")
+}
+
+func launchctlAbsentUnitDiagnostic() string {
+	return fmt.Sprintf("Could not find service %q in domain for user gui: %d", managerWakeLaunchdLabel, os.Getuid())
+}
+
+func launchctlPrintProvesCanonicalAbsence(args []string, runErr error, out []byte) bool {
+	if len(args) != 2 || args[0] != "print" || args[1] != managerWakeLaunchdTarget() {
+		return false
+	}
+	ee, ok := runErr.(*exec.ExitError)
+	if !ok || ee.ExitCode() != launchctlPrintAbsentExitCode {
+		return false
+	}
+	return strings.TrimSpace(string(out)) == launchctlAbsentUnitDiagnostic()
 }
 
 func managerWakeLaunchdPlistPath() string {
@@ -212,14 +228,7 @@ func managerWakeLaunchdTarget() string {
 }
 
 func launchctlServiceAbsent(err error) bool {
-	if err == nil {
-		return false
-	}
-	s := strings.ToLower(err.Error())
-	return strings.Contains(s, "not_loaded") ||
-		strings.Contains(s, "could not find") ||
-		strings.Contains(s, "no such") ||
-		strings.Contains(s, "not found")
+	return err != nil && err.Error() == "not_loaded"
 }
 
 func managerWakeUnloadService() error {

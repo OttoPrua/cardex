@@ -237,7 +237,7 @@ func withIsolatedManagerWakeLaunchd(t *testing.T, plistPath string) {
 	})
 }
 
-const launchctlAbsentUnitDiagnostic = `Could not find service "com.cardex.manager-wake" in domain for user gui: 501`
+const observedLaunchctlAbsentUnitDiagnosticUID501 = `Could not find service "com.cardex.manager-wake" in domain for user gui: 501`
 
 func withFakeLaunchctl(t *testing.T, script string) {
 	t.Helper()
@@ -248,6 +248,36 @@ func withFakeLaunchctl(t *testing.T, script string) {
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
+func withFakeLaunchctlCombinedOutput(t *testing.T, output string, exit int) {
+	t.Helper()
+	dir := t.TempDir()
+	outPath := filepath.Join(dir, "combined.out")
+	if err := os.WriteFile(outPath, []byte(output), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	script := fmt.Sprintf("#!/bin/sh\ncat %q >&2\nexit %d\n", outPath, exit)
+	if err := os.WriteFile(filepath.Join(dir, "launchctl"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func assertClosedLaunchctlAdapterError(t *testing.T, err error, want string) {
+	t.Helper()
+	if err == nil {
+		t.Fatalf("want %s, got nil", want)
+	}
+	if err.Error() != want {
+		t.Fatalf("want %s, got %v", want, err)
+	}
+	msg := err.Error()
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "could not find") || strings.Contains(low, "no such") || strings.Contains(low, "not found") ||
+		strings.Contains(msg, managerWakeLaunchdLabel) || strings.Contains(msg, launchctlAbsentUnitDiagnostic()) {
+		t.Fatalf("must not expose raw launchctl output: %v", err)
+	}
+}
+
 func withRealManagerWakeLaunchctlRunner(t *testing.T, plistPath string) {
 	t.Helper()
 	withIsolatedManagerWakeLaunchd(t, plistPath)
@@ -255,35 +285,94 @@ func withRealManagerWakeLaunchctlRunner(t *testing.T, plistPath string) {
 }
 
 func TestDefaultManagerWakeLaunchctlRunClassifiesAbsentUnitFromPrintOutput(t *testing.T) {
-	withFakeLaunchctl(t, "#!/bin/sh\nprintf '%s\\n' '"+launchctlAbsentUnitDiagnostic+"' >&2\nexit 113\n")
-	err := defaultManagerWakeLaunchctlRun("print", "gui/501/"+managerWakeLaunchdLabel)
-	if err == nil {
-		t.Fatal("absent print must be nonzero")
-	}
+	withFakeLaunchctlCombinedOutput(t, launchctlAbsentUnitDiagnostic()+"\n", 113)
+	err := defaultManagerWakeLaunchctlRun("print", managerWakeLaunchdTarget())
+	assertClosedLaunchctlAdapterError(t, err, "not_loaded")
 	if !launchctlServiceAbsent(err) {
 		t.Fatalf("real runner must classify absent-unit diagnostic, got %v", err)
-	}
-	if err.Error() != "not_loaded" {
-		t.Fatalf("closed absence token want not_loaded, got %v", err)
-	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "could not find") || strings.Contains(msg, managerWakeLaunchdLabel) || strings.Contains(err.Error(), launchctlAbsentUnitDiagnostic) {
-		t.Fatalf("must not expose raw launchctl output: %v", err)
 	}
 }
 
 func TestDefaultManagerWakeLaunchctlRunNonAbsentStaysFailClosed(t *testing.T) {
-	withFakeLaunchctl(t, "#!/bin/sh\nprintf '%s\\n' 'launchctl print failed: input error' >&2\nexit 113\n")
-	err := defaultManagerWakeLaunchctlRun("print", "gui/501/"+managerWakeLaunchdLabel)
-	if err == nil {
-		t.Fatal("nonzero print must fail")
-	}
+	withFakeLaunchctlCombinedOutput(t, "launchctl print failed: input error\n", 113)
+	err := defaultManagerWakeLaunchctlRun("print", managerWakeLaunchdTarget())
+	assertClosedLaunchctlAdapterError(t, err, "launchctl_failed")
 	if launchctlServiceAbsent(err) {
 		t.Fatalf("exit 113 without absent diagnostic must not classify as absent: %v", err)
 	}
-	msg := strings.ToLower(err.Error())
-	if strings.Contains(msg, "could not find") || strings.Contains(msg, "input error") || strings.Contains(msg, managerWakeLaunchdLabel) {
-		t.Fatalf("must not expose raw launchctl output: %v", err)
+}
+
+func TestObservedLaunchctlAbsentUnitDiagnosticShape(t *testing.T) {
+	got := fmt.Sprintf("Could not find service %q in domain for user gui: %d", managerWakeLaunchdLabel, 501)
+	if got != observedLaunchctlAbsentUnitDiagnosticUID501 {
+		t.Fatalf("observed print diagnostic shape changed: %q", got)
+	}
+}
+
+func TestLaunchctlServiceAbsentRejectsBroadSubstrings(t *testing.T) {
+	for _, s := range []string{
+		"could not find",
+		"no such",
+		"not found",
+		observedLaunchctlAbsentUnitDiagnosticUID501,
+		launchctlAbsentUnitDiagnostic(),
+	} {
+		if launchctlServiceAbsent(fmt.Errorf("%s", s)) {
+			t.Fatalf("broad substring %q must not classify as absent", s)
+		}
+	}
+	if !launchctlServiceAbsent(fmt.Errorf("not_loaded")) {
+		t.Fatal("closed token not_loaded must remain absent")
+	}
+}
+
+func TestDefaultManagerWakeLaunchctlRunSurroundingWhitespaceStillAbsent(t *testing.T) {
+	withFakeLaunchctlCombinedOutput(t, "\n  "+launchctlAbsentUnitDiagnostic()+"  \n", 113)
+	err := defaultManagerWakeLaunchctlRun("print", managerWakeLaunchdTarget())
+	assertClosedLaunchctlAdapterError(t, err, "not_loaded")
+}
+
+func TestDefaultManagerWakeLaunchctlRunMismatchedOutputFailClosed(t *testing.T) {
+	target := managerWakeLaunchdTarget()
+	diagnostic := launchctlAbsentUnitDiagnostic()
+	wrongTarget := fmt.Sprintf("gui/%d/com.cardex.tick", os.Getuid())
+	wrongService := fmt.Sprintf("Could not find service %q in domain for user gui: %d", "com.cardex.tick", os.Getuid())
+	cases := []struct {
+		name   string
+		args   []string
+		output string
+		exit   int
+	}{
+		{name: "wrong_exit", args: []string{"print", target}, output: diagnostic + "\n", exit: 1},
+		{name: "wrong_operation_bootout", args: []string{"bootout", target}, output: diagnostic + "\n", exit: 113},
+		{name: "wrong_operation_load", args: []string{"load", "-w", "/tmp/x.plist"}, output: diagnostic + "\n", exit: 113},
+		{name: "wrong_target", args: []string{"print", wrongTarget}, output: diagnostic + "\n", exit: 113},
+		{name: "wrong_service", args: []string{"print", target}, output: wrongService + "\n", exit: 113},
+		{name: "legacy_could_not_find", args: []string{"print", target}, output: "could not find\n", exit: 113},
+		{name: "legacy_no_such", args: []string{"print", target}, output: "no such process\n", exit: 113},
+		{name: "legacy_not_found", args: []string{"print", target}, output: "not found\n", exit: 113},
+		{name: "extra_semantic_text", args: []string{"print", target}, output: diagnostic + "\nPermission denied\n", exit: 113},
+		{name: "empty_output", args: []string{"print", target}, output: "", exit: 113},
+		{name: "permission_denied", args: []string{"print", target}, output: "Permission denied\n", exit: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			withFakeLaunchctlCombinedOutput(t, tc.output, tc.exit)
+			err := defaultManagerWakeLaunchctlRun(tc.args...)
+			assertClosedLaunchctlAdapterError(t, err, "launchctl_failed")
+			if launchctlServiceAbsent(err) {
+				t.Fatalf("%s must remain fail-closed, got %v", tc.name, err)
+			}
+		})
+	}
+}
+
+func TestDefaultManagerWakeLaunchctlRunCommandNotFoundFailClosed(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	err := defaultManagerWakeLaunchctlRun("print", managerWakeLaunchdTarget())
+	assertClosedLaunchctlAdapterError(t, err, "launchctl_failed")
+	if launchctlServiceAbsent(err) {
+		t.Fatalf("command-not-found must not classify as absent: %v", err)
 	}
 }
 
@@ -300,7 +389,7 @@ bootout)
 	exit 0
 	;;
 print)
-	printf '%s\n' 'Could not find service "com.cardex.manager-wake" in domain for user gui: 501' >&2
+	printf '%s\n' '`+launchctlAbsentUnitDiagnostic()+`' >&2
 	exit 113
 	;;
 *)
@@ -383,7 +472,7 @@ print)
 	if [ "$n" -ge 2 ]; then
 		exit 0
 	fi
-	printf '%s\n' 'Could not find service "com.cardex.manager-wake" in domain for user gui: 501' >&2
+	printf '%s\n' '`+launchctlAbsentUnitDiagnostic()+`' >&2
 	exit 113
 	;;
 *)
@@ -419,7 +508,7 @@ bootout)
 	exit 0
 	;;
 print)
-	printf '%s\n' 'Could not find service "com.cardex.manager-wake" in domain for user gui: 501' >&2
+	printf '%s\n' '`+launchctlAbsentUnitDiagnostic()+`' >&2
 	exit 113
 	;;
 *)

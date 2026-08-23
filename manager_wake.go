@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -75,6 +76,13 @@ var (
 	// managerWakeBeforeQueue fires after scan and before the inflight claim so
 	// tests can inject a committed supersession between bind and queue.
 	managerWakeBeforeQueue func()
+	// managerWakeBeforeStart fires after the queue command is prepared and
+	// immediately before cmd.Start. Tests inject a definite Start failure or a
+	// competing transition in the post-rebind/pre-Start window.
+	managerWakeBeforeStart func()
+	// errManagerWakeQueueStart is a definite pre-spawn cmd.Start failure.
+	// It is not delivery uncertainty: the OS child was never created.
+	errManagerWakeQueueStart = fmt.Errorf("queue_start_failed")
 )
 
 type managerWakeOutboxRow struct {
@@ -1463,8 +1471,11 @@ func defaultManagerWakeQueue(bin, thread, message string) error {
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
 	cmd.Stdin = nil
 	setupProcGroup(cmd)
+	if fn := managerWakeBeforeStart; fn != nil {
+		fn()
+	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("queue_failed")
+		return errManagerWakeQueueStart
 	}
 	pid := 0
 	if cmd.Process != nil {
@@ -1848,103 +1859,143 @@ func deliverSubscription(root string, sub ManagerWakeSubscription, rows []manage
 	return queueWakeRows(root, sub, delta, scanHigh, bin, cur, metrics, destSeen)
 }
 
+func taskIDsFromWakeRows(rows []managerWakeOutboxRow) []string {
+	seen := make(map[string]bool, len(rows))
+	var ids []string
+	for _, row := range rows {
+		id := strings.TrimSpace(row.TaskID)
+		if id == "" || seen[id] || id == managerWakeOnceLockID || id == managerWakeOutboxLockID {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func withSortedTaskControlLocks(root string, taskIDs []string, fn func() error) error {
+	ids := append([]string(nil), taskIDs...)
+	sort.Strings(ids)
+	var acquire func(int) error
+	acquire = func(i int) error {
+		if i == len(ids) {
+			return fn()
+		}
+		return withTaskControlLock(root, ids[i], func() error {
+			return acquire(i + 1)
+		})
+	}
+	return acquire(0)
+}
+
 func queueWakeRows(root string, sub ManagerWakeSubscription, delta []managerWakeOutboxRow, scanHigh int64, bin string, cur *managerWakeCursor, metrics *managerWakeMetrics, destSeen map[string]map[string]bool) error {
 	if fn := managerWakeBeforeQueue; fn != nil {
 		fn()
 	}
-	rebound, err := rebindWakeDelta(root, sub, delta)
-	if err != nil {
-		metrics.LastErrorClass = "outbox_identity_mismatch"
-		noteManagerWakeError(root, metrics, "outbox_identity_mismatch")
-		return fmt.Errorf("outbox_identity_mismatch")
-	}
-	delta = rebound
-	if strings.TrimSpace(bin) == "" {
-		metrics.LastErrorClass = "missing_codex_bin"
-		noteManagerWakeError(root, metrics, "missing_codex_bin")
-		return fmt.Errorf("missing_codex_bin")
-	}
-	if _, err := os.Stat(bin); err != nil {
-		if _, lookErr := exec.LookPath(bin); lookErr != nil {
+	return withSortedTaskControlLocks(root, taskIDsFromWakeRows(delta), func() error {
+		rebound, err := rebindWakeDelta(root, sub, delta)
+		if err != nil {
+			metrics.LastErrorClass = "outbox_identity_mismatch"
+			noteManagerWakeError(root, metrics, "outbox_identity_mismatch")
+			return fmt.Errorf("outbox_identity_mismatch")
+		}
+		delta = rebound
+		if strings.TrimSpace(bin) == "" {
 			metrics.LastErrorClass = "missing_codex_bin"
 			noteManagerWakeError(root, metrics, "missing_codex_bin")
 			return fmt.Errorf("missing_codex_bin")
 		}
-	}
-	receipts, class, err := loadManagerWakeReceiptIDs(root, sub.ID)
-	if class != "" {
-		metrics.LastErrorClass = class
-		noteManagerWakeError(root, metrics, class)
-		if err != nil {
-			return err
+		if _, err := os.Stat(bin); err != nil {
+			if _, lookErr := exec.LookPath(bin); lookErr != nil {
+				metrics.LastErrorClass = "missing_codex_bin"
+				noteManagerWakeError(root, metrics, "missing_codex_bin")
+				return fmt.Errorf("missing_codex_bin")
+			}
 		}
-		return fmt.Errorf("%s", class)
-	}
-	already := destSeen[strings.TrimSpace(sub.ThreadID)]
-	var toSend []managerWakeOutboxRow
-	for _, row := range delta {
-		if receipts[row.WakeEventID] || (already != nil && already[row.WakeEventID]) {
-			continue
+		receipts, class, err := loadManagerWakeReceiptIDs(root, sub.ID)
+		if class != "" {
+			metrics.LastErrorClass = class
+			noteManagerWakeError(root, metrics, class)
+			if err != nil {
+				return err
+			}
+			return fmt.Errorf("%s", class)
 		}
-		toSend = append(toSend, row)
-	}
-	commit := func() error {
-		cur.OutboxSeq = scanHigh
-		if len(delta) > 0 {
-			cur.LastWakeID = delta[len(delta)-1].WakeEventID
+		already := destSeen[strings.TrimSpace(sub.ThreadID)]
+		var toSend []managerWakeOutboxRow
+		for _, row := range delta {
+			if receipts[row.WakeEventID] || (already != nil && already[row.WakeEventID]) {
+				continue
+			}
+			toSend = append(toSend, row)
 		}
-		cur.LastErrorClass = ""
-		cur.LastDeliveryAt = time.Now().Format(time.RFC3339Nano)
-		if err := managerWakeCommitCursor(root, cur); err != nil {
-			return failCursorSave(root, metrics, err)
-		}
-		_ = clearManagerWakeInflight(root, sub.ID)
-		return nil
-	}
-	if len(toSend) == 0 {
-		if len(delta) == 0 {
+		commit := func() error {
+			cur.OutboxSeq = scanHigh
+			if len(delta) > 0 {
+				cur.LastWakeID = delta[len(delta)-1].WakeEventID
+			}
+			cur.LastErrorClass = ""
+			cur.LastDeliveryAt = time.Now().Format(time.RFC3339Nano)
+			if err := managerWakeCommitCursor(root, cur); err != nil {
+				return failCursorSave(root, metrics, err)
+			}
+			_ = clearManagerWakeInflight(root, sub.ID)
 			return nil
 		}
+		if len(toSend) == 0 {
+			if len(delta) == 0 {
+				return nil
+			}
+			return commit()
+		}
+		msg := compactWakeMessage(sub, toSend, scanHigh)
+		if !wakeMessageCarriesEventIDs(msg) {
+			metrics.LastErrorClass = "queue_idempotency_unsupported"
+			noteManagerWakeError(root, metrics, "queue_idempotency_unsupported")
+			return fmt.Errorf("queue_idempotency_unsupported")
+		}
+		if secretfulWakeMessage(msg) {
+			metrics.LastErrorClass = "payload_rejected"
+			noteManagerWakeError(root, metrics, "payload_rejected")
+			return fmt.Errorf("payload_rejected")
+		}
+		if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseClaimed); err != nil {
+			class := allowlistedWakeError(err, "inflight_save_failed")
+			metrics.LastErrorClass = class
+			noteManagerWakeError(root, metrics, class)
+			return fmt.Errorf("%s", class)
+		}
+		origSpawned := managerWakeQueueSpawned
+		managerWakeQueueSpawned = func() error {
+			if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned); err != nil {
+				return err
+			}
+			if origSpawned != nil {
+				return origSpawned()
+			}
+			return nil
+		}
+		defer func() { managerWakeQueueSpawned = origSpawned }()
+		metrics.QueueAttempts++
+		if err := managerWakeQueue(bin, sub.ThreadID, msg); err != nil {
+			metrics.QueueFailures++
+			if errors.Is(err, errManagerWakeQueueStart) || strings.TrimSpace(err.Error()) == "queue_start_failed" {
+				return noteWakeClass(root, cur, metrics, "queue_start_failed")
+			}
+			_ = saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned)
+			return failDeliveryUncertain(root, cur, metrics)
+		}
+		if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned); err != nil {
+			return failDeliveryUncertain(root, cur, metrics)
+		}
+		metrics.QueueSuccesses++
+		if err := managerWakePersistReceipts(root, sub.ID, toSend); err != nil {
+			return failDeliveryUncertain(root, cur, metrics)
+		}
+		markDestinationEventIDs(destSeen, sub.ThreadID, toSend)
+		_ = clearManagerWakeInflight(root, sub.ID)
 		return commit()
-	}
-	msg := compactWakeMessage(sub, toSend, scanHigh)
-	if !wakeMessageCarriesEventIDs(msg) {
-		metrics.LastErrorClass = "queue_idempotency_unsupported"
-		noteManagerWakeError(root, metrics, "queue_idempotency_unsupported")
-		return fmt.Errorf("queue_idempotency_unsupported")
-	}
-	if secretfulWakeMessage(msg) {
-		metrics.LastErrorClass = "payload_rejected"
-		noteManagerWakeError(root, metrics, "payload_rejected")
-		return fmt.Errorf("payload_rejected")
-	}
-	if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseClaimed); err != nil {
-		class := allowlistedWakeError(err, "inflight_save_failed")
-		metrics.LastErrorClass = class
-		noteManagerWakeError(root, metrics, class)
-		return fmt.Errorf("%s", class)
-	}
-	origSpawned := managerWakeQueueSpawned
-	managerWakeQueueSpawned = func() error {
-		return saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned)
-	}
-	defer func() { managerWakeQueueSpawned = origSpawned }()
-	metrics.QueueAttempts++
-	if err := managerWakeQueue(bin, sub.ThreadID, msg); err != nil {
-		metrics.QueueFailures++
-		_ = saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned)
-		return failDeliveryUncertain(root, cur, metrics)
-	}
-	if err := saveManagerWakeInflightPhase(root, sub.ID, sub.ThreadID, toSend, scanHigh, inflightPhaseSpawned); err != nil {
-		return failDeliveryUncertain(root, cur, metrics)
-	}
-	metrics.QueueSuccesses++
-	if err := managerWakePersistReceipts(root, sub.ID, toSend); err != nil {
-		return failDeliveryUncertain(root, cur, metrics)
-	}
-	markDestinationEventIDs(destSeen, sub.ThreadID, toSend)
-	_ = clearManagerWakeInflight(root, sub.ID)
-	return commit()
+	})
 }
 
 func secretfulWakeMessage(msg string) bool {

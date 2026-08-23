@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,7 +142,19 @@ func TestCmdManagerWakeInstallLaunchdWatchPathsAndInterval(t *testing.T) {
 	writeWakeConfig(t, root, bin, "wake-proj", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "mgr", true)
 	pp := filepath.Join(t.TempDir(), "com.cardex.manager-wake.plist")
 	withIsolatedManagerWakeLaunchd(t, pp)
-	managerWakeLaunchctlRun = func(args ...string) error { return nil }
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
+		}
+		switch args[0] {
+		case "print":
+			return fmt.Errorf("not_loaded")
+		case "bootout", "unload", "load":
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
+	}
 	if err := cmdManagerWake([]string{"install", "-root", root}); err != nil {
 		t.Fatal(err)
 	}

@@ -162,10 +162,19 @@ func TestInstallManagerWakeRestoreErrorSurfaces(t *testing.T) {
 	}
 	withIsolatedManagerWakeLaunchd(t, pp)
 	managerWakeLaunchctlRun = func(args ...string) error {
-		if len(args) > 0 && args[0] == "load" {
-			return fmt.Errorf("boom")
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
 		}
-		return nil
+		switch args[0] {
+		case "load":
+			return fmt.Errorf("boom")
+		case "print":
+			return fmt.Errorf("not_loaded")
+		case "bootout", "unload":
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
 	}
 	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
 		t.Fatal("restore load failure must surface")
@@ -208,6 +217,19 @@ func withIsolatedManagerWakeLaunchd(t *testing.T, plistPath string) {
 	}
 	managerWakePlistPathFn = func() string { return plistPath }
 	managerWakeExecutable = func() (string, error) { return exe, nil }
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
+		}
+		switch args[0] {
+		case "print":
+			return fmt.Errorf("not_loaded")
+		case "bootout", "unload", "load":
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
+	}
 	t.Cleanup(func() {
 		managerWakePlistPathFn = origPath
 		managerWakeExecutable = origExec
@@ -231,9 +253,14 @@ func TestInstallManagerWakeDurableWriteAndLoadFailureRestoresPrior(t *testing.T)
 			return fmt.Errorf("missing args")
 		}
 		switch args[0] {
-		case "unload":
+		case "unload", "bootout":
 			unloads++
 			return nil
+		case "print":
+			if loads >= 2 {
+				return nil
+			}
+			return fmt.Errorf("not_loaded")
 		case "load":
 			loads++
 			if loads == 1 {
@@ -270,10 +297,19 @@ func TestInstallManagerWakeLoadFailureRemovesNewPlistWhenNoPrior(t *testing.T) {
 	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
 	withIsolatedManagerWakeLaunchd(t, pp)
 	managerWakeLaunchctlRun = func(args ...string) error {
-		if len(args) > 0 && args[0] == "load" {
-			return fmt.Errorf("boom")
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
 		}
-		return nil
+		switch args[0] {
+		case "load":
+			return fmt.Errorf("boom")
+		case "print":
+			return fmt.Errorf("not_loaded")
+		case "bootout", "unload":
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
 	}
 	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
 		t.Fatal("load failure must surface")
@@ -290,10 +326,17 @@ func TestUninstallManagerWakeUnloadFailureSurfaces(t *testing.T) {
 	}
 	withIsolatedManagerWakeLaunchd(t, pp)
 	managerWakeLaunchctlRun = func(args ...string) error {
-		if len(args) > 0 && args[0] == "unload" {
-			return fmt.Errorf("boom")
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
 		}
-		return nil
+		switch args[0] {
+		case "bootout", "unload":
+			return fmt.Errorf("boom")
+		case "print":
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
 	}
 	if err := uninstallManagerWakeLaunchd(); err == nil {
 		t.Fatal("unload failure must surface")
@@ -312,7 +355,19 @@ func TestUninstallManagerWakeDurablePlistUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 	withIsolatedManagerWakeLaunchd(t, pp)
-	managerWakeLaunchctlRun = func(args ...string) error { return nil }
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
+		}
+		switch args[0] {
+		case "print":
+			return fmt.Errorf("not_loaded")
+		case "bootout", "unload", "load":
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
+	}
 	var synced []string
 	orig := syncDirAfterRename
 	t.Cleanup(func() { syncDirAfterRename = orig })
@@ -328,6 +383,116 @@ func TestUninstallManagerWakeDurablePlistUnlink(t *testing.T) {
 	}
 	if !containsString(synced, dir) {
 		t.Fatalf("plist unlink must sync containing dir: %v", synced)
+	}
+}
+
+func TestUninstallManagerWakeMissingPlistStillRequiresServiceAbsent(t *testing.T) {
+	pp := filepath.Join(t.TempDir(), managerWakeLaunchdLabel+".plist")
+	withIsolatedManagerWakeLaunchd(t, pp)
+	prints := 0
+	bootouts := 0
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
+		}
+		switch args[0] {
+		case "bootout":
+			bootouts++
+			if !strings.Contains(args[1], managerWakeLaunchdLabel) || !strings.HasPrefix(args[1], "gui/") {
+				t.Fatalf("bootout must be domain-and-label, got %v", args)
+			}
+			return nil
+		case "print":
+			prints++
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
+	}
+	if err := uninstallManagerWakeLaunchd(); err == nil || err.Error() != "launchctl_unload_failed" {
+		t.Fatalf("loaded service without plist must not report success, got %v", err)
+	}
+	if bootouts == 0 || prints == 0 {
+		t.Fatalf("must bootout and print, bootouts=%d prints=%d", bootouts, prints)
+	}
+}
+
+func TestRollbackUnloadFailureDoesNotUnlinkOrReportSuccess(t *testing.T) {
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	if err := os.WriteFile(pp, []byte("NEW PLIST\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withIsolatedManagerWakeLaunchd(t, pp)
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
+		}
+		switch args[0] {
+		case "bootout", "unload":
+			return fmt.Errorf("boom")
+		case "print":
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
+	}
+	if err := restoreManagerWakeLaunchd(pp, nil, false); err == nil || err.Error() != "launchctl_unload_failed" {
+		t.Fatalf("unload failure must surface, got %v", err)
+	}
+	if _, err := os.Stat(pp); err != nil {
+		t.Fatalf("failed unload must not unlink plist: %v", err)
+	}
+}
+
+func TestRollbackRestoresPriorArgvBeforeSuccess(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	pp := filepath.Join(dir, managerWakeLaunchdLabel+".plist")
+	prior, err := renderManagerWakePlist("/prior/cardex", "/prior/root", managerWakeWatchdogSec, "/tmp/prior.log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pp, []byte(prior), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	withIsolatedManagerWakeLaunchd(t, pp)
+	loads := 0
+	managerWakeLaunchctlRun = func(args ...string) error {
+		if len(args) == 0 {
+			return fmt.Errorf("missing args")
+		}
+		switch args[0] {
+		case "bootout", "unload":
+			return fmt.Errorf("not_loaded")
+		case "print":
+			if loads >= 2 {
+				return nil
+			}
+			return fmt.Errorf("not_loaded")
+		case "load":
+			loads++
+			if loads == 1 {
+				return fmt.Errorf("boom")
+			}
+			return nil
+		default:
+			return fmt.Errorf("unexpected %v", args)
+		}
+	}
+	if err := installManagerWakeLaunchd(root, &ManagerWakeConfig{Enabled: true}); err == nil {
+		t.Fatal("load failure must surface")
+	}
+	got, err := os.ReadFile(pp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != prior {
+		t.Fatalf("prior argv not restored: %q", got)
+	}
+	want := managerWakePlistProgramArguments(prior)
+	if !sameStringSlice(managerWakePlistProgramArguments(string(got)), want) {
+		t.Fatalf("restored argv %q want %q", managerWakePlistProgramArguments(string(got)), want)
 	}
 }
 

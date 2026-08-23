@@ -491,7 +491,43 @@ func loadTransition(root, taskID, transitionID string) (*TransitionRecord, error
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return nil, err
 	}
+	if err := validateTransitionRecord(&rec, taskID, transitionID); err != nil {
+		return nil, err
+	}
 	return &rec, nil
+}
+
+func validateTransitionRecord(rec *TransitionRecord, taskID, transitionID string) error {
+	if rec == nil {
+		return fmt.Errorf("empty transition record")
+	}
+	if rec.TaskID != taskID || rec.TransitionID != transitionID {
+		return fmt.Errorf("transition identity mismatch: have %s/%s want %s/%s", rec.TaskID, rec.TransitionID, taskID, transitionID)
+	}
+	if rec.ExpectedRevision < 0 || rec.NewRevision != rec.ExpectedRevision+1 {
+		return fmt.Errorf("transition revision mismatch: expected %d new %d", rec.ExpectedRevision, rec.NewRevision)
+	}
+	switch rec.State {
+	case transitionPrepared, transitionCommitted:
+	default:
+		return fmt.Errorf("transition state rejected: %s", rec.State)
+	}
+	if rec.EventType == "" || rec.Status == "" {
+		return fmt.Errorf("transition event identity missing")
+	}
+	if !closedTransitionEventType(rec.EventType) {
+		return fmt.Errorf("transition event type rejected: %s", rec.EventType)
+	}
+	return nil
+}
+
+func closedTransitionEventType(evType string) bool {
+	switch evType {
+	case evQueued, evDispatched, evStepOK, evLimitPaused, evHeld, evRetry, evCanceled, evDone, evFailed, evCloseout, evNeedsOwner:
+		return true
+	default:
+		return false
+	}
 }
 
 func digestDetail(detail map[string]any) string {

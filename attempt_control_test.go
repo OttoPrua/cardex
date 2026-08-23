@@ -1621,6 +1621,109 @@ func TestPreparedTerminalJournalAttemptIdentityBlocksCommit(t *testing.T) {
 	})
 }
 
+func TestForeignTransitionRecordDoesNotSatisfyDurableDone(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	done := newTask(root, testCfg(), typeSequence, "foreign transition", dir, []string{"p"}, 5)
+	if err := saveTask(root, done); err != nil {
+		t.Fatal(err)
+	}
+	done.Status = statusDone
+	if err := commitTaskTransition(root, done, transitionRequest{
+		EventType: evDone, Actor: "test", Status: statusDone, Step: 1,
+		Detail: withCostTelemetry(map[string]any{"reason": "test done"}, done),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, done.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !taskDurablyDone(root, fresh) {
+		t.Fatal("honest committed done must remain durably done")
+	}
+	tid := fresh.LastCommittedTransitionID
+	path := transitionPath(root, fresh.ID, tid)
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rec TransitionRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatal(err)
+	}
+	rec.TaskID = "t0000-0000-ffff"
+	forged, err := json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(forged, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadTransition(root, fresh.ID, tid); err == nil {
+		t.Fatal("foreign task id in transition record must fail load")
+	}
+	if taskDurablyDone(root, fresh) {
+		t.Fatal("foreign transition must not satisfy DAG done")
+	}
+
+	rec.TaskID = fresh.ID
+	rec.NewRevision = rec.ExpectedRevision + 99
+	forged, err = json.MarshalIndent(rec, "", "  ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, append(forged, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if taskDurablyDone(root, fresh) {
+		t.Fatal("revision-mismatched transition must not satisfy done")
+	}
+
+	honest, err := loadTask(root, done.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	child := newTask(root, testCfg(), typeSequence, "depends on foreign", dir, []string{"p"}, 5)
+	child.DependsOn = []string{honest.ID}
+	if err := saveTask(root, child); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := loadTasks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if liveDAGReadyIDs(root, tasks)[child.ID] {
+		t.Fatal("DAG must not treat a foreign transition as durable completion")
+	}
+}
+
+func TestDurableDoneRequiresMatchingCommittedEvent(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	tk := newTask(root, testCfg(), typeSequence, "missing done event", dir, []string{"p"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	tk.Status = statusDone
+	if err := commitTaskTransition(root, tk, transitionRequest{
+		EventType: evDone, Actor: "test", Status: statusDone, Step: 1,
+		Detail: withCostTelemetry(map[string]any{"reason": "test done"}, tk),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(eventsDir(root), fresh.ID+".jsonl")); err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if taskDurablyDone(root, fresh) {
+		t.Fatal("missing matching done event must not satisfy durable done")
+	}
+}
+
 func TestCommittedTerminalJournalAttemptFailureBlocksProjection(t *testing.T) {
 	cases := []struct {
 		name string

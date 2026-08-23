@@ -198,18 +198,78 @@ func managerWakePlistStartInterval(plist string) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(rest[:j]))
 }
 
+func managerWakeLaunchdTarget() string {
+	return fmt.Sprintf("gui/%d/%s", os.Getuid(), managerWakeLaunchdLabel)
+}
+
+func launchctlServiceAbsent(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "not_loaded") ||
+		strings.Contains(s, "could not find") ||
+		strings.Contains(s, "no such") ||
+		strings.Contains(s, "not found")
+}
+
+func managerWakeUnloadService() error {
+	target := managerWakeLaunchdTarget()
+	if err := managerWakeLaunchctlRun("bootout", target); err != nil && !launchctlServiceAbsent(err) {
+		return fmt.Errorf("launchctl_unload_failed")
+	}
+	return nil
+}
+
+func managerWakeServiceLoaded() (bool, error) {
+	target := managerWakeLaunchdTarget()
+	err := managerWakeLaunchctlRun("print", target)
+	if err == nil {
+		return true, nil
+	}
+	if launchctlServiceAbsent(err) {
+		return false, nil
+	}
+	return false, fmt.Errorf("launchctl_print_failed")
+}
+
 func restoreManagerWakeLaunchd(pp string, prior []byte, priorOK bool) error {
 	if priorOK {
 		if err := managerWakeWritePlist(pp, prior); err != nil {
 			return err
 		}
-		_ = managerWakeLaunchctlRun("unload", pp)
+		if err := managerWakeUnloadService(); err != nil {
+			return err
+		}
 		if err := managerWakeLaunchctlRun("load", "-w", pp); err != nil {
 			return err
 		}
+		loaded, err := managerWakeServiceLoaded()
+		if err != nil {
+			return err
+		}
+		if !loaded {
+			return fmt.Errorf("launchd_restore_unverified")
+		}
+		got, err := os.ReadFile(pp)
+		if err != nil {
+			return err
+		}
+		if !sameStringSlice(managerWakePlistProgramArguments(string(got)), managerWakePlistProgramArguments(string(prior))) {
+			return fmt.Errorf("launchd_restore_unverified")
+		}
 		return nil
 	}
-	_ = managerWakeLaunchctlRun("unload", pp)
+	if err := managerWakeUnloadService(); err != nil {
+		return err
+	}
+	loaded, err := managerWakeServiceLoaded()
+	if err != nil {
+		return err
+	}
+	if loaded {
+		return fmt.Errorf("launchctl_unload_failed")
+	}
 	return durableUnlinkFile(pp)
 }
 
@@ -256,7 +316,7 @@ func installManagerWakeLaunchd(root string, mw *ManagerWakeConfig) error {
 	if err := managerWakeWritePlist(pp, []byte(content)); err != nil {
 		return err
 	}
-	_ = managerWakeLaunchctlRun("unload", pp)
+	_ = managerWakeUnloadService()
 	if err := managerWakeLaunchctlRun("load", "-w", pp); err != nil {
 		if rerr := restoreManagerWakeLaunchd(pp, prior, priorOK); rerr != nil {
 			return fmt.Errorf("launchd_restore_failed")
@@ -272,17 +332,27 @@ func uninstallManagerWakeLaunchd() error {
 	if pp == "" {
 		return fmt.Errorf("launchd_path_unresolved")
 	}
+	plistMissing := false
 	if _, err := os.Stat(pp); err != nil {
-		if os.IsNotExist(err) {
-			return nil
+		if !os.IsNotExist(err) {
+			return err
 		}
+		plistMissing = true
+	}
+	if err := managerWakeUnloadService(); err != nil {
 		return err
 	}
-	if err := managerWakeLaunchctlRun("unload", pp); err != nil {
+	loaded, err := managerWakeServiceLoaded()
+	if err != nil {
+		return err
+	}
+	if loaded {
 		return fmt.Errorf("launchctl_unload_failed")
 	}
-	if err := durableUnlinkFile(pp); err != nil {
-		return err
+	if !plistMissing {
+		if err := durableUnlinkFile(pp); err != nil {
+			return err
+		}
 	}
 	fmt.Println("已卸载 manager-wake launchd:", pp)
 	return nil

@@ -3,8 +3,11 @@ package main
 import (
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"testing"
+	"time"
 )
 
 func mustWriteFile(t *testing.T, path, body string) {
@@ -370,5 +373,88 @@ func TestApplyTaskWriteDomainAndDependsOn(t *testing.T) {
 	}
 	if err := applyTaskDependsOn(tk, "tdone-one,tdone-one"); !errors.Is(err, errDAGDuplicateNode) {
 		t.Fatalf("duplicate depends: %v", err)
+	}
+}
+
+func TestGitIdentityFromNestedTaskDirAndUnreadableMetadata(t *testing.T) {
+	repo := t.TempDir()
+	mustWriteFile(t, filepath.Join(repo, ".git", "HEAD"), "ref: refs/heads/main\n")
+	mustWriteFile(t, filepath.Join(repo, "internal", "auth", "token.go"), "package auth\n")
+	nested := filepath.Join(repo, "internal", "auth")
+	legacyNested := &Task{ID: "legacy-nested", Dir: nested, Type: typeSequence}
+	legacyRoot := &Task{ID: "legacy-root", Dir: repo, Type: typeSequence}
+	if !writerConflictsWithActive(legacyNested, []*Task{legacyRoot}) || !writerConflictsWithActive(legacyRoot, []*Task{legacyNested}) {
+		t.Fatal("nested Task.Dir must resolve to the same git identity as the worktree root")
+	}
+	top, common, unc := resolveGitIdentity(nested)
+	if unc || top == "" || common == "" {
+		t.Fatalf("nested git identity uncertain top=%q common=%q unc=%v", top, common, unc)
+	}
+	if taskRepoRoot(legacyNested) != top {
+		t.Fatalf("taskRepoRoot nested=%q want %q", taskRepoRoot(legacyNested), top)
+	}
+
+	broken := t.TempDir()
+	gitFile := filepath.Join(broken, ".git")
+	mustWriteFile(t, gitFile, "gitdir: /nope\n")
+	if err := os.Chmod(gitFile, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(gitFile, 0o644) })
+	bad := &Task{ID: "legacy-unreadable", Dir: broken, Type: typeSequence}
+	claim := writerClaimForTask(bad)
+	if claim.valid {
+		t.Fatal("unreadable git metadata must fail closed")
+	}
+	if !writerConflictsWithActive(bad, nil) {
+		t.Fatal("uncertain git identity must block dispatch")
+	}
+}
+
+func TestWriterClaimsReconstructAfterAbruptParentDeath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("workspace flock is POSIX")
+	}
+	cardexRoot := testRoot(t)
+	ws := t.TempDir()
+	mustWriteFile(t, filepath.Join(ws, "internal", "auth", "token.go"), "package auth\n")
+	live := explicitTask(t, cardexRoot, "live writer", ws, "auth-tokens", "auth-tokens-lineage", "auth", []string{"internal/auth"}, nil)
+	other := &Task{ID: "other-auth", Dir: ws, Type: typeSequence, WriteDomain: &WriteDomain{
+		ID: "auth-other", Lineage: "auth-other-lineage", Component: "auth", Paths: []string{"internal/auth"},
+	}}
+
+	cmd := exec.Command("sleep", "30")
+	lease, err := prepareTaskProcessLease(cmd, live.ID, ws)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if lease != nil && lease.commit != nil {
+		lease.commit()
+	}
+	t.Cleanup(func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+			_, _ = cmd.Process.Wait()
+		}
+	})
+	deadline := time.Now().Add(2 * time.Second)
+	for !workspaceLeaseHeld(ws) {
+		if !time.Now().Before(deadline) {
+			t.Fatal("descendant did not retain workspace lease")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if !taskHasLiveWriterProof(cardexRoot, live) {
+		t.Fatal("live workspace lease must reconstruct a writer proof")
+	}
+	got := reconstructLiveWriterClaims(cardexRoot)
+	if !writerConflictsWithActive(other, got) {
+		t.Fatal("restart dispatch must serialize against reconstructed live claims")
+	}
+	if writerConflictsWithActive(other, nil) && !writerConflictsWithActive(other, got) {
+		t.Fatal("conflict must come from reconstructed claims, not the candidate alone")
 	}
 }

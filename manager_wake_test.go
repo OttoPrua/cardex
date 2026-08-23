@@ -370,7 +370,7 @@ func TestClosedTraversalSafeSubscriptionIDs(t *testing.T) {
 	_ = heldCommittedTask(t, root, "wake-proj", "traversal")
 	for _, id := range []string{"../passwd", "..", "a/b", "a\\b", ""} {
 		mw := testWakeCfg(bin, "wake-proj", "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee", id)
-		if err := managerWakeOnce(root, mw); err != nil {
+		if err := managerWakeOnce(root, mw); err != nil && err.Error() != "invalid_subscription_id" {
 			t.Fatalf("invalid id %q must fail closed without panic: %v", id, err)
 		}
 		if _, err := os.Stat(logPath); !os.IsNotExist(err) {
@@ -735,8 +735,8 @@ func TestInvalidThreadFailClosedNoSpawn(t *testing.T) {
 	bin, logPath := fakeCodexQueueBin(t, 0)
 	mw := testWakeCfg(bin, "wake-proj", "not-a-uuid", "mgr")
 	_ = heldCommittedTask(t, root, "wake-proj", "bad thread")
-	if err := managerWakeOnce(root, mw); err != nil {
-		t.Fatal(err)
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "invalid_thread_id" {
+		t.Fatalf("invalid thread must fail visibly, got %v", err)
 	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 		t.Fatal("invalid thread must not spawn")
@@ -744,6 +744,9 @@ func TestInvalidThreadFailClosedNoSpawn(t *testing.T) {
 	cur, _, _ := loadManagerWakeCursor(root, "mgr")
 	if cur.LastErrorClass != "invalid_thread_id" {
 		t.Fatalf("want invalid_thread_id, got %+v", cur)
+	}
+	if cur.OutboxSeq != 0 {
+		t.Fatalf("invalid thread must not consume cursor: %+v", cur)
 	}
 }
 
@@ -768,11 +771,15 @@ func TestUnknownProjectFailClosed(t *testing.T) {
 	bin, logPath := fakeCodexQueueBin(t, 0)
 	mw := testWakeCfg(bin, "no-such-project", "66666666-6666-6666-6666-666666666666", "mgr")
 	_ = heldCommittedTask(t, root, "wake-proj", "unknown proj")
-	if err := managerWakeOnce(root, mw); err != nil {
-		t.Fatal(err)
+	if err := managerWakeOnce(root, mw); err == nil || err.Error() != "unknown_project" {
+		t.Fatalf("unknown project must fail visibly, got %v", err)
 	}
 	if _, err := os.Stat(logPath); !os.IsNotExist(err) {
 		t.Fatal("unknown project must not spawn")
+	}
+	cur, _, _ := loadManagerWakeCursor(root, "mgr")
+	if cur != nil && cur.OutboxSeq != 0 {
+		t.Fatalf("unknown project must not consume cursor: %+v", cur)
 	}
 }
 
@@ -1468,20 +1475,25 @@ func TestPreSpawnInflightCrashStaleScanFailClosed(t *testing.T) {
 	bin, logPath := fakeCodexQueueBin(t, 0)
 	thread := "17171717-1717-1717-1717-171717171717"
 	mw := testWakeCfg(bin, "wake-proj", thread, "mgr")
+	writeWakeConfig(t, root, bin, "wake-proj", thread, "mgr", true)
 	tk := heldCommittedTask(t, root, "wake-proj", "pre-spawn-stale")
 	held := mustHeldEvent(t, root, tk.ID)
 	wantID := wakeEventID(tk.ID, held.Seq, held.TransitionID)
-	if err := saveManagerWakeInflight(root, "mgr", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1); err != nil {
+	if err := saveManagerWakeInflightPhase(root, "mgr", thread, []managerWakeOutboxRow{{WakeEventID: wantID}}, 1, inflightPhaseClaimed); err != nil {
 		t.Fatal(err)
 	}
 	if err := cmdSetStatus([]string{"-root", root, tk.ID}, "release"); err != nil {
 		t.Fatal(err)
 	}
-	before := inflightRaw(t, root, "mgr")
-	assertUncertainNoRetry(t, root, mw, logPath, before)
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("stale claimed inflight must resolve without blocking, got %v", err)
+	}
 	if queueThreadCount(logPath) != 0 {
 		data, _ := os.ReadFile(logPath)
-		t.Fatalf("stale scan must not queue or overwrite inflight: %s", data)
+		t.Fatalf("stale scan must not queue: %s", data)
+	}
+	if _, err := os.Stat(managerWakeInflightPath(root, "mgr")); !os.IsNotExist(err) {
+		t.Fatal("stale claimed inflight must be cleared")
 	}
 }
 

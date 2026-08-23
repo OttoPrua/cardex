@@ -152,7 +152,11 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						laneMetrics.AddWaits(1)
 						continue
 					}
-					if writerConflictsWithActive(t, activeWriters) {
+					if taskHasLiveWriterProof(root, t) {
+						laneMetrics.AddConflicts(1)
+						continue
+					}
+					if writerConflictsWithActive(t, mergeLiveWriterTasks(activeWriters, reconstructLiveWriterClaims(root))) {
 						laneMetrics.AddConflicts(1)
 						continue
 					}

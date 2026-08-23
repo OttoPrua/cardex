@@ -435,17 +435,28 @@ func (s *syncBuffer) String() string {
 	return s.b.String()
 }
 
+func killRegisteredProcGroups() {
+	procMu.Lock()
+	pids := make([]int, 0, len(procGroups))
+	for pid := range procGroups {
+		pids = append(pids, pid)
+	}
+	procMu.Unlock()
+	for _, pid := range pids {
+		if pid <= 0 {
+			continue
+		}
+		_ = killProcGroup(pid)
+	}
+}
+
 // installKillHandler 让 Ctrl-C/SIGTERM 先击杀全部在册执行器进程组再退出。
 func installKillHandler() {
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
-		procMu.Lock()
-		for pid := range procGroups {
-			_ = killProcGroup(pid)
-		}
-		procMu.Unlock()
+		killRegisteredProcGroups()
 		os.Exit(130)
 	}()
 }

@@ -76,6 +76,8 @@ func main() {
 		err = uninstallLaunchd()
 	case "engines":
 		err = cmdEngines(os.Args[2:])
+	case "workflow":
+		err = cmdWorkflow(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "version", "-v", "--version":
@@ -102,6 +104,8 @@ func printUsage() {
   add       [-type sequence|design-review|prompt-assembly|coordinate|progress-pull]
             [-title T] [-dir D] [-priority N] [-model haiku|sonnet|opus] [-file steps.md]
             [-stakes low|normal|high] [-review-after] [-emit] [-hold] [-skip-permissions]
+            [-write-domain-id ID] [-write-domain-lineage L] [-write-domain-component C]
+            [-write-paths p1,p2] [-write-resources kind:id] [-depends-on id1,id2]
             [-tools "A,B"] "prompt..."
             -file 中用单独一行 --- 分隔多个步骤（预设 prompt 序列）
             -stakes 查 config.stakes_policy 决定复核深度（low 不配复审 / high 强制复审+抬思考档），
@@ -154,6 +158,9 @@ func printUsage() {
                                    # （kimi / glm-cn / glm-global / minimax-cn / minimax-global /
                                    #   mimo / opencode-go / ollama），add 后配好密钥即可
                                    #   -runner <引擎名> 钉定主跑，或加入 fallback_order 参与降级链
+  workflow  init|list|show|advance|freeze-candidate|ingest-review|try-release-integration|mark
+            模块管理控制面：直派串联或联邦模块循环（Grok writer → 独立 Grok 审核 → 修复），
+            集成门默认 held，只有机器核验 verdict=pass 且 p0/p1 为空、候选与 custody 一致才可释放
 `)
 }
 
@@ -165,7 +172,7 @@ func cmdInit(args []string) error {
 	_ = fs.Parse(args)
 	root := resolveRoot(*rootFlag)
 
-	for _, d := range []string{root, tasksDir(root), archiveDir(root), logsDir(root)} {
+	for _, d := range []string{root, tasksDir(root), archiveDir(root), logsDir(root), workflowsDir(root)} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
@@ -233,6 +240,12 @@ func cmdAdd(args []string) error {
 	reviewHost := fs.String("review-host", "", "审核分流：完成后的对抗审核卡改在该远程主机执行（config.remote_hosts 的键），把只读审核负载分流到第二台机器")
 	reviewDir := fs.String("review-dir", "", "审核卡在审核主机上的工作目录（镜像路径），与 -review-host 成对指定")
 	reviewSync := fs.String("review-sync", "", "派审核卡前本地执行的同步命令（sh -c，如把改动 rsync 到审核主机）；失败则回退本地审核")
+	writeDomainID := fs.String("write-domain-id", "", "显式写域 ID（与 lineage/component/paths 成套）")
+	writeDomainLineage := fs.String("write-domain-lineage", "", "显式写域谱系（同一谱系同时只允许一个写者）")
+	writeDomainComponent := fs.String("write-domain-component", "", "显式写域组件（同组件互斥路径仍可并行）")
+	writePaths := fs.String("write-paths", "", "逗号分隔的仓相对写路径")
+	writeResources := fs.String("write-resources", "", "逗号分隔的封闭资源 kind:id")
+	dependsOn := fs.String("depends-on", "", "逗号分隔的前置任务 ID；仅 durably done 才算满足")
 	_ = fs.Parse(args)
 
 	root := resolveRoot(*rootFlag)
@@ -370,6 +383,12 @@ func cmdAdd(args []string) error {
 	t.ReviewHost = *reviewHost
 	t.ReviewDir = *reviewDir
 	t.ReviewSync = *reviewSync
+	if err := applyTaskWriteDomain(t, *writeDomainID, *writeDomainLineage, *writeDomainComponent, *writePaths, *writeResources); err != nil {
+		return err
+	}
+	if err := applyTaskDependsOn(t, *dependsOn); err != nil {
+		return err
+	}
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
@@ -1552,6 +1571,16 @@ func cmdSetStatus(args []string, action string) error {
 	case "release":
 		if t.Status != statusHeld {
 			return fmt.Errorf("%s 不在挂起状态（当前: %s）", t.ID, t.Status)
+		}
+		if t.IntegrationGate != nil {
+			dec := evaluateIntegrationRelease(root, t)
+			if !dec.Admit {
+				reason := dec.HoldReason
+				if reason == "" {
+					reason = holdReasonNotPass
+				}
+				return fmt.Errorf("%s 集成门仍 held（%s）；durable review done 不足以 release", t.ID, reason)
+			}
 		}
 		t.Status = statusQueued
 		t.NotBeforeEpoch = 0

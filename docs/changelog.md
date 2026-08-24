@@ -2,6 +2,16 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-24 · 模块管理控制面（直派串联 + 联邦 workflow）
+
+- **写域**（write_domains.go / writer_claims.go）：仓相对路径规范化；exact/subtree 与封闭资源互斥；无写域的写卡仍按同一 Git common dir 整仓串行。`cardex add` 增加 `-write-domain-*` / `-write-paths` / `-write-resources` / `-depends-on`。
+- **DAG**：`depends_on` 只认 durable `done`；缺边/环/坏 ID 对该分量 fail closed。
+- **workflow 控制面**：`cardex workflow` 耐久绑定 module/goal、repo/worktree、写域、轮次、候选/审核身份、effect gates 与本地进度文件。模块循环钉 `grok-build`，拒绝 Codex/Sol；未配置时等待，不 fail-open。
+- **集成门**：模块集成卡默认 held；tick 与 `cardex release` 都要求机器核验 `verdict=pass` 且空 p0/p1，并匹配候选与 custody。`concerns`/`block`/未知词汇/缺输出/证据不全继续 held。
+- **Root 通知**：仅 live-ready、真实外部依赖、Owner 抉择、路线耗尽。例行进度只写 `workflows/*.progress.json|.md`。
+- **直派串联**的 `review_after` 修复闭环保持原语义；`pass` 但 p0/p1 非空不再当可采信 pass。
+- 文档：`docs/workflows.md` 与 `docs/workflows.en.md`。完整 attempt/producerGone custody 与原生 Grok CLI 仍是后续夹具。
+
 ## 2026-08-03 · Gemini CLI 备用执行器（第二异构执行器）
 
 - **执行面**（gemini.go）：`gemini -o json` headless 接入（prompt 走 stdin），会话由 cardex

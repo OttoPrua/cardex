@@ -159,6 +159,18 @@ type Task struct {
 	CostUSD   float64 `json:"cost_usd,omitempty"`
 	// LastSummary 是最近一步执行输出的一行摘要，供 list 看板展示“最新进度概述”。
 	LastSummary string `json:"last_summary,omitempty"`
+
+	// WriteDomain is an explicit, omitempty claim of repository-relative paths and
+	// closed resources. Tasks without one keep whole-repository exclusion on the
+	// same Git common dir. omitempty keeps old task JSON readable without migration.
+	WriteDomain *WriteDomain `json:"write_domain,omitempty"`
+	// DependsOn lists other task IDs that must be durably done before this task is Ready.
+	DependsOn []string `json:"depends_on,omitempty"`
+	// WorkflowID binds this card to a durable module-management record.
+	WorkflowID string `json:"workflow_id,omitempty"`
+	// IntegrationGate, when set, default-holds dispatch and cardex release until a
+	// machine-checked review verdict=pass with empty p0/p1 matches candidate/custody.
+	IntegrationGate *IntegrationGate `json:"integration_gate,omitempty"`
 }
 
 func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }

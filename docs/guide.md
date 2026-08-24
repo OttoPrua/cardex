@@ -47,6 +47,10 @@ sonnet/haiku 能显著拉伸 5 小时窗口）。所有添加命令支持 `-mode
 （`~/.claude/agents/deep-reasoner.md` 绑 opus、`fast-worker.md` 绑 sonnet），执行会话可以把
 疑难推理上交、机械劳动下放——跨会话按任务路由 + 会话内按环节路由，两层叠加。
 
+### 直派串联与联邦模块工作流
+
+长期产品模块用 `cardex workflow` 绑定目标、写域和候选身份，循环 Grok writer → 独立 Grok 审核 → 修复；集成门默认 held。直派串联仍可用 `add -review-after`。写域、`depends_on`、审核词汇与 Root 通知契约见[推荐工作流](workflows.md)。联邦并行写者请把 `max_parallel` 调到大于 1。
+
 ### 文件化状态（fresh_steps）与人工把关（-hold）
 
 推荐把项目状态放在**文件**里（state.md / TASKS.md 等），任务不依赖会话记忆：

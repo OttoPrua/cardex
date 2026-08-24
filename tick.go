@@ -8,6 +8,9 @@ import (
 	"time"
 )
 
+// tickRunTask is the drain execution seam; tests replace it to observe concurrency.
+var tickRunTask = runTaskVia
+
 // tick 是调度的最小单元：抢锁 → 排空队列（drain）。
 // 每轮循环在冷却/红线允许的前提下，把就绪任务派发到并行槽位（最多 max_parallel 个），
 // 全部跑完或没有可派发任务时才返回。同一工作目录同一时刻只跑一个任务，
@@ -34,12 +37,12 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	// 70min 会让长步任务死透后一进 pgGrace 就被误归为 no_heartbeat 类污染审计视图。触发面已在
 	// patrol.go 收敛到 pgDeadTooLong,阈值现仅影响 reason 分类。抽成 helper 以便直测。
 	updatePatrolHeartbeatTimeout(cfg)
+	advanceWorkflows(root, cfg)
 
 	type doneMsg struct{ t *Task }
 	ch := make(chan doneMsg)
 	activeIDs := map[string]bool{}
-	activeDirs := map[string]bool{}
-	claimedDir := map[string]bool{}                  // 哪些在跑任务占用了目录互斥（只读类型不占用）
+	var activeWriters []*Task
 	activeCancels := map[string]context.CancelFunc{} // 取消对账命中时击杀该任务的执行进程组
 	// CG-5 巡逻累积状态:同一 drain 周期内跨轮记住 pgSeenAlive/日志 size/上次 stall 时间。
 	// 生命周期 = 一次 drain(tick 函数体);任务离开 activeIDs 后由 patrolOnce 内部清理。
@@ -127,7 +130,16 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						}
 						continue
 					}
-					if activeIDs[t.ID] || (activeDirs[t.Dir] && !readOnly(t)) {
+					if activeIDs[t.ID] {
+						continue
+					}
+					if !dagAllowsTask(root, tasks, t.ID) {
+						continue
+					}
+					if !integrationGateAllows(root, t) {
+						continue
+					}
+					if writerConflictsWithActive(t, mergeLiveWriterTasks(activeWriters, reconstructLiveWriterClaims(root))) {
 						continue
 					}
 					switch {
@@ -176,8 +188,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 					via := viaRunner[next.ID]
 					activeIDs[next.ID] = true
 					if !readOnly(next) {
-						activeDirs[next.Dir] = true
-						claimedDir[next.ID] = true
+						activeWriters = append(activeWriters, next)
 					}
 					runCtx, cancelRun := context.WithCancel(context.Background())
 					activeCancels[next.ID] = cancelRun
@@ -191,7 +202,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							next.ID, next.Type, next.Title, next.Step+1, len(next.Prompts), len(activeIDs), maxPar, runner)
 					}
 					go func(t *Task, via string) {
-						if err := runTaskVia(runCtx, root, cfg, t, via); err != nil && !quiet {
+						if err := tickRunTask(runCtx, root, cfg, t, via); err != nil && !quiet {
 							fmt.Printf("✖ %s 执行出错: %v\n", t.ID, err)
 						}
 						ch <- doneMsg{t}
@@ -226,9 +237,11 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		select {
 		case msg := <-ch:
 			delete(activeIDs, msg.t.ID)
-			if claimedDir[msg.t.ID] {
-				delete(activeDirs, msg.t.Dir)
-				delete(claimedDir, msg.t.ID)
+			for i, w := range activeWriters {
+				if w != nil && w.ID == msg.t.ID {
+					activeWriters = append(activeWriters[:i], activeWriters[i+1:]...)
+					break
+				}
 			}
 			if cancelRun := activeCancels[msg.t.ID]; cancelRun != nil {
 				cancelRun() // 正常完成也要释放 ctx，别泄漏

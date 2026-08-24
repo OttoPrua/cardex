@@ -10,6 +10,9 @@ The scheduler's behavioral contracts on the failure paths: dispatch order, limit
 2. **Higher priority wins**;
 3. **Type order** (`type_order`): default `progress-pull > coordinate > review > sequence > assembly` (review is cheap and returns feedback fast; assembly spawns new work so it goes last);
 4. FIFO within the same tier.
+5. **Write-domain exclusion**: explicit write domains serialize on canonical path/resource overlap; writers without a domain still serialize on the same Git common dir. Read-only types do not occupy a write lane.
+6. **`depends_on`**: predecessors must be durably `done`; a bad DAG fail-closes that component.
+7. **Integration gate**: a card with `integration_gate` cannot be `release`d or dispatched until a machine-checked `verdict=pass` (empty p0/p1, matching candidate and custody).
 
 Limits are global: whenever any task hits a limit, a global cooldown is written (`cooldown.json`); during it no task is dispatched and no probe calls are wasted. The cooldown time prefers the reset timestamp in the error message; if none can be parsed it falls back to retrying after `limit_fallback_min` minutes.
 

@@ -38,6 +38,10 @@ cardex progress                   # progress overview (a "status" column shows w
 
 **In-session sub-layering (sub-agents)**: `sequence` tasks whitelist the Task tool by default, so paired with user-level sub-agents (`~/.claude/agents/deep-reasoner.md` bound to opus, `fast-worker.md` bound to sonnet) an executing session can hand hard reasoning up and push mechanical labor down — routing by task across sessions and by stage within a session, two layers stacked.
 
+### Direct serial and federated module workflows
+
+Long-horizon product modules use `cardex workflow` to bind a goal, write domain, and candidate identity, then loop Grok writer → fresh Grok review → repair. Integration is created held. Direct serial still uses `add -review-after`. Write domains, `depends_on`, review vocabulary, and the Root notify contract are in [recommended workflows](workflows.en.md). Federated parallel writers need `max_parallel` greater than 1.
+
 ### File-based state (`fresh_steps`) and human gating (`-hold`)
 
 Keeping project state in **files** (state.md / TASKS.md, etc.) is recommended so tasks don't depend on session memory:

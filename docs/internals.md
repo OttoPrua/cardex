@@ -10,6 +10,9 @@
 2. **priority 大者优先**；
 3. **类型顺序**（`type_order`）：默认 审核 > 序列 > 装配（审核便宜且能尽快给出反馈，装配会派生新工作放最后）；
 4. 同级按先进先出。
+5. **写域互斥**：显式 write domain 按规范化 path/resource 重叠串行；无写域的写卡仍按同一 Git common dir 整仓串行。只读类型不占写线。
+6. **`depends_on`**：前置必须 durable `done`；坏 DAG 对该分量 fail closed。
+7. **集成门**：带 `integration_gate` 的卡在机器核验 `verdict=pass`（空 p0/p1、候选与 custody 一致）之前既不能 `release` 也不能被 tick 派发。
 
 限额是全局的：任何任务撞到限额，写入全局冷却（`cooldown.json`），期间不再派发任何任务、不浪费探测调用；冷却时间优先取错误信息里的重置时间戳，解析不到则回退 `limit_fallback_min` 分钟后重试。
 

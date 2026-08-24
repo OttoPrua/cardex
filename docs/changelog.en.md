@@ -1,5 +1,15 @@
 # cardex changelog
 
+## 2026-08-24 · Module-management control plane (direct serial + federated workflow)
+
+- **Write domains** (`write_domains.go` / `writer_claims.go`): repository-relative path canonicalization; exact/subtree and closed-resource exclusion; writers without a domain still serialize on the same Git common dir. `cardex add` gains `-write-domain-*` / `-write-paths` / `-write-resources` / `-depends-on`.
+- **DAG**: `depends_on` requires durable `done`; missing edges, cycles, and bad IDs fail closed for that component.
+- **Workflow control plane**: `cardex workflow` durably binds module/goal, repo/worktree, write domain, rounds, candidate/review identities, effect gates, and local progress files. The module loop pins `grok-build` and rejects Codex/Sol; unconfigured pins wait and do not fail open.
+- **Integration gate**: module integration cards are created held. Tick and `cardex release` both require a machine-checked `verdict=pass` with empty p0/p1 and matching candidate/custody. `concerns`/`block`/unknown vocabulary/missing output/incomplete evidence stay held.
+- **Root notify**: only live-ready, true external dependency, Owner choice, or exhausted route. Routine progress stays in `workflows/*.progress.json|.md`.
+- Direct-serial `review_after` is unchanged except that `pass` with non-empty p0/p1 is no longer an admissible pass.
+- Docs: `docs/workflows.md` and `docs/workflows.en.md`. Full attempt/producerGone custody and a native Grok CLI executor remain later fixtures.
+
 ## 2026-08-03 · Gemini CLI fallback executor (second heterogeneous executor)
 
 - **Execution** (gemini.go): headless `gemini -o json` (prompt over stdin); sessions are

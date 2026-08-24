@@ -75,6 +75,13 @@ Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs t
 
 **The desktop app is in scope too**: Claude Code's desktop app and the CLI share the `~/.claude/projects` session store and the same subscription quota, so sessions opened in the desktop app can equally be listed, pulled for progress, and taken over with `--resume`.
 
+## Two recommended workflow modes
+
+- **Direct serial**: advance one bounded goal through design → development → independent review → integration → an explicit live gate.
+- **Federated module loop**: each long-horizon module uses `cardex workflow` to bind goal/write-domain/candidate/review identity and run Grok writer → fresh Grok review → repair; module integration is created held.
+
+Both modes use `depends_on`, normalized write-domain/resource claims, separate reviewers, and default-held integration/live gates. Only a closed `verdict=pass` under the live `pass|concerns|block` contract (empty `p0/p1`) with matching candidate/custody evidence releases integration. The module loop pins `grok-build` and does not use Codex/Sol as an implementation engine. See [recommended workflows](docs/workflows.en.md).
+
 ## How it works
 
 ```
@@ -113,6 +120,7 @@ Once it's running, pick what you need — each of these is covered in full in th
 - **[Gemini CLI fallback executor](docs/guide.en.md#gemini-cli-fallback-executor-second-heterogeneous-executor)** — a second heterogeneous executor: pinned via `-runner gemini` (has sessions, multi-step works), diverts into the fallback chain, a fifth cross-verification engine; account-level daily quota cools down the whole lane, auth failures self-heal; model mapping uses the official stable aliases (pro/flash/flash-lite), tiered on the standard line.
 - **[Multi-subscription engines](docs/guide.en.md#multi-subscription-engines-engine-profiles-kimi--glm--minimax--mimo--opencode-go--ollama-cloud)** — Kimi Code / GLM Coding Plan / MiniMax / Xiaomi MiMo / OpenCode Go / Ollama Cloud plug in via engine profiles: the same claude CLI with per-task env injection, per-engine cooldowns and ledgers, one unified capability scale (anchored to Claude's own tiers), and a user-defined fallback order.
 - **[Taking over existing role sessions](docs/guide.en.md#taking-over-existing-role-sessions-the-reviewassemblyexecute-sessions-you-maintained-by-hand)** — fold hand-maintained review/assembly/execute sessions into the queue by role.
+- **[Direct serial and federated module workflows](docs/workflows.en.md)** — write-domain exclusion, `depends_on`, default-held integration gates, the Grok module loop, and Root notify only for live-ready / external dependency / Owner / exhausted route.
 
 For what happens on the failure paths (full dispatch rules, limit recovery, failure classification, stall patrol, the event ledger, idempotent tombstones, permission boundaries) → [runtime internals](docs/internals.en.md).
 
@@ -130,7 +138,7 @@ The keys you'll actually touch; the full table lives in the [configuration refer
 | `resume_first` | true | interrupted tasks resume before new ones start |
 | `type_order` | progress-pull > coordinate > review > sequence > assembly | type order at equal priority |
 | `type_defaults.*.model` | coordinate opus; progress-pull haiku | default model per type (--model value); empty uses the account default |
-| `max_parallel` | 1 | tasks per tick (writing tasks are serialized per directory; read-only types are exempt) |
+| `max_parallel` | 1 | tasks per tick (writers without a write domain still serialize on the Git common dir; disjoint explicit domains may run together; read-only types are exempt). Federated parallel writers need >1 |
 | `queue_budget_tokens` etc. | 0 (off) | 5-hour quota redline — see the [guide](docs/guide.en.md#5-hour-quota-redline-reserve-headroom) |
 | `no_fallback_models` | ["claude-fable-5","fable"] | design-tier models never downgraded to the codex backup — they wait for Claude |
 | `codex_bin` / `codex_fallback` | empty / false | cooldown backup executor — see the [guide](docs/guide.en.md#codex-backup-executor-no-downtime-during-limit-gaps) |
@@ -152,6 +160,7 @@ Prompt templates live in `~/.cardex/templates/*.md` and can be edited directly (
 | Doc | Contents |
 |---|---|
 | [Advanced guide](docs/guide.en.md) | Coordination loop, file-based state, review divert, cross-verification, web board, quota redline, codex backup executor |
+| [Recommended workflows](docs/workflows.en.md) | Direct serial, federated module loops, write-domain/resource exclusion, review vocabulary, default-held integration |
 | [Runtime internals](docs/internals.en.md) | Dispatch rules, limit recovery, failure classification, stall patrol, event ledger, idempotent tombstones, permissions |
 | [Configuration reference](docs/config.en.md) | The full `~/.cardex/config.json` key table + templates |
 | [Changelog](docs/changelog.en.md) | Version changes grouped by theme |

@@ -75,6 +75,13 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 
 **桌面端也在管辖范围内**：Claude Code 桌面端与 CLI 共用 `~/.claude/projects` 会话存储和订阅额度，所以桌面端里开的会话同样可以被列出、回收进度、`--resume` 接管。
 
+## 两种推荐工作流
+
+- **直派串联**：一个闭合目标按“设计 → 开发 → 独立审核 → 集成 → 明示 live 门”推进。
+- **联邦模块循环**：每个长期模块用 `cardex workflow` 耐久绑定目标/写域/候选/审核身份，循环 Grok writer → 独立 Grok 审核 → 修复；模块集成默认 held。
+
+两种模式都用 `depends_on`、规范化 write-domain/resource claims、独立 reviewer，以及默认 held 的 integration/live gate。只有现役 `pass|concerns|block` 契约中闭合 `verdict=pass`（`p0/p1` 为空）且候选/custody 一致才能释放集成门。模块循环钉 `grok-build`，不把 Codex/Sol 当实现引擎。详见[推荐工作流](docs/workflows.md)。
+
 ## 怎么做到的
 
 ```
@@ -113,6 +120,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 - **[Gemini CLI 备用执行器](docs/guide.md#gemini-cli-备用执行器第二异构执行器)**——第二异构执行器：`-runner gemini` 钉定（有会话、多步可用）、降级链改道、交叉验证第五种引擎；账号级每日配额挂车道冷却，认证故障自愈；模型映射用官方稳定别名（pro/flash/flash-lite），统一标准线定档。
 - **[多订阅引擎](docs/guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud)**——Kimi Code / GLM Coding Plan / MiniMax / 小米 MiMo / OpenCode Go / Ollama Cloud 订阅经引擎档案接入：复用 claude CLI + 环境注入，独立冷却、独立记账、统一能力分级（评测源锚定 Claude 各档），降级顺序自定义。
 - **[存量角色会话的接管](docs/guide.md#存量角色会话的接管此前手动维护的-审核装配执行-session)**——手工养的审核/装配/执行 session 按角色收编进队列。
+- **[直派串联与联邦模块工作流](docs/workflows.md)**——写域互斥、`depends_on`、默认 held 的集成门、Grok 模块循环、仅对 live-ready/外部依赖/Owner/耗尽通知 Root。
 
 想知道异常路径上到底怎么处理的（派发规则全文、限额恢复、失败分类、卡死巡逻、事件账本、幂等墓碑、权限边界）→ [运行时内核](docs/internals.md)。
 
@@ -130,7 +138,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 | `resume_first` | true | 被打断任务优先续跑 |
 | `type_order` | 进度回收>协调>审核>序列>装配 | 同优先级时的类型顺序 |
 | `type_defaults.*.model` | 协调 opus；回收 haiku | 各类型默认模型（--model 值），空用账号默认 |
-| `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行，只读类型豁免） |
+| `max_parallel` | 1 | 单次 tick 并行任务数（无写域的写卡仍按 Git common dir 串行；显式不重叠写域可并行；只读类型豁免）。联邦并行写者需 >1 |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见[进阶指南](docs/guide.md#5-小时额度红线保底额度) |
 | `no_fallback_models` | ["claude-fable-5","fable"] | 这些设计档模型冷却期不降级 codex，宁可排队等 claude |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见[进阶指南](docs/guide.md#codex-备用执行器限额空窗不断档) |
@@ -152,6 +160,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 | 文档 | 内容 |
 |---|---|
 | [进阶指南](docs/guide.md) | 分工协调闭环、文件化状态、审核分流、交叉验证、Web 看板、额度红线、codex 备用执行器 |
+| [推荐工作流](docs/workflows.md) | 直派串联、联邦模块循环、写域/资源防冲突、审核词汇、默认 held 集成门 |
 | [运行时内核](docs/internals.md) | 派发规则、限额恢复、失败分类、卡死巡逻、事件账本、幂等墓碑、权限与安全 |
 | [配置参考](docs/config.md) | `~/.cardex/config.json` 全量键表 + 模板说明 |
 | [更新记录](docs/changelog.md) | 按主题归并的版本变化 |

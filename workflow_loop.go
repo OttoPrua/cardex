@@ -31,6 +31,31 @@ func taskIsLive(t *Task) bool {
 	return false
 }
 
+// taskIsDispatchable is the narrower question of whether tick could still pick
+// the card up. A held card is live for dedupe purposes but cannot run.
+func taskIsDispatchable(t *Task) bool {
+	switch t.Status {
+	case statusQueued, statusRunning, statusLimitPaused:
+		return true
+	}
+	return false
+}
+
+// workflowDispatchableCards lists cards tick could still run for this workflow.
+func workflowDispatchableCards(root string, wf *WorkflowRecord) ([]*Task, error) {
+	tasks, err := loadTasks(root)
+	if err != nil {
+		return nil, err
+	}
+	var out []*Task
+	for _, t := range tasks {
+		if t != nil && t.WorkflowID == wf.ID && taskIsDispatchable(t) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
 // workflowActiveRole finds a live card already holding the given role for this
 // workflow. A load failure returns fail-closed (found=true, task=nil) so a
 // caller can never mint a duplicate writer just because the disk was unreadable.
@@ -600,6 +625,21 @@ func markWorkflowRoute(root string, cfg *Config, wf *WorkflowRecord, kind, summa
 		notifyKind, status = rootNotifyExhausted, workflowStatusExhausted
 	default:
 		return fmt.Errorf("%w: unknown mark kind %q", errWorkflowMalformed, kind)
+	}
+	// A terminal route stops claiming its write domain, so a successor module may
+	// take the same paths. Doing that while this workflow still has a runnable
+	// card would put two writers on one domain. Hold them first.
+	live, err := workflowDispatchableCards(root, wf)
+	if err != nil {
+		return err
+	}
+	if len(live) > 0 {
+		ids := make([]string, 0, len(live))
+		for _, t := range live {
+			ids = append(ids, t.ID+"("+t.Status+")")
+		}
+		return fmt.Errorf("%w: hold these cards before terminalizing the route: %s",
+			errWorkflowDuplicateRole, strings.Join(ids, ", "))
 	}
 	wf.Status = status
 	if err := emitRootNotify(root, wf, notifyKind, strings.TrimSpace(summary)); err != nil {

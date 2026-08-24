@@ -735,6 +735,87 @@ func TestReleasedIntegrationIsReHeldWhenEvidenceDisappears(t *testing.T) {
 	if integrationGateAllows(root, cfg, integ) {
 		t.Fatal("tick must also refuse the re-held card")
 	}
+
+	// Restoring the evidence must make the card releasable again, otherwise the
+	// re-hold is a one-way trap rather than a fail-closed latch.
+	writeReviewLog(t, root, review.ID, verdictJSON("pass", nil, nil))
+	if err := tryReleaseWorkflowIntegration(root, cfg, wf); err != nil {
+		t.Fatalf("restored evidence must release again: %v", err)
+	}
+	again, err := loadTask(root, wf.IntegrationTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again.Status != statusQueued {
+		t.Fatalf("re-release left status=%s", again.Status)
+	}
+}
+
+func TestGateRefusesAReviewBoundToNoWriter(t *testing.T) {
+	root, dir := workflowTestRoot(t)
+	cfg := workflowTestCfg(t, root)
+	wf := initTestWorkflow(t, root, dir)
+	wf, review := runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+
+	integ, err := loadTask(root, wf.IntegrationTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Drop both the gate's writer binding and the review's own subject, leaving a
+	// verdict that names no candidate producer at all.
+	integ.IntegrationGate.WriterTaskID = ""
+	if err := saveTask(root, integ); err != nil {
+		t.Fatal(err)
+	}
+	rv, err := loadTask(root, review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rv.ReviewOf = ""
+	if err := saveTask(root, rv); err != nil {
+		t.Fatal(err)
+	}
+	dec := evaluateIntegrationRelease(root, cfg, integ)
+	if dec.Admit || dec.HoldReason != holdReasonCustody {
+		t.Fatalf("an unbound review proves nothing: admit=%v reason=%q; 反例注入: integrationCustodyOK 里去掉 reviewOf == \"\" 的 fail-closed 分支", dec.Admit, dec.HoldReason)
+	}
+}
+
+func TestTerminalMarkRefusedWhileTheWorkflowStillHasARunnableCard(t *testing.T) {
+	root, dir := workflowTestRoot(t)
+	cfg := workflowTestCfg(t, root)
+	wf := initTestWorkflow(t, root, dir)
+	writer, err := admitWorkflowWriter(root, cfg, wf, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Marking terminal releases the write-domain claim. Doing that with a queued
+	// writer would let a successor module claim the same paths under it.
+	err = markWorkflowRoute(root, cfg, wf, "owner", "handing off")
+	if err == nil || !errors.Is(err, errWorkflowDuplicateRole) {
+		t.Fatalf("a runnable card must block terminalization: %v; 反例注入: markWorkflowRoute 里删掉 workflowDispatchableCards 检查", err)
+	}
+	if !strings.Contains(err.Error(), writer.ID) {
+		t.Fatalf("the refusal must name the blocking card: %v", err)
+	}
+	fresh, err := loadWorkflow(root, cfg, wf.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status == workflowStatusOwnerChoice {
+		t.Fatal("a refused mark must not have persisted the terminal status")
+	}
+	if entries, err := os.ReadDir(workflowNotifyDir(root)); err == nil && len(entries) != 0 {
+		t.Fatalf("a refused mark must not leave a Root receipt: %v", entries)
+	}
+
+	if err := terminalize(root, writer.ID, statusHeld, "test", "hold the writer", nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := markWorkflowRoute(root, cfg, wf, "owner", "handing off"); err != nil {
+		t.Fatalf("with every card held the route may terminalize: %v", err)
+	}
 }
 
 func TestCorruptWorkflowRecordIsSkippedNotFatal(t *testing.T) {

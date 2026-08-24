@@ -82,19 +82,24 @@ func integrationCustodyOK(root string, review, writer *Task) (bool, string) {
 			return false, holdReasonCustody
 		}
 	}
-	tasks, err := loadTasks(root)
-	if err != nil {
-		return false, holdReasonCustody
-	}
 	reviewOf := review.ReviewOf
 	if writer != nil {
 		reviewOf = writer.ID
+	}
+	if reviewOf == "" {
+		// Without a named subject there is nothing to prove single-reviewer
+		// custody against, and the review is not bound to any candidate producer.
+		return false, holdReasonCustody
+	}
+	tasks, err := loadTasks(root)
+	if err != nil {
+		return false, holdReasonCustody
 	}
 	for _, other := range tasks {
 		if other == nil || other.ID == review.ID || other.Type != typeReview {
 			continue
 		}
-		if reviewOf == "" || other.ReviewOf != reviewOf {
+		if other.ReviewOf != reviewOf {
 			continue
 		}
 		switch other.Status {

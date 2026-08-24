@@ -12,7 +12,8 @@ reviewer-custody validator) integrates into `main`.
 | Owned path | `docs/2026-08-24-cardex-a4-w3-manifest-binding-design.md` (this file, the only file) |
 | W2 reference (read-only) | PR #11 frozen repair `e795e898b4e8edc90f9a6cb9e8b51bf446c5d8d0` (tree `4475340d0f2892c79eb0a264064daa7d463699ef`), branch `cursor/cardex-w1w4-first-packet-9d89` |
 | Charter | `docs/workflows.md` § "W3 — manifest 与现有 Cardex task 绑定" |
-| Review status | **Not self-reviewed.** Independent review required before implementation adopts this contract. |
+| Revision | R2 — narrow repair of the 2026-08-24 local design gate P1s: P1-1 held role occupants (§2.1, §2.2 check 1, §2.2.1, §2.3, §3, §4 R8–R10), P1-2 init durability (§2.4, §3, §4 R11). No other section's semantics changed. |
+| Review status | **Not self-reviewed.** Fresh independent re-review of revision R2 required before implementation adopts this contract. |
 
 ## 0. One sentence
 
@@ -35,7 +36,8 @@ W3 adds no new state machine. It binds together machinery that is already on
 | `AnalyzeDependencyDAG`, `BindDependencyDomains` | `dependency_dag.go` | Closed DAG diagnosis: duplicate nodes, dangling edges, SCC cycles — already deterministic and fail-closed per component. |
 | `eligible`, `liveDAGReadyIDs`, `taskDurablyDone`, `writerConflictsWithActive`, `legacyWritersShareBoundary` | `dispatch.go`, `multilane_runtime.go` | Tick-side readiness and the **legacy whole-repo serialization** (same git common dir ⇒ writers serialize) that W3 must preserve untouched. |
 | `evaluateIntegrationRelease`, `integrationGateAllows`, `candidateIdentitiesMatch`, hold-reason vocabulary | `workflow_gate.go`, `workflow.go` | The existing read-only consult pattern W3 copies: tick asks, never mutates. |
-| `admitWorkflowWriter` / `admitWorkflowReviewer` / `admitWorkflowRepair`, `createHeldIntegrationTask`, `syncIntegrationGate`, `freezeWorkflowCandidate` → `verifyWorkflowCandidate`, `tryReleaseWorkflowIntegration` | `workflow_loop.go` | The only paths that mint or requeue workflow-bound cards — W3's enqueue surface. |
+| `admitWorkflowWriter` / `admitWorkflowReviewer` / `admitWorkflowRepair`, `createHeldIntegrationTask`, `syncIntegrationGate`, `freezeWorkflowCandidate` → `verifyWorkflowCandidate`, `tryReleaseWorkflowIntegration`; `taskIsLive` vs `taskIsDispatchable`, `workflowActiveRole` | `workflow_loop.go` | The `cardex workflow` verbs — W3's enqueue surface — and the liveness predicates: admission dedupes over `taskIsLive` (which **includes** `held`), tick over the narrower `taskIsDispatchable`. §2.2 check 1 must use the former. |
+| `handleReviewVerdict` fix loop: queued repair cards each round, and the held escalation shell past `max_fix_rounds` — both inherit `WorkflowID`/`WriteDomain` without touching the record slots | `runner.go` | The one existing path that mints workflow-carrying cards outside `cardex workflow` verbs; §2.2.1 defines how the binding surfaces them. |
 | `projectWakeAfterCommitted` → `committedWakeEligible` → `wakeEventStillCurrent`; `wakeEventID(task,seq,transition)`; `outboxRowIdentityConsistent`; `backfillWakeForTask` | `manager_wake.go` | Manager-wake already projects **only** a task's committed *current* transition (`ev.TransitionID == LastCommittedTransitionID`), even on backfill. W3 pins this as the bound-node invariant; it does not change the outbox schema. |
 | `cmdDoctor` | `main.go` | Existing read-only diagnosis surface W3 extends. |
 
@@ -96,7 +98,7 @@ state):
       "parent_id": "",
       "round": 1,
       "status": "writing",
-      "verdict": "bound|broken",
+      "verdict": "bound|blocked|broken",
       "nodes": [
         {
           "role": "writer|reviewer|integration",
@@ -110,7 +112,17 @@ state):
       "edges": [ {"from": "t...", "to": "t...", "resolves": true} ],
       "domain": {"id": "...", "lineage": "...", "paths": ["..."]},
       "candidate": {"commit": "", "tree": ""},
-      "gates": {"integration": "held", "live": "held", "cutover": "held"}
+      "gates": {"integration": "held", "live": "held", "cutover": "held"},
+      "blockers": [
+        {
+          "task_id": "t0824-...",
+          "role": "writer|reviewer|integration",
+          "task_status": "held",
+          "fix_round": 4,
+          "reason": "binding_held_blocker",
+          "decision": "owner"
+        }
+      ]
     }
   ],
   "orphans": [ {"task_id": "t...", "workflow_id": "wf...", "reason": "binding_unbound_task"} ],
@@ -120,22 +132,47 @@ state):
 
 Determinism requirements (so W4 can render it reproducibly and tests can
 golden it): workflows sorted by ID, nodes in fixed role order
-(writer, reviewer, integration), edges and reasons sorted, no timestamps
-inside per-node content (only the top-level `generated_at`).
+(writer, reviewer, integration), blockers sorted by task ID, edges and
+reasons sorted, no timestamps inside per-node content (only the top-level
+`generated_at`).
+
+The workflow-level `verdict` is three-valued. `bound`: every §2.2 check
+passes, `blockers` is empty, init is complete. `blocked`: identity agreement
+is intact but progress requires a **named** explicit operator action — a held
+occupant awaiting an owner decision (§2.2.1) or an `init_pending` record
+awaiting replay (§2.4); the report names the action. `broken`: at least one
+§2.2 check failed. `broken` dominates `blocked`. Node verdicts stay
+two-valued; blockers are report entries, not nodes — they are live cards the
+current slots do **not** name, which is exactly why they cannot appear in
+`nodes`.
 
 ### 2.2 Node binding checks (the contract)
 
 For a workflow record `wf` and the task universe (active + archive, via
 `findTaskAnywhere`), each named node must satisfy **all** checks; any failure
-marks the node — and the workflow — `broken` with a closed reason code:
+marks the node — and the workflow — `broken` with a closed reason code. One
+exception: the held branch of check 1 yields the workflow-level `blocked`
+verdict of §2.1 instead of `broken`, because identity agreement itself is
+intact there — what remains is a named owner decision:
 
 1. **Resolution (both directions).** Every non-empty role slot
    (`WriterTaskID`, `ReviewerTaskID`, `IntegrationTaskID`) resolves to a
    loadable task, and that task's `WorkflowID == wf.ID`. Conversely, every
-   *dispatchable* task carrying `WorkflowID == wf.ID` is named by some role
-   slot of the current round. Historical terminal cards from earlier rounds
-   (superseded writers/reviewers, status `done`/`failed`/`canceled`) are
-   lineage, not orphans; only live/dispatchable claims must be named.
+   **live** task carrying `WorkflowID == wf.ID` — live per `taskIsLive`:
+   `queued`, `running`, `limit_paused`, **and `held`** — must be named by a
+   role slot of the current round. The reverse scan must use the same
+   liveness predicate admission uses (`workflowActiveRole` dedupes over
+   `taskIsLive`), never the narrower `taskIsDispatchable` predicate tick
+   uses: a held card cannot run, but it **occupies a role** for admission, so
+   an unnamed held card the doctor skipped would be a permanent,
+   unattributed admission blocker. Severity splits by dispatchability: an
+   unnamed *dispatchable* card is `binding_unbound_task` (workflow `broken` —
+   tick could run it); an unnamed *held* card is `binding_held_blocker`
+   (workflow `blocked` — it cannot run, but writer/reviewer/repair admission
+   refuses as duplicate until an owner decides; see §2.2.1). Historical
+   terminal cards from earlier rounds (superseded writers/reviewers, status
+   `done`/`failed`/`canceled`) are lineage, not orphans; every live claim
+   must be named or surfaced.
 2. **Role shape.**
    - writer / repair-writer: `Type == typeSequence`, no `IntegrationGate`,
      `WriteDomain` present and (after `NormalizeWriteDomain` against the
@@ -168,6 +205,49 @@ marks the node — and the workflow — `broken` with a closed reason code:
    violation — absence of evidence is never treated as absence of a claim
    (same doctrine as `auditWorkflowWriteDomains` and W2 P1-2).
 
+### 2.2.1 Held occupants, and where the max-round escalation shell lives
+
+Base `a4a3acf` mints exactly one legitimate held occupant outside the record
+slots: when the fix loop exceeds `max_fix_rounds`, `handleReviewVerdict`
+(`runner.go`) creates a held escalation shell that inherits `WorkflowID` and
+`WriteDomain` precisely so `workflowActiveRole` still sees an occupant and
+cannot admit a duplicate writer — but nothing writes that shell into
+`WriterTaskID`. The intermediate fix-loop rounds mint queued repair cards the
+same way. Under the amended check 1 both shapes are named: queued →
+`binding_unbound_task`, held → `binding_held_blocker`. Nothing that can block
+admission may be invisible to doctor.
+
+**Decision: surface as a named Owner-decision blocker; do not bind the shell
+into the current slot.** Rationale, in order of weight:
+
+1. Slot-binding would make the runner a second writer of
+   `cardex.workflow.v1` records. Today only `cardex workflow` verbs persist
+   records (§6's single-origin doctrine), and the fix loop runs inside the
+   runner for workflow and non-workflow reviews alike.
+2. The shell legitimately fails writer role shape: its `FixRound` exceeds
+   `MaxRounds` (and therefore `CurrentRound`), and its prompt is an
+   adjudication request, not an admitted round's work order. Binding it into
+   the slot would force §2.2 check 2 to carry an exemption for exactly the
+   card that most needs scrutiny.
+3. The blocker listing gives the owner the same information — occupant ID,
+   occupied role, fix round, held reason — with zero new record writers.
+
+Contract for every live unnamed occupant:
+
+- **Report.** Listed under the workflow's `blockers` array with its
+  shape-derived occupancy (gateless sequence card → writer; review card →
+  reviewer; gate-bearing card → integration), `task_status`, `fix_round`,
+  `reason` (`binding_held_blocker` when held), and `decision: "owner"`.
+- **Attribution parity.** The duplicate-role refusal (`duplicateRoleErr`) and
+  the blocker entry must name the same task ID: an admission refusal can
+  never cite an occupant the report does not show, and the report can never
+  show an occupant admission would not refuse on.
+- **Owner exits are the existing explicit paths only.** Terminalize the
+  shell, or route the workflow (`workflow mark`, which already tolerates held
+  cards — it checks `workflowDispatchableCards`). `cardex release` of an
+  unnamed occupant refuses (`binding_unbound_task`), so a blocker cannot leak
+  into dispatch as a side effect of adjudication.
+
 ### 2.3 Closed reason-code enum
 
 New codes, disjoint from the integration-gate hold-reason vocabulary and from
@@ -176,7 +256,9 @@ W2's custody reasons so no surface can shadow another:
 | Code | Meaning |
 |---|---|
 | `binding_missing_workflow` | A card names a `workflow_id` whose record is absent or unloadable (the *missing workflow node* shape). |
-| `binding_unbound_task` | A dispatchable card carries a `workflow_id` but no current role slot of that record names it. |
+| `binding_unbound_task` | A dispatchable card carries a `workflow_id` but no current role slot of that record names it; also the refusal code when requeue/`release` would make an unnamed card dispatchable. |
+| `binding_held_blocker` | A held card carries a `workflow_id`, no current role slot names it, and it occupies a role for admission (`taskIsLive` dedupe): it cannot run, but writer/reviewer/repair admission refuses as duplicate on it. Owner decision required (§2.2.1). |
+| `binding_init_incomplete` | A record is `init_pending` (interrupted `workflow init`, §2.4): resumable only by an init replay that reuses the recorded identities; every other verb on the record refuses. |
 | `binding_dangling_role` | A record role slot names a task ID that resolves nowhere (active or archive). |
 | `binding_role_mismatch` | Role shape violated (wrong type, reviewer with a write domain, `review_of` not the current writer, gate/record disagreement, shared session). |
 | `binding_dangling_depends_on` | A bound card's `depends_on` names an unresolvable task ID. |
@@ -185,6 +267,69 @@ W2's custody reasons so no surface can shadow another:
 | `binding_domain_overlap` | Record-set or live-claim overlap (paths per git identity, resources globally). |
 | `binding_candidate_drift` | Static digest disagreement among gate, frozen record candidate, and review snapshot. |
 | `binding_unreadable` | Evidence required to prove the binding could not be read; fail-closed umbrella. |
+
+### 2.4 `workflow init` durability: intent-first, replay-safe
+
+**Why this section exists.** On base `a4a3acf`, `cmdWorkflowInit` calls
+`createHeldIntegrationTask` before `persistWorkflow`, and the helper writes
+the held task (`saveTask`) and its held event durably before
+`IntegrationTaskID` is even assigned in memory. A fault at the record write
+(e.g. `workflows/` unwritable) therefore leaves a durable held task,
+integration gate and event carrying a fresh workflow ID with **zero**
+workflow records — an orphan that `binding_missing_workflow` can only
+*detect* and nothing can *replay*, whose task-side write-domain claim
+persists with no record behind it. A fault is not a refusal, so §3's
+zero-write refusal posture does not cover it: the init write ordering itself
+is part of the W3 contract.
+
+**Durable write points, required order.** Init performs exactly four durable
+steps. The implementation must keep this order and make each step
+independently idempotent:
+
+| # | Write | Content | State if the crash lands after this write |
+|---|---|---|---|
+| I1 | Intent (record) | Full `cardex.workflow.v1` under `workflows/` carrying the **preallocated** workflow `ID` and the **preallocated** `IntegrationTaskID`, with `status: init_pending` — a new closed value of the *existing* `status` field, not a new field, so no stored-schema change and no migration; only the new init path ever writes it | Record names a task that does not resolve yet; doctor names `binding_init_incomplete`; replay resumes |
+| I2 | Task | Held integration card written under the preallocated task ID, `IntegrationGate.WorkflowID == ID` | Record and task agree; held event missing; replay emits it |
+| I3 | Event | The held ledger event for that task | Everything durable but the record still `init_pending`; replay finalizes |
+| I4 | Finalize | Record status flip `init_pending → design` plus the progress projection (`persistWorkflow`) — the commit point; init reports success only after I4 | Init complete |
+
+Every identity is minted **before I1** and recorded **in I1**; no later step
+mints an identity. Flag validation, engine checks and
+`auditWorkflowWriteDomains` all run before I1, so the first durable write is
+already an audited, non-overlapping domain claim — which also closes the
+second poison shape of the base bug: from I1 on, the domain claim is always
+record-backed.
+
+**Zero-orphan invariant.** At every crash point, every durable artifact
+carrying a workflow ID is reachable from a durable `cardex.workflow.v1`
+record that names it. Before I1 nothing is durable; from I1 on, the record
+is. A task or event with no record behind it
+(`binding_missing_workflow`) can therefore only be injected, never produced
+by init.
+
+**Replay rules.**
+
+- Re-running `workflow init` while an `init_pending` record exists for the
+  same module ID and write-domain identity **resumes that record**: each of
+  I2–I4 reads before it writes and writes only what is absent, using the
+  identities recorded at I1. A retry never mints a second workflow ID, task
+  ID, or a second held event for the same task.
+- A retry whose flags disagree with the pending record's stored fields
+  (goal, worktree, domain, engines, rounds) refuses and names the pending
+  record (`binding_init_incomplete`); it never silently overwrites an
+  intent.
+- While a record is `init_pending`: every other `cardex workflow` verb on it
+  refuses (`binding_init_incomplete`); its cards are never dispatched;
+  doctor names the pending init and the resume action. Doctor itself never
+  resumes anything — replay is an explicit command re-run, keeping doctor
+  strictly read-only.
+
+**Rejected alternative: best-effort rollback.** Keeping the base order and
+deleting the task when the record write fails does not close the window: the
+process can die between the durable task write and the cleanup, and the
+cleanup itself can fail on the same faulted filesystem. Only
+durable-intent-first ordering makes every crash point safe; rollback on top
+of it is at most cosmetic.
 
 ## 3. Enforcement surfaces and fail-closed matrix
 
@@ -197,7 +342,13 @@ Three surfaces, one shared derivation, three different fail-closed postures.
   integration card), `try-release-integration`, and `cardex release` on a
   gated card. `cardex add` gains **no** `-workflow-id` flag in W3; binding
   creation stays exclusive to `cardex workflow` commands, so arbitrary cards
-  cannot claim membership at add time.
+  cannot claim membership at add time. Refusal is zero-write; a **fault**
+  mid-command is not a refusal and gets its own contract: init follows
+  §2.4's intent-first order (on base `a4a3acf`, `cmdWorkflowInit` writes the
+  held task and event before any record write — the implementation must
+  invert that), so at every crash point every durable artifact stays
+  reachable from a durable record and replay converges without duplicate
+  identities.
 - **doctor** — read-only diagnosis. Fail-closed here means: every violation
   is **named**, never skipped; unreadable evidence is itself a named finding;
   doctor never mutates, repairs, holds, or releases anything. Two forms:
@@ -224,6 +375,8 @@ Matrix (violation × surface → behavior, reason code in parentheses):
 | Role mismatch | Admit paths refuse (duplicate-role and shape checks); injected shape drift refused on requeue/release (`binding_role_mismatch`) | Node `broken` (`binding_role_mismatch`) | Card skipped (`binding_role_mismatch`) |
 | Candidate-digest drift | `try-release-integration`/`cardex release` already refuse (`candidate_mismatch`); W3 doctor/tick name the static drift before release is even attempted (`binding_candidate_drift`) | Workflow `broken` (`binding_candidate_drift`) | Integration card held as today; stale reviewer bound to a cleared/changed candidate skipped (`binding_candidate_drift`) |
 | Unreadable evidence | Refuse (`binding_unreadable`) | Named finding, never skipped (`binding_unreadable`) | Bound cards of the affected record skipped (`binding_unreadable`) |
+| Held role occupant outside current slots (incl. the max-round escalation shell, §2.2.1) | `workflow writer`/`review`/`repair` refuse, naming the occupant's task ID (`binding_held_blocker`); `cardex release` of the occupant refuses (`binding_unbound_task`) | Listed under `blockers` as a named Owner-decision blocker; workflow verdict `blocked`, never silently `bound` (`binding_held_blocker`) | The occupant is held, hence never dispatchable; correctly bound slot-named siblings keep dispatching (identity agreement is intact); no release path can make the occupant dispatchable without passing enqueue |
+| Interrupted init (`init_pending` record, §2.4) | Every verb except init replay refuses (`binding_init_incomplete`); replay resumes with the I1-recorded identities | Named finding with the resume action (`binding_init_incomplete`); workflow verdict `blocked`; injected task/event sets with zero records stay `binding_missing_workflow` | Cards of an `init_pending` record never dispatched (`binding_init_incomplete`) |
 
 Ordering: surfaces evaluate checks in the §2.2 order and report the **first**
 failure per node plus **all** failures in doctor's report form (doctor
@@ -247,12 +400,19 @@ engines, performs network access, or touches `~/.cardex`.
 | R5 | Role mismatch (reviewer with write domain; `review_of` ≠ current writer; gate/record disagreement) | `TestBindingEnqueueRefusesRoleShapeDrift` | `TestBindingDoctorNamesRoleMismatch` | `TestBindingTickSkipsMismatchedReviewer` |
 | R6 | Candidate-digest drift (gate C2/T2 vs frozen C1/T1; stale reviewer after repair cleared candidate) | `TestBindingReleaseRefusesCandidateDrift` (extends existing `candidate_mismatch` coverage with the binding code) | `TestBindingDoctorNamesCandidateDrift` | `TestBindingTickSkipsStaleReviewerAfterCandidateClear` |
 | R7 | Missing workflow node (record file deleted/corrupt while cards remain) | `TestBindingEnqueueRefusesVerbOnMissingRecord` | `TestBindingDoctorNamesMissingWorkflow` — unreadable record is a finding, not a skip | `TestBindingTickSkipsCardsOfMissingRecord` |
+| R8 | Held **writer** occupant outside the slots (injected held sequence card carrying `workflow_id`; record slot empty or naming another card) | `TestBindingWriterAdmitRefusesNamingHeldOccupant` — `workflow writer` and `repair` refuse, error names the occupant's task ID (`binding_held_blocker`); `cardex release` of the occupant refuses (`binding_unbound_task`) | `TestBindingDoctorNamesHeldWriterBlocker` — `blockers` entry with role writer, workflow verdict `blocked`, never silently `bound`; refusal ID equals the report's blocker ID | `TestBindingTickNeverDispatchesHeldBlocker` — occupant never dispatched; correctly bound slot-named sibling still dispatches |
+| R9 | Held **reviewer** occupant outside the slots (injected held review card carrying `workflow_id`) | `TestBindingReviewerAdmitRefusesNamingHeldOccupant` — `workflow review` refuses naming the occupant (`binding_held_blocker`) | `TestBindingDoctorNamesHeldReviewerBlocker` — `blockers` entry with role reviewer, verdict `blocked` | `TestBindingTickSkipsHeldReviewerBlocker` |
+| R10 | **Max-round escalation shell**, reached through the real fix loop (reviewer verdict drives `handleReviewVerdict` past `max_fix_rounds`), not injection | `TestBindingRepairRefusesNamingEscalationShell` — `workflow repair`/`writer` refuse naming the shell's task ID; `cardex release` of the shell refuses (`binding_unbound_task`) | `TestBindingDoctorNamesEscalationShellAsOwnerBlocker` — blocker entry carries role, `fix_round`, `decision:"owner"`; after the owner terminalizes the shell, the blocker entry disappears and the workflow stops reporting `blocked` | `TestBindingTickNeverDispatchesEscalationShell` |
+| R11 | **Interrupted init** — per-write-point fault injection, one run per durable write point I1–I4 (§2.4) | `TestBindingInitFaultAtEachWritePoint` — init fails with a named error at every injected point and the zero-orphan invariant holds (no durable task/event/claim unreachable from a record); `TestBindingInitReplayReusesIdentities` — replay after the fault clears completes with the I1-recorded workflow ID and integration task ID, leaving exactly one record, one task, one held event; `TestBindingInitRetryRefusesMismatchedFlags` | `TestBindingDoctorNamesPendingInit` — `binding_init_incomplete` named with the resume action, verdict `blocked`; an injected task/event set with zero records stays `binding_missing_workflow` | `TestBindingTickSkipsCardsOfPendingInit` |
 
 Each RED fixture must assert three things: (a) the operation refuses / the
 card is not dispatched, (b) the exact closed reason code is surfaced, and
 (c) **no state was mutated** by the refusal (task JSON, record JSON, event
 ledger, and custody dir byte-identical before/after — doctor and tick are
-read-only; enqueue refusals write nothing).
+read-only; enqueue refusals write nothing). R11's fault paths are the one
+deliberate exception to (c): a fault, unlike a refusal, has already written
+the intent, so R11 asserts the §2.4 invariants instead — zero orphans at
+every crash point, identity-stable replay, no duplicates.
 
 ## 5. GREEN path
 
@@ -344,6 +504,10 @@ Boundary rules the implementation must keep:
   workflow-record mutations.
 - No `-workflow-id` flag on `cardex add`; no migration of stored JSON; no
   implicit adoption of legacy cards.
+- No doctor-side auto-heal: doctor names `init_pending` records and held
+  blockers but never resumes, releases, or terminalizes anything; init
+  replay is an explicit command re-run, and blocker exits go through the
+  existing explicit commands only (§2.2.1).
 - No changes to `docs/workflows*.md`, changelogs, or any `.go` file in this
   design packet (this file is the packet's entire diff).
 - No merge, install, launchd, live tick, or scheduler execution performed by
@@ -361,5 +525,6 @@ Boundary rules the implementation must keep:
 | W2 frozen reference (read-only) | `e795e898b4e8edc90f9a6cb9e8b51bf446c5d8d0` (tree `4475340d0f2892c79eb0a264064daa7d463699ef`) on `cursor/cardex-w1w4-first-packet-9d89` (PR #11) |
 | Implementation precondition | PR #11 integrated into `main`; implementation packet rebases this contract's anchors onto post-merge `main` (semantics are commit-pinned, only line anchors may move) |
 | Non-goals | §8 above — binding is read-only/fail-closed; no scheduler, no custody changes, no migration, no live/cutover path, no UI |
-| Review status | Not self-reviewed; independent review required before the implementation packet adopts §2–§7 as contract |
+| Revision | R2 — repairs the 2026-08-24 local design gate P1-1 (held role occupants: §2.1, §2.2 check 1, §2.2.1, §2.3, §3, §4 R8–R10) and P1-2 (init durability: §2.4, §3, §4 R11) |
+| Review status | Not self-reviewed; fresh independent re-review of revision R2 required before the implementation packet adopts §2–§7 as contract |
 | Commit / tree | Recorded in the PR description and branch tip (this file cannot contain its own commit hash) |

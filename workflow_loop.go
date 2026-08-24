@@ -389,6 +389,9 @@ func admitWorkflowReviewer(root string, cfg *Config, wf *WorkflowRecord) (*Task,
 
 // ingestWorkflowReview re-derives the verdict from the review transcript and
 // records it. Calling it twice on the same terminal yields the same snapshot.
+// It is also the only writer of custody observations (W2): each ingest records
+// one explicit quiet-window observation, so an admissible pass additionally
+// requires a re-run after the window has elapsed over unchanged evidence.
 func ingestWorkflowReview(root string, cfg *Config, wf *WorkflowRecord) error {
 	if err := refreshWorkflow(root, cfg, wf); err != nil {
 		return err
@@ -416,6 +419,20 @@ func ingestWorkflowReview(root string, cfg *Config, wf *WorkflowRecord) error {
 	if wf.Candidate != nil {
 		snap.CandidateCommit, snap.CandidateTree = wf.Candidate.Commit, wf.Candidate.Tree
 	}
+	// The custody observation happens on every ingest, regardless of verdict:
+	// the recovery fixture needs the reconciliation window to progress even
+	// while the review terminal is a held containment rather than a done pass.
+	drift := reviewCustodyDrift(root, review)
+	var custodyRec *CustodyRecord
+	hash := ""
+	if drift == "" {
+		if hash, err = custodyEvidenceHash(root, review, snap.CandidateCommit, snap.CandidateTree); err != nil {
+			drift = fmt.Sprintf("evidence unreadable: %v", err)
+		}
+	}
+	if custodyRec, err = observeReviewCustody(root, review, hash, drift); err != nil {
+		return err
+	}
 	if snap.HoldReason == "" {
 		switch {
 		case wf.Candidate == nil || (wf.Candidate.Commit == "" && wf.Candidate.Tree == ""):
@@ -427,6 +444,12 @@ func ingestWorkflowReview(root string, cfg *Config, wf *WorkflowRecord) error {
 			}
 			if ok, reason := integrationCustodyOK(root, review, writer); !ok {
 				snap.HoldReason = reason
+			} else if drift != "" {
+				snap.HoldReason = holdReasonCustodyDrift
+			} else if custodyRec == nil || custodyRec.Kind == "" {
+				snap.HoldReason = holdReasonCustodyWindow
+			} else if custodyRec.Kind != custodyKindAdmissibleReview || !custodyRec.SemanticReview {
+				snap.HoldReason = holdReasonCustodyReceipt
 			} else {
 				snap.Admissible = true
 			}

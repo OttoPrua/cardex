@@ -1,5 +1,38 @@
 # cardex changelog
 
+## 2026-08-24 · W2: reviewer-custody validator and the 20-second quiet-window receipt
+
+- **Custody validator** (workflow_custody.go): W2 in `docs/workflows.en.md` moves from
+  roadmap to a fail-closed machine decision. `exited` is no longer taken as
+  `producerGone`: the exact PID/PGID identity, registered descendants, runner residue, the
+  workspace lease, and successor attempts (same-card redispatch, including successors that
+  already exited) are disproved per component; any live component yields `custody_drift`,
+  which forbids accepting the `pass` and releasing integration. The process probes are
+  injectable, so the incident fixtures stay fully offline and never spawn or signal real
+  processes.
+- **Quiet-window receipt**: an admissible review receipt requires the whole evidence set —
+  task, events, attempts, transitions, transcript, candidate identity, and the process
+  observation — to hash-stable across a 20-second quiet window
+  (`control/custody/<review>.json`, schema `cardex.custody.v1`). Old-output splice, attempt
+  churn, or a process flap resets the window. Observations are written only by explicit
+  `cardex workflow ingest-review` calls; tick and `cardex release` re-derive read-only and
+  compare against the receipt, and a stale receipt (evidence moved again) drops back to
+  `custody_quiet_window`.
+- **A containment receipt is not a review receipt**: for `held`/`canceled` containment
+  terminals the window yields only the non-semantic `custody_reconciled_held` receipt — it
+  proves containment and terminal consistency, releases nothing, and whether to admit a
+  fresh reviewer afterwards remains a new module-manager decision.
+- **Paired incident fixtures** (workflow_custody_test.go): the failure side reproduces
+  "attempt exited but producer/children/lease still live, then same-card redispatch" and
+  asserts per channel that ingest, tick, `cardex release`, and try-release all refuse; the
+  recovery side contains only through the supported `cardex hold`, forms the reconciled
+  receipt after producers disappear plus the 20-second window, and the stale pass output
+  stays rejected, the candidate stays unreviewed, and the integration card stays held.
+- The semantic verdict and process custody sit in one chokepoint
+  (`evaluateIntegrationRelease` + ingest); neither can release alone. Cards without an
+  `integration_gate` behave exactly as before. W3 (manifest/task binding) and W4 (graph
+  projection) remain roadmap.
+
 ## 2026-08-24 · Workflow modes: durable serial/federated records and an enforced integration gate
 
 - **Workflow records** (workflow.go): `cardex workflow` turns the two topologies in

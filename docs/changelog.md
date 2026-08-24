@@ -2,6 +2,29 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-24 · W2：reviewer custody validator 与 20 秒 quiet-window 收据
+
+- **custody validator**（workflow_custody.go）：把 `docs/workflows.md` 的 W2 从路线图落成
+  fail-closed 机器判定。`exited` 不再被当作 `producerGone`：exact PID/PGID 身份、登记后代、
+  runner 残留、workspace lease、后继 attempt（同卡 redispatch，含已退出的后继）逐项证伪，
+  任一分量存活即 `custody_drift`，禁止按 `pass` 采信、禁止释放集成。进程探针可注入，
+  事故夹具全程离线、不派生不击杀真实进程。
+- **quiet-window 收据**：admissible review 收据要求 task/event/attempt/transition/transcript/
+  candidate/process 整套证据 hash 在 20 秒 quiet-window 内稳定（`control/custody/<review>.json`，
+  schema `cardex.custody.v1`）。迟到输出拼接（old-output splice）、attempt 变动、进程闪现都会
+  重置窗口。观察只由显式 `cardex workflow ingest-review` 写入；tick 与 `cardex release`
+  只读地重新推导并与收据比对，收据过期（证据又动了）即回 `custody_quiet_window`。
+- **收容收据不是审核收据**：`held`/`canceled` 收容终局的窗口只产生非语义的
+  `custody_reconciled_held` 收据——证明 containment 与终态一致，不释放任何集成卡；
+  恢复后是否派 fresh reviewer 仍是模块 manager 的新决策。
+- **成对事故夹具**（workflow_custody_test.go）：失败侧复现「attempt 已 exited 但 producer/
+  children/lease 仍活、随后同卡 redispatch」，逐通道断言 ingest/tick/`cardex release`/
+  try-release 全部拒绝；恢复侧只经受支持的 `cardex hold` 收容，producers 消失 + 20 秒
+  quiet-window 后形成 reconciled 收据，stale pass 输出仍被拒、候选仍 unreviewed、集成卡仍 held。
+- 语义 verdict 与 process custody 并入同一个门径（`evaluateIntegrationRelease` + ingest），
+  谁也不能单独放行；无 `integration_gate` 的存量卡行为不变。W3（manifest 与 task 绑定）、
+  W4（图形投影）仍是路线图。
+
 ## 2026-08-24 · 工作流模式：串联 / 联邦的耐久记录与强制集成门
 
 - **workflow 记录**（workflow.go）：`cardex workflow` 把 `docs/workflows.md` 的两种拓扑落成

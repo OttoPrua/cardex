@@ -324,6 +324,14 @@ func ensureGrokOpusAdversarialReview(cfg *Config, t *Task) {
 		modelTierKeyword(cfg, t.Model) != "opus" {
 		return
 	}
+	// A workflow-bound card already lives inside one-writer-one-reviewer: the
+	// workflow record admits its single independent reviewer explicitly, and the
+	// integration gate re-derives that reviewer's verdict. Re-enabling
+	// ReviewAfter here would mint a second, unaccounted reviewer for the same
+	// frozen candidate, so the obligation must not attach to these cards.
+	if t.WorkflowID != "" || t.IntegrationGate != nil {
+		return
+	}
 	t.ReviewAfter = true
 	t.SolMaxAdversarialReview = true
 	enforceReviewAfterEligibility(t)

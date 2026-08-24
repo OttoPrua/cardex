@@ -82,6 +82,8 @@ Tasks chain together: `assemble` → emits a `sequence` that enqueues → runs t
 
 Both modes use Cardex `depends_on`, normalized write-domain/resource claims, separate reviewers, durable task/event/attempt evidence, and held live gates. Management sessions do not write product bytes or bypass Cardex to create duplicate writers. See [recommended workflows](docs/workflows.en.md). That page documents the custody rule as an operator/policy gate operators must follow: when attempt, producer, and lease state disagree, review acceptance and redispatch must be refused. It is not a claim that current Cardex already machine-rejects those actions. Federated writers share a tick only when `max_parallel` > 1 (default 1). A workflow-managed independent review is not the same path as a `-review-after` / `-stakes high` automatic review child: do not enable automatic review when an independent reviewer already exists. The review terminal JSON is only `pass|concerns|block`, not ACCEPT/HELD.
 
+`cardex workflow` turns either topology into a durable record: it binds `serial`/`federated` mode, the module goal, a write domain, bounded rounds, and candidate identity, and creates a default-held integration card. Both tick dispatch and `cardex release` **re-derive** the independent review `verdict=pass` (empty `p0`/`p1`), candidate agreement, and reviewer custody for a gated card; a durable review `done` is not enough. Every transition is an explicit command — tick consults the integration gate read-only and never advances a workflow. Live and cutover have no release path in this tree.
+
 ## How it works
 
 ```

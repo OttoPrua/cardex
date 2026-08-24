@@ -152,6 +152,12 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						laneMetrics.AddWaits(1)
 						continue
 					}
+					if !integrationGateAllows(root, cfg, t) {
+						// A workflow integration card that was released and then lost its
+						// evidence must not run just because it is still queued on disk.
+						laneMetrics.AddWaits(1)
+						continue
+					}
 					if taskHasLiveWriterProof(root, t) {
 						laneMetrics.AddConflicts(1)
 						continue

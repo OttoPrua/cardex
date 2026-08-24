@@ -2,6 +2,28 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-24 · 工作流模式：串联 / 联邦的耐久记录与强制集成门
+
+- **workflow 记录**（workflow.go）：`cardex workflow` 把 `docs/workflows.md` 的两种拓扑落成
+  耐久记录（schema `cardex.workflow.v1`）——`mode` = `serial` | `federated`、module/goal、
+  federated 的 `parent_id`、规范化写域、轮次上限、候选身份，以及 integration / live / cutover
+  三道分离的 effect gate。跨记录写域审计对同一 Git identity 内的 exact/subtree 重叠、重复
+  lineage 与**跨仓**共享的封闭资源 fail closed；terminal 记录释放自己的 claim。
+- **集成门**（workflow_gate.go）：Task 新增 `workflow_id` 与 `integration_gate` 两个 omitempty
+  字段。带门的卡默认 held；tick 派发与 `cardex release` 都**重新**从审核日志解析 verdict，要求
+  `pass` 且 `p0`/`p1` 皆空、候选与冻结记录一致、reviewer 是已终止的独立只读角色且没有第二个
+  active reviewer。durable review `done` 不够。没有该字段的存量卡行为完全不变。
+- **有界循环与耐久 manager hook**（workflow_loop.go）：writer / freeze-candidate / review /
+  ingest-review / repair / try-release-integration / mark 每一步都是显式命令且可安全重放——
+  角色去重不会派出第二个 writer 或 reviewer，重放 ingest/release 不会累积收据。修复轮以
+  `max_rounds` 有界，超轮转 `exhausted`。例行进度只写 `workflows/<id>.progress.json|.md`；
+  只有 `review_passed`、`true_external_dependency`、`owner_choice`、`exhausted_route`
+  会在 `workflows/root-notify/` 留收据。
+- **tick 不推进 workflow**：调度器只读地咨询集成门。Cardex 不长第二套状态机、不做自动重规划。
+- **修复闭环**（runner.go）：`verdict=pass` 但 `p0`/`p1` 非空不再被当作可采信 pass 触发收口。
+- live 与 cutover 在本树没有任何释放路径；手改记录会在加载时被拒。完整的
+  `producerGone` / quiet-window custody 仍是 W2 后续夹具。
+
 ## 2026-08-03 · Gemini CLI 备用执行器（第二异构执行器）
 
 - **执行面**（gemini.go）：`gemini -o json` headless 接入（prompt 走 stdin），会话由 cardex

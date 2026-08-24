@@ -1,5 +1,34 @@
 # cardex changelog
 
+## 2026-08-24 · Workflow modes: durable serial/federated records and an enforced integration gate
+
+- **Workflow records** (workflow.go): `cardex workflow` turns the two topologies in
+  `docs/workflows.en.md` into a durable record (schema `cardex.workflow.v1`) — `mode` =
+  `serial` | `federated`, module/goal, a federated `parent_id`, a normalized write domain,
+  a round bound, candidate identity, and three separated integration/live/cutover effect
+  gates. The cross-record write-domain audit fails closed on exact/subtree overlap within
+  one Git identity, on duplicate lineage, and on a closed resource shared **across**
+  repositories; a terminal record releases its claim.
+- **Integration gate** (workflow_gate.go): Task gains two omitempty fields, `workflow_id`
+  and `integration_gate`. A gated card starts held; both tick dispatch and `cardex release`
+  **re-derive** the verdict from the review transcript and require `pass` with empty
+  `p0`/`p1`, a candidate matching the frozen record, and a terminated independent read-only
+  reviewer with no rival active reviewer. A durable review `done` is not enough. Existing
+  cards without the field behave exactly as before.
+- **Bounded loops and durable manager hooks** (workflow_loop.go): writer, freeze-candidate,
+  review, ingest-review, repair, try-release-integration, and mark are each an explicit,
+  replay-safe command — role dedupe never mints a second writer or reviewer, and replayed
+  ingest/release calls do not accumulate receipts. Repair rounds are bounded by
+  `max_rounds`, past which the route becomes `exhausted`. Routine progress goes only to
+  `workflows/<id>.progress.json|.md`; only `review_passed`, `true_external_dependency`,
+  `owner_choice`, and `exhausted_route` leave a receipt under `workflows/root-notify/`.
+- **Tick never advances a workflow**: the scheduler consults the integration gate read-only.
+  Cardex does not grow a second state machine or a silent replanner.
+- **Fix loop** (runner.go): a `verdict=pass` with non-empty `p0`/`p1` is no longer treated
+  as an admissible pass and no longer triggers closeout.
+- Live and cutover have no release path in this tree; a hand-edited record is rejected on
+  load. Full `producerGone` / quiet-window custody remains a W2 follow-up fixture.
+
 ## 2026-08-03 · Gemini CLI fallback executor (second heterogeneous executor)
 
 - **Execution** (gemini.go): headless `gemini -o json` (prompt over stdin); sessions are

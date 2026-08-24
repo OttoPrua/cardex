@@ -9,7 +9,8 @@
 1. **续跑优先**（`resume_first`）：被限额打断的任务先于新任务——先把没做完的做完；
 2. **priority 大者优先**；
 3. **类型顺序**（`type_order`）：默认 审核 > 序列 > 装配（审核便宜且能尽快给出反馈，装配会派生新工作放最后）；
-4. 同级按先进先出。
+4. 同级按先进先出；
+5. **集成门**：带 `integration_gate` 的卡在每次派发前重新核验证据——独立审核 `verdict=pass` 且 `p0`/`p1` 皆空、候选 commit/tree 与冻结记录一致、reviewer custody 一致。任一项不成立就跳过本轮，`cardex release` 同样拒绝。durable review `done` 不等于 verdict。没有该字段的卡行为不变。
 
 限额是全局的：任何任务撞到限额，写入全局冷却（`cooldown.json`），期间不再派发任何任务、不浪费探测调用；冷却时间优先取错误信息里的重置时间戳，解析不到则回退 `limit_fallback_min` 分钟后重试。
 

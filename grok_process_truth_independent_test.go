@@ -91,7 +91,10 @@ func cprocFailClosedProbes() map[string]string {
 // hardest case behind a fully valid in-window transport diagnostic that would
 // otherwise type the terminal.
 func TestCPROCFullStreamFailClosedEvidenceAtExtremeDistance(t *testing.T) {
-	const farLines = 20000
+	// 2000 lines is 250x the 8-line bound and ~75x the 2048-byte bound, which is
+	// far enough to distinguish a full-stream scan from a windowed one. Going
+	// further only multiplies race-detector cost for no extra discrimination.
+	const farLines = 2000
 	for probeName, probe := range cprocFailClosedProbes() {
 		for _, shape := range []struct {
 			name  string
@@ -162,7 +165,7 @@ func TestCPROCFarNoiseAloneStaysClassifiable(t *testing.T) {
 		{"invalid invocation first", "invalid option --independent", grokBuildProcessClassInvalidInvocation},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			stderr := strings.Join(append([]string{tc.first}, cprocNoise(20000)...), "\n")
+			stderr := strings.Join(append([]string{tc.first}, cprocNoise(2000)...), "\n")
 			class, ok := classifyGrokBuildProcessStderr(stderr)
 			if !ok {
 				t.Fatalf("evidence-free stream must stay classifiable, got ok=false")
@@ -214,24 +217,19 @@ func TestCPROCBoundedWindowEvidenceImpliesFullStreamFailClosed(t *testing.T) {
 // TestCPROCScannerLossIsFailClosed proves an unreadable stream is never typed.
 // A single token past the scanner bound makes the observation unprovable, which
 // must be treated as evidence of loss rather than as an absence of evidence.
+//
+// The stream deliberately opens with a valid transport diagnostic sitting inside
+// the positive-selection window. That is the case the candidate's own overflow
+// fixtures do not cover, and the only one where losing the tail could silently
+// promote a partially-read stream to a typed terminal. Scanning 8 MiB under the
+// race detector is expensive, so this stays a single targeted case.
 func TestCPROCScannerLossIsFailClosed(t *testing.T) {
-	oversized := strings.Repeat("a", grokBuildStderrScanMaxToken+4096)
-	for _, tc := range []struct {
-		name   string
-		stderr string
-	}{
-		{"oversized token alone", oversized},
-		{"transport then oversized token", "connection reset by peer\n" + oversized},
-		{"oversized token then transport", oversized + "\nconnection reset by peer"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if !grokBuildProcessStderrHasFailClosedEvidence(tc.stderr) {
-				t.Fatal("scanner loss must count as fail-closed evidence")
-			}
-			if class, ok := classifyGrokBuildProcessStderr(tc.stderr); ok {
-				t.Fatalf("scanner loss must not yield a class, got %q", class)
-			}
-		})
+	stderr := "connection reset by peer\n" + strings.Repeat("a", grokBuildStderrScanMaxToken+4096)
+	if !grokBuildProcessStderrHasFailClosedEvidence(stderr) {
+		t.Fatal("scanner loss must count as fail-closed evidence")
+	}
+	if class, ok := classifyGrokBuildProcessStderr(stderr); ok {
+		t.Fatalf("scanner loss must not yield a class, got %q", class)
 	}
 }
 

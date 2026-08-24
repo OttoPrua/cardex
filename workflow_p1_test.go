@@ -462,3 +462,148 @@ func TestP1GreenCompleteFinalPassStillReleasesEndToEnd(t *testing.T) {
 		t.Fatalf("integration release is never live authority: %+v", wf.EffectGates)
 	}
 }
+
+// ---- P1-B round 2: a verdict claim the scan cannot decode is still the last word ----
+//
+// The independent review of the round-1 repair found the seam these cover. The
+// strict reading refused an invalid final object, but it only counted objects
+// that json-decode. A trailing claim that never decodes — a prose correction, an
+// object cut off mid-write, a block whose verdict key is gone — left the earlier
+// complete pass as the last object the scan could see, and released on it. That
+// is the same walk-back the reading exists to refuse, reached through a shape
+// the scan was blind to.
+
+func TestP1BTrailingVerdictClaimHoldsInsteadOfWalkingBack(t *testing.T) {
+	complete := `{"verdict":"pass","p0":[],"p1":[],"p2":[],"summary":"ok"}`
+	fence := func(body string) string { return "报告\n```json\n" + body + "\n```\n" }
+
+	cases := []struct {
+		name, body, wantHold, wantVerdict string
+	}{
+		// R10: the trailing claim is plain text and decodes as nothing.
+		{"R10 trailing verdict line", fence(complete) + "verdict: block\n", holdReasonTrailingVerdict, ""},
+		{"R10 trailing correction sentence", fence(complete) + "更正：Final verdict = block\n", holdReasonTrailingVerdict, ""},
+		{"R10 trailing fullwidth colon", fence(complete) + "verdict：block\n", holdReasonTrailingVerdict, ""},
+		// R11: the trailing object was cut off before it could decode.
+		{"R11 trailing truncated object", fence(complete) + "```json\n{\"verdict\":\"pass\"\n", holdReasonTrailingVerdict, ""},
+		{"R11 trailing bare key", fence(complete) + "{\"verdict\"", holdReasonTrailingVerdict, ""},
+		// R12: unknown vocabulary. A decodable one was already refused by the
+		// final-object shape rule; a malformed one was invisible.
+		{"R12 trailing unknown vocabulary object", fence(complete) + fence(`{"verdict":"ACCEPT","p0":[],"p1":[],"p2":[],"summary":"s"}`), holdReasonUnknownVocabulary, ""},
+		{"R12 trailing malformed unknown vocabulary", fence(complete) + "```json\n{\"verdict\":\"ACCEPT\",\"p0\":[],}\n```\n", holdReasonTrailingVerdict, ""},
+		{"R12 trailing terminal without a verdict key", fence(complete) + fence(`{"p0":[],"p1":[],"p2":[],"summary":"s"}`), holdReasonTrailingVerdict, ""},
+		// R13: the body is the reviewer's report, and reports discuss verdicts.
+		// Only material after the terminal object is a competing claim, so none
+		// of these may cost the legitimate release.
+		{"R13 body names a verdict", "上一轮 verdict: concerns，本轮结论见文末机读块。\n" + fence(complete), "", "pass"},
+		{"R13 body quotes the verdict key", "模板要求 \"verdict\" 字段只能是三个 token 之一。\n" + fence(complete), "", "pass"},
+		{"R13 body carries the template keys", "逐条对照 \"p0\": 与 \"p1\": 两个数组后收尾。\n" + fence(complete), "", "pass"},
+		{"R13 trailing prose asserts nothing", fence(complete) + "以上即完整审核报告，无更正。\n", "", "pass"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			v, hold := parseReviewVerdictEvidence(tc.body)
+			if hold != tc.wantHold {
+				t.Fatalf("hold = %q, want %q", hold, tc.wantHold)
+			}
+			if tc.wantVerdict == "" {
+				if v != nil {
+					t.Fatalf("a held terminal must yield no verdict, got %+v", v)
+				}
+				return
+			}
+			if v == nil || v.Verdict != tc.wantVerdict {
+				t.Fatalf("verdict = %+v, want %q", v, tc.wantVerdict)
+			}
+		})
+	}
+}
+
+// R10/R11/R12 at the gate: an undecodable trailing claim must hold the
+// integration card through both consumers and through `cardex release`, exactly
+// as a decodable invalid final answer already does.
+func TestP1BTrailingVerdictClaimNeverReleases(t *testing.T) {
+	complete := `{"verdict":"pass","p0":[],"p1":[],"p2":[],"summary":"ok"}`
+	fence := func(body string) string { return "报告\n```json\n" + body + "\n```\n" }
+
+	cases := []struct {
+		name, body, want, inject string
+	}{
+		{"R10 trailing prose verdict", fence(complete) + "verdict: block\n", holdReasonTrailingVerdict,
+			"parseReviewVerdictEvidence 里去掉 trailingVerdictClaim（末尾非 JSON 结论回到更早的 pass）"},
+		{"R11 trailing truncated object", fence(complete) + "```json\n{\"verdict\":\"pass\"\n", holdReasonTrailingVerdict,
+			"trailingVerdictClaim 里去掉 \"verdict\" 键的裸出现判断"},
+		{"R12 trailing terminal without a verdict key", fence(complete) + fence(`{"p0":[],"p1":[],"p2":[],"summary":"s"}`), holdReasonTrailingVerdict,
+			"trailingVerdictClaim 里去掉 verdictTemplateKeyRe 判断"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root, dir := workflowTestRoot(t)
+			cfg := workflowTestCfg(t, root)
+			wf := initTestWorkflow(t, root, dir)
+			wf, _ = runWorkflowToReview(t, root, wf, tc.body)
+
+			integ, err := loadTask(root, wf.IntegrationTaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			mustHold(t, root, cfg, integ, tc.want, tc.inject)
+
+			if err := ingestWorkflowReview(root, cfg, wf); err != nil {
+				t.Fatal(err)
+			}
+			if wf.Review == nil || wf.Review.Admissible {
+				t.Fatalf("ingest must not record an admissible review: %+v", wf.Review)
+			}
+			if wf.Review.HoldReason != tc.want {
+				t.Fatalf("ingested hold reason = %q, want %q", wf.Review.HoldReason, tc.want)
+			}
+			if err := tryReleaseWorkflowIntegration(root, cfg, wf); !errors.Is(err, errWorkflowHeld) {
+				t.Fatalf("try-release must refuse: %v", err)
+			}
+			if err := cmdSetStatus([]string{"-root", root, integ.ID}, "release"); err == nil {
+				t.Fatal("cardex release must refuse a gated card without admissible evidence")
+			}
+			after, err := loadTask(root, integ.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Status != statusHeld {
+				t.Fatalf("integration must remain held, got %s", after.Status)
+			}
+		})
+	}
+}
+
+// R13 at the gate: a report whose body discusses verdicts, with one complete
+// final pass and no trailing claim, still releases end to end. The tail rule
+// costs the legitimate path nothing.
+func TestP1BBodyVerdictProseStillReleasesEndToEnd(t *testing.T) {
+	root, dir := workflowTestRoot(t)
+	cfg := workflowTestCfg(t, root)
+	wf := initTestWorkflow(t, root, dir)
+	wf, _ = runWorkflowToReview(t, root, wf,
+		"审核正文：上一轮 verdict: concerns 的两条 P1 已闭合，\"verdict\" 字段按模板收尾。\n"+
+			"```json\n{\"verdict\":\"pass\",\"p0\":[],\"p1\":[],\"p2\":[\"nit\"],\"summary\":\"complete terminal\"}\n```\n"+
+			"以上即完整审核报告。\n")
+
+	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
+		t.Fatal(err)
+	}
+	if wf.Review == nil || !wf.Review.Admissible {
+		t.Fatalf("prose about verdicts is not a competing verdict: %+v", wf.Review)
+	}
+	if err := tryReleaseWorkflowIntegration(root, cfg, wf); err != nil {
+		t.Fatalf("a complete final pass must still release integration: %v", err)
+	}
+	integ, err := loadTask(root, wf.IntegrationTaskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !integrationGateAllows(root, cfg, integ) {
+		t.Fatal("tick must dispatch the released card")
+	}
+	if wf.EffectGates.Live != effectGateHeld || wf.EffectGates.Cutover != effectGateHeld {
+		t.Fatalf("integration release is never live authority: %+v", wf.EffectGates)
+	}
+}

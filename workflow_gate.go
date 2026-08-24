@@ -15,6 +15,13 @@ type IntegrationReleaseDecision struct {
 	Review     *Task
 }
 
+// holdReasonTrailingVerdict is the refusal for a transcript that still asserts
+// a verdict after its last decodable verdict object. It is deliberately its own
+// reason: "the reviewer wrote something after the terminal block" is a different
+// thing for an operator to go look at than a terminal block that came out
+// malformed.
+const holdReasonTrailingVerdict = "trailing_verdict_claim"
+
 // reviewVerdictIsAdmissiblePass encodes templates/design-review.md: `pass` is
 // only a pass when p0 and p1 are both empty. `ACCEPT`, `HELD`, and any other
 // token are not machine vocabulary at all.

@@ -3582,17 +3582,22 @@ func (w reviewVerdictWire) verdict() *reviewVerdict {
 	return v
 }
 
+// verdictObjectSpan is one verdict-bearing object together with the byte range
+// it occupied. The range is what lets the reading below ask what the reviewer
+// went on to write after the terminal object.
+type verdictObjectSpan struct {
+	at   int
+	end  int
+	wire reviewVerdictWire
+}
+
 // scanVerdictObjects returns every JSON object in a transcript that carries a
 // top-level "verdict" key, in transcript order. It reads the raw text, so a
 // fenced terminal and a bare one are found by the same pass, and it reports all
 // of them rather than the first that happens to decode: telling a single answer
 // from two competing ones is only possible if both are seen.
-func scanVerdictObjects(result string) []reviewVerdictWire {
-	type found struct {
-		at   int
-		wire reviewVerdictWire
-	}
-	var hits []found
+func scanVerdictObjects(result string) []verdictObjectSpan {
+	var hits []verdictObjectSpan
 	seen := map[int]bool{}
 	for off := 0; ; {
 		k := strings.Index(result[off:], `"verdict"`)
@@ -3618,24 +3623,52 @@ func scanVerdictObjects(result string) []reviewVerdictWire {
 			}
 			if !seen[brace] {
 				seen[brace] = true
+				end := brace + int(dec.InputOffset())
 				var wire reviewVerdictWire
-				if err := json.Unmarshal([]byte(result[brace:brace+int(dec.InputOffset())]), &wire); err != nil {
+				if err := json.Unmarshal([]byte(result[brace:end]), &wire); err != nil {
 					// Right key, wrong field types. Still a verdict-bearing
 					// object, and an unusable one — recorded so it can hold.
 					wire = reviewVerdictWire{}
 				}
-				hits = append(hits, found{at: brace, wire: wire})
+				hits = append(hits, verdictObjectSpan{at: brace, end: end, wire: wire})
 			}
 			break
 		}
 		off = pos + len(`"verdict"`)
 	}
 	sort.Slice(hits, func(i, j int) bool { return hits[i].at < hits[j].at })
-	out := make([]reviewVerdictWire, 0, len(hits))
-	for _, h := range hits {
-		out = append(out, h.wire)
+	return hits
+}
+
+// verdictClaimRe matches a verdict asserted as text rather than as a decodable
+// object: the template's word or key followed by an assignment. `verdict:
+// block`, `Final verdict = ACCEPT` and the `"verdict":"pass` of an object cut
+// off mid-write all match. A mention that asserts nothing — "see the verdict
+// block above" — deliberately does not, which is why the separator is required
+// and the bare word is not enough.
+var verdictClaimRe = regexp.MustCompile(`(?i)\bverdict\b"?\s*[=:：]`)
+
+// verdictTemplateKeyRe matches the terminal block's other required keys, so a
+// trailing block that lost or renamed its "verdict" key is still read as a
+// verdict claim rather than as ordinary prose.
+var verdictTemplateKeyRe = regexp.MustCompile(`"(?:p0|p1|p2|summary)"\s*:`)
+
+// trailingVerdictClaim reports whether the transcript following the terminal
+// verdict object still asserts a verdict.
+//
+// scanVerdictObjects can only see claims that decode. A reviewer who appends a
+// prose correction, an object truncated mid-write, or a block whose verdict key
+// is gone has still spoken last, and the earlier complete object is no longer
+// the final answer — treating it as one is exactly the walk-back this gate
+// refuses, reached through a shape the scan is blind to. Any such tail holds.
+//
+// The tail is only the text after the terminal object, never the report body.
+// A review report discusses verdicts by nature; that is not a competing claim.
+func trailingVerdictClaim(tail string) bool {
+	if strings.Contains(tail, `"verdict"`) || verdictClaimRe.MatchString(tail) {
+		return true
 	}
-	return out
+	return strings.Contains(tail, "{") && verdictTemplateKeyRe.MatchString(tail)
 }
 
 // parseReviewVerdictEvidence is the gate-side reading of a review terminal, and
@@ -3649,9 +3682,15 @@ func scanVerdictObjects(result string) []reviewVerdictWire {
 // reviewer never wrote.
 //
 // This reading admits exactly one shape: a single complete verdict object that
-// is also the last verdict-bearing object in the transcript. Anything else
-// returns a hold reason. There is no walk-back — an invalid final answer is the
-// reviewer's answer, not a reason to go looking for a better one.
+// is also the reviewer's last word. Anything else returns a hold reason. There
+// is no walk-back — an invalid final answer is the reviewer's answer, not a
+// reason to go looking for a better one.
+//
+// "Last word" cannot mean "last object the scan could decode". A trailing claim
+// that decodes as nothing — prose, a truncated object, a block missing its
+// verdict key — is invisible to the scan while still being what the reviewer
+// wrote last, so reading the earlier complete object as final released on
+// precisely the walk-back this refuses. Such a tail holds too.
 func parseReviewVerdictEvidence(result string) (*reviewVerdict, string) {
 	if strings.TrimSpace(result) == "" {
 		return nil, holdReasonMissingOutput
@@ -3662,12 +3701,12 @@ func parseReviewVerdictEvidence(result string) (*reviewVerdict, string) {
 	}
 	complete := 0
 	for _, o := range objs {
-		if o.shape() == verdictShapeComplete {
+		if o.wire.shape() == verdictShapeComplete {
 			complete++
 		}
 	}
 	final := objs[len(objs)-1]
-	switch final.shape() {
+	switch final.wire.shape() {
 	case verdictShapeUnknown:
 		return nil, holdReasonUnknownVocabulary
 	case verdictShapeIncomplete:
@@ -3676,7 +3715,10 @@ func parseReviewVerdictEvidence(result string) (*reviewVerdict, string) {
 	if complete > 1 {
 		return nil, holdReasonCompetingVerdicts
 	}
-	return final.verdict(), ""
+	if trailingVerdictClaim(result[final.end:]) {
+		return nil, holdReasonTrailingVerdict
+	}
+	return final.wire.verdict(), ""
 }
 
 var fixTitleRe = regexp.MustCompile(`^修复R\d+: `)

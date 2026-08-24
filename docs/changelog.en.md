@@ -23,6 +23,14 @@
   rather than walking back to an earlier valid one, and two complete verdicts hold too. The
   forgiving `parseReviewVerdict` stays for legacy fix-loop compatibility and is no longer
   gate evidence.
+- **"Final" is not "the last object that decodes"** (runner.go / workflow_gate.go): the scan
+  above only counts verdict objects that json-decode, so a plain `verdict: block` line after a
+  complete pass, an object truncated mid-write, or a terminal block that lost its `verdict` key
+  was invisible to it — leaving the earlier complete pass as the "last object" and releasing on
+  it, which is the exact walk-back the rule exists to eliminate. A verdict claim after the
+  complete object now holds (`trailing_verdict_claim`). The test is assertion, not mention:
+  `verdict` counts only when followed by an assignment, and only text after the terminal object
+  is examined, so a report body discussing verdicts never participates.
 
 ## 2026-08-24 · Workflow modes: durable serial/federated records and an enforced integration gate
 

@@ -38,7 +38,7 @@ Cardex 推荐两种工作流拓扑：
 
 `ACCEPT` 与审核结论里的 `HELD` **不是** Cardex 机器 verdict。卡状态 `held`（`add -hold` / `cardex hold`）是调度状态，不要把它写成审核 JSON。模板规定：`verdict=pass` 的唯一标准是 p0 与 p1 皆空。
 
-集成门（`parseReviewVerdictEvidence`）只采信**唯一一个、且位于全文最后**的完整 verdict 对象：`p0`/`p1`/`p2` 三个数组与 `summary` 必须显式写出（缺键不等于空数组），末尾 verdict 非法即 held、不回溯到更早的合法结论，出现两个完整 verdict 同样 held。
+集成门（`parseReviewVerdictEvidence`）只采信**唯一一个、且位于全文最后**的完整 verdict 对象：`p0`/`p1`/`p2` 三个数组与 `summary` 必须显式写出（缺键不等于空数组），末尾 verdict 非法即 held、不回溯到更早的合法结论，出现两个完整 verdict 同样 held。"位于全文最后"不等于"最后一个解得出来的对象"：完整对象之后若还有结论性尾料——非 JSON 的 `verdict:` 断言、写到一半被截断的对象、丢了 `verdict` 键的终局块——一律 held（`trailing_verdict_claim`），审核正文里谈论 verdict 不算。
 
 | 机器 token | 操作语义（operator/policy；当前不会从 verdict 自动 `cardex release` 集成卡） |
 |---|---|

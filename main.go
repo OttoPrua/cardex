@@ -82,6 +82,8 @@ func main() {
 		err = uninstallLaunchd()
 	case "engines":
 		err = cmdEngines(os.Args[2:])
+	case "workflow":
+		err = cmdWorkflow(os.Args[2:])
 	case "doctor":
 		err = cmdDoctor(os.Args[2:])
 	case "version", "-v", "--version":
@@ -171,6 +173,12 @@ func printUsage() {
                                    # （kimi / glm-cn / glm-global / minimax-cn / minimax-global /
                                    #   mimo / opencode-go / ollama），add 后配好密钥即可
                                    #   -runner <引擎名> 钉定主跑，或加入 fallback_order 参与降级链
+  workflow  init|list|show|writer|freeze-candidate|review|ingest-review|repair|
+            try-release-integration|mark
+                                   # 串联/联邦工作流的耐久记录：绑定目标、写域、轮次上限、
+                                   # 候选身份与集成门。每一步都是显式命令，tick 不自动推进。
+                                   # 集成卡默认 held，只有机器核验 verdict=pass（p0/p1 皆空）、
+                                   # 候选与 custody 一致才可能释放；live/cutover 始终是另外的门
 `)
 }
 
@@ -182,7 +190,7 @@ func cmdInit(args []string) error {
 	_ = fs.Parse(args)
 	root := resolveRoot(*rootFlag)
 
-	for _, d := range []string{root, tasksDir(root), archiveDir(root), logsDir(root)} {
+	for _, d := range []string{root, tasksDir(root), archiveDir(root), logsDir(root), workflowsDir(root)} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			return err
 		}
@@ -1914,6 +1922,18 @@ func cmdSetStatus(args []string, action string) error {
 	case "release":
 		if t.Status != statusHeld {
 			return fmt.Errorf("%s 不在挂起状态（当前: %s）", t.ID, t.Status)
+		}
+		if t.IntegrationGate != nil {
+			// A durable review `done` is not a verdict. Manual release of a gated
+			// integration card re-derives the evidence and refuses without it.
+			cfg, err := loadConfig(root)
+			if err != nil {
+				return err
+			}
+			if dec := evaluateIntegrationRelease(root, cfg, t); !dec.Admit {
+				return fmt.Errorf("%s 集成门仍 held（%s）；durable review done 不等于 verdict=pass，不足以 release",
+					t.ID, dec.HoldReason)
+			}
 		}
 		restoreScheduling(t)
 		t.Status = statusQueued

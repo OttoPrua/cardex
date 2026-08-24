@@ -305,6 +305,12 @@ type Task struct {
 	WriteDomain *WriteDomain `json:"write_domain,omitempty"`
 	// DependsOn lists other task IDs that must be durably done before this task is Ready.
 	DependsOn []string `json:"depends_on,omitempty"`
+	// WorkflowID binds this card to a durable serial/federated workflow record.
+	WorkflowID string `json:"workflow_id,omitempty"`
+	// IntegrationGate latches dispatch and `cardex release` closed until a
+	// machine-re-derived review verdict=pass with empty p0/p1 matches the frozen
+	// candidate and passes custody. Absent gates leave a card's behavior unchanged.
+	IntegrationGate *IntegrationGate `json:"integration_gate,omitempty"`
 }
 
 func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }

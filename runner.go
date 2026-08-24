@@ -3492,6 +3492,12 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		logBlock(lg, "FIXLOOP", "审核输出中未找到 verdict json（旧格式或审核未按模板收尾），闭环跳过")
 		return
 	}
+	if v.Verdict == "pass" && !reviewVerdictIsAdmissiblePass(v) {
+		// templates/design-review.md: pass 的唯一标准是 p0 与 p1 皆空。带未闭合
+		// findings 的 pass 既不是收口依据，也不能当修复轮的输入。
+		logBlock(lg, "FIXLOOP", "verdict=pass 但 p0/p1 非空，按模板不是可采信 pass，闭环跳过")
+		return
+	}
 	if v.Verdict == "pass" {
 		logBlock(lg, "FIXLOOP", fmt.Sprintf("复审 PASS（第 %d 轮收口）: %s", t.FixRound, v.Summary))
 		// 收口回写：pass 是权威的"done"事件。若被审卡带 Closeout 指令，入队一张廉价收口卡

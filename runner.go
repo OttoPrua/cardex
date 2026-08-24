@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -3519,6 +3520,163 @@ func parseReviewVerdict(result string) *reviewVerdict {
 		off = pos + len(`"verdict"`)
 	}
 	return nil
+}
+
+// reviewVerdictWire is the shape-strict decoding of one terminal verdict
+// object. The fields are pointers because reviewVerdict is not: `{"verdict":
+// "pass"}` unmarshals into value-typed slices as empty p0/p1, which is
+// byte-for-byte indistinguishable from a reviewer that enumerated zero
+// findings. At the integration gate that difference is the entire decision, so
+// a key the reviewer never wrote has to stay missing rather than decode empty.
+type reviewVerdictWire struct {
+	Verdict *string   `json:"verdict"`
+	P0      *[]string `json:"p0"`
+	P1      *[]string `json:"p1"`
+	P2      *[]string `json:"p2"`
+	Summary *string   `json:"summary"`
+}
+
+const (
+	verdictShapeComplete = iota
+	verdictShapeUnknown
+	verdictShapeIncomplete
+)
+
+// shape classifies one decoded object. `complete` means every field the
+// design-review template requires is explicitly present, not merely defaulted.
+func (w reviewVerdictWire) shape() int {
+	if w.Verdict == nil {
+		return verdictShapeUnknown
+	}
+	switch *w.Verdict {
+	case "pass", "concerns", "block":
+	default:
+		return verdictShapeUnknown
+	}
+	if w.P0 == nil || w.P1 == nil || w.P2 == nil {
+		return verdictShapeIncomplete
+	}
+	if w.Summary == nil || strings.TrimSpace(*w.Summary) == "" {
+		return verdictShapeIncomplete
+	}
+	return verdictShapeComplete
+}
+
+func (w reviewVerdictWire) verdict() *reviewVerdict {
+	v := &reviewVerdict{}
+	if w.Verdict != nil {
+		v.Verdict = *w.Verdict
+	}
+	if w.P0 != nil {
+		v.P0 = append([]string(nil), *w.P0...)
+	}
+	if w.P1 != nil {
+		v.P1 = append([]string(nil), *w.P1...)
+	}
+	if w.P2 != nil {
+		v.P2 = append([]string(nil), *w.P2...)
+	}
+	if w.Summary != nil {
+		v.Summary = *w.Summary
+	}
+	return v
+}
+
+// scanVerdictObjects returns every JSON object in a transcript that carries a
+// top-level "verdict" key, in transcript order. It reads the raw text, so a
+// fenced terminal and a bare one are found by the same pass, and it reports all
+// of them rather than the first that happens to decode: telling a single answer
+// from two competing ones is only possible if both are seen.
+func scanVerdictObjects(result string) []reviewVerdictWire {
+	type found struct {
+		at   int
+		wire reviewVerdictWire
+	}
+	var hits []found
+	seen := map[int]bool{}
+	for off := 0; ; {
+		k := strings.Index(result[off:], `"verdict"`)
+		if k < 0 {
+			break
+		}
+		pos := off + k
+		brace := pos
+		for attempt := 0; attempt < 32; attempt++ {
+			brace = strings.LastIndex(result[:brace], "{")
+			if brace < 0 {
+				break
+			}
+			var probe map[string]json.RawMessage
+			dec := json.NewDecoder(strings.NewReader(result[brace:]))
+			if err := dec.Decode(&probe); err != nil {
+				continue
+			}
+			if _, ok := probe["verdict"]; !ok {
+				// A sibling object that merely sits between this key and its
+				// own opening brace; keep widening outward.
+				continue
+			}
+			if !seen[brace] {
+				seen[brace] = true
+				var wire reviewVerdictWire
+				if err := json.Unmarshal([]byte(result[brace:brace+int(dec.InputOffset())]), &wire); err != nil {
+					// Right key, wrong field types. Still a verdict-bearing
+					// object, and an unusable one — recorded so it can hold.
+					wire = reviewVerdictWire{}
+				}
+				hits = append(hits, found{at: brace, wire: wire})
+			}
+			break
+		}
+		off = pos + len(`"verdict"`)
+	}
+	sort.Slice(hits, func(i, j int) bool { return hits[i].at < hits[j].at })
+	out := make([]reviewVerdictWire, 0, len(hits))
+	for _, h := range hits {
+		out = append(out, h.wire)
+	}
+	return out
+}
+
+// parseReviewVerdictEvidence is the gate-side reading of a review terminal, and
+// the only one the integration latch may use.
+//
+// parseReviewVerdict is deliberately forgiving: it walks backward until
+// something decodes, which is what keeps the legacy fix loop working against
+// pre-template reviewers. As gate evidence that forgiveness is two holes. A
+// transcript whose real final answer is invalid gets released on an earlier
+// draft's `pass`, and `{"verdict":"pass"}` releases on p0/p1 arrays the
+// reviewer never wrote.
+//
+// This reading admits exactly one shape: a single complete verdict object that
+// is also the last verdict-bearing object in the transcript. Anything else
+// returns a hold reason. There is no walk-back — an invalid final answer is the
+// reviewer's answer, not a reason to go looking for a better one.
+func parseReviewVerdictEvidence(result string) (*reviewVerdict, string) {
+	if strings.TrimSpace(result) == "" {
+		return nil, holdReasonMissingOutput
+	}
+	objs := scanVerdictObjects(result)
+	if len(objs) == 0 {
+		return nil, holdReasonUnknownVocabulary
+	}
+	complete := 0
+	for _, o := range objs {
+		if o.shape() == verdictShapeComplete {
+			complete++
+		}
+	}
+	final := objs[len(objs)-1]
+	switch final.shape() {
+	case verdictShapeUnknown:
+		return nil, holdReasonUnknownVocabulary
+	case verdictShapeIncomplete:
+		return nil, holdReasonIncompleteEvidence
+	}
+	if complete > 1 {
+		return nil, holdReasonCompetingVerdicts
+	}
+	return final.verdict(), ""
 }
 
 var fixTitleRe = regexp.MustCompile(`^修复R\d+: `)

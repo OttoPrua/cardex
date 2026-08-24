@@ -57,6 +57,8 @@ const (
 	holdReasonCandidateMismatch  = "candidate_mismatch"
 	holdReasonCustody            = "incomplete_custody"
 	holdReasonNoGate             = "no_integration_gate"
+	holdReasonBrokenEvidence     = "broken_task_evidence"
+	holdReasonCompetingVerdicts  = "competing_verdicts"
 )
 
 var (
@@ -68,7 +70,66 @@ var (
 	errWorkflowMode           = errors.New("workflow unknown mode")
 	errWorkflowRoundsExceeded = errors.New("workflow repair rounds exhausted")
 	errWorkflowParent         = errors.New("workflow parent binding")
+	errWorkflowBrokenEvidence = errors.New("workflow durable task evidence unreadable")
 )
+
+// scanWorkflowTasks is the audit-side task loader. loadTasks warns and skips a
+// task file it cannot parse, which is right for `cardex list` and wrong for
+// every question a workflow asks: a role scan that silently drops an unreadable
+// card cannot tell "no active writer" from "the active writer's bytes are
+// unreadable", and answering the first when the truth is the second mints a
+// second writer onto the same write domain. The same drop lets a corrupt rival
+// reviewer vanish from the custody scan that exists to find it.
+//
+// Exactly one failure is tolerated, and only in the shape it can legitimately
+// take: an entry that ReadDir listed and that is already gone by the time it is
+// read, which is what archiving or canceling a card looks like from here. Every
+// other parse or read failure returns errWorkflowBrokenEvidence so the caller
+// holds closed instead of scanning an incomplete set.
+func scanWorkflowTasks(root string) ([]*Task, error) {
+	entries, err := os.ReadDir(tasksDir(root))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("%w: %s is missing; run cardex init", errWorkflowBrokenEvidence, tasksDir(root))
+		}
+		return nil, err
+	}
+	var tasks []*Task
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		t, err := loadTask(root, strings.TrimSuffix(e.Name(), ".json"))
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			return nil, fmt.Errorf("%w: task file %s: %v", errWorkflowBrokenEvidence, e.Name(), err)
+		}
+		tasks = append(tasks, t)
+	}
+	sort.Slice(tasks, func(i, j int) bool { return tasks[i].CreatedAt < tasks[j].CreatedAt })
+	return tasks, nil
+}
+
+// loadWorkflowRoleTask resolves a card that a durable record or gate names by
+// ID. A named role that will not load is broken evidence, never absence: the
+// record names it precisely because its state is load-bearing, so discarding
+// the lookup error turns a deleted or corrupt producer into "no producer named"
+// and skips every check bound to it.
+func loadWorkflowRoleTask(root, role, id string) (*Task, error) {
+	if strings.TrimSpace(id) == "" {
+		return nil, fmt.Errorf("%w: %s names no task", errWorkflowBrokenEvidence, role)
+	}
+	t, err := findTaskAnywhere(root, id)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s %s: %v", errWorkflowBrokenEvidence, role, id, err)
+	}
+	if t == nil {
+		return nil, fmt.Errorf("%w: %s %s resolved to nothing", errWorkflowBrokenEvidence, role, id)
+	}
+	return t, nil
+}
 
 // IntegrationGate is a fail-closed dispatch latch carried on an integration
 // task. A durable review `done` is deliberately not enough: both tick and

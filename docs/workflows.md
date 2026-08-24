@@ -38,6 +38,8 @@ Cardex 推荐两种工作流拓扑：
 
 `ACCEPT` 与审核结论里的 `HELD` **不是** Cardex 机器 verdict。卡状态 `held`（`add -hold` / `cardex hold`）是调度状态，不要把它写成审核 JSON。模板规定：`verdict=pass` 的唯一标准是 p0 与 p1 皆空。
 
+集成门（`parseReviewVerdictEvidence`）只采信**唯一一个、且位于全文最后**的完整 verdict 对象：`p0`/`p1`/`p2` 三个数组与 `summary` 必须显式写出（缺键不等于空数组），末尾 verdict 非法即 held、不回溯到更早的合法结论，出现两个完整 verdict 同样 held。
+
 | 机器 token | 操作语义（operator/policy；当前不会从 verdict 自动 `cardex release` 集成卡） |
 |---|---|
 | `pass` | 仅当证据完整且 attempt/process custody 一致时，才有资格被 manager 采信，并对那张精确 held 集成卡执行 `cardex release`。`pass` 本身不是 live 授权。 |

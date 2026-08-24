@@ -1,5 +1,29 @@
 # cardex changelog
 
+## 2026-08-24 · Fail-closed workflow evidence: broken durable tasks and non-final verdicts
+
+- **Broken means missing evidence, never "no such card"** (workflow.go / workflow_loop.go /
+  workflow_gate.go): the workflow role and custody scans now go through a new
+  `scanWorkflowTasks`. `loadTasks` warns and skips a task file it cannot parse, which is
+  right for `cardex list` and fatal here: a skipped corrupt writer reads as "there is no
+  writer" and mints a second one, and a skipped corrupt rival reviewer slips past the very
+  sweep that exists to find it. Only the ReadDir→ReadFile archive race is tolerated
+  (`os.IsNotExist`); everything else returns `errWorkflowBrokenEvidence`. Roles a record or
+  gate names by ID resolve through `loadWorkflowRoleTask`, so a deleted or corrupt named
+  card is a hard error instead of presenting as "no producer named" and skipping every
+  custody check bound to it.
+- **The integration gate requires a complete binding** (workflow_gate.go): a non-empty
+  `workflow_id`, a loadable workflow, and a frozen candidate in the record. Missing any of
+  the three holds. The gate's own candidate commit/tree ride on the card a release would
+  free, so matching them against themselves proves nothing.
+- **The verdict must be a single, final, complete object** (runner.go): the gate now reads
+  through `parseReviewVerdictEvidence`. `p0`, `p1`, `p2` and `summary` must be written
+  explicitly — `{"verdict":"pass"}` decodes into empty p0/p1 under value-typed fields, which
+  is indistinguishable from a reviewer that raised nothing. An invalid final verdict holds
+  rather than walking back to an earlier valid one, and two complete verdicts hold too. The
+  forgiving `parseReviewVerdict` stays for legacy fix-loop compatibility and is no longer
+  gate evidence.
+
 ## 2026-08-24 · Workflow modes: durable serial/federated records and an enforced integration gate
 
 - **Workflow records** (workflow.go): `cardex workflow` turns the two topologies in

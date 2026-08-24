@@ -2,6 +2,24 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-24 · 工作流证据 fail-closed：损坏的耐久任务与非终局 verdict
+
+- **损坏即证据缺失，不是"卡不存在"**（workflow.go / workflow_loop.go / workflow_gate.go）：
+  workflow 的角色扫描与 custody 扫描改走新的 `scanWorkflowTasks`。`loadTasks` 会告警并跳过
+  解析失败的任务文件——对 `cardex list` 是对的，对这里是致命的：被跳过的损坏 writer 会被
+  读成"没有 writer"从而派出第二个，被跳过的损坏 rival reviewer 恰好躲开了为找它而存在的
+  那次扫描。现在只容忍 ReadDir 与逐个读文件之间的归档竞态（`os.IsNotExist`），其余一律
+  `errWorkflowBrokenEvidence`。记录/门指名的角色改走 `loadWorkflowRoleTask`：指名的卡被删或
+  损坏是硬错误，不再被当作"没有指名 producer"而跳过所有与之绑定的 custody 检查。
+- **集成门要求完整绑定**（workflow_gate.go）：`workflow_id` 非空、workflow 可加载、记录里
+  有冻结候选，三者缺一即 held。门上的 candidate commit/tree 与被释放的卡是同一张，
+  自己与自己比对证明不了任何事。
+- **verdict 必须是唯一且终局的完整对象**（runner.go）：集成门改用
+  `parseReviewVerdictEvidence`。`p0`/`p1`/`p2` 与 `summary` 必须显式写出——`{"verdict":"pass"}`
+  在值类型解码下会变成"空 p0/p1"，与审核者真的一条都没提完全无法区分；末尾 verdict 非法
+  即 held，不再向前回溯到更早的合法结论；两个完整 verdict 同样 held。宽松的
+  `parseReviewVerdict` 保留给修复闭环的旧格式兼容，不再供闸门使用。
+
 ## 2026-08-24 · 工作流模式：串联 / 联邦的耐久记录与强制集成门
 
 - **workflow 记录**（workflow.go）：`cardex workflow` 把 `docs/workflows.md` 的两种拓扑落成

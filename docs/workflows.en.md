@@ -38,6 +38,8 @@ The parsable independent-`design-review` terminal matches `templates/design-revi
 
 `ACCEPT` and a review-conclusion `HELD` are **not** Cardex machine verdicts. Card status `held` (`add -hold` / `cardex hold`) is a scheduling state; do not write it into the review JSON. The template's only rule for `verdict=pass` is that both p0 and p1 are empty.
 
+The integration gate (`parseReviewVerdictEvidence`) accepts exactly one complete verdict object, and only if it is the last one in the transcript: `p0`, `p1`, `p2` and `summary` must all be written explicitly (a missing key is not an empty array), an invalid final verdict holds without walking back to an earlier valid one, and two complete verdicts hold as well.
+
 | Machine token | Operational meaning (operator/policy; current tick does not auto-`cardex release` an integrate card from the verdict) |
 |---|---|
 | `pass` | Eligible for manager acceptance and `cardex release` of that exact held integrate card only when evidence is complete and attempt/process custody is consistent. `pass` itself is not live authority. |

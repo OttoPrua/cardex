@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -16,6 +17,26 @@ import (
 // counter-injection that turns it red so the assertion cannot rot into a
 // tautology.
 
+// workflowGit runs one git command in the fixture worktree with a pinned
+// identity, so freeze verification exercises the same object database checks
+// production does.
+func workflowGit(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	full := append([]string{"-C", dir,
+		"-c", "user.name=cardex-test", "-c", "user.email=cardex-test@example.invalid"}, args...)
+	out, err := exec.Command("git", full...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// workflowHeadCandidate reads the real frozen identity of the worktree's HEAD.
+func workflowHeadCandidate(t *testing.T, dir string) (commit, tree string) {
+	t.Helper()
+	return workflowGit(t, dir, "rev-parse", "HEAD"), workflowGit(t, dir, "rev-parse", "HEAD^{tree}")
+}
+
 func workflowTestRoot(t *testing.T) (root, dir string) {
 	t.Helper()
 	root = testRoot(t)
@@ -25,6 +46,9 @@ func workflowTestRoot(t *testing.T) (root, dir string) {
 	dir = t.TempDir()
 	mustWriteFile(t, filepath.Join(dir, "internal", "auth", "token.go"), "package auth\n")
 	mustWriteFile(t, filepath.Join(dir, "internal", "billing", "bill.go"), "package billing\n")
+	workflowGit(t, dir, "init", "-q")
+	workflowGit(t, dir, "add", "-A")
+	workflowGit(t, dir, "commit", "-q", "-m", "fixture")
 	return root, dir
 }
 
@@ -105,7 +129,9 @@ func markTaskDone(t *testing.T, root, id string) *Task {
 
 // runWorkflowToReview drives one workflow from init through a terminated
 // reviewer bound to the frozen candidate, then writes the given review body.
-func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, commit, tree, body string) (*WorkflowRecord, *Task) {
+// The candidate is the worktree's real HEAD: freeze now verifies identities
+// against the repository, so fabricated strings are refused by design.
+func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, body string) (*WorkflowRecord, *Task) {
 	t.Helper()
 	cfg := workflowTestCfg(t, root)
 	writer, err := admitWorkflowWriter(root, cfg, wf, "")
@@ -113,6 +139,7 @@ func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, commit, 
 		t.Fatalf("admit writer: %v", err)
 	}
 	markTaskDone(t, root, writer.ID)
+	commit, tree := workflowHeadCandidate(t, wf.Worktree)
 	if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: commit, Tree: tree}); err != nil {
 		t.Fatalf("freeze: %v", err)
 	}
@@ -175,7 +202,7 @@ func TestReviewResultGateHoldsEveryNonAdmissibleTerminal(t *testing.T) {
 			root, dir := workflowTestRoot(t)
 			cfg := workflowTestCfg(t, root)
 			wf := initTestWorkflow(t, root, dir)
-			wf, _ = runWorkflowToReview(t, root, wf, "c1", "t1", tc.body)
+			wf, _ = runWorkflowToReview(t, root, wf, tc.body)
 
 			integ, err := loadTask(root, wf.IntegrationTaskID)
 			if err != nil {
@@ -209,7 +236,7 @@ func TestAdmissiblePassReleasesIntegrationButNeverLive(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, _ = runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 
 	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
 		t.Fatal(err)
@@ -246,7 +273,7 @@ func TestGateRefusesWhenCandidateIdentityDrifts(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, _ = runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 
 	integ, err := loadTask(root, wf.IntegrationTaskID)
 	if err != nil {
@@ -289,7 +316,7 @@ func TestGateRefusesReviewerThatIsNotAnIndependentReadOnlyRole(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, review := runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+	wf, review := runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 	integ, err := loadTask(root, wf.IntegrationTaskID)
 	if err != nil {
 		t.Fatal(err)
@@ -617,7 +644,8 @@ func TestReplayNeverCreatesASecondWriterOrReviewer(t *testing.T) {
 		}
 	}
 	markTaskDone(t, root, writer.ID)
-	if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: "c1", Tree: "t1"}); err != nil {
+	commit, tree := workflowHeadCandidate(t, dir)
+	if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: commit, Tree: tree}); err != nil {
 		t.Fatal(err)
 	}
 	review, err := admitWorkflowReviewer(root, cfg, wf)
@@ -662,7 +690,8 @@ func TestFreezeRefusesWhileTheWriterIsStillLive(t *testing.T) {
 	if _, err := admitWorkflowWriter(root, cfg, wf, ""); err != nil {
 		t.Fatal(err)
 	}
-	err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: "c1", Tree: "t1"})
+	commit, tree := workflowHeadCandidate(t, dir)
+	err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: commit, Tree: tree})
 	if !errors.Is(err, errWorkflowDuplicateRole) {
 		t.Fatalf("bytes under a live writer are not frozen: %v", err)
 	}
@@ -672,7 +701,7 @@ func TestReplayedIngestAndReleaseAreStable(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, _ = runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 
 	for i := 0; i < 3; i++ {
 		if err := ingestWorkflowReview(root, cfg, wf); err != nil {
@@ -711,7 +740,7 @@ func TestReleasedIntegrationIsReHeldWhenEvidenceDisappears(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, review := runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+	wf, review := runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -755,7 +784,7 @@ func TestGateRefusesAReviewBoundToNoWriter(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, review := runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+	wf, review := runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 
 	integ, err := loadTask(root, wf.IntegrationTaskID)
 	if err != nil {
@@ -868,11 +897,18 @@ func TestRepairRoundsAreBoundedAndExhaustionNotifiesRoot(t *testing.T) {
 
 	for round := 0; round <= wf.MaxRounds; round++ {
 		if round == 0 {
-			wf, _ = runWorkflowToReview(t, root, wf, "c0", "t0", verdictJSON("block", []string{"still broken"}, nil))
+			wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("block", []string{"still broken"}, nil))
 		} else {
 			markTaskDone(t, root, wf.WriterTaskID)
+			// Each repair round produces new bytes; commit them so the frozen
+			// candidate is a distinct, verifiable repository identity.
+			mustWriteFile(t, filepath.Join(dir, "internal", "auth", "token.go"),
+				"package auth\n// round "+string(rune('0'+round))+"\n")
+			workflowGit(t, dir, "add", "-A")
+			workflowGit(t, dir, "commit", "-q", "-m", "repair round")
+			commit, tree := workflowHeadCandidate(t, dir)
 			if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{
-				Commit: "c" + string(rune('0'+round)), Tree: "t" + string(rune('0'+round)),
+				Commit: commit, Tree: tree,
 			}); err != nil {
 				t.Fatal(err)
 			}
@@ -920,7 +956,7 @@ func TestRepairClearsThePreviousCandidateAndVerdict(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, _ = runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("concerns", nil, []string{"tighten this"}))
+	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("concerns", nil, []string{"tighten this"}))
 	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -946,7 +982,7 @@ func TestRepairRefusesAfterAnAdmissiblePass(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, _ = runWorkflowToReview(t, root, wf, "c1", "t1", verdictJSON("pass", nil, nil))
+	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -988,7 +1024,8 @@ func TestRoutineProgressIsDurableAndNeverNotifiesRoot(t *testing.T) {
 		t.Fatal(err)
 	}
 	markTaskDone(t, root, writer.ID)
-	if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: "c1", Tree: "t1"}); err != nil {
+	commit, tree := workflowHeadCandidate(t, dir)
+	if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: commit, Tree: tree}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := admitWorkflowReviewer(root, cfg, wf); err != nil {
@@ -1107,7 +1144,8 @@ func TestWorkflowEnginesMustBePinnableWithoutFailOpen(t *testing.T) {
 	}
 
 	markTaskDone(t, root, writer.ID)
-	if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: "c1", Tree: "t1"}); err != nil {
+	commit, tree := workflowHeadCandidate(t, dir)
+	if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: commit, Tree: tree}); err != nil {
 		t.Fatal(err)
 	}
 	review, err := admitWorkflowReviewer(root, cfg, wf)
@@ -1120,6 +1158,216 @@ func TestWorkflowEnginesMustBePinnableWithoutFailOpen(t *testing.T) {
 	if review.ReviewOf != writer.ID || review.PreferRunner != grokBuildRunnerName {
 		t.Fatalf("reviewer binding: review_of=%s runner=%s", review.ReviewOf, review.PreferRunner)
 	}
+}
+
+// ---- P1 repairs (review bc-78137f61 on PR #7 @ 722670b) ----
+
+// P1-1a: the Grok Opus adversarial-review obligation must never attach to a
+// workflow-bound card. The workflow record owns its single independent
+// reviewer; ReviewAfter here would mint a second one for the same candidate.
+func TestGrokOpusAdversarialReviewNeverRegrowsAReviewerOnWorkflowCards(t *testing.T) {
+	cfg := grokBuildTestConfig(t, "/usr/bin/true")
+
+	writer := &Task{Type: typeSequence, Model: "opus", WorkflowID: "wf0101-0000-aaaaaa"}
+	ensureGrokOpusAdversarialReview(cfg, writer)
+	if writer.ReviewAfter || writer.SolMaxAdversarialReview {
+		t.Fatalf("workflow writer regrew an auto reviewer: review_after=%v sol_max=%v; 反例注入: ensureGrokOpusAdversarialReview 里删掉 WorkflowID 守卫",
+			writer.ReviewAfter, writer.SolMaxAdversarialReview)
+	}
+
+	integ := &Task{Type: typeSequence, Model: "opus", WorkflowID: "wf0101-0000-aaaaaa",
+		IntegrationGate: &IntegrationGate{WorkflowID: "wf0101-0000-aaaaaa"}}
+	ensureGrokOpusAdversarialReview(cfg, integ)
+	if integ.ReviewAfter || integ.SolMaxAdversarialReview {
+		t.Fatalf("integration card regrew an auto reviewer: %+v", integ)
+	}
+
+	// Positive control: without it, deleting the whole function body would also
+	// turn this test green while silently dropping the Opus obligation.
+	plain := &Task{Type: typeSequence, Model: "opus"}
+	ensureGrokOpusAdversarialReview(cfg, plain)
+	if !plain.ReviewAfter || !plain.SolMaxAdversarialReview {
+		t.Fatalf("non-workflow Opus card must still owe its adversarial review: %+v", plain)
+	}
+
+	// The shared admission guardrail is the backstop for every other entry
+	// point that flips ReviewAfter on (owner routes, stakes, emit).
+	bound := &Task{Type: typeSequence, WorkflowID: "wf0101-0000-aaaaaa", ReviewAfter: true}
+	enforceReviewAfterEligibility(bound)
+	if bound.ReviewAfter {
+		t.Fatal("enforceReviewAfterEligibility must clear ReviewAfter on workflow-bound cards; 反例注入: stakes.go 守卫里删掉 WorkflowID 条件")
+	}
+}
+
+// P1-1b: fix-loop repair and escalation cards must preserve the reviewed
+// card's WorkflowID and WriteDomain. A repair card without them is invisible
+// to workflowActiveRole (a second writer could be admitted onto the same
+// domain) and fail-opens the write-domain audit.
+func TestFixLoopRepairAndEscalationCardsPreserveWorkflowBinding(t *testing.T) {
+	root, dir := workflowTestRoot(t)
+	cfg := workflowTestCfg(t, root)
+	wf := initTestWorkflow(t, root, dir)
+	wf, review := runWorkflowToReview(t, root, wf, verdictJSON("concerns", nil, []string{"tighten"}))
+
+	rv, err := loadTask(root, review.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handleReviewVerdict(root, cfg, rv, verdictJSON("concerns", nil, []string{"tighten"}), nil)
+
+	tasks, err := loadTasks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fix *Task
+	for _, tk := range tasks {
+		if strings.HasPrefix(tk.Title, "修复R1: ") {
+			fix = tk
+		}
+	}
+	if fix == nil {
+		t.Fatal("concerns must still enqueue the repair card")
+	}
+	if fix.WorkflowID != wf.ID {
+		t.Fatalf("repair card lost its workflow binding: %q; 反例注入: handleReviewVerdict 修复卡不再继承 orig.WorkflowID", fix.WorkflowID)
+	}
+	if fix.WriteDomain == nil || fix.WriteDomain.ID != "auth-tokens" {
+		t.Fatalf("repair card lost the write-domain claim: %+v; 反例注入: 修复卡不再继承 orig.WriteDomain", fix.WriteDomain)
+	}
+	if fix.ReviewAfter {
+		t.Fatal("a workflow-bound repair card must not carry review_after: the workflow owns its single reviewer")
+	}
+	// The preserved binding is what keeps one-writer-one-reviewer machine-checkable:
+	// while the repair card is live, no second writer can be admitted.
+	if _, err := admitWorkflowWriter(root, cfg, wf, ""); !errors.Is(err, errWorkflowDuplicateRole) {
+		t.Fatalf("a live repair card must block a second writer: %v", err)
+	}
+
+	// Escalation shell (over max rounds) preserves the same lineage. Cancel the
+	// live repair card first so the held escalation is the only writer-shaped card.
+	if err := terminalize(root, fix.ID, statusCanceled, "test", "clear repair", nil); err != nil {
+		t.Fatal(err)
+	}
+	rv.FixRound = rv.MaxFixRounds // next round would exceed the bound
+	if err := saveTask(root, rv); err != nil {
+		t.Fatal(err)
+	}
+	handleReviewVerdict(root, cfg, rv, verdictJSON("block", []string{"still broken"}, nil), nil)
+	tasks, err = loadTasks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var esc *Task
+	for _, tk := range tasks {
+		if strings.HasPrefix(tk.Title, "[超轮限") {
+			esc = tk
+		}
+	}
+	if esc == nil {
+		t.Fatal("over-limit review must enqueue the held escalation card")
+	}
+	if esc.WorkflowID != wf.ID || esc.WriteDomain == nil || esc.WriteDomain.ID != "auth-tokens" {
+		t.Fatalf("escalation card lost workflow binding or claim: workflow=%q domain=%+v", esc.WorkflowID, esc.WriteDomain)
+	}
+	if esc.Status != statusHeld {
+		t.Fatalf("escalation card must be held, got %s", esc.Status)
+	}
+}
+
+// P1-2: an unloadable record is a possible live overlapping claim. The audit
+// must hold closed instead of skipping it, or a successor module could take
+// paths that a broken-but-real record still owns.
+func TestUnloadableWorkflowRecordHoldsWriteDomainAuditClosed(t *testing.T) {
+	root, dir := workflowTestRoot(t)
+	_ = initTestWorkflow(t, root, dir)
+	brokenPath := workflowPath(root, "wf0101-0000-cccccc")
+	if err := os.WriteFile(brokenPath, []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	disjoint := []string{
+		"-root", root, "-module", "billing", "-goal-id", "billing-v1", "-goal", "bill",
+		"-dir", dir, "-terminal-criteria", "c", "-engine", grokBuildRunnerName,
+		"-write-domain-id", "billing-core", "-write-domain-lineage", "billing-core-lineage",
+		"-write-domain-component", "billing", "-write-paths", "internal/billing",
+	}
+	err := cmdWorkflowInit(disjoint)
+	if !errors.Is(err, errWorkflowWriteOverlap) {
+		t.Fatalf("an unloadable record must hold the audit closed even for disjoint paths: %v; 反例注入: auditWorkflowWriteDomains 用回跳过损坏文件的 loadWorkflows", err)
+	}
+	if !strings.Contains(err.Error(), "wf0101-0000-cccccc.json") {
+		t.Fatalf("the refusal must name the unloadable file: %v", err)
+	}
+
+	// Repairing (here: removing) the broken record reopens the lane. Without
+	// this leg the hold-closed check could be satisfied by an audit that always
+	// refuses everything.
+	if err := os.Remove(brokenPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdWorkflowInit(disjoint); err != nil {
+		t.Fatalf("with the broken record repaired the disjoint lane must be admitted: %v", err)
+	}
+}
+
+// P1-3: freeze must prove the operator-supplied commit/tree against the
+// repository object database and store the resolved SHAs; a fabricated pair
+// would otherwise become the label the integration gate later matches against
+// itself.
+func TestFreezeCandidateVerifiesIdentityAgainstTheRepository(t *testing.T) {
+	root, dir := workflowTestRoot(t)
+	cfg := workflowTestCfg(t, root)
+	wf := initTestWorkflow(t, root, dir)
+	commit1, tree1 := workflowHeadCandidate(t, dir)
+	mustWriteFile(t, filepath.Join(dir, "internal", "auth", "token.go"), "package auth\n// v2\n")
+	workflowGit(t, dir, "add", "-A")
+	workflowGit(t, dir, "commit", "-q", "-m", "second")
+	commit2, tree2 := workflowHeadCandidate(t, dir)
+
+	t.Run("fabricated commit refused", func(t *testing.T) {
+		err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{
+			Commit: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef", Tree: tree1})
+		if !errors.Is(err, errWorkflowMalformed) {
+			t.Fatalf("a commit the repository does not contain must be refused: %v; 反例注入: freezeWorkflowCandidate 里删掉 verifyWorkflowCandidate 调用", err)
+		}
+	})
+
+	t.Run("tree of a different commit refused", func(t *testing.T) {
+		err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: commit1, Tree: tree2})
+		if !errors.Is(err, errWorkflowMalformed) {
+			t.Fatalf("a commit/tree pair naming two snapshots must be refused: %v", err)
+		}
+	})
+
+	t.Run("commit id pasted into the tree flag refused", func(t *testing.T) {
+		err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{Commit: commit1, Tree: commit1})
+		if !errors.Is(err, errWorkflowMalformed) {
+			t.Fatalf("a non-tree object in -tree must be refused: %v; 反例注入: verifyWorkflowCandidate 里删掉 cat-file -t 检查", err)
+		}
+	})
+
+	t.Run("non-git worktree fails closed", func(t *testing.T) {
+		if _, _, err := verifyWorkflowCandidate(t.TempDir(), commit1, tree1); err == nil {
+			t.Fatal("an unverifiable candidate identity must never be frozen")
+		}
+	})
+
+	t.Run("abbreviated identities are resolved and stored in full", func(t *testing.T) {
+		if err := freezeWorkflowCandidate(root, cfg, wf, WorkflowCandidate{
+			Commit: commit2[:10], Tree: tree2[:10]}); err != nil {
+			t.Fatalf("verifiable abbreviations must be accepted: %v", err)
+		}
+		if wf.Candidate.Commit != commit2 || wf.Candidate.Tree != tree2 {
+			t.Fatalf("the record must store the resolved SHAs, not the operator strings: %+v", wf.Candidate)
+		}
+		integ, err := loadTask(root, wf.IntegrationTaskID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if integ.IntegrationGate.CandidateCommit != commit2 || integ.IntegrationGate.CandidateTree != tree2 {
+			t.Fatalf("the gate must mirror the resolved identities: %+v", integ.IntegrationGate)
+		}
+	})
 }
 
 func TestWorkflowRecordDoesNotStoreThePromptBody(t *testing.T) {

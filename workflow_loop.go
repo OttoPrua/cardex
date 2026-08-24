@@ -211,6 +211,15 @@ func copyWriteDomain(d WriteDomain) *WriteDomain {
 	}
 }
 
+// inheritWriteDomain deep-copies an optional claim across a card lineage, so a
+// derived card never aliases (and cannot silently drop) its parent's claim.
+func inheritWriteDomain(d *WriteDomain) *WriteDomain {
+	if d == nil {
+		return nil
+	}
+	return copyWriteDomain(*d)
+}
+
 // createHeldIntegrationTask mints the module/program integration card. It is
 // created `held` with a gate attached, which is the whole point: the card
 // exists so the DAG can name it, not so it can run.
@@ -521,7 +530,53 @@ func admitWorkflowRepair(root string, cfg *Config, wf *WorkflowRecord, findings,
 	return t, persistWorkflow(root, cfg, wf)
 }
 
-// freezeWorkflowCandidate binds the exact bytes a review will be about.
+// verifyWorkflowCandidate proves an operator-supplied commit/tree pair against
+// the repository object database and returns the fully-resolved SHAs. Three
+// separate refusals, each fail-closed:
+//   - the commit must resolve to a commit object (`rev-parse --verify ^{commit}`);
+//   - the tree must resolve to an object of type tree (`cat-file -t`), so a
+//     commit or blob id pasted into -tree is not silently accepted;
+//   - the tree must be exactly the tree of that commit, so the pair cannot name
+//     two unrelated snapshots.
+//
+// `--end-of-options` keeps a hostile identifier from being parsed as a git
+// flag. A worktree that is not a git repository refuses too: an unverifiable
+// candidate identity must never be frozen.
+func verifyWorkflowCandidate(worktree, commitArg, treeArg string) (commit, tree string, err error) {
+	out, gitErr := gitOutput(worktree, "rev-parse", "--verify", "--quiet", "--end-of-options", commitArg+"^{commit}")
+	if gitErr != nil {
+		return "", "", fmt.Errorf("%w: candidate commit %q does not resolve to a commit object in %s",
+			errWorkflowMalformed, commitArg, worktree)
+	}
+	commit = strings.TrimSpace(string(out))
+	out, gitErr = gitOutput(worktree, "rev-parse", "--verify", "--quiet", "--end-of-options", treeArg)
+	if gitErr != nil {
+		return "", "", fmt.Errorf("%w: candidate tree %q does not resolve to an object in %s",
+			errWorkflowMalformed, treeArg, worktree)
+	}
+	tree = strings.TrimSpace(string(out))
+	out, gitErr = gitOutput(worktree, "cat-file", "-t", tree)
+	if gitErr != nil || strings.TrimSpace(string(out)) != "tree" {
+		return "", "", fmt.Errorf("%w: candidate tree %q is not a tree object in %s",
+			errWorkflowMalformed, treeArg, worktree)
+	}
+	out, gitErr = gitOutput(worktree, "rev-parse", "--verify", "--quiet", "--end-of-options", commit+"^{tree}")
+	if gitErr != nil {
+		return "", "", fmt.Errorf("%w: cannot derive the tree of commit %s in %s",
+			errWorkflowMalformed, commit, worktree)
+	}
+	if derived := strings.TrimSpace(string(out)); derived != tree {
+		return "", "", fmt.Errorf("%w: candidate tree %s is not the tree of commit %s (its tree is %s)",
+			errWorkflowMalformed, tree, commit, derived)
+	}
+	return commit, tree, nil
+}
+
+// freezeWorkflowCandidate binds the exact bytes a review will be about. The
+// operator-supplied commit/tree are claims, not evidence: both are re-derived
+// from the repository itself and the record stores the fully-resolved SHAs, so
+// a fabricated or typo'd identity can never become the label the integration
+// gate later matches against.
 func freezeWorkflowCandidate(root string, cfg *Config, wf *WorkflowRecord, cand WorkflowCandidate) error {
 	if err := refreshWorkflow(root, cfg, wf); err != nil {
 		return err
@@ -533,9 +588,14 @@ func freezeWorkflowCandidate(root string, cfg *Config, wf *WorkflowRecord, cand 
 		return fmt.Errorf("%w: writer %s still live; bytes are not frozen",
 			errWorkflowDuplicateRole, taskIDOrUnknown(active))
 	}
+	commit, tree, err := verifyWorkflowCandidate(wf.Worktree,
+		strings.TrimSpace(cand.Commit), strings.TrimSpace(cand.Tree))
+	if err != nil {
+		return err
+	}
 	wf.Candidate = &WorkflowCandidate{
-		Commit:       strings.TrimSpace(cand.Commit),
-		Tree:         strings.TrimSpace(cand.Tree),
+		Commit:       commit,
+		Tree:         tree,
 		Branch:       strings.TrimSpace(cand.Branch),
 		ChangedPaths: append([]string(nil), cand.ChangedPaths...),
 	}

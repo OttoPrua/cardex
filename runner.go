@@ -3640,6 +3640,12 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		// 会在 release 后被派到本机、cd 直接失败（实测远端 R4 卡两张踩中）。
 		esc.RemoteHost = orig.RemoteHost
 		esc.Project = orig.Project // 显式归属随派生卡继承（升级卡属于原卡的项目）
+		// workflow 绑定与写域主张随谱系继承：丢掉 WorkflowID 会让这张卡对
+		// workflowActiveRole 隐身（同一写域可再被派第二个写者）；丢掉 WriteDomain
+		// 会让写域审计对它 fail-open。held 升级卡按 taskIsLive 仍占用角色位，
+		// 恰好挡住 route 终局前的重复写者。
+		esc.WorkflowID = orig.WorkflowID
+		esc.WriteDomain = inheritWriteDomain(orig.WriteDomain)
 		esc.RouteClass = orig.RouteClass
 		esc.FixRound = round
 		esc.MaxFixRounds = orig.MaxFixRounds // 轮限随谱系留档：人裁后 release 续跑不该换上限
@@ -3687,7 +3693,14 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	})
 	title := fmt.Sprintf("修复R%d: %s [%s:%dP0+%dP1]", round, base, v.Verdict, len(v.P0), len(v.P1))
 	nt := newTask(root, cfg, typeSequence, title, orig.Dir, []string{prompt}, orig.Priority)
+	// workflow 绑定与写域主张随修复链继承：不带 WorkflowID 的修复卡对
+	// workflowActiveRole 隐身，同一写域会被并行派第二个写者；不带 WriteDomain
+	// 的修复卡在写域审计里 fail-open。ReviewAfter 经 enforceReviewAfterEligibility
+	// 收口：workflow 卡的唯一审核归 workflow 记录本身，修复卡不得再挂自动复审。
+	nt.WorkflowID = orig.WorkflowID
+	nt.WriteDomain = inheritWriteDomain(orig.WriteDomain)
 	nt.ReviewAfter = true
+	enforceReviewAfterEligibility(nt)
 	nt.FixRound = round
 	nt.Project = orig.Project // 显式归属随修复链继承
 	// 轮限随修复链继承：下一轮的 handleReviewVerdict 读的是**下一张卡**的卡面，不继承就会在

@@ -61,9 +61,11 @@ func reviewAfterEligibleType(t *Task) bool {
 }
 
 // enforceReviewAfterEligibility 是所有入队入口共用的硬护栏。风险档仍可抬模型/effort，
-// 但不能把非实现卡变成递归复审源。
+// 但不能把非实现卡变成递归复审源。workflow 卡同样在此收口：workflow 记录自己拥有唯一
+// 独立审核（one-writer-one-reviewer），任何入口给 workflow 卡挂 review_after 都会为同一
+// 冻结候选生出第二个不入账的审核者。
 func enforceReviewAfterEligibility(t *Task) {
-	if !reviewAfterEligibleType(t) {
+	if !reviewAfterEligibleType(t) || t.WorkflowID != "" || t.IntegrationGate != nil {
 		t.ReviewAfter = false
 	}
 }

@@ -356,15 +356,19 @@ func refreshWorkflow(root string, cfg *Config, wf *WorkflowRecord) error {
 	return nil
 }
 
-func loadWorkflows(root string, cfg *Config) ([]*WorkflowRecord, error) {
+// scanWorkflows reads every record file once and reports the unloadable ones
+// alongside the loadable ones instead of deciding for the caller. Listing may
+// tolerate a corrupt sibling; the write-domain audit must not, because a record
+// that will not load could still be a live claim on the very paths under audit.
+func scanWorkflows(root string, cfg *Config) (loaded []*WorkflowRecord, broken map[string]error, err error) {
 	entries, err := os.ReadDir(workflowsDir(root))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
-	var out []*WorkflowRecord
+	broken = map[string]error{}
 	for _, e := range entries {
 		name := e.Name()
 		if e.IsDir() || !strings.HasSuffix(name, ".json") || strings.HasSuffix(name, ".progress.json") {
@@ -373,12 +377,31 @@ func loadWorkflows(root string, cfg *Config) ([]*WorkflowRecord, error) {
 		id := strings.TrimSuffix(name, ".json")
 		wf, err := loadWorkflow(root, cfg, id)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "警告: 跳过损坏的 workflow 文件 %s: %v\n", name, err)
+			broken[name] = err
 			continue
 		}
-		out = append(out, wf)
+		loaded = append(loaded, wf)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	sort.Slice(loaded, func(i, j int) bool { return loaded[i].ID < loaded[j].ID })
+	return loaded, broken, nil
+}
+
+// loadWorkflows is the display-side loader: a corrupt sibling must not hide the
+// healthy records from `workflow list`. Audit paths must not use it — they go
+// through scanWorkflows and hold closed on any unloadable record.
+func loadWorkflows(root string, cfg *Config) ([]*WorkflowRecord, error) {
+	out, broken, err := scanWorkflows(root, cfg)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(broken))
+	for name := range broken {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		fmt.Fprintf(os.Stderr, "警告: 跳过损坏的 workflow 文件 %s: %v\n", name, broken[name])
+	}
 	return out, nil
 }
 
@@ -396,13 +419,27 @@ func workflowClaimsActive(wf *WorkflowRecord) bool {
 // other live record. Paths are compared per Git identity (linked worktrees of
 // one repository share it); closed resources are compared globally, because a
 // shared database or manifest serializes across repositories too.
+//
+// An unloadable record is treated as a possible live overlapping claim, not as
+// absence of one: its write domain cannot be read, so disjointness cannot be
+// proven and the audit holds closed until the operator repairs or removes the
+// broken file. Skipping it here would fail-open the entire audit.
 func auditWorkflowWriteDomains(root string, cfg *Config, incoming *WorkflowRecord) error {
 	if incoming == nil {
 		return errWorkflowMalformed
 	}
-	existing, err := loadWorkflows(root, cfg)
+	existing, broken, err := scanWorkflows(root, cfg)
 	if err != nil {
 		return err
+	}
+	if len(broken) > 0 {
+		names := make([]string, 0, len(broken))
+		for name := range broken {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return fmt.Errorf("%w: %d workflow record(s) unloadable (%s); their write domains cannot be read, so disjointness cannot be proven — repair or remove them first",
+			errWorkflowWriteOverlap, len(names), strings.Join(names, ", "))
 	}
 	byRepo := map[string][]WriteDomain{}
 	repoRoots := map[string]string{}

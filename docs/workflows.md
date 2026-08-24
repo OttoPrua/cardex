@@ -21,7 +21,7 @@ Cardex 推荐两种工作流拓扑：
 | 独立审核角色 | 部分执行 | `design-review` 是只读类型并不占写域。`cardex workflow` 派出的 reviewer 额外由机器保证：另一张卡、`review_of` 指向 writer、无写域、不继承 writer session、同一 writer 同时只有一个 active reviewer |
 | 直派 / 联邦模式名、父子 manager | 部分执行 | `cardex workflow` 有耐久记录：`mode` = `serial` \| `federated`、`module_id` / `goal_id`、federated 的 `parent_id`、写域、轮次上限、候选身份、三道 effect gate。Task 侧新增的一等字段只有 `workflow_id` 与 `integration_gate`；manager 层级本身仍是约定 |
 | 审核通过、集成通过、live、用户验收 | 不由 `done` 推断 | 必须是不同证据门；Cardex 卡完成不自动授权发布、服务重启、设备操作、凭证使用或外部写入 |
-| reviewer attempt custody | 已执行 | 集成门在语义 verdict 之外还要求 W2 process custody：`exited` ≠ `producerGone`（由 PID/PGID 身份、后代消失、workspace lease、runner 残留、后继 attempt 缺席逐项证伪），且 task/event/attempt/process/source 证据 hash 须在 20 秒 quiet-window 内稳定并形成耐久收据（`control/custody/`）。收据只由显式 `ingest-review` 观察写入；tick 与 `cardex release` 只读地重新核对 |
+| reviewer attempt custody | 已执行 | 集成门在语义 verdict 之外还要求 W2 process custody：`exited` ≠ `producerGone`（由 PID/PGID 身份、后代消失、workspace lease、runner 残留、后继 attempt 缺席逐项证伪），且 task/event/attempt/process/source 证据 hash 须在 20 秒 quiet-window 内稳定并形成耐久收据（`control/custody/`）。收据只由显式 `ingest-review` 观察写入；tick 与 `cardex release` 只读地重新核对。注意探针的进程边界：后代与 runner 残留两个探针只在常驻 tick 进程内有信息量，短命 CLI 进程（`ingest-review` / `release`）里跨进程可信的是 attempt 的 PID/PGID start identity 与 workspace lease（内核 flock）。因此 attempt 证据缺席即 fail closed：`done` 终局必须至少有一条 attempt 记录，且最新 committed 终局 transition 必须点名一个在盘的 attempt 记录；attempt/transition 时间戳按解析后的时间序比较（不是 RFC3339Nano 字符串序——混合 UTC offset 或小数位宽会颠倒字符串序），无法解析即漂移 |
 | 语义集成门 | 已执行 | 带 `integration_gate` 的卡默认 held。tick 派发与 `cardex release` 都会**重新**从审核日志解析 verdict，要求 `pass` 且 `p0`/`p1` 皆空、候选 commit/tree 与冻结记录一致、custody 一致。durable review `done` 不够 |
 | live / cutover 门 | 默认 held | 本树没有任何 live/cutover 释放路径。workflow 记录里 `live` 与 `cutover` 只能是 `held`；手改成 `released` 的记录会在加载时被拒 |
 | 自动推进 | 不执行（有意） | tick 只读地咨询集成门，绝不推进 workflow。writer、freeze、review、ingest、repair、release 每一步都是显式 `cardex workflow` 命令。Cardex 不会长出第二套状态机或自动重规划器 |
@@ -329,7 +329,7 @@ cardex workflow list|show <id>
 - **引擎必须可钉定**。`-engine` 只接受 tick 能钉定且不会 fail-open 的执行器（`claude`、`codex`、`gemini`、`opencode`、`kimi-cli`、`grok-build`、`cursor`，或 `config.engines` 里已配的引擎档案）。留空或写未知名字会被拒，避免悄悄落到默认 provider 上——那会让 writer/reviewer 的引擎分离形同虚设。
 - **有界轮次**。`max_rounds >= 1`。超轮不再派修复卡，记录转 `exhausted` 并写一条 Root 收据。修复轮会清空上一轮的候选、verdict 与集成门上的候选身份。
 - **写域跨记录互斥**。同一 Git identity 内的 exact/subtree 路径重叠、重复 lineage、以及**跨仓**共享的封闭资源都 fail closed。terminal 记录（`exhausted` / `owner_choice` / `external_blocked`）释放自己的 claim，后继模块才能接手。
-- **process custody 收据（W2）**。每次 `ingest-review` 都是一次显式 custody 观察：先证伪 producerGone 的每个分量（exact PID/PGID、后代、runner 残留、workspace lease、后继 attempt），再要求整套证据 hash 在 20 秒 quiet-window 内稳定，才形成耐久的 admissible review 收据（`control/custody/<review>.json`）。任何漂移（迟到输出、attempt 变动、进程闪现）重置窗口；集成门与 `cardex release` 每次只读地重新推导并与收据比对。对 `held`/`canceled` 收容终局，窗口只产生**非语义**的 reconciliation 收据，不能据此集成。
+- **process custody 收据（W2）**。每次 `ingest-review` 都是一次显式 custody 观察：先证伪 producerGone 的每个分量（exact PID/PGID、后代、runner 残留、workspace lease、后继 attempt），再要求整套证据 hash 在 20 秒 quiet-window 内稳定，才形成耐久的 admissible review 收据（`control/custody/<review>.json`）。任何漂移（迟到输出、attempt 变动、进程闪现）重置窗口；集成门与 `cardex release` 每次只读地重新推导并与收据比对。对 `held`/`canceled` 收容终局，窗口只产生**非语义**的 reconciliation 收据，不能据此集成。attempt 证据本身也是门：`done` 终局没有任何 attempt 记录、没有 committed 终局 transition、或该 transition 没点名一个在盘 attempt，都按 `custody_drift` 拒绝——缺席的证据不是被证伪的 producer。后继判定按解析后的时间序，任何无法解析的时间戳同样 fail closed。
 - **三道 effect gate 分离**。`integration` 可以被释放；`live` 与 `cutover` 在本树没有任何释放路径，手改记录会在加载时被拒。
 
 ### 耐久 manager hook 与 Root 通知
@@ -365,7 +365,8 @@ cardex workflow list|show <id>
 `workflow_custody.go` 落地为 fail-closed validator + 耐久 quiet-window 收据，成对夹具钉在 `workflow_custody_test.go`：失败侧复现“attempt record exited，但 producer/children/lease 仍 live，随后同卡 redispatch”；恢复侧只允许受支持的 hold 撤销 scheduling/attempt，等待 exact producers 和一次性副本消失并完成 20 秒 quiet-window，同时保持 review 未采信。机器执行的边界：
 
 - 一个 role/task 只有一个 active role instance / active attempt：任何 reserved/bound attempt 或第二个 active reviewer 都 fail closed；
-- `exited` 不等于 `producerGone`：后者由 PID/PGID identity、descendant absence、workspace lease、runner residue 与 successor-attempt absence 逐项证伪，任一分量存活即拒绝；
+- `exited` 不等于 `producerGone`：后者由 PID/PGID identity、descendant absence、workspace lease、runner residue 与 successor-attempt absence 逐项证伪，任一分量存活即拒绝。descendant 与 residue 探针只在常驻 tick 进程内有信息量；短命 CLI 进程里跨进程可信的是 PID/PGID start identity 与 workspace lease（flock），所以 attempt 证据缺席不可视作证伪成功；
+- attempt 证据完整性是 `done` 终局的前置：至少一条 attempt 记录、最新 committed 终局 transition 点名一个在盘 attempt，缺任何一环都是 `custody_drift`；successor 判定与终局选择都按解析后的时间序（RFC3339Nano 字符串序在混合 UTC offset / 小数位宽下会颠倒），无法解析的时间戳 fail closed；
 - producerGone 前禁止 review redispatch、按 `pass` 采信、old-output splice 和对后继执行 `cardex release`：ingest 记 `custody_drift`，集成门与 `cardex release` 每次重新推导并拒绝；
 - terminal quiet-window（20 秒）内 task/event/attempt/process/source hashes 稳定，才生成 admissible review receipt（`control/custody/`）；任何漂移重置窗口；收据只由显式 `ingest-review` 观察写入，tick 只读；
 - custody reconciliation 的 held receipt（`custody_reconciled_held`）不是 semantic review receipt，不能释放集成；恢复后是否创建 fresh reviewer 仍需模块 manager 新决策。

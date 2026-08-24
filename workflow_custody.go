@@ -188,11 +188,31 @@ func reviewCustodyDrift(root string, review *Task) string {
 	return ""
 }
 
+// custodyStamp parses a record timestamp for ordering. RFC3339Nano stamps are
+// not lexicographically ordered: they carry the writer's local UTC offset and
+// trim trailing fractional-second zeros, so raw string `>` inverts across
+// mixed offsets (launchd job vs interactive shell, DST transitions) and across
+// fractional widths. Every ordering decision must go through parsed
+// time.Time values; a stamp that will not parse is drift (fail closed), never
+// an ordering tie.
+func custodyStamp(stamp string) (time.Time, bool) {
+	at, err := time.Parse(time.RFC3339Nano, stamp)
+	return at, err == nil
+}
+
 // successorAttemptDrift detects the same-card redispatch shape: the committed
 // terminal transition is bound to one exact attempt, so any attempt record
 // minted after that one means a second producer touched the card after its
 // terminal. Even a successor that later exited breaks custody — the transcript
 // can no longer be attributed to the terminal attempt alone.
+//
+// It also owns the attempt-evidence completeness requirement for the semantic
+// `done` terminal: zero attempt records, a missing committed terminal
+// transition, or a terminal transition that names no attempt all mean
+// producerGone is unproven, not disproven. Absent evidence must never mint an
+// admissible receipt — in a short-lived CLI process the descendant and
+// runner-residue probes are structurally silent, so without attempt records
+// the "proof" would collapse to a single workspace-lease check.
 func successorAttemptDrift(root string, review *Task, attempts []*AttemptRecord) string {
 	if !isTerminalTransitionStatus(review.Status) {
 		return ""
@@ -202,13 +222,28 @@ func successorAttemptDrift(root string, review *Task, attempts []*AttemptRecord)
 		return fmt.Sprintf("transition journal unreadable: %v", err)
 	}
 	var term *TransitionRecord
+	var termAt time.Time
 	for _, rec := range transitions {
 		if rec == nil || rec.State != transitionCommitted || !isTerminalTransitionStatus(rec.Status) {
 			continue
 		}
-		if term == nil || rec.CreatedAt > term.CreatedAt ||
-			(rec.CreatedAt == term.CreatedAt && rec.TransitionID > term.TransitionID) {
-			term = rec
+		at, ok := custodyStamp(rec.CreatedAt)
+		if !ok {
+			return fmt.Sprintf("terminal transition %s carries unparseable created_at %q: attempt order cannot be proven", rec.TransitionID, rec.CreatedAt)
+		}
+		if term == nil || at.After(termAt) || (at.Equal(termAt) && rec.TransitionID > term.TransitionID) {
+			term, termAt = rec, at
+		}
+	}
+	if review.Status == statusDone {
+		if len(attempts) == 0 {
+			return "no attempt records exist for this review terminal: absent evidence is incomplete, not proven producerGone"
+		}
+		if term == nil {
+			return "no committed terminal transition exists for this review terminal: the producing attempt cannot be identified"
+		}
+		if term.AttemptID == "" {
+			return fmt.Sprintf("terminal transition %s names no attempt: the producing attempt cannot be identified", term.TransitionID)
 		}
 	}
 	if term == nil || term.AttemptID == "" {
@@ -223,11 +258,19 @@ func successorAttemptDrift(root string, review *Task, attempts []*AttemptRecord)
 	if bound == nil {
 		return fmt.Sprintf("terminal transition %s names attempt %s but its record is missing", term.TransitionID, term.AttemptID)
 	}
+	boundAt, ok := custodyStamp(bound.CreatedAt)
+	if !ok {
+		return fmt.Sprintf("terminal attempt %s carries unparseable created_at %q: attempt order cannot be proven", bound.AttemptID, bound.CreatedAt)
+	}
 	for _, a := range attempts {
 		if a.AttemptID == term.AttemptID {
 			continue
 		}
-		if a.CreatedAt > bound.CreatedAt {
+		at, ok := custodyStamp(a.CreatedAt)
+		if !ok {
+			return fmt.Sprintf("attempt %s carries unparseable created_at %q: attempt order cannot be proven", a.AttemptID, a.CreatedAt)
+		}
+		if at.After(boundAt) {
 			return fmt.Sprintf("successor attempt %s was minted after terminal attempt %s: same-card redispatch", a.AttemptID, term.AttemptID)
 		}
 	}

@@ -128,11 +128,16 @@ func markTaskDone(t *testing.T, root, id string) *Task {
 	return tk
 }
 
-// runWorkflowToReview drives one workflow from init through a terminated
+// runWorkflowToBareReview drives one workflow from init through a terminated
 // reviewer bound to the frozen candidate, then writes the given review body.
 // The candidate is the worktree's real HEAD: freeze now verifies identities
 // against the repository, so fabricated strings are refused by design.
-func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, body string) (*WorkflowRecord, *Task) {
+//
+// "Bare" means the reviewer terminal carries no attempt/transition custody
+// evidence at all. W2 fails closed on that shape (absent evidence is not
+// proven producerGone), so only the custody fixtures that pin the refusal use
+// this variant directly; everything else goes through runWorkflowToReview.
+func runWorkflowToBareReview(t *testing.T, root string, wf *WorkflowRecord, body string) (*WorkflowRecord, *Task) {
 	t.Helper()
 	cfg := workflowTestCfg(t, root)
 	writer, err := admitWorkflowWriter(root, cfg, wf, "")
@@ -154,6 +159,19 @@ func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, body str
 	if err != nil {
 		t.Fatal(err)
 	}
+	return fresh, review
+}
+
+// runWorkflowToReview is runWorkflowToBareReview plus the durable evidence a
+// runner-produced terminal leaves behind: one exited attempt record and a
+// committed done transition naming it. The stamps are backdated so fixtures
+// can mint successors "after the terminal attempt" without future timestamps.
+func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, body string) (*WorkflowRecord, *Task) {
+	t.Helper()
+	fresh, review := runWorkflowToBareReview(t, root, wf, body)
+	at := time.Now().Add(-10 * time.Minute)
+	writeReviewAttempt(t, root, review.ID, reviewFixtureAttemptID, attemptExited, at)
+	writeCommittedDoneTransition(t, root, review.ID, "tr-producer-fixture", reviewFixtureAttemptID, at.Add(time.Minute))
 	return fresh, review
 }
 

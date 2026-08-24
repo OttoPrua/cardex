@@ -42,6 +42,10 @@ func stubCustodyProbes(t *testing.T) *custodyProbeStub {
 	return s
 }
 
+// reviewFixtureAttemptID is the producing attempt runWorkflowToReview binds
+// the reviewer terminal to; its committed done transition names this ID.
+const reviewFixtureAttemptID = "at-producer-fixture"
+
 func writeReviewAttempt(t *testing.T, root, taskID, attemptID, state string, createdAt time.Time) *AttemptRecord {
 	t.Helper()
 	rec := &AttemptRecord{
@@ -219,7 +223,7 @@ func TestCustodyEveryProducerGoneComponentFailsClosed(t *testing.T) {
 		name   string
 		inject func(s *custodyProbeStub)
 	}{
-		{"exact pid/pgid identity still alive", func(s *custodyProbeStub) { s.aliveAttempts["at-fixture-1"] = true }},
+		{"exact pid/pgid identity still alive", func(s *custodyProbeStub) { s.aliveAttempts[reviewFixtureAttemptID] = true }},
 		{"registered descendant still alive", func(s *custodyProbeStub) { s.taskAlive = true }},
 		{"runner residue remains", func(s *custodyProbeStub) { s.residue = true }},
 		{"workspace lease still held", func(s *custodyProbeStub) { s.lease = true }},
@@ -230,8 +234,7 @@ func TestCustodyEveryProducerGoneComponentFailsClosed(t *testing.T) {
 			root, dir := workflowTestRoot(t)
 			cfg := workflowTestCfg(t, root)
 			wf := initTestWorkflow(t, root, dir)
-			wf, review := runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
-			writeReviewAttempt(t, root, review.ID, "at-fixture-1", attemptExited, time.Now().Add(-time.Minute))
+			wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 
 			// Positive control first: with everything gone the same evidence
 			// completes a window and admits, so each failing leg below fails
@@ -265,7 +268,9 @@ func TestCustodySuccessorAttemptAfterTerminalIsRedispatchDrift(t *testing.T) {
 	root, dir := workflowTestRoot(t)
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
-	wf, stale := runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
+	// The bare variant: this fixture writes its own terminal attempt evidence
+	// with controlled timestamps.
+	wf, stale := runWorkflowToBareReview(t, root, wf, verdictJSON("pass", nil, nil))
 	// Fresh-read the reviewer terminal; the admit-time copy predates `done`.
 	review, err := loadTask(root, stale.ID)
 	if err != nil {
@@ -457,9 +462,11 @@ func TestCustodyQuietWindowResetsWheneverEvidenceMoves(t *testing.T) {
 		t.Fatalf("splice must restart the window with a new hash: %+v", after)
 	}
 
-	// Attempt-record churn mid-window resets too.
+	// Attempt-record churn mid-window resets too. The late-surfacing record is
+	// backdated before the terminal attempt so it is churn (a hash move), not
+	// a successor: redispatch drift is pinned by its own fixtures.
 	backdateCustodyWindow(t, root, review.ID, custodyQuietWindow+time.Second)
-	writeReviewAttempt(t, root, review.ID, "at-late", attemptExited, time.Now())
+	writeReviewAttempt(t, root, review.ID, "at-late", attemptExited, time.Now().Add(-2*time.Hour))
 	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -594,4 +601,254 @@ func TestCustodyGateStaysReadOnly(t *testing.T) {
 	if rec, err := loadCustodyRecord(root, review.ID); err != nil || rec != nil {
 		t.Fatalf("gate consults must not write custody observations: %+v err=%v; 反例注入: reviewCustodyReceiptReason 里调用 observeReviewCustody", rec, err)
 	}
+}
+
+// ---- P1 repairs from the 2026-08-24 independent review ----
+
+// bareReviewForCustody drives a workflow to a done reviewer with a pass
+// verdict but no attempt/transition evidence, and fresh-reads the terminal.
+func bareReviewForCustody(t *testing.T) (root string, cfg *Config, wf *WorkflowRecord, review *Task) {
+	t.Helper()
+	root, dir := workflowTestRoot(t)
+	cfg = workflowTestCfg(t, root)
+	wf = initTestWorkflow(t, root, dir)
+	wf, stale := runWorkflowToBareReview(t, root, wf, verdictJSON("pass", nil, nil))
+	review, err := loadTask(root, stale.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return root, cfg, wf, review
+}
+
+// TestCustodySuccessorOrderingIsChronologicalNotLexicographic (P1-1): attempt
+// stamps are RFC3339Nano with the writer's local offset and trimmed fractional
+// zeros, so raw string `>` is not wall-clock order. A successor minted minutes
+// after the terminal attempt must be drift no matter how the two stamps are
+// encoded — a launchd job and an interactive shell routinely write the same
+// data root with different offsets, and DST alone flips one twice a year.
+func TestCustodySuccessorOrderingIsChronologicalNotLexicographic(t *testing.T) {
+	cases := []struct {
+		name      string
+		terminal  time.Time
+		successor time.Time
+	}{
+		{
+			// 17:00+08:00 is 09:00Z; the successor lands five real minutes
+			// later but its UTC stamp compares *smaller* as a string.
+			name:      "mixed utc offsets",
+			terminal:  time.Date(2026, 8, 24, 17, 0, 0, 1, time.FixedZone("UTC+8", 8*3600)),
+			successor: time.Date(2026, 8, 24, 9, 5, 0, 1, time.UTC),
+		},
+		{
+			// RFC3339Nano trims trailing zeros: ".5Z" compares larger than the
+			// 100µs-later ".5001Z" because byte 'Z' > byte '0'.
+			name:      "fractional second width",
+			terminal:  time.Date(2026, 8, 24, 9, 0, 0, 500000000, time.UTC),
+			successor: time.Date(2026, 8, 24, 9, 0, 0, 500100000, time.UTC),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = stubCustodyProbes(t)
+			root, cfg, wf, review := bareReviewForCustody(t)
+			writeReviewAttempt(t, root, review.ID, "at-terminal", attemptExited, tc.terminal)
+			writeCommittedDoneTransition(t, root, review.ID, "tr-terminal", "at-terminal", tc.terminal)
+			if drift := reviewCustodyDrift(root, review); drift != "" {
+				t.Fatalf("terminal attempt alone must be clean: %q", drift)
+			}
+
+			writeReviewAttempt(t, root, review.ID, "at-successor", attemptExited, tc.successor)
+			drift := reviewCustodyDrift(root, review)
+			if drift == "" || !strings.Contains(drift, "successor") {
+				t.Fatalf("a successor later in wall time must be drift regardless of stamp encoding: %q; 反例注入: successorAttemptDrift 里退回 CreatedAt 字符串比较", drift)
+			}
+			if err := ingestWorkflowReview(root, cfg, wf); err != nil {
+				t.Fatal(err)
+			}
+			if wf.Review.Admissible || wf.Review.HoldReason != holdReasonCustodyDrift {
+				t.Fatalf("mixed-encoding redispatch must not be adoptable: %+v", wf.Review)
+			}
+			integ, err := loadTask(root, wf.IntegrationTaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dec := evaluateIntegrationRelease(root, cfg, integ); dec.Admit || dec.HoldReason != holdReasonCustodyDrift {
+				t.Fatalf("gate must hold: admit=%v reason=%q", dec.Admit, dec.HoldReason)
+			}
+		})
+	}
+}
+
+// TestCustodyTerminalSelectionOrdersTransitionsByTime (P1-1, second seam): the
+// newest committed terminal must be picked by parsed time, not by string-max.
+// A stale terminal whose offset stamp compares largest would otherwise anchor
+// the successor check at the wrong attempt and hide a genuine redispatch.
+func TestCustodyTerminalSelectionOrdersTransitionsByTime(t *testing.T) {
+	_ = stubCustodyProbes(t)
+	root, _, _, review := bareReviewForCustody(t)
+	zone := time.FixedZone("UTC+8", 8*3600)
+
+	// Real order: at-old (08:55Z) → tr-old (09:00Z, stamped 17:00+08:00) →
+	// at-new (09:55Z) → tr-new (10:00Z). String-max would pick tr-old and
+	// anchor at at-old.
+	writeReviewAttempt(t, root, review.ID, "at-old", attemptExited, time.Date(2026, 8, 24, 16, 55, 0, 1, zone))
+	writeCommittedDoneTransition(t, root, review.ID, "tr-old", "at-old", time.Date(2026, 8, 24, 17, 0, 0, 1, zone))
+	writeReviewAttempt(t, root, review.ID, "at-new", attemptExited, time.Date(2026, 8, 24, 9, 55, 0, 1, time.UTC))
+	writeCommittedDoneTransition(t, root, review.ID, "tr-new", "at-new", time.Date(2026, 8, 24, 10, 0, 0, 1, time.UTC))
+	if drift := reviewCustodyDrift(root, review); drift != "" {
+		t.Fatalf("re-terminalized card without a post-terminal attempt must be clean: %q", drift)
+	}
+
+	// The redispatch: minted after the *true* newest terminal attempt, but
+	// before the stale string-max anchor's stamp.
+	writeReviewAttempt(t, root, review.ID, "at-ghost", attemptExited, time.Date(2026, 8, 24, 10, 30, 0, 1, time.UTC))
+	drift := reviewCustodyDrift(root, review)
+	if drift == "" || !strings.Contains(drift, "successor") {
+		t.Fatalf("anchoring at a stale string-max terminal hides the redispatch: %q; 反例注入: successorAttemptDrift 终局选择退回 CreatedAt 字符串比较", drift)
+	}
+}
+
+// TestCustodyUnparseableStampsFailClosed (P1-1): a stamp that will not parse
+// cannot prove ordering, so it is drift — never an ordering tie in either
+// direction.
+func TestCustodyUnparseableStampsFailClosed(t *testing.T) {
+	t.Run("attempt stamp", func(t *testing.T) {
+		_ = stubCustodyProbes(t)
+		root, _, _, review := bareReviewForCustody(t)
+		base := time.Now().Add(-time.Hour)
+		writeReviewAttempt(t, root, review.ID, "at-terminal", attemptExited, base)
+		writeCommittedDoneTransition(t, root, review.ID, "tr-terminal", "at-terminal", base.Add(time.Minute))
+		// A garbage stamp that compares string-smaller than any RFC3339 date:
+		// the old string order would silently treat it as "not after".
+		rec := &AttemptRecord{
+			TaskID: review.ID, AttemptID: "at-garbage", ExpectedRevision: 1, ControlEpoch: 1,
+			State: attemptExited, CreatedAt: "1999-bogus-stamp",
+		}
+		if err := writeAttempt(root, rec); err != nil {
+			t.Fatal(err)
+		}
+		drift := reviewCustodyDrift(root, review)
+		if drift == "" || !strings.Contains(drift, "unparseable") {
+			t.Fatalf("an unparseable attempt stamp must fail closed: %q", drift)
+		}
+	})
+	t.Run("transition stamp", func(t *testing.T) {
+		_ = stubCustodyProbes(t)
+		root, _, _, review := bareReviewForCustody(t)
+		writeReviewAttempt(t, root, review.ID, "at-terminal", attemptExited, time.Now().Add(-time.Hour))
+		tr := &TransitionRecord{
+			TransitionID: "tr-garbage", TaskID: review.ID, ExpectedRevision: 1, NewRevision: 2,
+			ControlEpoch: 1, AttemptID: "at-terminal", EventType: evDone, Status: statusDone,
+			State: transitionCommitted, CreatedAt: "not-a-time",
+		}
+		if err := writeTransition(root, tr); err != nil {
+			t.Fatal(err)
+		}
+		drift := reviewCustodyDrift(root, review)
+		if drift == "" || !strings.Contains(drift, "unparseable") {
+			t.Fatalf("an unparseable transition stamp must fail closed: %q", drift)
+		}
+	})
+}
+
+// TestCustodyAbsentAttemptEvidenceFailsClosed (P1-2): zero attempt records —
+// or a terminal that cannot be bound to a present attempt record — is
+// incomplete evidence, not proven producerGone. No admissible_review receipt
+// may form, and both CLI adoption paths must refuse. This matters most in a
+// fresh `ingest-review`/`release` process, where the descendant and residue
+// probes are structurally silent and the "proof" would otherwise collapse to
+// a single workspace-lease check.
+func TestCustodyAbsentAttemptEvidenceFailsClosed(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(t *testing.T, root string, review *Task)
+		want string
+	}{
+		{
+			name: "zero attempt records",
+			seed: func(t *testing.T, root string, review *Task) {},
+			want: "no attempt records",
+		},
+		{
+			name: "no committed terminal transition",
+			seed: func(t *testing.T, root string, review *Task) {
+				writeReviewAttempt(t, root, review.ID, "at-other", attemptExited, time.Now().Add(-time.Hour))
+			},
+			want: "no committed terminal transition",
+		},
+		{
+			name: "terminal transition names no attempt",
+			seed: func(t *testing.T, root string, review *Task) {
+				writeReviewAttempt(t, root, review.ID, "at-other", attemptExited, time.Now().Add(-time.Hour))
+				writeCommittedDoneTransition(t, root, review.ID, "tr-anon", "", time.Now().Add(-30*time.Minute))
+			},
+			want: "names no attempt",
+		},
+		{
+			name: "named attempt record missing",
+			seed: func(t *testing.T, root string, review *Task) {
+				writeReviewAttempt(t, root, review.ID, "at-other", attemptExited, time.Now().Add(-time.Hour))
+				writeCommittedDoneTransition(t, root, review.ID, "tr-ghost", "at-ghost", time.Now().Add(-30*time.Minute))
+			},
+			want: "record is missing",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_ = stubCustodyProbes(t)
+			root, cfg, wf, review := bareReviewForCustody(t)
+			tc.seed(t, root, review)
+
+			drift := reviewCustodyDrift(root, review)
+			if drift == "" || !strings.Contains(drift, tc.want) {
+				t.Fatalf("incomplete attempt evidence must be drift (%q): %q; 反例注入: successorAttemptDrift 里删掉 statusDone 的证据完整性检查", tc.want, drift)
+			}
+
+			// Two observations across a backdated window must still refuse:
+			// drift resets the window on every ingest, so no receipt of any
+			// kind may form.
+			if err := ingestWorkflowReview(root, cfg, wf); err != nil {
+				t.Fatal(err)
+			}
+			backdateCustodyWindow(t, root, review.ID, custodyQuietWindow+time.Second)
+			if err := ingestWorkflowReview(root, cfg, wf); err != nil {
+				t.Fatal(err)
+			}
+			if wf.Review.Admissible || wf.Review.HoldReason != holdReasonCustodyDrift {
+				t.Fatalf("absent evidence must not become adoptable: %+v", wf.Review)
+			}
+			if rec, err := loadCustodyRecord(root, review.ID); err != nil || rec == nil || rec.Kind != "" || rec.Drift == "" {
+				t.Fatalf("no receipt may form on incomplete evidence: %+v err=%v", rec, err)
+			}
+
+			integ, err := loadTask(root, wf.IntegrationTaskID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if dec := evaluateIntegrationRelease(root, cfg, integ); dec.Admit || dec.HoldReason != holdReasonCustodyDrift {
+				t.Fatalf("gate must hold on incomplete evidence: admit=%v reason=%q", dec.Admit, dec.HoldReason)
+			}
+			if err := tryReleaseWorkflowIntegration(root, cfg, wf); !errors.Is(err, errWorkflowHeld) {
+				t.Fatalf("try-release must refuse: %v", err)
+			}
+			if err := cmdSetStatus([]string{"-root", root, integ.ID}, "release"); err == nil {
+				t.Fatal("cardex release must refuse while attempt evidence is missing")
+			}
+		})
+	}
+
+	// Positive control: the same workflow shape with a present attempt record
+	// and a committed terminal transition naming it completes a quiet window
+	// and admits — the refusal above is a latch on evidence, not a trap.
+	t.Run("positive control with complete evidence", func(t *testing.T) {
+		_ = stubCustodyProbes(t)
+		root, cfg, wf, review := bareReviewForCustody(t)
+		at := time.Now().Add(-time.Hour)
+		writeReviewAttempt(t, root, review.ID, "at-terminal", attemptExited, at)
+		writeCommittedDoneTransition(t, root, review.ID, "tr-terminal", "at-terminal", at.Add(time.Minute))
+		completeReviewCustodyWindow(t, root, cfg, wf)
+		if !wf.Review.Admissible {
+			t.Fatalf("complete evidence over a full window must admit: %+v", wf.Review)
+		}
+	})
 }

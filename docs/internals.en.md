@@ -9,7 +9,8 @@ The scheduler's behavioral contracts on the failure paths: dispatch order, limit
 1. **Resume first** (`resume_first`): tasks interrupted by a limit run before new ones — finish the unfinished first;
 2. **Higher priority wins**;
 3. **Type order** (`type_order`): default `progress-pull > coordinate > review > sequence > assembly` (review is cheap and returns feedback fast; assembly spawns new work so it goes last);
-4. FIFO within the same tier.
+4. FIFO within the same tier;
+5. **Integration gate**: a card carrying `integration_gate` re-derives its evidence before every dispatch — an independent review `verdict=pass` with empty `p0`/`p1`, a candidate commit/tree matching the frozen record, and consistent reviewer custody. Any failure skips the card this round, and `cardex release` refuses it too. A durable review `done` is not a verdict. Cards without the field behave exactly as before.
 
 Limits are global: whenever any task hits a limit, a global cooldown is written (`cooldown.json`); during it no task is dispatched and no probe calls are wasted. The cooldown time prefers the reset timestamp in the error message; if none can be parsed it falls back to retrying after `limit_fallback_min` minutes.
 

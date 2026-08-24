@@ -18,13 +18,17 @@ Cardex 推荐两种工作流拓扑：
 | `depends_on` DAG | 已执行 | 前置卡必须有可核验的 durable `done` transition；缺边、环、坏 ID、坏 domain binding 对相关分量 fail closed，不阻塞无关分量 |
 | 显式 write domain | 已执行 | 仓相对路径先规范化；同仓 exact/subtree 重叠、同 domain/lineage、同封闭资源均串行 |
 | 旧卡兼容 | 已执行 | 写卡没声明 write domain 时，同一 Git common dir 仍按整仓串行；不会因升级而意外放宽 |
-| 独立审核角色 | 部分执行 | `design-review` 是只读类型并不占写域；“是否独立于 writer、是否消费了冻结候选、结论是否准入”仍须由 packet/manager 证明 |
-| 直派 / 联邦模式名、父子 manager | 推荐约定 | 目前不是 Task 的一等 schema 字段；用 project、title、lineage、DAG、manager-wake scope 和收据表达 |
+| 独立审核角色 | 部分执行 | `design-review` 是只读类型并不占写域。`cardex workflow` 派出的 reviewer 额外由机器保证：另一张卡、`review_of` 指向 writer、无写域、不继承 writer session、同一 writer 同时只有一个 active reviewer |
+| 直派 / 联邦模式名、父子 manager | 部分执行 | `cardex workflow` 有耐久记录：`mode` = `serial` \| `federated`、`module_id` / `goal_id`、federated 的 `parent_id`、写域、轮次上限、候选身份、三道 effect gate。Task 侧新增的一等字段只有 `workflow_id` 与 `integration_gate`；manager 层级本身仍是约定 |
 | 审核通过、集成通过、live、用户验收 | 不由 `done` 推断 | 必须是不同证据门；Cardex 卡完成不自动授权发布、服务重启、设备操作、凭证使用或外部写入 |
-| reviewer attempt custody | 已知需加固 | 操作/政策门：出现 attempt/producer/lease 矛盾时必须阻断审核采信与重派、不得释放依赖。当前 tick 并未完整机器执行该门；后文 W2 才是路线图上的机器不变量，尚未落地 |
-| 语义集成门 / 联邦 manager 层级 | 操作/政策 + 推荐约定 | `pass` 不会自动 `cardex release` 集成卡；父子 manager 也还不是 Task schema。W1–W4 尚未落地 |
+| reviewer attempt custody | 部分执行 | 已机器执行的最小 custody 见上一行。完整的 `exited` ≠ `producerGone`（PID/PGID 身份、后代消失、workspace lease、runner 残留、后继 attempt 缺席）与 20 秒 quiet-window 仍是 W2 路线图，尚未落地 |
+| 语义集成门 | 已执行 | 带 `integration_gate` 的卡默认 held。tick 派发与 `cardex release` 都会**重新**从审核日志解析 verdict，要求 `pass` 且 `p0`/`p1` 皆空、候选 commit/tree 与冻结记录一致、custody 一致。durable review `done` 不够 |
+| live / cutover 门 | 默认 held | 本树没有任何 live/cutover 释放路径。workflow 记录里 `live` 与 `cutover` 只能是 `held`；手改成 `released` 的记录会在加载时被拒 |
+| 自动推进 | 不执行（有意） | tick 只读地咨询集成门，绝不推进 workflow。writer、freeze、review、ingest、repair、release 每一步都是显式 `cardex workflow` 命令。Cardex 不会长出第二套状态机或自动重规划器 |
 
 因此，本页给出的命令是**现在可用的安全编排方式**，不是宣称所有联邦语义都已成为 Cardex schema。
+
+手工用 `cardex add` 编排的路径（下文模式 A / 模式 B）与 `cardex workflow` 的耐久记录并存：前者灵活、由 manager 自己守纪律；后者把「一个 writer、一个独立 reviewer、冻结候选、有界轮次、默认 held 的集成门」变成机器不变量。两者共用同一套任务、写域和事件账本。
 
 ### 审核结论的机器词汇：`pass` / `concerns` / `block`
 
@@ -291,23 +295,69 @@ Manager-wake 是**已提交任务 transition 的通知投影**：
 | bounded retry / recovery | 保留 Cardex attempt、lease、terminalization、hold 和人工 Owner 路径；不做静默自动 replan |
 | visualization | 未来可把 workflow manifest 投影为图；不能反过来让 UI 图成为调度真相 |
 
+## `cardex workflow`：串联与联邦模式的耐久记录
+
+`cardex workflow` 把上面两种拓扑落成一条耐久记录（`~/.cardex/workflows/<id>.json`，schema `cardex.workflow.v1`）。它是**状态，不是调度器**：tick 只读地咨询集成门，从不推进记录；每一步转移都是显式命令。
+
+```bash
+# 1. 建记录。集成卡同时创建并立刻 held，带上 integration_gate。
+cardex workflow init -mode serial -module auth -goal-id auth-token-v1 \
+  -goal "交付独立审核过的 auth token 垂直" \
+  -dir /absolute/path/to/auth-worktree \
+  -terminal-criteria "独立审核 pass 且 p0/p1 皆空；集成与 live 仍 held" \
+  -write-domain-id auth-tokens -write-domain-lineage auth-tokens-lineage \
+  -write-domain-component auth -write-paths internal/auth \
+  -engine grok-build -max-rounds 3
+
+cardex workflow writer <id>                              # 派唯一 writer（钉定引擎，review_after=false）
+cardex workflow freeze-candidate <id> -commit C -tree T  # writer 终止后冻结精确字节
+cardex workflow review <id>                              # 派独立只读 reviewer，绑定该候选
+cardex workflow ingest-review <id>                       # 重新解析审核日志，记录 verdict 与 hold 原因
+cardex workflow repair <id>                              # 有界修复轮；超过 max-rounds 即 exhausted
+cardex workflow try-release-integration <id>             # 仅 admissible pass 才把集成卡转 queued
+cardex workflow mark <id> -kind external|owner|exhausted -summary ...
+cardex workflow list|show <id>
+```
+
+联邦模式只多一个 `-mode federated -parent <program-workflow-id>`：父记录必须已存在且可加载，否则 fail closed。`serial` 模式不接受 `-parent`。
+
+机器不变量：
+
+- **一个 writer、一个 reviewer**。writer 或 reviewer 还 live 时重放同一命令返回 duplicate role，不会派第二张卡。manager 重启后重放安全。
+- **候选必须先冻结**。writer 还 live 时 `freeze-candidate` 被拒；没有冻结候选时 `review` 被拒。
+- **reviewer 独立**：另一张 `design-review` 卡、`review_of` 指向 writer、无写域、`session_id` 清空、同一 writer 不得有第二个 active reviewer。
+- **引擎必须可钉定**。`-engine` 只接受 tick 能钉定且不会 fail-open 的执行器（`claude`、`codex`、`gemini`、`opencode`、`kimi-cli`、`grok-build`、`cursor`，或 `config.engines` 里已配的引擎档案）。留空或写未知名字会被拒，避免悄悄落到默认 provider 上——那会让 writer/reviewer 的引擎分离形同虚设。
+- **有界轮次**。`max_rounds >= 1`。超轮不再派修复卡，记录转 `exhausted` 并写一条 Root 收据。修复轮会清空上一轮的候选、verdict 与集成门上的候选身份。
+- **写域跨记录互斥**。同一 Git identity 内的 exact/subtree 路径重叠、重复 lineage、以及**跨仓**共享的封闭资源都 fail closed。terminal 记录（`exhausted` / `owner_choice` / `external_blocked`）释放自己的 claim，后继模块才能接手。
+- **三道 effect gate 分离**。`integration` 可以被释放；`live` 与 `cutover` 在本树没有任何释放路径，手改记录会在加载时被拒。
+
+### 耐久 manager hook 与 Root 通知
+
+例行进度只写两个文件，manager 不必靠聊天回合就能恢复：
+
+- `workflows/<id>.progress.json`（schema `cardex.workflow.progress.v1`）
+- `workflows/<id>.progress.md`
+
+只有**实质**转移会在 `workflows/root-notify/` 写收据，且每个 `(workflow, kind)` 只有一份、重放时原地重写：`review_passed`、`true_external_dependency`、`owner_choice`、`exhausted_route`。派 writer、冻结候选、派 reviewer 都是例行进度，不产生收据。
+
+记录与进度文件只存坐标与身份（task ID、commit/tree、路径、资源、verdict token），不存 prompt 正文、模型输出或密钥。
+
 ## 分阶段机器化路线图
 
-当前已有 DAG 与 write-domain 调度，不需要另造一个大框架。本轮推荐先把工作流契约稳定下来，再做以下窄增量。W1–W4 都是路线图，尚未落地：
+当前已有 DAG 与 write-domain 调度，不需要另造一个大框架。W1 已按上节落地为耐久记录 + 强制集成门；W2–W4 仍是路线图：
 
-### W1 — 离线 `workflow.v1` validator
+### W1 — `workflow.v1` 记录与集成门（已落地）
 
-新增可选、无运行副作用的 manifest/validator，表达：`mode`、manager/role、task ID、parent/module、depends、candidate/evidence refs、write domain、review-of、integration/final/live gate。只做解析和诊断，不自动派卡。
+`cardex workflow` 表达 `mode`、module/goal、federated `parent`、write domain、候选/证据身份、review-of 与三道 effect gate，并校验：
 
-必须校验：
-
-- direct 模式的 design→write→independent-review→integration→live-gate 闭合；
-- federated 模式每个 module 有自己的 review 与默认 held 的 module-integrate，整体 program-integrate 也默认 held，join 后另有 final review；
-- DAG 无环/缺边，domain/path/resource 正规化，one writer per lineage/domain；
+- serial 与 federated 两种模式的 writer → 冻结候选 → 独立审核 → 默认 held 的集成 → 独立 live 门闭合；
+- domain/path/resource 正规化，一个 lineage 一个 live 写域；
 - reviewer 与被审 writer 不同 role instance，reviewer 无 product write claim；
-- 可写的 module-integrate 与 program-integrate 默认 held；durable `done` 不是 `pass`，不能自动 `cardex release`；
-- live/cutover node 另作独立 held 门，且没有 Owner authority/evidence 时不可标 Ready；
-- receipt/evidence 只引用 digest 与位置，不把 prompt、output、secret 塞入 claim。
+- 集成卡默认 held；durable `done` 不是 `pass`，`cardex release` 与 tick 都重新核验；
+- live/cutover 没有释放路径；
+- 记录只引用位置与 digest，不把 prompt、output、secret 塞入 claim。
+
+与原计划的差别：它不是纯离线 validator，而是一条会创建 held 集成卡、并在 tick 与 `cardex release` 上强制生效的记录。它仍然**不**自动派卡——没有 graph walker、没有自动重规划。
 
 ### W2 — reviewer custody validator 与事故 fixture
 
@@ -330,7 +380,7 @@ Manager-wake 是**已提交任务 transition 的通知投影**：
 ## 派卡前清单
 
 - [ ] 当前 Cardex/Git/worktree/attempt/lease/dirty state 已只读恢复，重复卡已排除。
-- [ ] 选择了 direct 或 federated，且 DAG/join/gate 画清楚。
+- [ ] 选择了 serial（直派串联）或 federated，且 DAG/join/gate 画清楚；用 `cardex workflow` 时模式与 `parent` 已一致。
 - [ ] 每个 writer 有独立 worktree、lineage、闭合 paths/resources；共享接口先冻结。同 tick 并行须 `max_parallel` > 1（默认 1）。
 - [ ] 每个 reviewer 是独立只读 role，无 write claim，不消费旧 attempt 拼接结果；writer 未再开 `-review-after` / `-stakes high` 除非那张自动子卡就是唯一 reviewer。
 - [ ] 所有依赖用 Cardex task ID 表达；聊天消息和 wake 不替代 transition。
@@ -338,3 +388,4 @@ Manager-wake 是**已提交任务 transition 的通知投影**：
 - [ ] module integration、program integration、final review、live/cutover 是不同门；可写的 module-integrate 与 program-integrate 默认 `add -hold`，live/cutover 另作独立 held 门；审核卡 `done` 不是 `pass`，也不能自动对 live 执行 `cardex release`。审核终局只认 `pass|concerns|block`。
 - [ ] shared runtime/database/profile/manifest/device/credential/cutover 被显式串行。
 - [ ] receipt 明确 exact bytes、测试、review verdict、effects、rollback，以及 not-integrated/not-live 边界。
+- [ ] 用 `cardex workflow` 时：候选已 `freeze-candidate`、reviewer 由 `review` 而不是 `-review-after` 派出、`max-rounds` 有界、集成卡只经 `try-release-integration` 或 `cardex release` 放行，live/cutover 另有独立 held 卡。

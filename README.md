@@ -82,6 +82,8 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 
 两种模式都用 Cardex 的 `depends_on`、规范化 write-domain/resource claims、独立 reviewer、持久 task/event/attempt 证据和 held live gate；management session 不写 product bytes，也不绕过 Cardex 另派重复 writer。详见[推荐工作流](docs/workflows.md)。该页把 attempt/producer/lease 漂移时禁止审核采信与重派写成 operator/policy 门（操作员必须遵守），不是当前调度器已机器拒绝审核采信或 redispatch 的宣称。联邦写卡要同 tick 并行须配置 `max_parallel` > 1（默认 1）。工作流管理的独立审核与 `-review-after` / `-stakes high` 自动复审子卡不是同一条路：已有独立 reviewer 时不要再开自动复审。审核终局 JSON 只认 `pass|concerns|block`，不是 ACCEPT/HELD。
 
+`cardex workflow` 可以把两种拓扑落成耐久记录：绑定 `serial`/`federated` 模式、模块目标、写域、有界轮次和候选身份，并创建一张默认 held 的集成卡。带门的集成卡在 tick 派发与 `cardex release` 时都会**重新**核验独立审核 `verdict=pass`（`p0`/`p1` 皆空）、候选一致与 reviewer custody；durable review `done` 不够。每一步转移都是显式命令——tick 只读地咨询集成门，不自动推进 workflow。live 与 cutover 在本树没有释放路径。
+
 ## 怎么做到的
 
 ```

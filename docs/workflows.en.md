@@ -18,13 +18,17 @@ The shape adapts Maestro Flow ideas such as graph, fork, join, gate, and session
 | `depends_on` DAG | Enforced | A predecessor must have a verifiable durable `done` transition. Missing edges, cycles, malformed IDs, and bad domain bindings fail closed for the affected component while unrelated components continue |
 | Explicit write domain | Enforced | Repository-relative paths are normalized first. Exact/subtree overlap in one repository, equal domain/lineage, and equal closed resources all serialize |
 | Legacy compatibility | Enforced | A writing task without a write domain retains whole-repository exclusion on the same Git common dir; an upgrade does not silently widen concurrency |
-| Independent reviewer role | Partly enforced | `design-review` is read-only and does not occupy a write domain. The packet/manager must still prove independence from the writer, use of the frozen candidate, and admissibility of the verdict |
-| Direct/federated mode names and manager hierarchy | Recommended convention | They are not first-class Task schema fields yet. Express them with project, title, lineage, DAG, manager-wake scope, and receipts |
+| Independent reviewer role | Partly enforced | `design-review` is read-only and does not occupy a write domain. A reviewer dispatched by `cardex workflow` is additionally machine-guaranteed to be a separate card whose `review_of` names the writer, with no write domain, no inherited writer session, and no rival active reviewer for the same writer |
+| Serial/federated mode names and manager hierarchy | Partly enforced | `cardex workflow` keeps a durable record: `mode` = `serial` \| `federated`, `module_id`/`goal_id`, a federated `parent_id`, write domain, round bound, candidate identity, and three effect gates. The only new first-class Task fields are `workflow_id` and `integration_gate`; the manager hierarchy itself is still convention |
 | Review accepted, integrated, live, user accepted | Never inferred from `done` | These are separate evidence gates. A completed Cardex task does not authorize publishing, service restart, device action, credential use, or external mutation |
-| Reviewer-attempt custody | Known hardening gap | Operator/policy gate: any contradiction among attempt, producer, and lease must block review acceptance, redispatch, and dependency release. Current tick does not fully machine-enforce this gate; W2 below is the roadmap-only machine invariant and is not live |
-| Semantic integration gates / federated manager hierarchy | Operator/policy plus recommended convention | `pass` does not auto-run `cardex release` on an integrate card, and parent/module managers are not Task schema fields. W1–W4 are not live |
+| Reviewer-attempt custody | Partly enforced | The minimal custody above is machine-enforced. Full `exited` ≠ `producerGone` proof (PID/PGID identity, descendant absence, workspace lease, runner residue, successor-attempt absence) and the 20-second quiet window remain W2 roadmap and are not live |
+| Semantic integration gate | Enforced | A card carrying `integration_gate` starts held. Both tick dispatch and `cardex release` **re-derive** the verdict from the review transcript and require `pass` with empty `p0`/`p1`, a candidate commit/tree matching the frozen record, and consistent custody. A durable review `done` is not enough |
+| live / cutover gates | Held only | This tree has no release path for either. A workflow record may only carry `held` for `live` and `cutover`; a record hand-edited to `released` is rejected on load |
+| Automatic advancement | Deliberately not enforced | Tick consults the integration gate read-only and never advances a workflow. Writer, freeze, review, ingest, repair, and release are each an explicit `cardex workflow` command. Cardex does not grow a second state machine or a silent replanner |
 
 The commands on this page are therefore a safe workflow available now, not a claim that every federated concept already has a Cardex schema field.
+
+Hand-orchestrated `cardex add` pipelines (modes A and B below) coexist with the durable `cardex workflow` record: the former is flexible and manager-disciplined, while the latter turns "one writer, one independent reviewer, a frozen candidate, bounded rounds, a default-held integration gate" into machine invariants. Both share the same tasks, write domains, and event ledger.
 
 ### Machine review vocabulary: `pass` / `concerns` / `block`
 
@@ -291,23 +295,70 @@ Keep “bytes authored,” “tests passed,” “Cardex done,” “integrated,
 | bounded retry / recovery | Cardex attempts, leases, terminalization, hold, and Owner escalation; no silent automatic replan |
 | visualization | a future workflow manifest may project a graph; the UI graph never becomes scheduler truth |
 
+## `cardex workflow`: the durable record for serial and federated modes
+
+`cardex workflow` turns either topology into a durable record (`~/.cardex/workflows/<id>.json`, schema `cardex.workflow.v1`). It is **state, not a scheduler**: tick consults the integration gate read-only and never advances a record, and every transition is an explicit command.
+
+```bash
+# 1. Create the record. The integration card is created and immediately held,
+#    carrying its integration_gate.
+cardex workflow init -mode serial -module auth -goal-id auth-token-v1 \
+  -goal "deliver an independently reviewed auth token vertical" \
+  -dir /absolute/path/to/auth-worktree \
+  -terminal-criteria "independent review pass with empty p0/p1; integration and live stay held" \
+  -write-domain-id auth-tokens -write-domain-lineage auth-tokens-lineage \
+  -write-domain-component auth -write-paths internal/auth \
+  -engine grok-build -max-rounds 3
+
+cardex workflow writer <id>                              # the single writer, pinned engine, review_after=false
+cardex workflow freeze-candidate <id> -commit C -tree T  # freeze exact bytes after the writer terminates
+cardex workflow review <id>                              # an independent read-only reviewer bound to that candidate
+cardex workflow ingest-review <id>                       # re-parse the transcript; record verdict and hold reason
+cardex workflow repair <id>                              # a bounded repair round; past max-rounds the route is exhausted
+cardex workflow try-release-integration <id>             # only an admissible pass queues the integration card
+cardex workflow mark <id> -kind external|owner|exhausted -summary ...
+cardex workflow list|show <id>
+```
+
+Federated mode adds only `-mode federated -parent <program-workflow-id>`; the parent must already exist and load, or init fails closed. `serial` mode rejects `-parent`.
+
+Machine invariants:
+
+- **One writer, one reviewer.** Replaying a command while that role is live returns a duplicate-role error instead of minting a second card, so a manager restart is replay-safe.
+- **Freeze before review.** `freeze-candidate` is refused while the writer is live, and `review` is refused without a frozen candidate.
+- **Reviewer independence**: a separate `design-review` card whose `review_of` names the writer, with no write domain, a cleared `session_id`, and no second active reviewer for that writer.
+- **Pinnable engines only.** `-engine` accepts only runners tick pins without fail-open (`claude`, `codex`, `gemini`, `opencode`, `kimi-cli`, `grok-build`, `cursor`, or a configured `config.engines` profile). An empty or unknown name is refused, because silently landing on the default provider would destroy the writer/reviewer engine separation.
+- **Bounded rounds.** `max_rounds >= 1`. Exceeding it dispatches no further repair card, moves the record to `exhausted`, and writes one Root receipt. A repair round clears the previous candidate, verdict, and the candidate identity on the gate.
+- **Cross-record write-domain exclusion.** Exact/subtree path overlap within one Git identity, duplicate lineage, and a closed resource shared **across repositories** all fail closed. A terminal record (`exhausted` / `owner_choice` / `external_blocked`) releases its claim so a successor module can take the paths.
+- **Three separated effect gates.** `integration` can be released; `live` and `cutover` have no release path in this tree, and a hand-edited record is rejected on load.
+
+### Durable manager hooks and Root notification
+
+Routine progress goes to two files, so a manager can recover without a chat turn:
+
+- `workflows/<id>.progress.json` (schema `cardex.workflow.progress.v1`)
+- `workflows/<id>.progress.md`
+
+Only **material** transitions write a receipt under `workflows/root-notify/`, one per `(workflow, kind)`, rewritten in place on replay: `review_passed`, `true_external_dependency`, `owner_choice`, `exhausted_route`. Dispatching a writer, freezing a candidate, and dispatching a reviewer are routine progress and produce no receipt.
+
+Records and progress files store coordinates and identities only (task IDs, commit/tree, paths, resources, verdict tokens), never prompt bodies, model output, or secrets.
+
 ## Staged machine-enforcement roadmap
 
-The DAG and write-domain scheduler already exist; Cardex does not need a broad new framework. Stabilize the workflow contract first, then add narrow increments. W1–W4 remain staged roadmap and are not live:
+The DAG and write-domain scheduler already exist; Cardex does not need a broad new framework. W1 landed as the durable record plus enforced integration gate described above; W2–W4 remain roadmap:
 
-### W1 — offline `workflow.v1` validator
+### W1 — `workflow.v1` record and integration gate (landed)
 
-Add an optional, zero-runtime-effect manifest/validator for `mode`, manager/role, task ID, parent/module, dependencies, candidate/evidence refs, write domain, review-of, integration/final/live gates. It parses and diagnoses only; it does not dispatch.
+`cardex workflow` expresses `mode`, module/goal, a federated `parent`, write domain, candidate/evidence identity, review-of, and three effect gates, and validates:
 
-It must validate:
-
-- closure of design→write→independent-review→integration→live-gate in direct mode;
-- a module review plus held-by-default module-integrate loop for every federated module, a held-by-default program-integrate join, and another final review;
-- no DAG cycle/missing edge, normalized domains/paths/resources, and one writer per lineage/domain;
+- closure of writer → frozen candidate → independent review → held integration → a separate live gate in both serial and federated mode;
+- normalized domains/paths/resources, and one live write domain per lineage;
 - a reviewer role instance different from the writer and no product write claim on the reviewer;
-- write-capable module-integrate and program-integrate nodes held by default; durable `done` is not `pass` and does not auto-run `cardex release` on them;
-- live/cutover nodes as a separate held gate, never Ready without Owner authority/evidence;
-- receipt/evidence references contain coordinates and digests, not prompts, output, or secrets.
+- integration cards held by default; durable `done` is not `pass`, and both `cardex release` and tick re-derive the verdict;
+- no release path for live or cutover;
+- records reference coordinates and digests, not prompts, output, or secrets.
+
+It differs from the original plan in one way: it is not a purely offline validator but a record that creates a held integration card and is enforced at tick dispatch and `cardex release`. It still does **not** dispatch on its own — there is no graph walker and no automatic replan.
 
 ### W2 — reviewer-custody validator and incident fixture
 
@@ -330,7 +381,7 @@ The board may read-only display modules, roles, forks, joins, gates, claim confl
 ## Pre-dispatch checklist
 
 - [ ] Current Cardex/Git/worktree/attempt/lease/dirty state was recovered read-only and duplicate cards were ruled out.
-- [ ] Direct or federated mode was chosen and the DAG, joins, and gates are explicit.
+- [ ] Serial (direct) or federated mode was chosen and the DAG, joins, and gates are explicit; with `cardex workflow`, mode and `parent` agree.
 - [ ] Every writer has an isolated worktree, lineage, and closed paths/resources; shared interfaces were frozen first. Same-tick parallelism requires `max_parallel` > 1 (default 1).
 - [ ] Every reviewer is an independent read-only role with no write claim and no old-attempt output splice. Writers do not also enable `-review-after` / `-stakes high` unless that automatic child is the sole intended reviewer.
 - [ ] Dependencies use Cardex task IDs; chat and wake messages never replace transitions.
@@ -338,3 +389,4 @@ The board may read-only display modules, roles, forks, joins, gates, claim confl
 - [ ] Module integration, program integration, final review, and live/cutover are distinct gates. Write-capable module-integrate and program-integrate cards are created with `add -hold`; live/cutover is a separate held gate. A review-card `done` is not `pass` and does not auto-run `cardex release` on live. The review terminal is only `pass|concerns|block`.
 - [ ] Shared runtime/database/profile/manifest/device/credential/cutover resources are serialized explicitly.
 - [ ] Receipts name exact bytes, tests, review verdict, effects, rollback, and not-integrated/not-live boundaries.
+- [ ] With `cardex workflow`: the candidate was frozen with `freeze-candidate`, the reviewer came from `review` rather than `-review-after`, `max-rounds` is bounded, the integration card is released only through `try-release-integration` or `cardex release`, and live/cutover is a separate held card.

@@ -2,6 +2,55 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-24 · W2 P1 修复：attempt 时间序比较与证据完整性 fail-closed
+
+独立审核（REQUEST_CHANGES，P0=0 / P1=2）钉出的两道 fail-open 缝，均已按 RED→GREEN 夹具闭合：
+
+- **P1-1 时间序不是字符串序**（workflow_custody.go）：successor-attempt 判定与「最新 committed
+  终局 transition」的选择原先用 RFC3339Nano 字符串 `>` 排序。该编码带本地 UTC offset 且裁剪
+  小数尾零，字符串序在混合 offset（launchd 任务 vs 交互 shell、DST 切换）或小数位宽不同（`.5Z`
+  vs `.5001Z`）时会颠倒——晚 5 分钟的同卡 redispatch 会被漏判并放行集成。现在所有排序都走
+  `time.Parse` 后的时间值；无法解析的时间戳按漂移 fail closed，绝不当排序平手。夹具：
+  `TestCustodySuccessorOrderingIsChronologicalNotLexicographic`、
+  `TestCustodyTerminalSelectionOrdersTransitionsByTime`、`TestCustodyUnparseableStampsFailClosed`。
+- **P1-2 缺席的 attempt 证据不是被证伪的 producer**（workflow_custody.go）：原先 attempt 目录
+  不存在时逐 attempt 检查被整体跳过，零 attempt 的 `done` 终局能铸出完整 `admissible_review`
+  收据；而短命 CLI 进程（`ingest-review` / `release`）里 descendant / runner-residue 两个探针
+  结构性为假，custody「证明」塌缩成一次 flock 探测。现在 `done` 终局要求：至少一条 attempt
+  记录、存在 committed 终局 transition、且该 transition 点名一个在盘 attempt——缺任何一环都
+  记 `custody_drift`，不开窗、不铸收据、门与 release 全拒。文档同步把「后代/残留」探针的
+  跨进程边界写明。夹具：`TestCustodyAbsentAttemptEvidenceFailsClosed`（四缺席形态 + 阳性对照）。
+- **CLI 端到端证据**（test/integration.sh 场景35）：用真实 runner（mock claude）跑 writer 与
+  reviewer 产生真实 attempt/transition 证据，然后走显式 CLI 路径：`ingest-review` 开窗 →
+  窗口未满 release 必拒 → 真实流逝 21 秒 → 第二次 `ingest-review` 铸出 `admissible_review`
+  耐久收据 → `try-release-integration` 放行集成（live/cutover 仍 held）。20 秒窗口常量未缩短、
+  时间戳未回填。
+- 既有绿色基线夹具补上了真实终局证据（exited attempt + 点名它的 committed done transition），
+  不再骑在零 attempt 路径上。
+
+## 2026-08-24 · W2：reviewer custody validator 与 20 秒 quiet-window 收据
+
+- **custody validator**（workflow_custody.go）：把 `docs/workflows.md` 的 W2 从路线图落成
+  fail-closed 机器判定。`exited` 不再被当作 `producerGone`：exact PID/PGID 身份、登记后代、
+  runner 残留、workspace lease、后继 attempt（同卡 redispatch，含已退出的后继）逐项证伪，
+  任一分量存活即 `custody_drift`，禁止按 `pass` 采信、禁止释放集成。进程探针可注入，
+  事故夹具全程离线、不派生不击杀真实进程。
+- **quiet-window 收据**：admissible review 收据要求 task/event/attempt/transition/transcript/
+  candidate/process 整套证据 hash 在 20 秒 quiet-window 内稳定（`control/custody/<review>.json`，
+  schema `cardex.custody.v1`）。迟到输出拼接（old-output splice）、attempt 变动、进程闪现都会
+  重置窗口。观察只由显式 `cardex workflow ingest-review` 写入；tick 与 `cardex release`
+  只读地重新推导并与收据比对，收据过期（证据又动了）即回 `custody_quiet_window`。
+- **收容收据不是审核收据**：`held`/`canceled` 收容终局的窗口只产生非语义的
+  `custody_reconciled_held` 收据——证明 containment 与终态一致，不释放任何集成卡；
+  恢复后是否派 fresh reviewer 仍是模块 manager 的新决策。
+- **成对事故夹具**（workflow_custody_test.go）：失败侧复现「attempt 已 exited 但 producer/
+  children/lease 仍活、随后同卡 redispatch」，逐通道断言 ingest/tick/`cardex release`/
+  try-release 全部拒绝；恢复侧只经受支持的 `cardex hold` 收容，producers 消失 + 20 秒
+  quiet-window 后形成 reconciled 收据，stale pass 输出仍被拒、候选仍 unreviewed、集成卡仍 held。
+- 语义 verdict 与 process custody 并入同一个门径（`evaluateIntegrationRelease` + ingest），
+  谁也不能单独放行；无 `integration_gate` 的存量卡行为不变。W3（manifest 与 task 绑定）、
+  W4（图形投影）仍是路线图。
+
 ## 2026-08-24 · 工作流模式：串联 / 联邦的耐久记录与强制集成门
 
 - **workflow 记录**（workflow.go）：`cardex workflow` 把 `docs/workflows.md` 的两种拓扑落成

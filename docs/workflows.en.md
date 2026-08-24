@@ -21,7 +21,7 @@ The shape adapts Maestro Flow ideas such as graph, fork, join, gate, and session
 | Independent reviewer role | Partly enforced | `design-review` is read-only and does not occupy a write domain. A reviewer dispatched by `cardex workflow` is additionally machine-guaranteed to be a separate card whose `review_of` names the writer, with no write domain, no inherited writer session, and no rival active reviewer for the same writer |
 | Serial/federated mode names and manager hierarchy | Partly enforced | `cardex workflow` keeps a durable record: `mode` = `serial` \| `federated`, `module_id`/`goal_id`, a federated `parent_id`, write domain, round bound, candidate identity, and three effect gates. The only new first-class Task fields are `workflow_id` and `integration_gate`; the manager hierarchy itself is still convention |
 | Review accepted, integrated, live, user accepted | Never inferred from `done` | These are separate evidence gates. A completed Cardex task does not authorize publishing, service restart, device action, credential use, or external mutation |
-| Reviewer-attempt custody | Partly enforced | The minimal custody above is machine-enforced. Full `exited` ≠ `producerGone` proof (PID/PGID identity, descendant absence, workspace lease, runner residue, successor-attempt absence) and the 20-second quiet window remain W2 roadmap and are not live |
+| Reviewer-attempt custody | Enforced | Beyond the semantic verdict, the integration gate requires W2 process custody: `exited` ≠ `producerGone` (disproved per component: PID/PGID identity, descendant absence, workspace lease, runner residue, successor-attempt absence), and the task/event/attempt/process/source evidence hash must stay stable through a 20-second quiet window, forming a durable receipt under `control/custody/`. Receipts are written only by explicit `ingest-review` observations; tick and `cardex release` re-verify read-only. Mind the process boundary of the probes: the descendant and runner-residue probes carry information only inside a live tick process; in a short-lived CLI process (`ingest-review` / `release`) the cross-process proofs are the attempt's PID/PGID start identity and the workspace lease (kernel flock). Absent attempt evidence therefore fails closed: a `done` terminal must have at least one attempt record, and the newest committed terminal transition must name an attempt whose record is present; attempt/transition stamps are compared in parsed time order (not RFC3339Nano string order — mixed UTC offsets or fractional widths invert string order), and an unparseable stamp is drift |
 | Semantic integration gate | Enforced | A card carrying `integration_gate` starts held. Both tick dispatch and `cardex release` **re-derive** the verdict from the review transcript and require `pass` with empty `p0`/`p1`, a candidate commit/tree matching the frozen record, and consistent custody. A durable review `done` is not enough |
 | live / cutover gates | Held only | This tree has no release path for either. A workflow record may only carry `held` for `live` and `cutover`; a record hand-edited to `released` is rejected on load |
 | Automatic advancement | Deliberately not enforced | Tick consults the integration gate read-only and never advances a workflow. Writer, freeze, review, ingest, repair, and release are each an explicit `cardex workflow` command. Cardex does not grow a second state machine or a silent replanner |
@@ -267,7 +267,7 @@ In this shape, every module or central manager must:
 
 This does not ask a module manager to mutate production containment. It requires the opposite: fail closed and hand the incident to the Cardex owner.
 
-The paired **recovery fixture** must preserve the same boundary. The Cardex owner invokes the supported `cardex hold` exactly once and sends no manual PID/PGID signals; the control plane atomically revokes scheduling and closes the active attempt. `terminal held / custody reconciled` is admissible only after every exact runner/reviewer/test descendant and disposable review copy is absent, the source candidate remains clean, and the readback is stable for at least a 20-second quiet window. This fixture result proves containment and terminal consistency only. Old or late output stays rejected, the candidate remains **unreviewed**, already-enqueued held integrate cards stay held, and neither `cardex release` nor integration is permitted. Test the failure and recovery fixtures as a pair; a test that merely reaches held is insufficient.
+The paired **recovery fixture** must preserve the same boundary. The Cardex owner invokes the supported `cardex hold` exactly once and sends no manual PID/PGID signals; the control plane atomically revokes scheduling and closes the active attempt. `terminal held / custody reconciled` is admissible only after every exact runner/reviewer/test descendant and disposable review copy is absent, the source candidate remains clean, and the readback is stable for at least a 20-second quiet window. This fixture result proves containment and terminal consistency only. Old or late output stays rejected, the candidate remains **unreviewed**, already-enqueued held integrate cards stay held, and neither `cardex release` nor integration is permitted. Test the failure and recovery fixtures as a pair; a test that merely reaches held is insufficient. This pair is pinned per W2 in `workflow_custody_test.go`; the validator lives in `workflow_custody.go`.
 
 ## Terminal and evidence semantics
 
@@ -313,7 +313,7 @@ cardex workflow init -mode serial -module auth -goal-id auth-token-v1 \
 cardex workflow writer <id>                              # the single writer, pinned engine, review_after=false
 cardex workflow freeze-candidate <id> -commit C -tree T  # freeze exact bytes after the writer terminates
 cardex workflow review <id>                              # an independent read-only reviewer bound to that candidate
-cardex workflow ingest-review <id>                       # re-parse the transcript; record verdict and hold reason
+cardex workflow ingest-review <id>                       # re-parse the transcript + one explicit custody observation; admissible only after the quiet window
 cardex workflow repair <id>                              # a bounded repair round; past max-rounds the route is exhausted
 cardex workflow try-release-integration <id>             # only an admissible pass queues the integration card
 cardex workflow mark <id> -kind external|owner|exhausted -summary ...
@@ -330,6 +330,7 @@ Machine invariants:
 - **Pinnable engines only.** `-engine` accepts only runners tick pins without fail-open (`claude`, `codex`, `gemini`, `opencode`, `kimi-cli`, `grok-build`, `cursor`, or a configured `config.engines` profile). An empty or unknown name is refused, because silently landing on the default provider would destroy the writer/reviewer engine separation.
 - **Bounded rounds.** `max_rounds >= 1`. Exceeding it dispatches no further repair card, moves the record to `exhausted`, and writes one Root receipt. A repair round clears the previous candidate, verdict, and the candidate identity on the gate.
 - **Cross-record write-domain exclusion.** Exact/subtree path overlap within one Git identity, duplicate lineage, and a closed resource shared **across repositories** all fail closed. A terminal record (`exhausted` / `owner_choice` / `external_blocked`) releases its claim so a successor module can take the paths.
+- **Process-custody receipt (W2).** Every `ingest-review` is one explicit custody observation: each `producerGone` component (exact PID/PGID, descendants, runner residue, workspace lease, successor attempts) is disproved first, then the whole evidence hash must stay stable through the 20-second quiet window before a durable admissible-review receipt exists (`control/custody/<review>.json`). Any drift — late output, attempt churn, a process flap — resets the window; the gate and `cardex release` re-derive and compare against the receipt on every call. For `held`/`canceled` containment terminals the window yields only a **non-semantic** reconciliation receipt, which cannot release integration. The attempt evidence itself is a gate: a `done` terminal with no attempt records, no committed terminal transition, or a terminal transition that does not name a present attempt record is refused as `custody_drift` — absent evidence is not a disproved producer. Successor ordering uses parsed time, and any unparseable stamp likewise fails closed.
 - **Three separated effect gates.** `integration` can be released; `live` and `cutover` have no release path in this tree, and a hand-edited record is rejected on load.
 
 ### Durable manager hooks and Root notification
@@ -345,7 +346,7 @@ Records and progress files store coordinates and identities only (task IDs, comm
 
 ## Staged machine-enforcement roadmap
 
-The DAG and write-domain scheduler already exist; Cardex does not need a broad new framework. W1 landed as the durable record plus enforced integration gate described above; W2–W4 remain roadmap:
+The DAG and write-domain scheduler already exist; Cardex does not need a broad new framework. W1 landed as the durable record plus enforced integration gate described above, and W2 landed as the custody validator plus quiet-window receipt; W3–W4 remain roadmap:
 
 ### W1 — `workflow.v1` record and integration gate (landed)
 
@@ -360,15 +361,18 @@ The DAG and write-domain scheduler already exist; Cardex does not need a broad n
 
 It differs from the original plan in one way: it is not a purely offline validator but a record that creates a held integration card and is enforced at tick dispatch and `cardex release`. It still does **not** dispatch on its own — there is no graph walker and no automatic replan.
 
-### W2 — reviewer-custody validator and incident fixture
+### W2 — reviewer-custody validator and incident fixture (landed)
 
-This item remains roadmap-only and is not live. Add paired redacted fixtures. The failure side reproduces “attempt says exited, but producer/children/lease remain live, then the same task is redispatched.” The recovery side permits only a supported hold to revoke scheduling/attempt custody, waits for exact producers and the disposable copy to disappear, and completes a 20-second quiet window while leaving the review unaccepted. The validator must fail closed and prove:
+`workflow_custody.go` landed as a fail-closed validator plus a durable quiet-window receipt, with the paired fixtures pinned in `workflow_custody_test.go`: the failure side reproduces “attempt says exited, but producer/children/lease remain live, then the same task is redispatched”; the recovery side permits only a supported hold to revoke scheduling/attempt custody, waits for exact producers and the disposable copy to disappear, and completes a 20-second quiet window while leaving the review unaccepted. The machine-enforced boundary:
 
-- one active role instance / active attempt per role/task;
-- `exited` does not imply `producerGone`; the latter requires PID/PGID identity, descendant absence, workspace lease, runner residue, and successor-attempt absence;
-- no reviewer redispatch, manager acceptance under `pass`, old-output splice, or `cardex release` of dependents before producerGone;
-- task/event/attempt/process/source hashes remain stable through a terminal quiet window before an admissible review receipt exists.
-- a custody-reconciliation held receipt is not a semantic-review receipt; only a new module-manager decision may admit a fresh reviewer after recovery.
+- one active role instance / active attempt per role/task: any reserved/bound attempt or rival active reviewer fails closed;
+- `exited` does not imply `producerGone`; the latter is disproved per component — PID/PGID identity, descendant absence, workspace lease, runner residue, successor-attempt absence — and any live component refuses. The descendant and residue probes carry information only inside a live tick process; in a short-lived CLI process the cross-process proofs are the PID/PGID start identity and the workspace lease (flock), so absent attempt evidence must never count as a successful disproof;
+- attempt-evidence completeness is a precondition of the `done` terminal: at least one attempt record, and the newest committed terminal transition must name a present attempt — anything less is `custody_drift`. Successor detection and terminal selection order by parsed time (RFC3339Nano string order inverts under mixed UTC offsets / fractional widths), and unparseable stamps fail closed;
+- no reviewer redispatch, manager acceptance under `pass`, old-output splice, or `cardex release` of dependents before producerGone: ingest records `custody_drift`, and both the gate and `cardex release` re-derive and refuse on every call;
+- task/event/attempt/process/source hashes must remain stable through the terminal quiet window (20 seconds) before an admissible review receipt exists (`control/custody/`); any drift resets the window; receipts are written only by explicit `ingest-review` observations, and tick stays read-only;
+- a custody-reconciliation held receipt (`custody_reconciled_held`) is not a semantic-review receipt and cannot release integration; whether to admit a fresh reviewer after recovery remains a new module-manager decision.
+
+One difference from the original plan: the validator is not a standalone command; it is folded into the single chokepoint `evaluateIntegrationRelease` plus `ingest-review`, so the semantic verdict and process custody sit in one fail-closed decision and neither can release alone.
 
 ### W3 — bind the manifest to existing Cardex tasks
 
@@ -385,7 +389,7 @@ The board may read-only display modules, roles, forks, joins, gates, claim confl
 - [ ] Every writer has an isolated worktree, lineage, and closed paths/resources; shared interfaces were frozen first. Same-tick parallelism requires `max_parallel` > 1 (default 1).
 - [ ] Every reviewer is an independent read-only role with no write claim and no old-attempt output splice. Writers do not also enable `-review-after` / `-stakes high` unless that automatic child is the sole intended reviewer.
 - [ ] Dependencies use Cardex task IDs; chat and wake messages never replace transitions.
-- [ ] Attempt custody is consistent; `producerGone` and the terminal quiet window hold before accepting a `pass`.
+- [ ] Attempt custody is consistent; `producerGone` and the terminal quiet window hold before accepting a `pass` (machine-enforced by the gate and `ingest-review` since W2).
 - [ ] Module integration, program integration, final review, and live/cutover are distinct gates. Write-capable module-integrate and program-integrate cards are created with `add -hold`; live/cutover is a separate held gate. A review-card `done` is not `pass` and does not auto-run `cardex release` on live. The review terminal is only `pass|concerns|block`.
 - [ ] Shared runtime/database/profile/manifest/device/credential/cutover resources are serialized explicitly.
 - [ ] Receipts name exact bytes, tests, review verdict, effects, rollback, and not-integrated/not-live boundaries.

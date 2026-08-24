@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // The fixtures below cover the five acceptance areas for workflow modes:
@@ -127,11 +128,16 @@ func markTaskDone(t *testing.T, root, id string) *Task {
 	return tk
 }
 
-// runWorkflowToReview drives one workflow from init through a terminated
+// runWorkflowToBareReview drives one workflow from init through a terminated
 // reviewer bound to the frozen candidate, then writes the given review body.
 // The candidate is the worktree's real HEAD: freeze now verifies identities
 // against the repository, so fabricated strings are refused by design.
-func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, body string) (*WorkflowRecord, *Task) {
+//
+// "Bare" means the reviewer terminal carries no attempt/transition custody
+// evidence at all. W2 fails closed on that shape (absent evidence is not
+// proven producerGone), so only the custody fixtures that pin the refusal use
+// this variant directly; everything else goes through runWorkflowToReview.
+func runWorkflowToBareReview(t *testing.T, root string, wf *WorkflowRecord, body string) (*WorkflowRecord, *Task) {
 	t.Helper()
 	cfg := workflowTestCfg(t, root)
 	writer, err := admitWorkflowWriter(root, cfg, wf, "")
@@ -153,6 +159,19 @@ func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, body str
 	if err != nil {
 		t.Fatal(err)
 	}
+	return fresh, review
+}
+
+// runWorkflowToReview is runWorkflowToBareReview plus the durable evidence a
+// runner-produced terminal leaves behind: one exited attempt record and a
+// committed done transition naming it. The stamps are backdated so fixtures
+// can mint successors "after the terminal attempt" without future timestamps.
+func runWorkflowToReview(t *testing.T, root string, wf *WorkflowRecord, body string) (*WorkflowRecord, *Task) {
+	t.Helper()
+	fresh, review := runWorkflowToBareReview(t, root, wf, body)
+	at := time.Now().Add(-10 * time.Minute)
+	writeReviewAttempt(t, root, review.ID, reviewFixtureAttemptID, attemptExited, at)
+	writeCommittedDoneTransition(t, root, review.ID, "tr-producer-fixture", reviewFixtureAttemptID, at.Add(time.Minute))
 	return fresh, review
 }
 
@@ -238,6 +257,15 @@ func TestAdmissiblePassReleasesIntegrationButNeverLive(t *testing.T) {
 	wf := initTestWorkflow(t, root, dir)
 	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 
+	// W2: the first ingest only opens the custody quiet window; the pass
+	// becomes admissible after a second observation over unchanged evidence.
+	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
+		t.Fatal(err)
+	}
+	if wf.Review == nil || wf.Review.Admissible || wf.Review.HoldReason != holdReasonCustodyWindow {
+		t.Fatalf("first ingest must hold for the quiet window: %+v", wf.Review)
+	}
+	backdateCustodyWindow(t, root, wf.ReviewerTaskID, custodyQuietWindow+time.Second)
 	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -317,6 +345,7 @@ func TestGateRefusesReviewerThatIsNotAnIndependentReadOnlyRole(t *testing.T) {
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
 	wf, review := runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
+	completeReviewCustodyWindow(t, root, cfg, wf)
 	integ, err := loadTask(root, wf.IntegrationTaskID)
 	if err != nil {
 		t.Fatal(err)
@@ -703,6 +732,8 @@ func TestReplayedIngestAndReleaseAreStable(t *testing.T) {
 	wf := initTestWorkflow(t, root, dir)
 	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
 
+	// W2: establish the custody receipt once; replays must then be stable.
+	completeReviewCustodyWindow(t, root, cfg, wf)
 	for i := 0; i < 3; i++ {
 		if err := ingestWorkflowReview(root, cfg, wf); err != nil {
 			t.Fatalf("ingest replay %d: %v", i, err)
@@ -741,9 +772,7 @@ func TestReleasedIntegrationIsReHeldWhenEvidenceDisappears(t *testing.T) {
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
 	wf, review := runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
-	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
-		t.Fatal(err)
-	}
+	completeReviewCustodyWindow(t, root, cfg, wf)
 	if err := tryReleaseWorkflowIntegration(root, cfg, wf); err != nil {
 		t.Fatal(err)
 	}
@@ -983,9 +1012,7 @@ func TestRepairRefusesAfterAnAdmissiblePass(t *testing.T) {
 	cfg := workflowTestCfg(t, root)
 	wf := initTestWorkflow(t, root, dir)
 	wf, _ = runWorkflowToReview(t, root, wf, verdictJSON("pass", nil, nil))
-	if err := ingestWorkflowReview(root, cfg, wf); err != nil {
-		t.Fatal(err)
-	}
+	completeReviewCustodyWindow(t, root, cfg, wf)
 	if _, err := admitWorkflowRepair(root, cfg, wf, "", ""); !errors.Is(err, errWorkflowMalformed) {
 		t.Fatalf("there is nothing to repair after a pass: %v", err)
 	}

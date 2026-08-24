@@ -59,11 +59,11 @@ func loadTaskResultForGate(root string, t *Task) string {
 	return string(data)
 }
 
-// integrationCustodyOK is the minimal custody proof this tree can actually
-// make: the reviewer is a distinct read-only role instance that terminated on
-// its own card and has no rival active reviewer for the same writer. Full
-// producerGone/quiet-window custody (docs/workflows.md W2) is still a
-// roadmap fixture, so this deliberately errs toward holding.
+// integrationCustodyOK is the role-level custody proof: the reviewer is a
+// distinct read-only role instance that terminated on its own card and has no
+// rival active reviewer for the same writer. The process-level half —
+// producerGone disproof and the quiet-window receipt (docs/workflows.md W2) —
+// lives in workflow_custody.go and is enforced separately by the gate.
 func integrationCustodyOK(root string, review, writer *Task) (bool, string) {
 	if review == nil || review.Type != typeReview {
 		return false, holdReasonCustody
@@ -211,6 +211,15 @@ func evaluateIntegrationRelease(root string, cfg *Config, t *Task) IntegrationRe
 	}
 	if !candidateIdentitiesMatch(gate, snapshot, frozen) {
 		dec.HoldReason = holdReasonCandidateMismatch
+		return dec
+	}
+
+	// W2 process-custody latch: a semantic pass with matching identities is
+	// still not adoptable until producerGone is proven and a quiet-window
+	// receipt covering exactly this evidence exists. Read-only: the receipt is
+	// written only by explicit ingest observations, never by the gate.
+	if reason := reviewCustodyReceiptReason(root, review, snapshot.CandidateCommit, snapshot.CandidateTree); reason != "" {
+		dec.HoldReason = reason
 		return dec
 	}
 

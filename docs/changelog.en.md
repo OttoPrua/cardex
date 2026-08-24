@@ -1,5 +1,75 @@
 # cardex changelog
 
+## 2026-08-24 · W2 P1 repairs: time-ordered attempt comparison and evidence-completeness fail-closed
+
+Two fail-open seams pinned by the independent review (REQUEST_CHANGES, P0=0 / P1=2), both
+closed with RED→GREEN fixtures:
+
+- **P1-1 time order is not string order** (workflow_custody.go): successor-attempt
+  detection and the "newest committed terminal transition" selection previously ordered
+  RFC3339Nano stamps with raw string `>`. That encoding carries the writer's local UTC
+  offset and trims trailing fractional zeros, so string order inverts under mixed offsets
+  (a launchd job vs an interactive shell, DST transitions) or differing fractional widths
+  (`.5Z` vs `.5001Z`) — a same-card redispatch five real minutes later was missed and the
+  gate admitted release. All ordering now goes through parsed `time.Time` values; an
+  unparseable stamp is drift (fail closed), never an ordering tie. Fixtures:
+  `TestCustodySuccessorOrderingIsChronologicalNotLexicographic`,
+  `TestCustodyTerminalSelectionOrdersTransitionsByTime`,
+  `TestCustodyUnparseableStampsFailClosed`.
+- **P1-2 absent attempt evidence is not a disproved producer** (workflow_custody.go):
+  a missing attempts directory used to skip the per-attempt loop entirely, so a `done`
+  terminal with zero attempt records minted a full `admissible_review` receipt — while in
+  a short-lived CLI process (`ingest-review` / `release`) the descendant and runner-residue
+  probes are structurally false, collapsing the custody "proof" to a single flock probe.
+  A `done` terminal now requires at least one attempt record, a committed terminal
+  transition, and that transition naming an attempt whose record is present; anything less
+  records `custody_drift` — no window opens, no receipt forms, gate and release refuse.
+  The docs now state the cross-process boundary of the descendant/residue probes.
+  Fixture: `TestCustodyAbsentAttemptEvidenceFailsClosed` (four absence shapes plus a
+  positive control).
+- **CLI end-to-end evidence** (test/integration.sh scenario 35): a real runner (mock
+  claude) produces genuine attempt/transition evidence for writer and reviewer, then the
+  explicit CLI path runs: `ingest-review` opens the window → release refuses while the
+  window is open → 21 real seconds elapse → a second `ingest-review` mints the durable
+  `admissible_review` receipt → `try-release-integration` releases integration
+  (live/cutover stay held). The 20-second constant is not shrunk and no timestamps are
+  backfilled.
+- Existing green-baseline fixtures now carry real terminal evidence (an exited attempt
+  plus a committed done transition naming it) instead of riding the zero-attempt path.
+
+## 2026-08-24 · W2: reviewer-custody validator and the 20-second quiet-window receipt
+
+- **Custody validator** (workflow_custody.go): W2 in `docs/workflows.en.md` moves from
+  roadmap to a fail-closed machine decision. `exited` is no longer taken as
+  `producerGone`: the exact PID/PGID identity, registered descendants, runner residue, the
+  workspace lease, and successor attempts (same-card redispatch, including successors that
+  already exited) are disproved per component; any live component yields `custody_drift`,
+  which forbids accepting the `pass` and releasing integration. The process probes are
+  injectable, so the incident fixtures stay fully offline and never spawn or signal real
+  processes.
+- **Quiet-window receipt**: an admissible review receipt requires the whole evidence set —
+  task, events, attempts, transitions, transcript, candidate identity, and the process
+  observation — to hash-stable across a 20-second quiet window
+  (`control/custody/<review>.json`, schema `cardex.custody.v1`). Old-output splice, attempt
+  churn, or a process flap resets the window. Observations are written only by explicit
+  `cardex workflow ingest-review` calls; tick and `cardex release` re-derive read-only and
+  compare against the receipt, and a stale receipt (evidence moved again) drops back to
+  `custody_quiet_window`.
+- **A containment receipt is not a review receipt**: for `held`/`canceled` containment
+  terminals the window yields only the non-semantic `custody_reconciled_held` receipt — it
+  proves containment and terminal consistency, releases nothing, and whether to admit a
+  fresh reviewer afterwards remains a new module-manager decision.
+- **Paired incident fixtures** (workflow_custody_test.go): the failure side reproduces
+  "attempt exited but producer/children/lease still live, then same-card redispatch" and
+  asserts per channel that ingest, tick, `cardex release`, and try-release all refuse; the
+  recovery side contains only through the supported `cardex hold`, forms the reconciled
+  receipt after producers disappear plus the 20-second window, and the stale pass output
+  stays rejected, the candidate stays unreviewed, and the integration card stays held.
+- The semantic verdict and process custody sit in one chokepoint
+  (`evaluateIntegrationRelease` + ingest); neither can release alone. Cards without an
+  `integration_gate` behave exactly as before. W3 (manifest/task binding) and W4 (graph
+  projection) remain roadmap.
+
 ## 2026-08-24 · Workflow modes: durable serial/federated records and an enforced integration gate
 
 - **Workflow records** (workflow.go): `cardex workflow` turns the two topologies in

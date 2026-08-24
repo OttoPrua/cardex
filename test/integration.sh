@@ -602,6 +602,98 @@ echo 0 > "$MOCK_DIR/codex-n"; touch "$MOCK_DIR/codex-fail-all"   # 本轮所有 
 assert "codex 瞬时失败→取真错误(非横幅)且判 transient 退避重试" "one(title='codex-netfail')['status']=='queued' and one(title='codex-netfail')['attempts']==1 and 'stream' in one(title='codex-netfail')['last_error'].lower() and 'reading additional input' not in one(title='codex-netfail')['last_error'].lower()"
 rm -f "$MOCK_DIR/codex-fail-all"  # 解除失败标记
 
+echo "== 场景35: workflow W2 custody CLI 端到端（真实 attempt 证据 → quiet window → admissible_review → release）=="
+# W2 收据要求 review 终局带真实 attempt/transition 证据（缺证据 fail closed），
+# 所以本场景用真实 runner（mock claude）跑 writer 与 reviewer，再走显式 CLI 观察路径：
+# ingest-review 开窗 → 期间 release 必拒 → 20 秒 quiet window 真实流逝 → ingest-review 成收据 → release 放行。
+# 用独立数据根隔离前面场景的残留卡。
+export CARDEX_ROOT="$TMP/root-wf"
+"$BIN" init >/dev/null
+python3 - "$CARDEX_ROOT/config.json" "$PWD/test/mock-claude.sh" <<'EOF'
+import json,sys
+p,mock=sys.argv[1],sys.argv[2]
+cfg=json.load(open(p))
+cfg["claude_bin"]=mock
+json.dump(cfg,open(p,"w"),indent=2,ensure_ascii=False)
+EOF
+# 最小审核模板（模板是 init 落盘、operator 可配的数据面）。默认 design-review 模板在 prompt
+# 里内嵌了 {"verdict":"block",...} 示例 JSON 和孤立围栏标记；runner 会把 prompt 回显进
+# logs/<id>.log，W1 门径的 log 侧 verdict 解析会被这些示例污染成 block——那是 W1 transcript
+# 解析的既有缝（本场景不修，只避开），custody 本身不受影响。
+cat > "$CARDEX_ROOT/templates/design-review.md" <<'EOF'
+对 {{DIR}} 的冻结候选做独立只读审核。
+
+审核关注点：{{FOCUS}}
+
+最后输出一个 JSON 代码块，verdict 只能是 pass、concerns 或 block；pass 仅当 p0 与 p1 皆空。
+EOF
+WFP="$TMP/wfproj" && mkdir -p "$WFP"
+echo "package wfauth" > "$WFP/wfauth.go"
+git -C "$WFP" init -q
+git -C "$WFP" -c user.name=cardex-test -c user.email=cardex-test@example.invalid add -A
+git -C "$WFP" -c user.name=cardex-test -c user.email=cardex-test@example.invalid commit -q -m fixture
+"$BIN" workflow init -mode serial -module wfauth -goal "workflow custody e2e" -dir "$WFP" \
+  -terminal-criteria "independent review pass with empty p0/p1" \
+  -write-paths "wfauth.go" -engine claude -max-rounds 2 >/dev/null
+WFID=$("$BIN" workflow list -json | python3 -c "import json,sys;print([w['id'] for w in json.load(sys.stdin) if w['module_id']=='wfauth'][0])")
+# 一份计划、共用计数器：writer 消费第 1 行（sess-1），reviewer 消费第 2 行（sess-2）。
+# 各自重置计数会让两卡拿到相同 session_id，被 integrationCustodyOK 按「reviewer 继承
+# writer session」拒绝——独立性检查是真的在咬。
+printf 'ok\nreview_pass\n' > "$MOCK_DIR/plan"; echo 0 > "$MOCK_DIR/n"
+"$BIN" workflow writer "$WFID" >/dev/null
+"$BIN" run -quiet
+assert "workflow writer 由真实 runner 跑完" "one(title='workflow writer: wfauth')['status']=='done'"
+WCOMMIT=$(git -C "$WFP" rev-parse HEAD); WTREE=$(git -C "$WFP" rev-parse "HEAD^{tree}")
+"$BIN" workflow freeze-candidate -commit "$WCOMMIT" -tree "$WTREE" "$WFID" >/dev/null
+"$BIN" workflow review "$WFID" >/dev/null
+"$BIN" run -quiet
+assert "workflow reviewer 由真实 runner 跑完" "one(title='workflow review: wfauth')['status']=='done'"
+RID=$("$BIN" workflow list -json | python3 -c "import json,sys;print([w['reviewer_task_id'] for w in json.load(sys.stdin) if w['module_id']=='wfauth'][0])")
+if python3 - "$CARDEX_ROOT" "$RID" <<'EOF'
+import glob,json,sys
+root,rid=sys.argv[1],sys.argv[2]
+attempts=[json.load(open(f)) for f in glob.glob(f"{root}/control/attempts/{rid}/*.json")]
+assert attempts, "reviewer attempt records missing"
+trs=[json.load(open(f)) for f in glob.glob(f"{root}/control/transitions/{rid}/*.json")]
+named={t.get("attempt_id") for t in trs if t.get("state")=="committed" and t.get("status")=="done"}
+assert named & {a["attempt_id"] for a in attempts}, "committed done transition names no present attempt"
+EOF
+then echo "  ✔ reviewer 终局带真实 attempt+committed transition 证据"; pass=$((pass+1))
+else echo "  ✖ reviewer 终局缺 attempt/transition 证据"; fail=$((fail+1)); fi
+OUT1=$("$BIN" workflow ingest-review "$WFID")
+echo "$OUT1" | grep -q "hold=custody_quiet_window" && echo "  ✔ 首次 ingest 只开 quiet window（hold=custody_quiet_window）" && pass=$((pass+1)) || { echo "  ✖ 首次 ingest 未按 quiet window 持留: $OUT1"; fail=$((fail+1)); }
+if python3 - "$CARDEX_ROOT/control/custody/$RID.json" <<'EOF'
+import json,sys
+rec=json.load(open(sys.argv[1]))
+assert rec.get("kind","")=="" and rec.get("drift","")=="", rec
+EOF
+then echo "  ✔ 窗口未满前不产生任何收据"; pass=$((pass+1))
+else echo "  ✖ 窗口未满就出了收据"; fail=$((fail+1)); fi
+if "$BIN" workflow try-release-integration "$WFID" >/dev/null 2>&1; then
+  echo "  ✖ quiet window 未满时 release 被放行"; fail=$((fail+1))
+else echo "  ✔ quiet window 未满时 release 被拒"; pass=$((pass+1)); fi
+sleep 21   # 真实流逝 20 秒 quiet window，不缩短、不回填时间戳
+OUT2=$("$BIN" workflow ingest-review "$WFID")
+echo "$OUT2" | grep -q "status=review_passed" && echo "  ✔ 窗口满后第二次 ingest 采信 pass" && pass=$((pass+1)) || { echo "  ✖ 第二次 ingest 未采信: $OUT2"; fail=$((fail+1)); }
+if python3 - "$CARDEX_ROOT/control/custody/$RID.json" <<'EOF'
+import json,sys
+rec=json.load(open(sys.argv[1]))
+assert rec.get("kind")=="admissible_review" and rec.get("semantic_review") is True, rec
+EOF
+then echo "  ✔ 耐久收据 kind=admissible_review 已落盘"; pass=$((pass+1))
+else echo "  ✖ 缺 admissible_review 收据"; fail=$((fail+1)); fi
+"$BIN" workflow try-release-integration "$WFID" >/dev/null
+assert "集成卡释放为 queued" "one(title='workflow integrate: wfauth')['status']=='queued'"
+if python3 - <<EOF
+import json,subprocess
+wfs=json.loads(subprocess.run(["$BIN","workflow","list","-json"],capture_output=True,text=True).stdout)
+wf=[w for w in wfs if w["module_id"]=="wfauth"][0]
+g=wf["effect_gates"]
+assert g["integration"]=="released" and g["live"]=="held" and g["cutover"]=="held", g
+EOF
+then echo "  ✔ 只放 integration；live/cutover 仍 held"; pass=$((pass+1))
+else echo "  ✖ effect gates 状态错误"; fail=$((fail+1)); fi
+
 echo
 echo "结果: $pass 通过, $fail 失败"
 [ "$fail" -eq 0 ]

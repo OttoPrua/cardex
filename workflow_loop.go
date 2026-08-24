@@ -547,15 +547,12 @@ func tryReleaseWorkflowIntegration(root string, cfg *Config, wf *WorkflowRecord)
 	dec := evaluateIntegrationRelease(root, cfg, integ)
 	if !dec.Admit {
 		// Fail closed: a queued integration card that no longer has admissible
-		// evidence is put back on hold and the refusal is recorded.
+		// evidence goes back on hold through the supported control-plane path.
 		if integ.Status == statusQueued {
-			integ.Status = statusHeld
-			integ.touch()
-			if err := saveTask(root, integ); err != nil {
+			if err := terminalize(root, integ.ID, statusHeld, "workflow:integration-refused",
+				dec.HoldReason, map[string]any{"workflow": wf.ID, "reason": dec.HoldReason}); err != nil {
 				return err
 			}
-			emitTaskEvent(root, integ.ID, evHeld, "workflow:integration-refused", statusHeld, integ.Step,
-				withCostTelemetry(map[string]any{"workflow": wf.ID, "reason": dec.HoldReason}, integ))
 		}
 		if wf.Review != nil {
 			wf.Review.Admissible = false
@@ -569,6 +566,9 @@ func tryReleaseWorkflowIntegration(root string, cfg *Config, wf *WorkflowRecord)
 		return fmt.Errorf("%w: %s", errWorkflowHeld, dec.HoldReason)
 	}
 	if integ.Status == statusHeld {
+		// Same control-plane transition `cardex release` performs: an epoch bump
+		// is what makes held → queued a legal write.
+		restoreScheduling(integ)
 		integ.Status = statusQueued
 		integ.NotBeforeEpoch = 0
 		integ.touch()

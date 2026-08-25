@@ -791,6 +791,171 @@ func TestOwnerWakeRootFilterGapIgnoresRefusedCards(t *testing.T) {
 	}
 }
 
+// ---- R8-REV-R3-P1-3: a padded event_types entry is a delivery gap, not coverage ----
+//
+// closedManagerWakeSubscription validates each event_types entry after TrimSpace but never
+// writes the trimmed form back, and subscriptionMatches compares the stored entry to the
+// row's event type by raw string equality. A padded entry like "held " therefore passes
+// every config gate yet can never match a row at delivery. Planning used to trim before
+// checking coverage, so it counted the padded entry as coverage delivery does not have:
+// the root leg stayed enabled, subscriptionMatches skipped the row, and the enabled root
+// consumed it — a silent permanent drop for endpoint_kind=root, a half-delivery for
+// escalate_to_root. Coverage must be computed with exactly the comparison delivery uses.
+
+func TestOwnerWakeM1RootEndpointPaddedEventTypeFailsClosed(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	// Trailing pad: validation trims and accepts the entry, delivery never matches it.
+	mw := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evHeld + " "}, "wake-proj"))
+	q := captureOwnerWakeQueue(t)
+
+	tk := routedHeldTask(t, root, "wake-proj", "root endpoint behind a padded filter", rootRoute("alpha"))
+
+	for pass := 0; pass < 2; pass++ {
+		if err := managerWakeOnce(root, mw); err != nil {
+			t.Fatalf("pass %d: a padded root filter must isolate, not fail the pass: %v", pass, err)
+		}
+	}
+	if calls := q.snapshot(); len(calls) != 0 {
+		t.Fatalf("a root whose raw filter cannot match the row still queued a model turn: %+v", calls)
+	}
+	blocked := loadOwnerWakeBlocks(root)
+	if len(blocked) != 1 || blocked[0].Class != ownerErrRootUnreachable ||
+		blocked[0].RequesterID != "alpha" || !containsString(blocked[0].TaskIDs, tk.ID) {
+		t.Fatalf("endpoint_kind=root behind a padded root filter must be a durable fail-closed coordinate, got %+v", blocked)
+	}
+	rb := managerWakeReadback(root, mw)
+	if diag, _ := rb["diagnosis"].([]string); !containsString(diag, ownerErrRootUnreachable) {
+		t.Fatalf("diagnosis must name the unreachable root: %v", diag)
+	}
+	// Held, not destroyed: the root leg must not have consumed the row its raw filter
+	// would have skipped at delivery.
+	row := outboxRow(t, root, tk.ID)
+	if got := rootCursorSeq(t, root, "mgr"); got >= row.Seq {
+		t.Fatalf("root cursor consumed the row its padded filter silently skipped: cursor=%d row=%d", got, row.Seq)
+	}
+
+	// The planner holds the pass; it never rewrites the operator's configured bytes.
+	rows, class, err := loadManagerWakeOutbox(root)
+	if err != nil || class != "" {
+		t.Fatalf("outbox load: class=%q err=%v", class, err)
+	}
+	plan, planClass, planErr := planOwnerWakeDeliveries(root, mw, rows)
+	if planClass != "" || planErr != nil {
+		t.Fatalf("plan: class=%q err=%v", planClass, planErr)
+	}
+	if len(plan.configSubs) != 1 || plan.configSubs[0].Enabled {
+		t.Fatalf("a root leg behind a padded filter must be held for the pass: %+v", plan.configSubs)
+	}
+	if !equalStrings(plan.configSubs[0].EventTypes, []string{evHeld + " "}) {
+		t.Fatalf("planner rewrote the configured root event filter: %v", plan.configSubs[0].EventTypes)
+	}
+
+	// Fail-closed, not lost: repairing the entry to its canonical spelling delivers the
+	// held wake and clears the record.
+	on := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evHeld}, "wake-proj"))
+	if err := managerWakeOnce(root, on); err != nil {
+		t.Fatalf("pass after repairing the root filter: %v", err)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, []string{wakeIDOf(t, root, tk)}) {
+		t.Fatalf("repaired root received %v, want the held wake once", got)
+	}
+	if blocked := loadOwnerWakeBlocks(root); len(blocked) != 0 {
+		t.Fatalf("a recovered requester must clear its block record: %+v", blocked)
+	}
+}
+
+func TestOwnerWakeM7EscalationPaddedEventTypeNoHalfDelivery(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	// Leading pad: the same bypass from the other side of the entry.
+	mw := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{" " + evHeld}, "wake-proj"))
+	q := captureOwnerWakeQueue(t)
+
+	esc := routedHeldTask(t, root, "wake-proj", "escalation behind a padded filter",
+		codexThreadRoute("alpha", ownerWakeAlphaThread, true))
+	neighbour := routedHeldTask(t, root, "wake-proj", "beta needs no root",
+		codexThreadRoute("beta", ownerWakeBetaThread, false))
+
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("a padded root filter must isolate, not fail the pass: %v", err)
+	}
+	if got := q.wakeIDsOn(ownerWakeAlphaThread); len(got) != 0 {
+		t.Fatalf("owner leg delivered while the padded filter starved the root leg: %v", got)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); len(got) != 0 {
+		t.Fatalf("a root whose raw filter cannot match the row received a turn: %v", got)
+	}
+	if got := q.wakeIDsOn(ownerWakeBetaThread); !equalStrings(got, []string{wakeIDOf(t, root, neighbour)}) {
+		t.Fatalf("a requester that needs no root was starved by its neighbour: %v", got)
+	}
+	blocked := loadOwnerWakeBlocks(root)
+	if len(blocked) != 1 || blocked[0].SubscriptionID != "owner-alpha" ||
+		blocked[0].Class != ownerErrRootUnreachable || !containsString(blocked[0].TaskIDs, esc.ID) {
+		t.Fatalf("escalation behind a padded root filter = %+v", blocked)
+	}
+	// A requester that never delivered must not own any protocol file.
+	for _, path := range []string{
+		managerWakeCursorPath(root, "owner-alpha"),
+		managerWakeReceiptPath(root, "owner-alpha"),
+		managerWakeInflightPath(root, "owner-alpha"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("blocked requester left %s behind: %v", filepath.Base(path), err)
+		}
+	}
+	escRow := outboxRow(t, root, esc.ID)
+	if got := rootCursorSeq(t, root, "mgr"); got >= escRow.Seq {
+		t.Fatalf("root cursor consumed the escalated row its padded filter skipped: cursor=%d row=%d", got, escRow.Seq)
+	}
+
+	// Both legs land exactly once when the entry is repaired; neither was consumed.
+	on := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evHeld}, "wake-proj"))
+	if err := managerWakeOnce(root, on); err != nil {
+		t.Fatalf("pass after repairing the root filter: %v", err)
+	}
+	want := []string{wakeIDOf(t, root, esc)}
+	if got := q.wakeIDsOn(ownerWakeAlphaThread); !equalStrings(got, want) {
+		t.Fatalf("recovered owner leg = %v, want %v", got, want)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, want) {
+		t.Fatalf("recovered root leg = %v, want %v", got, want)
+	}
+}
+
+// rootEventTypesCover must use delivery's raw comparison verbatim: an empty filter covers
+// everything, a canonical entry covers exactly its own row type, and a padded entry —
+// which subscriptionMatches can never match — covers nothing.
+func TestOwnerWakeRootEventTypesCoverRawComparison(t *testing.T) {
+	filter := func(types ...string) ManagerWakeSubscription {
+		sub := ownerWakeRootSub("mgr", "wake-proj")
+		sub.EventTypes = types
+		return sub
+	}
+	held := map[string]bool{evHeld: true}
+	if !rootEventTypesCover(filter(), held) {
+		t.Fatal("an empty filter must cover every row")
+	}
+	if !rootEventTypesCover(filter(evHeld, evDone), map[string]bool{}) {
+		t.Fatal("no root-bound rows means nothing to cover")
+	}
+	if !rootEventTypesCover(filter(evHeld), held) {
+		t.Fatal("a canonical entry must cover its own row type")
+	}
+	if rootEventTypesCover(filter(evHeld+" "), held) {
+		t.Fatal("a trailing-padded entry never matches at delivery and must not count as coverage")
+	}
+	if rootEventTypesCover(filter(" "+evHeld), held) {
+		t.Fatal("a leading-padded entry never matches at delivery and must not count as coverage")
+	}
+	if rootEventTypesCover(filter(evDone, evHeld+" "), held) {
+		t.Fatal("a canonical neighbour must not lend coverage to a padded entry")
+	}
+	if !rootEventTypesCover(filter(evDone, evHeld), held) {
+		t.Fatal("canonical entries must keep covering after the repair")
+	}
+}
+
 // ---- M8: routed and legacy cards coexist in one pass ----
 
 func TestOwnerWakeM8LegacyMix(t *testing.T) {

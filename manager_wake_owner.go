@@ -418,13 +418,22 @@ func rootBoundEventTypes(rootBound map[string]bool, rows []managerWakeOutboxRow)
 // rootEventTypesCover reports whether the configured root subscription would still match
 // every root-bound row once delivery applies its event_types filter. An empty filter
 // matches everything, which is the unfiltered default.
+//
+// Coverage is computed with exactly the comparison delivery uses: subscriptionMatches
+// matches a row by raw string equality, and config validation only checks the trimmed
+// form of each entry without writing it back, so a padded entry like "held " passes the
+// config gate yet can never match a "held" row at delivery. Trimming here would credit
+// the planner with coverage delivery does not have, and an enabled root would then
+// advance its cursor past the row it silently skipped — destruction, not a hold. Raw
+// comparison keeps the planner's verdict aligned with delivery: a padded entry is a gap,
+// the root leg is held for the pass, and the row survives until config is repaired.
 func rootEventTypesCover(sub ManagerWakeSubscription, want map[string]bool) bool {
 	if len(sub.EventTypes) == 0 || len(want) == 0 {
 		return true
 	}
 	have := make(map[string]bool, len(sub.EventTypes))
 	for _, et := range sub.EventTypes {
-		have[strings.TrimSpace(et)] = true
+		have[et] = true
 	}
 	for et := range want {
 		if !have[et] {

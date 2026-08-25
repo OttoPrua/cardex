@@ -55,6 +55,12 @@
 | `remote_mirror_root` | "" | 远端镜像根；与 `default_review_host` 成对，审核目录自动推导为 `<root>/<worktree名>` |
 | `default_review_sync` | "" | 全局默认分流前同步命令（sh -c，cwd=实现卡目录）；三键缺一不套默认 |
 | `remote_hosts.<name>.codex_only` | false | 为 true 时该主机机械禁止 Claude；带 Claude 模型及自动审核卡均在派发入口改道远端 Codex |
+| `manager_wake` | 空（关闭） | 管理卡唤醒。`enabled` 不完整时载入即 fail closed，唤醒本身永不授权一次模型 turn 之外的动作 |
+| `manager_wake.owner_routing` | false | R8「谁派的卡回报给谁」。关闭时逐字节回滚：不派生 `owner-<requester_id>` 订阅、不创建任何 `owner-*` cursor/receipt/inflight，卡面已钉的 `reply_route` 完全惰性。与顶层 `owner_routing_enforced`（Owner provider 矩阵）无关 |
+| `manager_wake.subscriptions[].role` | ""（普通作用域订阅） | 填 `root` 标记唯一的 root 回报端点，接收 `endpoint_kind=root` 与 `escalate_to_root` 扇出。出现两个即 `duplicate_root_subscription` 拒绝加载；订阅 ID 不得使用保留前缀 `owner-` |
+
+卡面 `reply_route`（`cardex.task.reply_route.v1`）、可执行与保留端点、隔离边界与
+M1–M12 验收靶见[发送方回报契约](manager-wake-sender-contract.md)。
 
 ## 看板配置速查（~/.cardex/board.json）
 

@@ -374,3 +374,328 @@ func TestReleaseLockRestoresLockStolenBetweenReadAndDelete(t *testing.T) {
 		t.Fatalf("归属被夺: got PID=%d, want %d", restored.PID, livePID)
 	}
 }
+
+func versionedLockGatePath(lockFile string) string { return lockFile + ".gate.v2" }
+func legacyLockGatePath(lockFile string) string    { return lockFile + ".gate" }
+
+func waitBarrierFile(t *testing.T, path string, deadline time.Time) {
+	t.Helper()
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("timeout waiting for barrier file %s", path)
+		}
+		runtime.Gosched()
+	}
+}
+
+func writeBarrierFile(path, body string) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(body), 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+func waitBarrierFileEnv(path string, deadline time.Time) bool {
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return true
+		}
+		if !time.Now().Before(deadline) {
+			return false
+		}
+		runtime.Gosched()
+	}
+}
+
+// TestNewGenerationGateLeavesLegacyNamespaceFreeForDrainedRollback proves the
+// v2 acquire path creates only .lock.gate.v2, never .lock.gate, and leaves the
+// legacy namespace free for a drained O_EXCL rollback probe.
+func TestNewGenerationGateLeavesLegacyNamespaceFreeForDrainedRollback(t *testing.T) {
+	root := testRoot(t)
+	path := lockPath(root)
+	legacy := legacyLockGatePath(path)
+	versioned := versionedLockGatePath(path)
+	if versioned != filepath.Join(root, ".lock.gate.v2") {
+		t.Fatalf("new generation must use .lock.gate.v2, got %q", versioned)
+	}
+	if !acquireLock(root, time.Hour) {
+		t.Fatal("acquireLock")
+	}
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("new acquire must not create legacy .lock.gate")
+	}
+	if _, err := os.Stat(versioned); err != nil {
+		t.Fatalf("new acquire must create/use versioned .lock.gate.v2: %v", err)
+	}
+	releaseLock(root)
+	if _, err := os.Stat(legacy); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("releaseLock must not create legacy .lock.gate")
+	}
+	if _, err := os.Stat(versioned); err != nil {
+		t.Fatalf("releaseLock must not unlink versioned .lock.gate.v2: %v", err)
+	}
+	f, err := os.OpenFile(legacy, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatalf("drained rollback O_EXCL probe must acquire legacy .lock.gate after new holder release: %v", err)
+	}
+	_ = f.Close()
+}
+
+// TestNewGenerationLeavesPreexistingLegacyGateUntouched proves new-generation
+// acquire/release never create, mutate, or unlink a pre-existing .lock.gate.
+func TestNewGenerationLeavesPreexistingLegacyGateUntouched(t *testing.T) {
+	root := testRoot(t)
+	path := lockPath(root)
+	legacy := legacyLockGatePath(path)
+	const leftover = "r5-legacy-residue\n"
+	if err := os.WriteFile(legacy, []byte(leftover), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stBefore, err := os.Stat(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !acquireLock(root, time.Hour) {
+		t.Fatal("preexisting legacy residue must not deny new-generation acquire")
+	}
+	got, err := os.ReadFile(legacy)
+	if err != nil || string(got) != leftover {
+		t.Fatalf("new acquire must not mutate legacy .lock.gate: err=%v data=%q", err, got)
+	}
+	stAfterAcquire, err := os.Stat(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(stBefore, stAfterAcquire) {
+		t.Fatal("new acquire replaced the legacy .lock.gate inode")
+	}
+	releaseLock(root)
+	got, err = os.ReadFile(legacy)
+	if err != nil || string(got) != leftover {
+		t.Fatalf("releaseLock must not mutate legacy .lock.gate: err=%v data=%q", err, got)
+	}
+	stAfterRelease, err := os.Stat(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(stBefore, stAfterRelease) {
+		t.Fatal("releaseLock replaced the legacy .lock.gate inode")
+	}
+}
+
+// TestOccupyLockGateSerializesConcurrentGoroutines proves occupyLockGate is a
+// fail-closed non-blocking exclusive hold: concurrent goroutines cannot occupy
+// while a holder is live, and they must not block.
+func TestOccupyLockGateSerializesConcurrentGoroutines(t *testing.T) {
+	root := testRoot(t)
+	path := lockPath(root)
+	first, ok := occupyLockGate(path)
+	if !ok {
+		t.Fatal("first occupyLockGate")
+	}
+	defer releaseLockGate(first)
+
+	const n = 8
+	results := make(chan bool, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			g, occupied := occupyLockGate(path)
+			if occupied {
+				releaseLockGate(g)
+			}
+			results <- occupied
+		}()
+	}
+	got := 0
+	timeout := time.After(2 * time.Second)
+	for got < n {
+		select {
+		case occupied := <-results:
+			if occupied {
+				t.Fatal("contender occupied the versioned gate while the holder still held it")
+			}
+			got++
+		case <-timeout:
+			t.Fatal("second occupier blocked; occupyLockGate must fail-closed non-blocking")
+		}
+	}
+	releaseLockGate(first)
+	after, afterOK := occupyLockGate(path)
+	if !afterOK {
+		t.Fatal("holder release must free the gate for the next occupier")
+	}
+	releaseLockGate(after)
+}
+
+// TestReleaseAndGateCleanupDoNotUnlinkVersionedGateInode proves releaseLockGate,
+// acquireLock, and releaseLock keep the same .lock.gate.v2 inode.
+func TestReleaseAndGateCleanupDoNotUnlinkVersionedGateInode(t *testing.T) {
+	root := testRoot(t)
+	path := lockPath(root)
+	gp := versionedLockGatePath(path)
+	held, ok := occupyLockGate(path)
+	if !ok {
+		t.Fatal("occupyLockGate")
+	}
+	before, err := os.Stat(gp)
+	if err != nil {
+		t.Fatalf("versioned gate missing after occupy: %v", err)
+	}
+	releaseLockGate(held)
+	afterGateRelease, err := os.Stat(gp)
+	if err != nil {
+		t.Fatalf("releaseLockGate must not unlink versioned gate: %v", err)
+	}
+	if !os.SameFile(before, afterGateRelease) {
+		t.Fatal("releaseLockGate replaced the stable versioned inode")
+	}
+	if !acquireLock(root, time.Hour) {
+		t.Fatal("acquireLock")
+	}
+	afterAcquire, err := os.Stat(gp)
+	if err != nil {
+		t.Fatalf("versioned gate missing after acquireLock: %v", err)
+	}
+	if !os.SameFile(before, afterAcquire) {
+		t.Fatal("acquireLock replaced the stable versioned inode")
+	}
+	releaseLock(root)
+	afterLockRelease, err := os.Stat(gp)
+	if err != nil {
+		t.Fatalf("releaseLock must not unlink versioned gate: %v", err)
+	}
+	if !os.SameFile(before, afterLockRelease) {
+		t.Fatal("releaseLock replaced the stable versioned inode")
+	}
+}
+
+// TestHelperProcessOccupyLockGate is the cross-process occupyLockGate helper.
+// Coordination uses task-local barrier files, never a fixed sleep.
+func TestHelperProcessOccupyLockGate(t *testing.T) {
+	if os.Getenv("GO_TEST_HELPER_OCCUPY_GATE") != "1" {
+		return
+	}
+	root := os.Getenv("HELPER_ROOT")
+	dir := os.Getenv("HELPER_BARRIER_DIR")
+	id := os.Getenv("HELPER_ID")
+	deadline := time.Now().Add(20 * time.Second)
+	if err := writeBarrierFile(filepath.Join(dir, id+".ready"), "1\n"); err != nil {
+		os.Exit(2)
+	}
+	if !waitBarrierFileEnv(filepath.Join(dir, "go"), deadline) {
+		os.Exit(3)
+	}
+	g, ok := occupyLockGate(lockPath(root))
+	if !ok {
+		_ = writeBarrierFile(filepath.Join(dir, id+".result"), "BUSY\n")
+		os.Exit(1)
+	}
+	if err := writeBarrierFile(filepath.Join(dir, id+".result"), "HOLDING\n"); err != nil {
+		releaseLockGate(g)
+		os.Exit(2)
+	}
+	if !waitBarrierFileEnv(filepath.Join(dir, "release"), deadline) {
+		releaseLockGate(g)
+		os.Exit(3)
+	}
+	releaseLockGate(g)
+	if err := writeBarrierFile(filepath.Join(dir, id+".released"), "1\n"); err != nil {
+		os.Exit(2)
+	}
+	os.Exit(0)
+}
+
+// TestOccupyLockGateCrossProcessMutualExclusion proves two helper processes
+// cannot occupy .lock.gate.v2 at the same time. Readiness and winner release
+// are task-local files, not fixed sleeps.
+func TestOccupyLockGateCrossProcessMutualExclusion(t *testing.T) {
+	root := testRoot(t)
+	dir := t.TempDir()
+	ids := []string{"a", "b"}
+	cmds := make([]*exec.Cmd, 0, len(ids))
+	for _, id := range ids {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestHelperProcessOccupyLockGate$", "-test.v=false", "-test.count=1")
+		cmd.Env = append(os.Environ(),
+			"GO_TEST_HELPER_OCCUPY_GATE=1",
+			"HELPER_ROOT="+root,
+			"HELPER_BARRIER_DIR="+dir,
+			"HELPER_ID="+id,
+		)
+		cmd.Stderr = os.Stderr
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("helper %s Start: %v", id, err)
+		}
+		cmds = append(cmds, cmd)
+	}
+	defer func() {
+		for _, cmd := range cmds {
+			if cmd.Process != nil {
+				_ = cmd.Process.Kill()
+			}
+		}
+	}()
+	deadline := time.Now().Add(20 * time.Second)
+	for _, id := range ids {
+		waitBarrierFile(t, filepath.Join(dir, id+".ready"), deadline)
+	}
+	if err := writeBarrierFile(filepath.Join(dir, "go"), "1\n"); err != nil {
+		t.Fatal(err)
+	}
+	holding := 0
+	busy := 0
+	for _, id := range ids {
+		p := filepath.Join(dir, id+".result")
+		var got string
+		for {
+			if !time.Now().Before(deadline) {
+				t.Fatalf("timeout waiting for helper %s result", id)
+			}
+			data, err := os.ReadFile(p)
+			if err == nil {
+				got = strings.TrimSpace(string(data))
+				if got == "HOLDING" || got == "BUSY" {
+					break
+				}
+			}
+			runtime.Gosched()
+		}
+		switch got {
+		case "HOLDING":
+			holding++
+		case "BUSY":
+			busy++
+		}
+	}
+	if holding != 1 || busy != 1 {
+		t.Fatalf("simultaneous gate occupancy: holding=%d busy=%d (want 1 and 1)", holding, busy)
+	}
+	if err := writeBarrierFile(filepath.Join(dir, "release"), "1\n"); err != nil {
+		t.Fatal(err)
+	}
+	for i, id := range ids {
+		err := cmds[i].Wait()
+		cmds[i].Process = nil
+		data, readErr := os.ReadFile(filepath.Join(dir, id+".result"))
+		if readErr != nil {
+			t.Fatalf("helper %s result missing after wait: %v", id, readErr)
+		}
+		switch strings.TrimSpace(string(data)) {
+		case "HOLDING":
+			if err != nil {
+				t.Fatalf("holding helper %s wait: %v", id, err)
+			}
+			if _, err := os.Stat(filepath.Join(dir, id+".released")); err != nil {
+				t.Fatalf("holding helper %s did not release: %v", id, err)
+			}
+		case "BUSY":
+			var exitErr *exec.ExitError
+			if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
+				t.Fatalf("busy helper %s wait=%v, want exit 1", id, err)
+			}
+		}
+	}
+}

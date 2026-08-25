@@ -69,6 +69,11 @@ type lockInfo struct {
 // 并按抢占失败返回, 让 A 的锁不被误删。tombstones.go / events.go 同类闭合。
 func acquireLock(root string, ttl time.Duration) bool {
 	path := lockPath(root)
+	gate, ok := occupyLockGate(path)
+	if !ok {
+		return false
+	}
+	defer releaseLockGate(gate)
 	for i := 0; i < 2; i++ {
 		tmp := fmt.Sprintf("%s.acq-%d-%d", path, os.Getpid(), time.Now().UnixNano())
 		info, _ := json.Marshal(lockInfo{PID: os.Getpid(), At: time.Now().Format(time.RFC3339)})
@@ -100,6 +105,38 @@ func acquireLock(root string, ttl time.Duration) bool {
 		}
 	}
 	return false
+}
+
+func lockGatePath(path string) string { return path + ".gate.v2" }
+
+// lockGate is a kernel-owned exclusive hold on the acquire/steal critical
+// section only. It is not a second scheduler ownership plane: acquireLock
+// always releases it before returning. The gate file is a stable versioned
+// flock target; content is not an ownership token, and the path is never
+// unlinked by this protocol.
+type lockGate struct {
+	f *os.File
+}
+
+func occupyLockGate(path string) (*lockGate, bool) {
+	f, err := os.OpenFile(lockGatePath(path), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, false
+	}
+	if err := tryLockFile(f); err != nil {
+		_ = f.Close()
+		return nil, false
+	}
+	return &lockGate{f: f}, true
+}
+
+func releaseLockGate(g *lockGate) {
+	if g == nil || g.f == nil {
+		return
+	}
+	_ = unlockFile(g.f)
+	_ = g.f.Close()
+	g.f = nil
 }
 
 // staleLock reports whether path may be stolen. A live scheduler owner is never

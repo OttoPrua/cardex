@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"syscall"
 )
 
@@ -19,4 +20,26 @@ func processAlive(pid int) bool {
 		return false
 	}
 	return proc.Signal(syscall.Signal(0)) == nil
+}
+
+func tryLockFile(f *os.File) error {
+	fd := int(f.Fd())
+	for {
+		err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
+		runtime.KeepAlive(f)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
+}
+
+func unlockFile(f *os.File) error {
+	fd := int(f.Fd())
+	for {
+		err := syscall.Flock(fd, syscall.LOCK_UN)
+		runtime.KeepAlive(f)
+		if err != syscall.EINTR {
+			return err
+		}
+	}
 }

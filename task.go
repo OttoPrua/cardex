@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -311,6 +312,79 @@ type Task struct {
 	// machine-re-derived review verdict=pass with empty p0/p1 matches the frozen
 	// candidate and passes custody. Absent gates leave a card's behavior unchanged.
 	IntegrationGate *IntegrationGate `json:"integration_gate,omitempty"`
+	// ReplyRoute is the sender-receives coordinate: who asked for this card and
+	// where its terminal wake must be reported. Pinned at enqueue and immutable
+	// afterwards, so a later config edit can never redirect a card's reply.
+	ReplyRoute *TaskReplyRoute `json:"reply_route,omitempty"`
+}
+
+// taskReplyRouteSchemaV1 是回报路由卡面的封闭 schema。缺失字段的存量卡按"无路由"处理，
+// 走既有的 manager_wake 配置订阅匹配，字节不变。
+const taskReplyRouteSchemaV1 = "cardex.task.reply_route.v1"
+
+// Closed reply endpoint kinds. Only replyEndpointCodexThread and replyEndpointRoot are
+// executable in v1; the remaining three are reserved fail-closed coordinates so a card can
+// declare an endpoint that this build refuses to deliver to instead of silently retargeting.
+const (
+	replyEndpointCodexThread    = "codex-thread"
+	replyEndpointRoot           = "root"
+	replyEndpointExternalAgent  = "external-agent"
+	replyEndpointCursorAgent    = "cursor-agent"
+	replyEndpointManagementCard = "management-card"
+)
+
+// TaskReplyRoute 是"谁派的卡，回报给谁"的卡面坐标（cardex.task.reply_route.v1）。
+// 入队即钉：requester 与端点在建卡那一刻固定，之后改 config、改订阅、改 owner 矩阵
+// 都不会让已在队的卡改投别处——与 Stakes/MaxFixRounds 同一条防漂移纪律。
+type TaskReplyRoute struct {
+	Schema string `json:"schema"`
+	// RequesterID 派生出订阅身份 owner-<requester_id>，因此必须落在封闭订阅 ID 字符集内。
+	RequesterID string `json:"requester_id"`
+	// EndpointKind 是封闭端点类别；EndpointThread 只对 codex-thread 有意义。
+	EndpointKind   string `json:"endpoint_kind"`
+	EndpointThread string `json:"endpoint_thread,omitempty"`
+	// 以下三项是审计坐标，投递层不解释它们的内容，只保证随卡不可改地留痕。
+	TargetManagementConversation string `json:"target_management_conversation,omitempty"`
+	CallbackTopLevelSession      string `json:"callback_top_level_session,omitempty"`
+	ReceiptRoute                 string `json:"receipt_route,omitempty"`
+	// EscalateToRoot 让同一条 wake 在投给 requester 之外再扇出给 root 订阅。
+	EscalateToRoot bool `json:"escalate_to_root,omitempty"`
+}
+
+// errReplyRouteImmutable 是"卡已落盘后有人改回报路由"的封闭失败。
+var errReplyRouteImmutable = errors.New("reply_route_immutable")
+
+// inheritTaskReplyRoute 深拷贝路由给派生卡。浅拷贝指针会让父子共享同一结构：
+// 任何一侧改字段都会静默改掉另一侧的回报坐标，这正是入队即钉要挡的漂移。
+func inheritTaskReplyRoute(r *TaskReplyRoute) *TaskReplyRoute {
+	if r == nil {
+		return nil
+	}
+	c := *r
+	return &c
+}
+
+func sameTaskReplyRoute(a, b *TaskReplyRoute) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// assertReplyRoutePinned 拒绝对已落盘卡的回报路由做任何改动，包括事后补挂一条
+// 原本没有的路由——"卡面上没有路由"同样是入队那一刻钉死的事实。
+func assertReplyRoutePinned(root string, next *Task) error {
+	if next == nil || next.ID == "" {
+		return nil
+	}
+	current, err := loadTask(root, next.ID)
+	if err != nil || current == nil {
+		return nil
+	}
+	if sameTaskReplyRoute(current.ReplyRoute, next.ReplyRoute) {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", errReplyRouteImmutable, next.ID)
 }
 
 func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }
@@ -510,6 +584,9 @@ func writeTaskFile(root string, t *Task) error {
 }
 
 func saveTask(root string, t *Task) error {
+	if err := assertReplyRoutePinned(root, t); err != nil {
+		return err
+	}
 	return persistTaskCAS(root, t)
 }
 

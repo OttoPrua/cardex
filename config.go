@@ -324,6 +324,13 @@ type Config struct {
 	// ManagerWake is disabled by default. Enabled incomplete configuration fails
 	// closed at delivery/install and is visible in doctor/readback; it never
 	// authorizes a management model turn on its own.
+	//
+	// The R8 sender-receives layer lives on the same block as
+	// manager_wake.owner_routing and manager_wake.subscriptions[].role. Both default
+	// off/empty, which reproduces the pre-R8 delivery bytes exactly: without
+	// owner_routing no owner-* cursor/receipt/inflight file is ever created and a
+	// card's pinned reply_route stays inert. Note this is unrelated to the top-level
+	// owner_routing_enforced switch, which is the Owner provider matrix.
 	ManagerWake *ManagerWakeConfig `json:"manager_wake,omitempty"`
 }
 

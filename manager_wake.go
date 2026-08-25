@@ -41,6 +41,18 @@ type ManagerWakeSubscription struct {
 	DirPrefixes []string `json:"dir_prefixes,omitempty"`
 	EventTypes  []string `json:"event_types,omitempty"`
 	Enabled     bool     `json:"enabled"`
+	// Role marks the single root reply endpoint that escalations and
+	// endpoint_kind=root cards fan out to. Empty is a plain scoped subscription.
+	Role string `json:"role,omitempty"`
+
+	// derived marks a subscription minted at delivery time from card-face reply
+	// routes rather than read from config. Only derived subscriptions may carry
+	// the reserved owner- ID prefix.
+	derived bool
+	// excludeTaskIDs removes cards that a pinned reply route already owns from a
+	// config subscription's scope, so a routed card is delivered exactly once, to
+	// its requester, instead of also matching a project/dir-prefix subscription.
+	excludeTaskIDs map[string]bool
 }
 
 // ManagerWakeConfig is the self-contained wake core config. It is stored on
@@ -48,8 +60,12 @@ type ManagerWakeSubscription struct {
 // WatchdogSec is diagnostic only; the running policy is hard-coded to
 // managerWakeWatchdogSec.
 type ManagerWakeConfig struct {
-	Enabled       bool                      `json:"enabled"`
-	CodexBin      string                    `json:"codex_bin,omitempty"`
+	Enabled  bool   `json:"enabled"`
+	CodexBin string `json:"codex_bin,omitempty"`
+	// OwnerRouting turns on R8 sender-receives delivery. Default false is a
+	// byte-level no-op: no owner-* cursor/receipt/inflight file is created and
+	// every pinned card-face reply route stays inert.
+	OwnerRouting  bool                      `json:"owner_routing,omitempty"`
 	WatchdogSec   int                       `json:"watchdog_sec,omitempty"`
 	Subscriptions []ManagerWakeSubscription `json:"subscriptions,omitempty"`
 }
@@ -149,6 +165,9 @@ type managerWakeMetrics struct {
 	WatchdogSec      int    `json:"watchdog_sec"`
 	Enabled          bool   `json:"enabled"`
 	LaunchdInstalled bool   `json:"launchd_installed"`
+	// OwnerBlocked counts requesters whose endpoint was unreachable before any
+	// inflight claim in the last pass. omitempty keeps owner-routing-off bytes intact.
+	OwnerBlocked int `json:"owner_blocked,omitempty"`
 }
 
 type managerWakeErrorState struct {
@@ -481,7 +500,8 @@ func managerWakeConfigBlocking(root string, mw *ManagerWakeConfig) []string {
 		switch d {
 		case "watchdog_sec_rejected", "invalid_subscription_id", "duplicate_subscription",
 			"invalid_thread_id", "unscoped_subscription", "empty_project", "missing_codex_bin",
-			"invalid_event_type", "invalid_task_id", "invalid_dir_prefix":
+			"invalid_event_type", "invalid_task_id", "invalid_dir_prefix",
+			"reserved_subscription_prefix", "duplicate_root_subscription", "invalid_subscription_role":
 			add(d)
 		default:
 			if strings.HasPrefix(d, "subscription_") {
@@ -1248,6 +1268,15 @@ func closedManagerWakeSubscription(sub ManagerWakeSubscription) (ManagerWakeSubs
 	if !ok {
 		return sub, "invalid_subscription_id"
 	}
+	if !sub.derived && strings.HasPrefix(id, ownerWakeSubPrefix) {
+		return sub, "reserved_subscription_prefix"
+	}
+	switch strings.TrimSpace(sub.Role) {
+	case "", managerWakeRoleRoot:
+	default:
+		return sub, "invalid_subscription_role"
+	}
+	sub.Role = strings.TrimSpace(sub.Role)
 	sub.ID = id
 	if !managerWakeThreadRE.MatchString(strings.TrimSpace(sub.ThreadID)) {
 		return sub, "invalid_thread_id"
@@ -1312,6 +1341,7 @@ func diagnoseManagerWake(root string, mw *ManagerWakeConfig) []string {
 		out = append(out, "watchdog_sec_rejected")
 	}
 	seen := map[string]bool{}
+	roots := 0
 	for i, sub := range mw.Subscriptions {
 		id := strings.TrimSpace(sub.ID)
 		if id == "" {
@@ -1321,6 +1351,12 @@ func diagnoseManagerWake(root string, mw *ManagerWakeConfig) []string {
 		if _, ok := closedManagerWakeSubID(id); !ok {
 			out = append(out, "invalid_subscription_id")
 			continue
+		}
+		if strings.TrimSpace(sub.Role) == managerWakeRoleRoot {
+			roots++
+			if roots > 1 {
+				out = append(out, "duplicate_root_subscription")
+			}
 		}
 		if seen[id] {
 			out = append(out, "duplicate_subscription")
@@ -1360,6 +1396,11 @@ func diagnoseManagerWake(root string, mw *ManagerWakeConfig) []string {
 	}
 	if class := loadManagerWakeErrorClass(root); class != "" {
 		out = append(out, class)
+	}
+	if ownerWakeRoutingEnabled(mw) {
+		for _, b := range loadOwnerWakeBlocks(root) {
+			out = append(out, b.Class)
+		}
 	}
 	entries, err := os.ReadDir(managerWakeCursorDir(root))
 	if err == nil {
@@ -1463,6 +1504,9 @@ func subscriptionMatches(sub ManagerWakeSubscription, t *Task, row managerWakeOu
 		return false
 	}
 	if _, ok := closedManagerWakeSubID(sub.ID); !ok {
+		return false
+	}
+	if sub.excludeTaskIDs[row.TaskID] {
 		return false
 	}
 	if len(sub.EventTypes) > 0 {
@@ -1739,7 +1783,31 @@ func managerWakeOnceLocked(root string, mw *ManagerWakeConfig) error {
 
 	bin := strings.TrimSpace(mw.CodexBin)
 	pending := 0
-	destSeen, destClass, destErr := preloadDestinationEventIDs(root, mw, rows)
+	// Owner routing off (default) keeps the exact legacy shape: config subscriptions
+	// only, no derived owner identity, no extra destination inventory.
+	deliverable := mw.Subscriptions
+	var ownerPlan *ownerWakeRoutePlan
+	if ownerWakeRoutingEnabled(mw) {
+		plan, planClass, planErr := planOwnerWakeDeliveries(root, mw, rows)
+		if planClass != "" {
+			if planClass == "delivery_uncertain" {
+				return failDeliveryUncertain(root, nil, &metrics)
+			}
+			noteManagerWakeError(root, &metrics, planClass)
+			if planErr != nil {
+				return planErr
+			}
+			return fmt.Errorf("%s", planClass)
+		}
+		ownerPlan = plan
+		deliverable = append(append([]ManagerWakeSubscription(nil), plan.configSubs...), plan.ownerSubs...)
+		metrics.OwnerBlocked = len(plan.blocked)
+		if err := recordOwnerWakeBlocks(root, plan); err != nil {
+			noteManagerWakeError(root, &metrics, allowlistedWakeError(err, "cursor_save_failed"))
+			return err
+		}
+	}
+	destSeen, destClass, destErr := preloadDestinationEventIDs(root, mw, ownerPlan, rows)
 	if destClass != "" {
 		if destClass == "delivery_uncertain" {
 			return failDeliveryUncertain(root, nil, &metrics)
@@ -1750,7 +1818,7 @@ func managerWakeOnceLocked(root string, mw *ManagerWakeConfig) error {
 		}
 		return fmt.Errorf("%s", destClass)
 	}
-	for _, sub := range mw.Subscriptions {
+	for _, sub := range deliverable {
 		if !sub.Enabled {
 			continue
 		}
@@ -1759,7 +1827,7 @@ func managerWakeOnceLocked(root string, mw *ManagerWakeConfig) error {
 			return err
 		}
 	}
-	for _, sub := range mw.Subscriptions {
+	for _, sub := range deliverable {
 		if !sub.Enabled {
 			continue
 		}
@@ -1890,7 +1958,7 @@ func seedDestinationEventIDs(dest map[string]map[string]bool, thread string, ids
 	return true
 }
 
-func preloadDestinationEventIDs(root string, mw *ManagerWakeConfig, rows []managerWakeOutboxRow) (map[string]map[string]bool, string, error) {
+func preloadDestinationEventIDs(root string, mw *ManagerWakeConfig, plan *ownerWakeRoutePlan, rows []managerWakeOutboxRow) (map[string]map[string]bool, string, error) {
 	dest := map[string]map[string]bool{}
 	enabled := map[string]bool{}
 	configThread := map[string]string{}
@@ -1905,6 +1973,19 @@ func preloadDestinationEventIDs(root string, mw *ManagerWakeConfig, rows []manag
 			}
 			configThread[id] = sub.ThreadID
 		}
+	}
+	// A derived owner subscription owns its inflight/receipt files exactly like a
+	// configured one. Leaving it out of the inventory would make its own live claim
+	// look like an orphan and fail the whole pass closed.
+	for _, sub := range plan.ownerSubscriptions() {
+		id, ok := closedManagerWakeSubID(sub.ID)
+		if !ok {
+			return dest, "invalid_subscription_id", fmt.Errorf("invalid_subscription_id")
+		}
+		if sub.Enabled {
+			enabled[id] = true
+		}
+		configThread[id] = sub.ThreadID
 	}
 	if class, err := inventoryPersistedWakeReceipts(root, dest, configThread); class != "" {
 		return dest, class, err
@@ -2516,6 +2597,8 @@ func managerWakeReadback(root string, mw *ManagerWakeConfig) map[string]any {
 		"queue_failures":    metrics.QueueFailures,
 		"launchd_installed": installed,
 		"subscriptions":     subs,
+		"owner_routing":     ownerWakeRoutingEnabled(mw),
+		"owner_blocked":     ownerWakeBlockReadback(root, mw),
 		"diagnosis":         diagnoseManagerWake(root, mw),
 	}
 }

@@ -2886,6 +2886,7 @@ func ensureReviewAfterTaskWithEvidence(root string, cfg *Config, t *Task, priorE
 	rv := newTask(root, cfg, typeReview, "Owner gate ["+stage+"]: "+t.Title, t.Dir, []string{prompt}, t.Priority)
 	rv.ReviewOf = t.ID
 	rv.Project = t.Project
+	rv.ReplyRoute = inheritTaskReplyRoute(t.ReplyRoute)
 	rv.FixRound = t.FixRound
 	rv.MaxFixRounds = t.MaxFixRounds
 	if err := pinPlannedReviewIdentity(cfg, t, rv, stage); err != nil {
@@ -2947,6 +2948,7 @@ func ensureLegacyReviewAfterTask(root string, cfg *Config, t *Task, lg *os.File)
 	rv := newTask(root, cfg, typeReview, "审核: "+t.Title, reviewDir, []string{prompt}, t.Priority)
 	rv.ReviewOf = t.ID
 	rv.Project = t.Project
+	rv.ReplyRoute = inheritTaskReplyRoute(t.ReplyRoute)
 	rv.FixRound = t.FixRound
 	rv.MaxFixRounds = t.MaxFixRounds
 	rv.RemoteHost = reviewHost
@@ -3568,6 +3570,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 				co.Model = "haiku"
 				co.RouteClass = orig.RouteClass
 				co.Project = orig.Project // 显式归属随派生卡继承（收口卡属于被收口卡的项目）
+				co.ReplyRoute = inheritTaskReplyRoute(orig.ReplyRoute)
 				co.EmittedBy = t.ID       // 谱系标：系统派生卡，进度预估的派生耦合系数依赖（boardestimate.go）
 				co.SkipPermissions = orig.SkipPermissions
 				co.RemoteHost = orig.RemoteHost
@@ -3640,6 +3643,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 		// 会在 release 后被派到本机、cd 直接失败（实测远端 R4 卡两张踩中）。
 		esc.RemoteHost = orig.RemoteHost
 		esc.Project = orig.Project // 显式归属随派生卡继承（升级卡属于原卡的项目）
+		esc.ReplyRoute = inheritTaskReplyRoute(orig.ReplyRoute)
 		// workflow 绑定与写域主张随谱系继承：丢掉 WorkflowID 会让这张卡对
 		// workflowActiveRole 隐身（同一写域可再被派第二个写者）；丢掉 WriteDomain
 		// 会让写域审计对它 fail-open。held 升级卡按 taskIsLive 仍占用角色位，
@@ -3703,6 +3707,7 @@ func handleReviewVerdict(root string, cfg *Config, t *Task, result string, lg *o
 	enforceReviewAfterEligibility(nt)
 	nt.FixRound = round
 	nt.Project = orig.Project // 显式归属随修复链继承
+	nt.ReplyRoute = inheritTaskReplyRoute(orig.ReplyRoute)
 	// 轮限随修复链继承：下一轮的 handleReviewVerdict 读的是**下一张卡**的卡面，不继承就会在
 	// R2 静默掉回全局值。生产 high 当前钉 1；历史卡或显式配置仍可能有其它绝对值。
 	nt.MaxFixRounds = orig.MaxFixRounds
@@ -4041,6 +4046,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 				t.Dir, []string{prompt}, t.Priority)
 			c.XRole = "C"
 			c.Project = t.Project
+			c.ReplyRoute = inheritTaskReplyRoute(t.ReplyRoute)
 			c.XKey = t.XKey
 			c.XProfile = t.XProfile
 			c.XTask = t.XTask
@@ -4092,6 +4098,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		b := newTask(root, cfg, typeCrossCheck, "交叉B["+t.XProfile+"]: "+base, t.Dir, []string{t.Prompts[0]}, t.Priority)
 		b.XRole = "B"
 		b.Project = t.Project // 显式归属随交叉链继承
+		b.ReplyRoute = inheritTaskReplyRoute(t.ReplyRoute)
 		b.XKey = t.XKey
 		b.XProfile = t.XProfile
 		b.XTask = t.XTask
@@ -4130,6 +4137,7 @@ func handleCrossStage(root string, cfg *Config, t *Task, res *claudeResult, lg *
 		c := newTask(root, cfg, typeCrossCheck, "交叉C汇总["+t.XProfile+"]: "+base, t.Dir, []string{prompt}, t.Priority)
 		c.XRole = "C"
 		c.Project = t.Project // 显式归属随交叉链继承
+		c.ReplyRoute = inheritTaskReplyRoute(t.ReplyRoute)
 		c.XKey = t.XKey
 		c.XProfile = t.XProfile
 		c.XEngineB = t.XEngineB
@@ -4405,6 +4413,9 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		// 谱系标：emit 产出是"系统繁殖"的主力人口，卡面必须留父指针（此前只在事件 detail），
 		// 进度预估的派生耦合系数靠它区分系统派生与人工立项（boardestimate.go）。
 		nt.EmittedBy = parent.ID
+		// 回报路由随 emit 谱系继承：派生子卡的终态同样属于最初那个请求方，
+		// 不继承就会让"谁派的谁收"在第一层装配处断链。
+		nt.ReplyRoute = inheritTaskReplyRoute(parent.ReplyRoute)
 		nt.ReviewAfter = s.ReviewAfter
 		enforceReviewAfterEligibility(nt)
 		// 协调链：产出的 coordinate 任务同样具备 emit 能力（自愈式续排——每批收尾排下一批）。

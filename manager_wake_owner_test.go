@@ -436,6 +436,109 @@ func TestOwnerWakeM7EscalateToRootFanout(t *testing.T) {
 	}
 }
 
+// ---- R8-REV-P1-1: a switched-off root subscription is not a reachable root ----
+//
+// Config may keep its role=root subscription while it is disabled, and delivery skips
+// disabled subscriptions. Counting one as reachable would make an endpoint_kind=root card
+// disappear with no record, and would let an escalation deliver its owner leg while the
+// root leg silently evaporated. A disabled root must behave exactly like a missing one.
+
+func TestOwnerWakeM1RootEndpointDisabledRootFailsClosed(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	off := ownerWakeRootSub("mgr", "wake-proj")
+	off.Enabled = false
+	mw := writeOwnerWakeConfig(t, root, bin, true, off)
+	q := captureOwnerWakeQueue(t)
+
+	tk := routedHeldTask(t, root, "wake-proj", "root endpoint with root switched off", rootRoute("alpha"))
+
+	for pass := 0; pass < 2; pass++ {
+		if err := managerWakeOnce(root, mw); err != nil {
+			t.Fatalf("pass %d: a disabled root must isolate, not fail the pass: %v", pass, err)
+		}
+	}
+	if calls := q.snapshot(); len(calls) != 0 {
+		t.Fatalf("disabled root still queued a model turn: %+v", calls)
+	}
+	blocked := loadOwnerWakeBlocks(root)
+	if len(blocked) != 1 || blocked[0].Class != ownerErrRootUnreachable ||
+		blocked[0].RequesterID != "alpha" || !containsString(blocked[0].TaskIDs, tk.ID) {
+		t.Fatalf("endpoint_kind=root into a disabled root must be a durable fail-closed coordinate, got %+v", blocked)
+	}
+	rb := managerWakeReadback(root, mw)
+	if diag, _ := rb["diagnosis"].([]string); !containsString(diag, ownerErrRootUnreachable) {
+		t.Fatalf("diagnosis must name the unreachable root: %v", diag)
+	}
+
+	// Fail-closed, not lost: re-enabling root delivers the held wake and clears the record.
+	on := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSub("mgr", "wake-proj"))
+	if err := managerWakeOnce(root, on); err != nil {
+		t.Fatalf("pass after re-enabling root: %v", err)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, []string{wakeIDOf(t, root, tk)}) {
+		t.Fatalf("re-enabled root received %v, want the held wake once", got)
+	}
+	if blocked := loadOwnerWakeBlocks(root); len(blocked) != 0 {
+		t.Fatalf("a recovered requester must clear its block record: %+v", blocked)
+	}
+}
+
+func TestOwnerWakeM7EscalationDisabledRootNoHalfDelivery(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	off := ownerWakeRootSub("mgr", "wake-proj")
+	off.Enabled = false
+	mw := writeOwnerWakeConfig(t, root, bin, true, off)
+	q := captureOwnerWakeQueue(t)
+
+	esc := routedHeldTask(t, root, "wake-proj", "escalation into a disabled root",
+		codexThreadRoute("alpha", ownerWakeAlphaThread, true))
+	neighbour := routedHeldTask(t, root, "wake-proj", "beta needs no root",
+		codexThreadRoute("beta", ownerWakeBetaThread, false))
+
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("a disabled root must isolate, not fail the pass: %v", err)
+	}
+	if got := q.wakeIDsOn(ownerWakeAlphaThread); len(got) != 0 {
+		t.Fatalf("owner leg delivered while the root leg had nowhere to land: %v", got)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); len(got) != 0 {
+		t.Fatalf("a disabled root received a turn: %v", got)
+	}
+	if got := q.wakeIDsOn(ownerWakeBetaThread); !equalStrings(got, []string{wakeIDOf(t, root, neighbour)}) {
+		t.Fatalf("a requester that needs no root was starved by its neighbour: %v", got)
+	}
+	blocked := loadOwnerWakeBlocks(root)
+	if len(blocked) != 1 || blocked[0].SubscriptionID != "owner-alpha" ||
+		blocked[0].Class != ownerErrRootUnreachable || !containsString(blocked[0].TaskIDs, esc.ID) {
+		t.Fatalf("escalation into a disabled root = %+v", blocked)
+	}
+	// A requester that never delivered must not own any protocol file.
+	for _, path := range []string{
+		managerWakeCursorPath(root, "owner-alpha"),
+		managerWakeReceiptPath(root, "owner-alpha"),
+		managerWakeInflightPath(root, "owner-alpha"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("blocked requester left %s behind: %v", filepath.Base(path), err)
+		}
+	}
+
+	// Both legs land once root is reachable again; neither leg was consumed by the block.
+	on := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSub("mgr", "wake-proj"))
+	if err := managerWakeOnce(root, on); err != nil {
+		t.Fatalf("pass after re-enabling root: %v", err)
+	}
+	want := []string{wakeIDOf(t, root, esc)}
+	if got := q.wakeIDsOn(ownerWakeAlphaThread); !equalStrings(got, want) {
+		t.Fatalf("recovered owner leg = %v, want %v", got, want)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, want) {
+		t.Fatalf("recovered root leg = %v, want %v", got, want)
+	}
+}
+
 // ---- M8: routed and legacy cards coexist in one pass ----
 
 func TestOwnerWakeM8LegacyMix(t *testing.T) {

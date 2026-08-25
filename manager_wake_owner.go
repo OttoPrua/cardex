@@ -207,6 +207,9 @@ type ownerWakeGroup struct {
 func planOwnerWakeDeliveries(root string, mw *ManagerWakeConfig, rows []managerWakeOutboxRow) (*ownerWakeRoutePlan, string, error) {
 	plan := &ownerWakeRoutePlan{}
 	rootIdx := -1
+	// Delivery skips a disabled subscription, so a switched-off role=root endpoint is
+	// unreachable in exactly the way a missing one is.
+	rootReachable := false
 	for i, sub := range mw.Subscriptions {
 		id, ok := closedManagerWakeSubID(sub.ID)
 		if !ok {
@@ -222,6 +225,7 @@ func planOwnerWakeDeliveries(root string, mw *ManagerWakeConfig, rows []managerW
 				return nil, "duplicate_root_subscription", fmt.Errorf("duplicate_root_subscription")
 			}
 			rootIdx = i
+			rootReachable = sub.Enabled
 		default:
 			return nil, "invalid_subscription_role", fmt.Errorf("invalid_subscription_role")
 		}
@@ -271,7 +275,7 @@ func planOwnerWakeDeliveries(root string, mw *ManagerWakeConfig, rows []managerW
 			continue
 		}
 		wantRoot := closed.EndpointKind == replyEndpointRoot || closed.EscalateToRoot
-		if wantRoot && rootIdx < 0 {
+		if wantRoot && !rootReachable {
 			g.markClass(ownerErrRootUnreachable)
 			continue
 		}
@@ -343,7 +347,7 @@ func planOwnerWakeDeliveries(root string, mw *ManagerWakeConfig, rows []managerW
 		for id := range routedTasks {
 			exclude[id] = true
 		}
-		if i == rootIdx {
+		if rootReachable && i == rootIdx {
 			listed := map[string]bool{}
 			for _, id := range next.TaskIDs {
 				listed[strings.TrimSpace(id)] = true

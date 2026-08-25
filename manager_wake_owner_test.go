@@ -30,6 +30,14 @@ func ownerWakeRootSub(id string, projects ...string) ManagerWakeSubscription {
 	}
 }
 
+// ownerWakeRootSubEvents is a root endpoint that only listens for some event types,
+// which is the operator filter R8-REV-P1-2 turns into a delivery gap.
+func ownerWakeRootSubEvents(id string, eventTypes []string, projects ...string) ManagerWakeSubscription {
+	sub := ownerWakeRootSub(id, projects...)
+	sub.EventTypes = eventTypes
+	return sub
+}
+
 func writeOwnerWakeConfig(t *testing.T, root, bin string, ownerRouting bool, subs ...ManagerWakeSubscription) *ManagerWakeConfig {
 	t.Helper()
 	mw := &ManagerWakeConfig{
@@ -93,6 +101,54 @@ func wakeIDOf(t *testing.T, root string, tk *Task) string {
 	t.Helper()
 	held := mustHeldEvent(t, root, tk.ID)
 	return wakeEventID(tk.ID, held.Seq, held.TransitionID)
+}
+
+// canceledCommittedTask commits a routeless card on a second wake-eligible event type,
+// so a root filter can be shown to still exclude what the operator excluded.
+func canceledCommittedTask(t *testing.T, root, project, title string) *Task {
+	t.Helper()
+	tk := newTask(root, testCfg(), typeSequence, title, "/tmp", []string{"p"}, 5)
+	tk.Project = project
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := terminalize(root, tk.ID, statusCanceled, "test:cancel", "test cancel", map[string]any{"reason": "test cancel"}); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fresh
+}
+
+func outboxRow(t *testing.T, root, taskID string) managerWakeOutboxRow {
+	t.Helper()
+	rows, class, err := loadManagerWakeOutbox(root)
+	if err != nil || class != "" {
+		t.Fatalf("outbox load: class=%q err=%v", class, err)
+	}
+	for _, row := range rows {
+		if row.TaskID == taskID {
+			return row
+		}
+	}
+	t.Fatalf("no outbox row for %s", taskID)
+	return managerWakeOutboxRow{}
+}
+
+// rootCursorSeq is the outbox position the configured root endpoint has already
+// consumed. A row below it can never be delivered again.
+func rootCursorSeq(t *testing.T, root, subID string) int64 {
+	t.Helper()
+	cur, class, err := loadManagerWakeCursor(root, subID)
+	if class != "" || err != nil {
+		t.Fatalf("root cursor: class=%q err=%v", class, err)
+	}
+	if cur == nil {
+		return 0
+	}
+	return cur.OutboxSeq
 }
 
 type ownerWakeCall struct {
@@ -536,6 +592,202 @@ func TestOwnerWakeM7EscalationDisabledRootNoHalfDelivery(t *testing.T) {
 	}
 	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, want) {
 		t.Fatalf("recovered root leg = %v, want %v", got, want)
+	}
+}
+
+// ---- R8-REV-P1-2: a root subscription that filters out the row is not a reachable root ----
+//
+// role=root may carry an event_types filter. When a card pinned at endpoint_kind=root (or
+// escalating to root) produces a row of a type that filter excludes, planning used to
+// count root as reachable while subscriptionMatches skipped the root leg at delivery. The
+// enabled root then advanced its cursor past the row, so unlike the disabled-root case the
+// wake was not held but destroyed. Planning must treat the gap as an unreachable root:
+// record the requester fail-closed and hold the root leg's cursor for the pass.
+
+func TestOwnerWakeM1RootEndpointEventTypeGapFailsClosed(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	// Root only listens for done; the card below commits a held row.
+	mw := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evDone}, "wake-proj"))
+	q := captureOwnerWakeQueue(t)
+
+	tk := routedHeldTask(t, root, "wake-proj", "root endpoint outside the root filter", rootRoute("alpha"))
+
+	for pass := 0; pass < 2; pass++ {
+		if err := managerWakeOnce(root, mw); err != nil {
+			t.Fatalf("pass %d: a filtered-out root leg must isolate, not fail the pass: %v", pass, err)
+		}
+	}
+	if calls := q.snapshot(); len(calls) != 0 {
+		t.Fatalf("a root that cannot carry the row still queued a model turn: %+v", calls)
+	}
+	blocked := loadOwnerWakeBlocks(root)
+	if len(blocked) != 1 || blocked[0].Class != ownerErrRootUnreachable ||
+		blocked[0].RequesterID != "alpha" || !containsString(blocked[0].TaskIDs, tk.ID) {
+		t.Fatalf("endpoint_kind=root outside the root event filter must be a durable fail-closed coordinate, got %+v", blocked)
+	}
+	rb := managerWakeReadback(root, mw)
+	if diag, _ := rb["diagnosis"].([]string); !containsString(diag, ownerErrRootUnreachable) {
+		t.Fatalf("diagnosis must name the unreachable root: %v", diag)
+	}
+	// Held, not destroyed: the root leg must not have consumed the row it refused.
+	row := outboxRow(t, root, tk.ID)
+	if got := rootCursorSeq(t, root, "mgr"); got >= row.Seq {
+		t.Fatalf("root cursor consumed the row it silently skipped: cursor=%d row=%d", got, row.Seq)
+	}
+
+	// Widening the root filter to cover the row delivers the held wake and clears the record.
+	on := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evDone, evHeld}, "wake-proj"))
+	if err := managerWakeOnce(root, on); err != nil {
+		t.Fatalf("pass after widening the root filter: %v", err)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, []string{wakeIDOf(t, root, tk)}) {
+		t.Fatalf("repaired root received %v, want the held wake once", got)
+	}
+	if blocked := loadOwnerWakeBlocks(root); len(blocked) != 0 {
+		t.Fatalf("a recovered requester must clear its block record: %+v", blocked)
+	}
+}
+
+func TestOwnerWakeM7EscalationEventTypeGapNoHalfDelivery(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	mw := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evDone}, "wake-proj"))
+	q := captureOwnerWakeQueue(t)
+
+	esc := routedHeldTask(t, root, "wake-proj", "escalation outside the root filter",
+		codexThreadRoute("alpha", ownerWakeAlphaThread, true))
+	neighbour := routedHeldTask(t, root, "wake-proj", "beta needs no root",
+		codexThreadRoute("beta", ownerWakeBetaThread, false))
+
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("a filtered-out root leg must isolate, not fail the pass: %v", err)
+	}
+	if got := q.wakeIDsOn(ownerWakeAlphaThread); len(got) != 0 {
+		t.Fatalf("owner leg delivered while the root leg was being filtered away: %v", got)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); len(got) != 0 {
+		t.Fatalf("a root that cannot carry the row received a turn: %v", got)
+	}
+	if got := q.wakeIDsOn(ownerWakeBetaThread); !equalStrings(got, []string{wakeIDOf(t, root, neighbour)}) {
+		t.Fatalf("a requester that needs no root was starved by its neighbour: %v", got)
+	}
+	blocked := loadOwnerWakeBlocks(root)
+	if len(blocked) != 1 || blocked[0].SubscriptionID != "owner-alpha" ||
+		blocked[0].Class != ownerErrRootUnreachable || !containsString(blocked[0].TaskIDs, esc.ID) {
+		t.Fatalf("escalation outside the root event filter = %+v", blocked)
+	}
+	// A requester that never delivered must not own any protocol file.
+	for _, path := range []string{
+		managerWakeCursorPath(root, "owner-alpha"),
+		managerWakeReceiptPath(root, "owner-alpha"),
+		managerWakeInflightPath(root, "owner-alpha"),
+	} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("blocked requester left %s behind: %v", filepath.Base(path), err)
+		}
+	}
+	escRow := outboxRow(t, root, esc.ID)
+	if got := rootCursorSeq(t, root, "mgr"); got >= escRow.Seq {
+		t.Fatalf("root cursor consumed the escalated row it could not carry: cursor=%d row=%d", got, escRow.Seq)
+	}
+
+	// Both legs land once the root filter covers the row; neither leg was consumed.
+	on := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evDone, evHeld}, "wake-proj"))
+	if err := managerWakeOnce(root, on); err != nil {
+		t.Fatalf("pass after widening the root filter: %v", err)
+	}
+	want := []string{wakeIDOf(t, root, esc)}
+	if got := q.wakeIDsOn(ownerWakeAlphaThread); !equalStrings(got, want) {
+		t.Fatalf("recovered owner leg = %v, want %v", got, want)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, want) {
+		t.Fatalf("recovered root leg = %v, want %v", got, want)
+	}
+}
+
+// The repair must not buy root reachability by widening the operator's filter: a root
+// event_types list still excludes every unrouted row the operator excluded.
+func TestOwnerWakeRootEventTypeFilterNotWidened(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	mw := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evHeld}, "wake-proj"))
+	q := captureOwnerWakeQueue(t)
+
+	pinned := routedHeldTask(t, root, "wake-proj", "root endpoint inside the root filter", rootRoute("alpha"))
+	legacy := canceledCommittedTask(t, root, "wake-proj", "legacy canceled outside the root filter")
+
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("covered root pass: %v", err)
+	}
+	if got := q.wakeIDsOn(ownerWakeRootThread); !equalStrings(got, []string{wakeIDOf(t, root, pinned)}) {
+		t.Fatalf("a root filter that covers the pinned row must deliver it and nothing else: %v", got)
+	}
+	if blocked := loadOwnerWakeBlocks(root); len(blocked) != 0 {
+		t.Fatalf("a covered root must not be reported unreachable: %+v", blocked)
+	}
+
+	rows, class, err := loadManagerWakeOutbox(root)
+	if err != nil || class != "" {
+		t.Fatalf("outbox load: class=%q err=%v", class, err)
+	}
+	plan, planClass, planErr := planOwnerWakeDeliveries(root, mw, rows)
+	if planClass != "" || planErr != nil {
+		t.Fatalf("plan: class=%q err=%v", planClass, planErr)
+	}
+	if len(plan.configSubs) != 1 {
+		t.Fatalf("config subscriptions = %+v", plan.configSubs)
+	}
+	planned := plan.configSubs[0]
+	if !planned.Enabled {
+		t.Fatalf("a root that covers every root-bound row must stay deliverable: %+v", planned)
+	}
+	if !equalStrings(planned.EventTypes, []string{evHeld}) {
+		t.Fatalf("planner rewrote the configured root event filter: %v", planned.EventTypes)
+	}
+	legacyTask, err := findTaskAnywhere(root, legacy.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subscriptionMatches(planned, legacyTask, outboxRow(t, root, legacy.ID)) {
+		t.Fatalf("planner widened the root filter onto an unrouted %s row", evCanceled)
+	}
+}
+
+// A card that is already refused never reaches the root leg, so it must not hold it: the
+// gap is measured on the cards this pass would actually deliver at root.
+func TestOwnerWakeRootFilterGapIgnoresRefusedCards(t *testing.T) {
+	root := testRoot(t)
+	bin, _ := fakeCodexQueueBin(t, 0)
+	mw := writeOwnerWakeConfig(t, root, bin, true, ownerWakeRootSubEvents("mgr", []string{evDone}, "wake-proj"))
+	q := captureOwnerWakeQueue(t)
+
+	refused := codexThreadRoute("yvonne", ownerWakeAlphaThread, true)
+	refused.EndpointKind = replyEndpointExternalAgent
+	refused.EndpointThread = ""
+	tk := routedHeldTask(t, root, "wake-proj", "refused endpoint that also escalates", refused)
+
+	if err := managerWakeOnce(root, mw); err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if calls := q.snapshot(); len(calls) != 0 {
+		t.Fatalf("a refused endpoint delivered: %+v", calls)
+	}
+	blocked := loadOwnerWakeBlocks(root)
+	if len(blocked) != 1 || blocked[0].Class != ownerErrEndpointUnsupported ||
+		!containsString(blocked[0].TaskIDs, tk.ID) {
+		t.Fatalf("a refused endpoint must keep its own class, got %+v", blocked)
+	}
+	rows, class, err := loadManagerWakeOutbox(root)
+	if err != nil || class != "" {
+		t.Fatalf("outbox load: class=%q err=%v", class, err)
+	}
+	plan, planClass, planErr := planOwnerWakeDeliveries(root, mw, rows)
+	if planClass != "" || planErr != nil {
+		t.Fatalf("plan: class=%q err=%v", planClass, planErr)
+	}
+	if len(plan.configSubs) != 1 || !plan.configSubs[0].Enabled {
+		t.Fatalf("a card that never reaches root must not hold the root leg: %+v", plan.configSubs)
 	}
 }
 

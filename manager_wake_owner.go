@@ -305,6 +305,34 @@ func planOwnerWakeDeliveries(root string, mw *ManagerWakeConfig, rows []managerW
 		}
 	}
 
+	// A role=root subscription may carry an event_types filter, and delivery applies it
+	// to the root leg like any other. A root-bound row of a type the filter excludes is
+	// therefore skipped at delivery — but an *enabled* root also advances its cursor past
+	// that row, so the skip is not a hold, it is destruction. Widening the filter instead
+	// is not available: event_types has no per-card grain, so it would hand root every
+	// unrouted row the operator excluded. Planning treats the gap as an unreachable root,
+	// exactly like a switched-off one: every requester that needs the root leg is held
+	// whole, and the root leg itself is held for the pass so its cursor stays off the row
+	// it refused.
+	rootFilterGap := false
+	if rootIdx >= 0 && rootReachable && len(rootExtra) > 0 &&
+		!rootEventTypesCover(mw.Subscriptions[rootIdx], rootBoundEventTypes(rootExtra, rows)) {
+		rootFilterGap = true
+		for _, subID := range order {
+			g := groups[subID]
+			if g.class != "" {
+				continue
+			}
+			for _, id := range g.taskIDs {
+				if rootExtra[id] {
+					g.markClass(ownerErrRootUnreachable)
+					break
+				}
+			}
+		}
+		rootExtra = map[string]bool{}
+	}
+
 	for _, subID := range order {
 		g := groups[subID]
 		sort.Strings(g.taskIDs)
@@ -347,6 +375,12 @@ func planOwnerWakeDeliveries(root string, mw *ManagerWakeConfig, rows []managerW
 		for id := range routedTasks {
 			exclude[id] = true
 		}
+		if rootFilterGap && i == rootIdx {
+			// Held, not filtered: a root leg that cannot carry this pass's
+			// root-bound rows must not consume the outbox for anyone, or the
+			// wake it refused is gone before config can be repaired.
+			next.Enabled = false
+		}
 		if rootReachable && i == rootIdx {
 			listed := map[string]bool{}
 			for _, id := range next.TaskIDs {
@@ -365,6 +399,39 @@ func planOwnerWakeDeliveries(root string, mw *ManagerWakeConfig, rows []managerW
 		plan.configSubs = append(plan.configSubs, next)
 	}
 	return plan, "", nil
+}
+
+// rootBoundEventTypes is the set of outbox event types this pass would have to deliver at
+// the root endpoint. It deliberately over-approximates within the root-bound cards — a
+// row delivery would later suppress as stale still counts — because the safe direction
+// here is to hold a reachable root, never to call an unreachable one reachable.
+func rootBoundEventTypes(rootBound map[string]bool, rows []managerWakeOutboxRow) map[string]bool {
+	types := map[string]bool{}
+	for _, row := range rows {
+		if rootBound[row.TaskID] {
+			types[row.EventType] = true
+		}
+	}
+	return types
+}
+
+// rootEventTypesCover reports whether the configured root subscription would still match
+// every root-bound row once delivery applies its event_types filter. An empty filter
+// matches everything, which is the unfiltered default.
+func rootEventTypesCover(sub ManagerWakeSubscription, want map[string]bool) bool {
+	if len(sub.EventTypes) == 0 || len(want) == 0 {
+		return true
+	}
+	have := make(map[string]bool, len(sub.EventTypes))
+	for _, et := range sub.EventTypes {
+		have[strings.TrimSpace(et)] = true
+	}
+	for et := range want {
+		if !have[et] {
+			return false
+		}
+	}
+	return true
 }
 
 func (g *ownerWakeGroup) markClass(class string) {

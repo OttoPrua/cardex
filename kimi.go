@@ -414,12 +414,126 @@ func overrideKimiTopLevelConfig(raw string, values map[string]string) string {
 	return strings.Join(append(prefix, kept...), "\n")
 }
 
+// kimiCredentialDirMode is the permission Cardex enforces on the task-local credentials directory
+// it owns. The directory is the containment boundary for anything Kimi writes there.
+const kimiCredentialDirMode os.FileMode = 0o700
+
+// projectKimiTaskLocalCredentials makes destCredentials a real Cardex-owned mode-0700 directory and
+// projects every allowed source credential into it as a precise per-file symlink.
+//
+// A whole-directory symlink cannot be used here: Kimi refreshes its OAuth credential by creating a
+// temp file next to the credential and renaming it over the credential name. Through a directory
+// symlink that same-directory rename resolves into the user's global Kimi home and overwrites the
+// global credential. With a real task-local directory the rename replaces the per-file symlink
+// itself (rename(2) does not follow the destination symlink), so the refreshed credential stays
+// task-local and the global source is never written.
+//
+// The projection is path-level only. Cardex never opens, reads, copies, hashes, or serializes
+// credential content, and never modifies the source directory or its entries. Every state that is
+// not a proven-good projection fails closed rather than being silently repaired, so an operator
+// always resolves an unexpected credential path by hand.
+func projectKimiTaskLocalCredentials(sourceCredentials, destCredentials string) error {
+	switch info, err := os.Lstat(destCredentials); {
+	case err == nil:
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("Kimi CLI 任务级凭据目录必须是真实目录，检测到目录级软链接: %s（请人工删除该链接后重试）", destCredentials)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("Kimi CLI 任务级凭据路径已存在且不是目录: %s", destCredentials)
+		}
+		if info.Mode().Perm() != kimiCredentialDirMode {
+			if err := os.Chmod(destCredentials, kimiCredentialDirMode); err != nil {
+				return err
+			}
+		}
+	case os.IsNotExist(err):
+		if err := os.Mkdir(destCredentials, kimiCredentialDirMode); err != nil {
+			return err
+		}
+		if err := os.Chmod(destCredentials, kimiCredentialDirMode); err != nil {
+			return err
+		}
+	default:
+		return err
+	}
+
+	sourceEntries, err := os.ReadDir(sourceCredentials)
+	if err != nil {
+		return fmt.Errorf("枚举 Kimi CLI 凭据目录失败 %s: %w", sourceCredentials, err)
+	}
+	allowed := make(map[string]struct{}, len(sourceEntries))
+	for _, entry := range sourceEntries {
+		name := entry.Name()
+		if !kimiCredentialEntryInBounds(sourceCredentials, name) || !kimiCredentialEntryInBounds(destCredentials, name) {
+			return fmt.Errorf("Kimi CLI 凭据条目名越界: %s 中的 %q", sourceCredentials, name)
+		}
+		if !entry.Type().IsRegular() {
+			return fmt.Errorf("Kimi CLI 凭据目录只允许普通文件，检测到 %s: %s",
+				entry.Type().String(), filepath.Join(sourceCredentials, name))
+		}
+		allowed[name] = struct{}{}
+	}
+
+	destEntries, err := os.ReadDir(destCredentials)
+	if err != nil {
+		return fmt.Errorf("枚举 Kimi CLI 任务级凭据目录失败 %s: %w", destCredentials, err)
+	}
+	projected := make(map[string]struct{}, len(destEntries))
+	for _, entry := range destEntries {
+		name := entry.Name()
+		path := filepath.Join(destCredentials, name)
+		switch {
+		case entry.Type()&os.ModeSymlink != 0:
+			if !kimiCredentialEntryInBounds(destCredentials, name) {
+				return fmt.Errorf("Kimi CLI 任务级凭据条目名越界: %q", name)
+			}
+			if _, ok := allowed[name]; !ok {
+				return fmt.Errorf("Kimi CLI 任务级凭据软链接没有对应的源凭据文件: %s", path)
+			}
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if target != filepath.Join(sourceCredentials, name) {
+				return fmt.Errorf("Kimi CLI 任务级凭据软链接目标不一致: %s", path)
+			}
+		case entry.Type().IsRegular():
+			// Kimi 已在任务级目录内原子替换出自己的凭据文件。保留原样：不回读、不覆盖、
+			// 不改权限，重新投影会丢掉 Kimi 刚刷新的令牌。
+		default:
+			return fmt.Errorf("Kimi CLI 任务级凭据目录出现意外文件类型 %s: %s", entry.Type().String(), path)
+		}
+		projected[name] = struct{}{}
+	}
+
+	for _, entry := range sourceEntries {
+		name := entry.Name()
+		if _, ok := projected[name]; ok {
+			continue
+		}
+		if err := os.Symlink(filepath.Join(sourceCredentials, name), filepath.Join(destCredentials, name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// kimiCredentialEntryInBounds rejects any directory entry name that would resolve outside its own
+// directory. os.ReadDir cannot produce such a name today; this keeps the projection provably
+// in-bounds if a name ever reaches it from somewhere else.
+func kimiCredentialEntryInBounds(dir, name string) bool {
+	if name == "" || name == "." || name == ".." || name != filepath.Base(name) {
+		return false
+	}
+	return filepath.Dir(filepath.Join(dir, name)) == filepath.Clean(dir)
+}
+
 // prepareKimiCLIHome creates a mode-specific Cardex-owned runtime home so prompt mode can use
 // automatic permissions without mutating the user's global Kimi config. Review tasks use Kimi's
 // configured plan mode, while sequence tasks use execute mode. Keeping separate homes avoids a
 // concurrent review changing the permissions of an executing task (or vice versa). OAuth
-// credentials remain in the user's Kimi home and are referenced through a directory symlink; the
-// token is never copied into Cardex state.
+// credentials stay in the user's Kimi home and are projected per file into a task-local
+// credentials directory; the token is never read or copied into Cardex state.
 func prepareKimiCLIHome(root string, cfg *Config, planMode bool) (string, error) {
 	if cfg == nil {
 		return "", fmt.Errorf("Kimi CLI 配置为空")
@@ -438,8 +552,12 @@ func prepareKimiCLIHome(root string, cfg *Config, planMode bool) (string, error)
 		return "", fmt.Errorf("读取 Kimi CLI 配置失败 %s: %w", sourceConfig, err)
 	}
 	sourceCredentials := filepath.Join(sourceHome, "credentials")
-	if _, err := os.Stat(sourceCredentials); err != nil {
+	sourceInfo, err := os.Stat(sourceCredentials)
+	if err != nil {
 		return "", fmt.Errorf("Kimi CLI OAuth 凭据目录不可用 %s: %w", sourceCredentials, err)
+	}
+	if !sourceInfo.IsDir() {
+		return "", fmt.Errorf("Kimi CLI OAuth 凭据路径不是目录 %s", sourceCredentials)
 	}
 
 	mode := "execute"
@@ -451,19 +569,7 @@ func prepareKimiCLIHome(root string, cfg *Config, planMode bool) (string, error)
 		return "", err
 	}
 	destCredentials := filepath.Join(runtimeHome, "credentials")
-	if info, err := os.Lstat(destCredentials); err == nil {
-		if info.Mode()&os.ModeSymlink == 0 {
-			return "", fmt.Errorf("Kimi CLI 隔离凭据路径已存在且不是软链接: %s", destCredentials)
-		}
-		target, readErr := os.Readlink(destCredentials)
-		if readErr != nil || target != sourceCredentials {
-			return "", fmt.Errorf("Kimi CLI 隔离凭据软链接目标不一致: %s", destCredentials)
-		}
-	} else if os.IsNotExist(err) {
-		if err := os.Symlink(sourceCredentials, destCredentials); err != nil {
-			return "", err
-		}
-	} else {
+	if err := projectKimiTaskLocalCredentials(sourceCredentials, destCredentials); err != nil {
 		return "", err
 	}
 

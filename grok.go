@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1005,8 +1006,11 @@ const (
 var grokBuildPlainInvalidInvocationRe = regexp.MustCompile(`(?i)^(?:error:\s*)?(?:invalid (?:option|argument|flag)\b.*|usage:\s.+)$`)
 
 type grokBuildProcessTerminal struct {
-	class      grokBuildProcessClass
-	exitStatus string
+	class                 grokBuildProcessClass
+	exitStatus            string
+	stderrBytes           int
+	stderrSHA256          string
+	stderrLineCountBucket int
 }
 
 func (t grokBuildProcessTerminal) subtype() string {
@@ -1014,7 +1018,12 @@ func (t grokBuildProcessTerminal) subtype() string {
 }
 
 func (t grokBuildProcessTerminal) result() string {
-	return "exit_status=" + t.exitStatus
+	result := "exit_status=" + t.exitStatus
+	if t.class == grokBuildProcessClassUnclassified {
+		result += fmt.Sprintf(" stderr_bytes=%d stderr_sha256=%s stderr_line_count_bucket=%d",
+			t.stderrBytes, t.stderrSHA256, t.stderrLineCountBucket)
+	}
+	return result
 }
 
 func grokBuildZeroWorkObservation(res *claudeResult) bool {
@@ -1028,6 +1037,17 @@ func grokBuildNormalizedProcessExitStatus(runErr error) string {
 		return strconv.Itoa(exitErr.ExitCode())
 	}
 	return grokBuildProcessExitNonExit
+}
+
+func grokBuildProcessStderrLineCountBucket(stderr string) int {
+	lines := strings.Count(stderr, "\n")
+	if stderr != "" && !strings.HasSuffix(stderr, "\n") {
+		lines++
+	}
+	if lines > grokBuildProcessStderrMaxLines {
+		return grokBuildProcessStderrMaxLines + 1
+	}
+	return lines
 }
 
 func grokBuildPlainPermissionEnvironmentLine(line string) bool {
@@ -1127,10 +1147,16 @@ func grokBuildZeroEventProcessTerminal(stdout, stderr string, runErr error) (gro
 	if !grokBuildZeroWorkObservation(stdoutOnly) || !stdoutOnly.ObservationComplete {
 		return grokBuildProcessTerminal{}, nil, false
 	}
-	return grokBuildProcessTerminal{
+	terminal := grokBuildProcessTerminal{
 		class:      class,
 		exitStatus: grokBuildNormalizedProcessExitStatus(runErr),
-	}, stdoutOnly, true
+	}
+	if class == grokBuildProcessClassUnclassified {
+		terminal.stderrBytes = len(stderr)
+		terminal.stderrSHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
+		terminal.stderrLineCountBucket = grokBuildProcessStderrLineCountBucket(stderr)
+	}
+	return terminal, stdoutOnly, true
 }
 
 func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, prompt string) (*claudeResult, string, error) {
@@ -1238,6 +1264,9 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 			stdoutOnly.IsError = true
 			stdoutOnly.Subtype = proc.subtype()
 			stdoutOnly.Result = proc.result()
+			stdoutOnly.ProcessStderrBytes = proc.stderrBytes
+			stdoutOnly.ProcessStderrSHA256 = proc.stderrSHA256
+			stdoutOnly.ProcessStderrLineCountBucket = proc.stderrLineCountBucket
 			res = stdoutOnly
 			combined = stdout.String()
 		}

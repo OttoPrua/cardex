@@ -35,11 +35,14 @@ type claudeResult struct {
 	// Policy fallback observations are populated by streaming parsers. They are internal proof
 	// signals, not provider wire fields: a serial next leg is legal only when the parser completely
 	// observed the stream and saw zero semantic/model and zero tool events.
-	SemanticEvents      int  `json:"-"`
-	ModelEvents         int  `json:"-"`
-	ToolEvents          int  `json:"-"`
-	ObservationComplete bool `json:"-"`
-	TerminalEvents      int  `json:"-"`
+	SemanticEvents               int    `json:"-"`
+	ModelEvents                  int    `json:"-"`
+	ToolEvents                   int    `json:"-"`
+	ObservationComplete          bool   `json:"-"`
+	TerminalEvents               int    `json:"-"`
+	ProcessStderrBytes           int    `json:"-"`
+	ProcessStderrSHA256          string `json:"-"`
+	ProcessStderrLineCountBucket int    `json:"-"`
 	// ResultFromTranscript 标记 Result 是否源自 combined(stdout+stderr transcript)。
 	// 【P1 教训 · CG-3 Round-3】codex 本机/远端与远端 claude 的失败路径会把 codexErrorLine
 	// 挑走的行或 firstLine(combined) 直接写进 Result，经 errorSummary 拼进 msg 后参与
@@ -1741,13 +1744,19 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				logBlock(lg, "GROK_PROCESS_HELD", fmt.Sprintf(
 					"zero-event process exit held (class=%s, kind=%s, observation_complete=true)",
 					processClass, failureKind))
+				detail := map[string]any{
+					"reason": "grok_zero_event_process_exit_held", "err": safeErr,
+					"failure_class": processClass, "failure_kind": failureKind,
+					"observation_complete": true, "semantic_events": 0,
+					"model_events": 0, "tool_events": 0,
+				}
+				if processClass == string(grokBuildProcessClassUnclassified) {
+					detail["stderr_bytes"] = res.ProcessStderrBytes
+					detail["stderr_sha256"] = res.ProcessStderrSHA256
+					detail["stderr_line_count_bucket"] = res.ProcessStderrLineCountBucket
+				}
 				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:classifier", statusHeld, t.Step,
-					withCostTelemetry(withRouteAttempt(map[string]any{
-						"reason": "grok_zero_event_process_exit_held", "err": safeErr,
-						"failure_class": processClass, "failure_kind": failureKind,
-						"observation_complete": true, "semantic_events": 0,
-						"model_events": 0, "tool_events": 0,
-					}, t), t)))
+					withCostTelemetry(withRouteAttempt(detail, t), t)))
 			}
 		}
 

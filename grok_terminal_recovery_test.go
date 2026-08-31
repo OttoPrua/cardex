@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -527,6 +529,30 @@ func assertGrokProcessTerminalResult(t *testing.T, res *claudeResult, combined s
 	if !strings.Contains(res.Result, grokProcessExitStatus(want.exitCode)) {
 		t.Fatalf("normalized exit status %d missing from result %q", want.exitCode, res.Result)
 	}
+	if want.wantClass == grokBuildProcessClassUnclassified {
+		stderr := want.stderr + "\n"
+		sha := fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
+		lineBucket := strings.Count(stderr, "\n")
+		if lineBucket > grokBuildProcessStderrMaxLines {
+			lineBucket = grokBuildProcessStderrMaxLines + 1
+		}
+		if res.ProcessStderrBytes != len(stderr) || res.ProcessStderrSHA256 != sha ||
+			res.ProcessStderrLineCountBucket != lineBucket {
+			t.Fatalf("unclassified stderr metadata mismatch: %+v result=%q", res, res.Result)
+		}
+		for _, value := range []string{
+			"stderr_bytes=" + strconv.Itoa(len(stderr)),
+			"stderr_sha256=" + sha,
+			"stderr_line_count_bucket=" + strconv.Itoa(lineBucket),
+		} {
+			if !strings.Contains(res.Result, value) {
+				t.Fatalf("unclassified result missing %q: %q", value, res.Result)
+			}
+		}
+	} else if res.Result != grokProcessExitStatus(want.exitCode) || res.ProcessStderrBytes != 0 ||
+		res.ProcessStderrSHA256 != "" || res.ProcessStderrLineCountBucket != 0 {
+		t.Fatalf("known class behavior changed: %+v result=%q", res, res.Result)
+	}
 	if kind, unknown := grokTerminalUnknownOutcome(res); unknown || kind != "" {
 		t.Fatalf("process terminal must not take the unknown-outcome mask: kind=%q unknown=%v res=%+v", kind, unknown, res)
 	}
@@ -660,6 +686,30 @@ func assertGrokProcessTerminalHeld(t *testing.T, root string, task *Task, produc
 	if held.Detail["observation_complete"] != want.wantObsComplete {
 		t.Fatalf("held observation_complete: %+v want %v", held.Detail, want.wantObsComplete)
 	}
+	if want.wantClass == grokBuildProcessClassUnclassified {
+		stderr := want.stderr + "\n"
+		sha := fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
+		lineBucket := strings.Count(stderr, "\n")
+		if lineBucket > grokBuildProcessStderrMaxLines {
+			lineBucket = grokBuildProcessStderrMaxLines + 1
+		}
+		if intFromDetail(held.Detail["stderr_bytes"]) != len(stderr) ||
+			held.Detail["stderr_sha256"] != sha ||
+			intFromDetail(held.Detail["stderr_line_count_bucket"]) != lineBucket {
+			t.Fatalf("held unclassified stderr metadata mismatch: %+v", held.Detail)
+		}
+		if !strings.Contains(got.LastError, "stderr_bytes="+strconv.Itoa(len(stderr))) ||
+			!strings.Contains(got.LastError, "stderr_sha256="+sha) ||
+			!strings.Contains(got.LastError, "stderr_line_count_bucket="+strconv.Itoa(lineBucket)) {
+			t.Fatalf("last_error missing unclassified stderr identity: %q", got.LastError)
+		}
+	} else {
+		for _, key := range []string{"stderr_bytes", "stderr_sha256", "stderr_line_count_bucket"} {
+			if _, ok := held.Detail[key]; ok || strings.Contains(got.LastError, key+"=") {
+				t.Fatalf("known class gained unclassified metadata %q: detail=%+v last_error=%q", key, held.Detail, got.LastError)
+			}
+		}
+	}
 	errText, _ := held.Detail["err"].(string)
 	if !strings.Contains(errText, want.wantSubtype) || !strings.Contains(errText, grokProcessExitStatus(want.exitCode)) {
 		t.Fatalf("held err must retain typed process class and exit status: %+v", held.Detail)
@@ -727,6 +777,41 @@ func TestGrokBuildNormalizedProcessExitStatus(t *testing.T) {
 	}
 	if got := grokBuildNormalizedProcessExitStatus(nil); got != grokBuildProcessExitNonExit {
 		t.Fatalf("nil error: got %q want %q", got, grokBuildProcessExitNonExit)
+	}
+}
+
+func TestGrokBuildUnclassifiedProcessMetadataDeterministicAndBounded(t *testing.T) {
+	terminal := func(stderr string) grokBuildProcessTerminal {
+		t.Helper()
+		got, res, ok := grokBuildZeroEventProcessTerminal("", stderr, errors.New("process exited"))
+		if !ok || res == nil || got.class != grokBuildProcessClassUnclassified {
+			t.Fatalf("expected unclassified zero-event terminal: terminal=%+v res=%+v ok=%v", got, res, ok)
+		}
+		return got
+	}
+
+	stderr := "opaque-secret-one\nopaque-secret-two"
+	a, b := terminal(stderr), terminal(stderr)
+	changed := terminal(stderr + "-changed")
+	wantSHA := fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
+	if a != b {
+		t.Fatalf("equal stderr metadata differs: a=%+v b=%+v", a, b)
+	}
+	if a.stderrBytes != len(stderr) || a.stderrSHA256 != wantSHA || a.stderrLineCountBucket != 2 {
+		t.Fatalf("metadata mismatch: got=%+v want bytes=%d sha=%s lines=2", a, len(stderr), wantSHA)
+	}
+	if len(a.stderrSHA256) != 64 || strings.ToLower(a.stderrSHA256) != a.stderrSHA256 {
+		t.Fatalf("sha256 must be 64 lowercase hex characters: %q", a.stderrSHA256)
+	}
+	if changed.stderrSHA256 == a.stderrSHA256 {
+		t.Fatalf("changed stderr retained identity: before=%+v after=%+v", a, changed)
+	}
+	if strings.Contains(a.result(), "opaque-secret") {
+		t.Fatalf("metadata result leaked stderr: %q", a.result())
+	}
+	manyLines := terminal(strings.Repeat("opaque\n", grokBuildProcessStderrMaxLines+100))
+	if manyLines.stderrLineCountBucket != grokBuildProcessStderrMaxLines+1 {
+		t.Fatalf("line bucket is not bounded: %+v", manyLines)
 	}
 }
 

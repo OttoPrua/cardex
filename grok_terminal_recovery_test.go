@@ -1425,7 +1425,7 @@ func TestRunTaskGrokScannerOverflowRemainsFailClosed(t *testing.T) {
 }
 
 func TestCardexReleaseIdentity(t *testing.T) {
-	if version != "0.10.12" {
-		t.Fatalf("release identity %q want 0.10.12", version)
+	if version != "0.10.13" {
+		t.Fatalf("release identity %q want 0.10.13", version)
 	}
 }

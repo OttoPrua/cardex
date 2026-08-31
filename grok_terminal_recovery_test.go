@@ -48,7 +48,11 @@ func fakeGrokBuildCounted(t *testing.T, payload, stderr string, exitCode int) (b
 	if stderr != "" {
 		script += "printf '%s\\n' " + shSingleQuote(stderr) + " >&2\n"
 	}
-	script += "exit " + strconv.Itoa(exitCode) + "\n"
+	if exitCode < 0 {
+		script += "kill -9 $$\n"
+	} else {
+		script += "exit " + strconv.Itoa(exitCode) + "\n"
+	}
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -497,6 +501,11 @@ func grokZeroEventProcessFixtures() []grokZeroEventProcessFixture {
 			wantObsComplete: true,
 			leaks:           []string{grokTerminalFixtureStderrSentinel, "SECRETTOKEN", grokProcessUnknownURLLeak},
 		},
+		{
+			name: "unknown signal", stderr: grokTerminalFixtureStderrSentinel, exitCode: -1,
+			wantSubtype: "grok_build_process_unclassified", wantClass: grokBuildProcessClassUnclassified,
+			wantObsComplete: true, leaks: []string{grokTerminalFixtureStderrSentinel},
+		},
 	}
 }
 
@@ -529,7 +538,7 @@ func assertGrokProcessTerminalResult(t *testing.T, res *claudeResult, combined s
 	if !strings.Contains(res.Result, grokProcessExitStatus(want.exitCode)) {
 		t.Fatalf("normalized exit status %d missing from result %q", want.exitCode, res.Result)
 	}
-	if want.wantClass == grokBuildProcessClassUnclassified {
+	if want.wantClass == grokBuildProcessClassUnclassified && want.exitCode > 0 {
 		stderr := want.stderr + "\n"
 		sha := fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
 		lineBucket := strings.Count(stderr, "\n")
@@ -551,7 +560,7 @@ func assertGrokProcessTerminalResult(t *testing.T, res *claudeResult, combined s
 		}
 	} else if res.Result != grokProcessExitStatus(want.exitCode) || res.ProcessStderrBytes != 0 ||
 		res.ProcessStderrSHA256 != "" || res.ProcessStderrLineCountBucket != 0 {
-		t.Fatalf("known class behavior changed: %+v result=%q", res, res.Result)
+		t.Fatalf("stderr-free process metadata behavior changed: %+v result=%q", res, res.Result)
 	}
 	if kind, unknown := grokTerminalUnknownOutcome(res); unknown || kind != "" {
 		t.Fatalf("process terminal must not take the unknown-outcome mask: kind=%q unknown=%v res=%+v", kind, unknown, res)
@@ -686,7 +695,7 @@ func assertGrokProcessTerminalHeld(t *testing.T, root string, task *Task, produc
 	if held.Detail["observation_complete"] != want.wantObsComplete {
 		t.Fatalf("held observation_complete: %+v want %v", held.Detail, want.wantObsComplete)
 	}
-	if want.wantClass == grokBuildProcessClassUnclassified {
+	if want.wantClass == grokBuildProcessClassUnclassified && want.exitCode > 0 {
 		stderr := want.stderr + "\n"
 		sha := fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
 		lineBucket := strings.Count(stderr, "\n")
@@ -706,7 +715,7 @@ func assertGrokProcessTerminalHeld(t *testing.T, root string, task *Task, produc
 	} else {
 		for _, key := range []string{"stderr_bytes", "stderr_sha256", "stderr_line_count_bucket"} {
 			if _, ok := held.Detail[key]; ok || strings.Contains(got.LastError, key+"=") {
-				t.Fatalf("known class gained unclassified metadata %q: detail=%+v last_error=%q", key, held.Detail, got.LastError)
+				t.Fatalf("metadata-free exit gained stderr identity %q: detail=%+v last_error=%q", key, held.Detail, got.LastError)
 			}
 		}
 	}
@@ -772,6 +781,10 @@ func TestGrokBuildNormalizedProcessExitStatus(t *testing.T) {
 	if got := grokBuildNormalizedProcessExitStatus(err); got != "7" {
 		t.Fatalf("ordinary ExitError: got %q want 7", got)
 	}
+	signalErr := exec.Command("/bin/sh", "-c", "kill -9 $$").Run()
+	if got := grokBuildNormalizedProcessExitStatus(signalErr); got != "-1" {
+		t.Fatalf("signal ExitError: got %q want -1", got)
+	}
 	if got := grokBuildNormalizedProcessExitStatus(errors.New("exec: not started")); got != grokBuildProcessExitNonExit {
 		t.Fatalf("non-exit process error: got %q want %q", got, grokBuildProcessExitNonExit)
 	}
@@ -820,14 +833,17 @@ func TestGrokBuildUnclassifiedProcessMetadataDeterministicAndBounded(t *testing.
 	}
 }
 
-func TestGrokBuildUnclassifiedProcessMetadataRequiresExitError(t *testing.T) {
+func TestGrokBuildUnclassifiedProcessMetadataRequiresPositiveExit(t *testing.T) {
+	signalErr := exec.Command("/bin/sh", "-c", "kill -9 $$").Run()
 	for _, tc := range []struct {
-		name string
-		err  error
+		name       string
+		err        error
+		exitStatus string
 	}{
-		{name: "ordinary", err: errors.New("exec: not started")},
-		{name: "context deadline", err: context.DeadlineExceeded},
-		{name: "wrapped context cancellation", err: fmt.Errorf("command stopped: %w", context.Canceled)},
+		{name: "signal", err: signalErr, exitStatus: "-1"},
+		{name: "ordinary", err: errors.New("exec: not started"), exitStatus: grokBuildProcessExitNonExit},
+		{name: "context deadline", err: context.DeadlineExceeded, exitStatus: grokBuildProcessExitNonExit},
+		{name: "wrapped context cancellation", err: fmt.Errorf("command stopped: %w", context.Canceled), exitStatus: grokBuildProcessExitNonExit},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got, res, ok := grokBuildZeroEventProcessTerminal("", "opaque diagnostic", tc.err)
@@ -837,8 +853,8 @@ func TestGrokBuildUnclassifiedProcessMetadataRequiresExitError(t *testing.T) {
 			if got.stderrBytes != 0 || got.stderrSHA256 != "" || got.stderrLineCountBucket != 0 {
 				t.Fatalf("non-exit error gained stderr metadata: %+v", got)
 			}
-			if got.result() != "exit_status="+grokBuildProcessExitNonExit {
-				t.Fatalf("non-exit result gained stderr metadata: %q", got.result())
+			if got.result() != "exit_status="+tc.exitStatus {
+				t.Fatalf("non-positive exit result gained stderr metadata: %q", got.result())
 			}
 		})
 	}

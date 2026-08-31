@@ -1152,7 +1152,7 @@ func grokBuildZeroEventProcessTerminal(stdout, stderr string, runErr error) (gro
 		exitStatus: grokBuildNormalizedProcessExitStatus(runErr),
 	}
 	var exitErr *exec.ExitError
-	if class == grokBuildProcessClassUnclassified && errors.As(runErr, &exitErr) && exitErr.ExitCode() != 0 {
+	if class == grokBuildProcessClassUnclassified && errors.As(runErr, &exitErr) && exitErr.ExitCode() > 0 {
 		terminal.stderrBytes = len(stderr)
 		terminal.stderrSHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
 		terminal.stderrLineCountBucket = grokBuildProcessStderrLineCountBucket(stderr)

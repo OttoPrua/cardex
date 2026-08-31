@@ -1750,7 +1750,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					"observation_complete": true, "semantic_events": 0,
 					"model_events": 0, "tool_events": 0,
 				}
-				if processClass == string(grokBuildProcessClassUnclassified) {
+				if res.ProcessStderrSHA256 != "" {
 					detail["stderr_bytes"] = res.ProcessStderrBytes
 					detail["stderr_sha256"] = res.ProcessStderrSHA256
 					detail["stderr_line_count_bucket"] = res.ProcessStderrLineCountBucket

@@ -1019,7 +1019,7 @@ func (t grokBuildProcessTerminal) subtype() string {
 
 func (t grokBuildProcessTerminal) result() string {
 	result := "exit_status=" + t.exitStatus
-	if t.class == grokBuildProcessClassUnclassified {
+	if t.stderrSHA256 != "" {
 		result += fmt.Sprintf(" stderr_bytes=%d stderr_sha256=%s stderr_line_count_bucket=%d",
 			t.stderrBytes, t.stderrSHA256, t.stderrLineCountBucket)
 	}
@@ -1151,7 +1151,8 @@ func grokBuildZeroEventProcessTerminal(stdout, stderr string, runErr error) (gro
 		class:      class,
 		exitStatus: grokBuildNormalizedProcessExitStatus(runErr),
 	}
-	if class == grokBuildProcessClassUnclassified {
+	var exitErr *exec.ExitError
+	if class == grokBuildProcessClassUnclassified && errors.As(runErr, &exitErr) && exitErr.ExitCode() != 0 {
 		terminal.stderrBytes = len(stderr)
 		terminal.stderrSHA256 = fmt.Sprintf("%x", sha256.Sum256([]byte(stderr)))
 		terminal.stderrLineCountBucket = grokBuildProcessStderrLineCountBucket(stderr)

@@ -781,9 +781,14 @@ func TestGrokBuildNormalizedProcessExitStatus(t *testing.T) {
 }
 
 func TestGrokBuildUnclassifiedProcessMetadataDeterministicAndBounded(t *testing.T) {
+	runErr := exec.Command("/bin/sh", "-c", "exit 7").Run()
+	var exitErr *exec.ExitError
+	if !errors.As(runErr, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("expected real exit error 7, got %T %v", runErr, runErr)
+	}
 	terminal := func(stderr string) grokBuildProcessTerminal {
 		t.Helper()
-		got, res, ok := grokBuildZeroEventProcessTerminal("", stderr, errors.New("process exited"))
+		got, res, ok := grokBuildZeroEventProcessTerminal("", stderr, runErr)
 		if !ok || res == nil || got.class != grokBuildProcessClassUnclassified {
 			t.Fatalf("expected unclassified zero-event terminal: terminal=%+v res=%+v ok=%v", got, res, ok)
 		}
@@ -812,6 +817,30 @@ func TestGrokBuildUnclassifiedProcessMetadataDeterministicAndBounded(t *testing.
 	manyLines := terminal(strings.Repeat("opaque\n", grokBuildProcessStderrMaxLines+100))
 	if manyLines.stderrLineCountBucket != grokBuildProcessStderrMaxLines+1 {
 		t.Fatalf("line bucket is not bounded: %+v", manyLines)
+	}
+}
+
+func TestGrokBuildUnclassifiedProcessMetadataRequiresExitError(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{name: "ordinary", err: errors.New("exec: not started")},
+		{name: "context deadline", err: context.DeadlineExceeded},
+		{name: "wrapped context cancellation", err: fmt.Errorf("command stopped: %w", context.Canceled)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, res, ok := grokBuildZeroEventProcessTerminal("", "opaque diagnostic", tc.err)
+			if !ok || res == nil || got.class != grokBuildProcessClassUnclassified {
+				t.Fatalf("prior unclassified behavior changed: terminal=%+v res=%+v ok=%v", got, res, ok)
+			}
+			if got.stderrBytes != 0 || got.stderrSHA256 != "" || got.stderrLineCountBucket != 0 {
+				t.Fatalf("non-exit error gained stderr metadata: %+v", got)
+			}
+			if got.result() != "exit_status="+grokBuildProcessExitNonExit {
+				t.Fatalf("non-exit result gained stderr metadata: %q", got.result())
+			}
+		})
 	}
 }
 

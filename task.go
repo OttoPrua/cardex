@@ -277,6 +277,8 @@ type Task struct {
 	ResumeAtEpoch  int64 `json:"resume_at_epoch,omitempty"`
 	NotBeforeEpoch int64 `json:"not_before_epoch,omitempty"`
 	Attempts       int   `json:"attempts,omitempty"`
+	// MaxAttempts 为正时覆盖全局重试上限；0 表示继承 config.max_attempts_per_step。
+	MaxAttempts int `json:"max_attempts,omitempty"`
 
 	PermissionMode  string   `json:"permission_mode,omitempty"`
 	AllowedTools    []string `json:"allowed_tools,omitempty"`

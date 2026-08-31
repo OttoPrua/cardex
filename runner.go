@@ -2259,8 +2259,11 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				}
 				t.LastError = annotatedError(lastErrCls, msg)
 				logBlock(lg, "ERROR", fmt.Sprintf("第 %d 次失败[%s]: %s", t.Attempts, cls, msg))
-				if t.Attempts >= cfg.MaxAttempts {
-					t.Status = statusFailed
+				maxAttempts := cfg.MaxAttempts
+				if t.MaxAttempts > 0 {
+					maxAttempts = t.MaxAttempts
+				}
+				if t.Attempts >= maxAttempts {
 					detail := map[string]any{
 						"err": msg, "attempts": t.Attempts, "failure_class": string(cls),
 					}
@@ -2268,6 +2271,14 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 						detail["softened_from_terminal"] = true
 						detail["reason"] = "softened_transcript_derived"
 					}
+					if t.MaxAttempts > 0 {
+						t.Status = statusHeld
+						detail["reason"] = "task_max_attempts_reached"
+						detail["max_attempts"] = maxAttempts
+						t.touch()
+						return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner", statusHeld, t.Step, withCostTelemetry(withRouteAttempt(detail, t), t)))
+					}
+					t.Status = statusFailed
 					t.touch()
 					return finishIfStopped(persistTaskEvent(root, t, evFailed, "runner", statusFailed, t.Step, withCostTelemetry(withRouteAttempt(detail, t), t)))
 				}

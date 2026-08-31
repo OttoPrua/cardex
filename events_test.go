@@ -295,6 +295,126 @@ func TestRunTaskEmitsRetryThenFailed(t *testing.T) {
 	}
 }
 
+func TestTaskMaxAttempts(t *testing.T) {
+	t.Run("missing_or_zero_inherits_global", func(t *testing.T) {
+		for name, raw := range map[string]string{
+			"missing": `{}`,
+			"zero":    `{"max_attempts":0}`,
+		} {
+			t.Run(name, func(t *testing.T) {
+				var tk Task
+				if err := json.Unmarshal([]byte(raw), &tk); err != nil {
+					t.Fatal(err)
+				}
+				if tk.MaxAttempts != 0 {
+					t.Fatalf("max_attempts 应读回 0 并继承全局, got %d", tk.MaxAttempts)
+				}
+			})
+		}
+
+		root := testRoot(t)
+		errJSON := `{"type":"result","is_error":true,"subtype":"random_error","result":"some transient hiccup"}`
+		cfg := runTaskCfg(t, fakeClaudeBin(t, errJSON, "", 1))
+		cfg.MaxAttempts = 3
+
+		tk := newTask(root, cfg, typeSequence, "继承全局重试上限", t.TempDir(), []string{"p"}, 5)
+		if err := saveTask(root, tk); err != nil {
+			t.Fatal(err)
+		}
+		loaded, err := loadTask(root, tk.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < cfg.MaxAttempts; i++ {
+			if err := runTask(context.Background(), root, cfg, loaded, false); err != nil {
+				t.Fatal(err)
+			}
+			loaded, err = loadTask(root, tk.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+		}
+		if loaded.Status != statusFailed || loaded.Attempts != 3 {
+			t.Fatalf("继承全局上限 3 后应 failed/attempts=3, got status=%q attempts=%d", loaded.Status, loaded.Attempts)
+		}
+		if got := eventTypes(readAllEventsRaw(t, root, tk.ID)); !equalStringSlices(got, []string{
+			evDispatched, evRetry, evDispatched, evRetry, evDispatched, evFailed,
+		}) {
+			t.Fatalf("继承全局重试事件序列错误: %v", got)
+		}
+	})
+
+	t.Run("cmd_add_persists_one_and_rejects_negative", func(t *testing.T) {
+		root := testRoot(t)
+		work := t.TempDir()
+		if err := saveConfig(root, defaultConfig("claude")); err != nil {
+			t.Fatal(err)
+		}
+		if err := cmdAdd([]string{"-root", root, "-dir", work, "-max-attempts", "1", "只跑一次"}); err != nil {
+			t.Fatal(err)
+		}
+		tasks, err := loadTasks(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tasks) != 1 || tasks[0].MaxAttempts != 1 {
+			t.Fatalf("cmdAdd 应持久化 max_attempts=1, got %+v", tasks)
+		}
+		if err := cmdAdd([]string{"-root", root, "-dir", work, "-max-attempts", "-1", "非法"}); err == nil {
+			t.Fatal("负数 -max-attempts 应被拒绝")
+		}
+		tasks, err = loadTasks(root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(tasks) != 1 {
+			t.Fatalf("负数 -max-attempts 不得创建任务, got %d", len(tasks))
+		}
+	})
+
+	t.Run("explicit_one_holds_after_one_provider_start", func(t *testing.T) {
+		root := testRoot(t)
+		counter := filepath.Join(t.TempDir(), "starts")
+		binDir := t.TempDir()
+		claudeBin := filepath.Join(binDir, "claude")
+		script := "#!/bin/sh\nprintf x >> " + shSingleQuote(counter) + "\n" +
+			"printf '%s\\n' '{\"type\":\"result\",\"is_error\":true,\"subtype\":\"random_error\",\"result\":\"some transient hiccup\"}'\nexit 1\n"
+		if err := os.WriteFile(claudeBin, []byte(script), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		cfg := runTaskCfg(t, claudeBin)
+		tk := newTask(root, cfg, typeSequence, "显式一次后挂起", t.TempDir(), []string{"p"}, 5)
+		tk.MaxAttempts = 1
+		if err := saveTask(root, tk); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := runTask(context.Background(), root, cfg, tk, false); err != nil {
+			t.Fatal(err)
+		}
+		starts, err := os.ReadFile(counter)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(starts) != 1 {
+			t.Fatalf("显式上限 1 应只启动 provider 一次, got %d", len(starts))
+		}
+		got, err := loadTask(root, tk.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.Status != statusHeld || got.Attempts != 1 {
+			t.Fatalf("显式上限 1 后应 held/attempts=1, got status=%q attempts=%d", got.Status, got.Attempts)
+		}
+		if eligible(got, time.Now()) {
+			t.Fatal("held 任务不得参与自动派发")
+		}
+		if types := eventTypes(readAllEventsRaw(t, root, tk.ID)); !equalStringSlices(types, []string{evDispatched, evHeld}) {
+			t.Fatalf("显式上限 1 应只发 dispatched+held 且无 retry, got %v", types)
+		}
+	})
+}
+
 // TestCliSetStatusHoldReleaseCancelEvents 验证 CLI 的 hold/release/cancel 各自留一条对应事件。
 func TestCliSetStatusHoldReleaseCancelEvents(t *testing.T) {
 	root := testRoot(t)
@@ -584,6 +704,7 @@ func TestPostCompleteProgressFailureEmitsFailed(t *testing.T) {
 //   - evDispatched: 派上时 Step=待执行步序(0-indexed),显示 +1;
 //   - evStepOK: runner.go:779 已 t.Step++,Step=已完成步数(1-indexed),直接显示;
 //   - 末步 evStepOK(final_step=true): 同样直接显示,不再 +1(否则两步卡末步会说"第 3 步")。
+//
 // 反例注入:把 evStepOK 分支恢复成 ev.Step+1,末步文本会退化为"第 N+1 步·末步",本测试报红。
 func TestDescribeEventStepNumbers(t *testing.T) {
 	// 派上执行:runner.go:775 dispatched 时 Step 是 0-indexed 待执行序,显示应为"第 Step+1 步"。

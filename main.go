@@ -113,7 +113,7 @@ func printUsage() {
 	          [-kimi-model kimi-code/k3] [-grok-model grok-4.6] [-grok-effort xhigh] [-cursor-model MODEL]
 	          [-route-class general|backend] [-risk-class ordinary|high-risk|critical|production]
 	          [-quality-sensitive] [-specialized-frontend] [-owner-critical-bypass-reason REASON]
-            [-stakes low|normal|high] [-review-after] [-emit] [-hold] [-skip-permissions]
+	          [-stakes low|normal|high] [-max-attempts N] [-review-after] [-emit] [-hold] [-skip-permissions]
             [-tools "A,B"] [-write-domain-id ID] [-write-domain-lineage L]
             [-write-domain-component C] [-write-paths p1,p2] [-write-resources kind:id]
             [-depends-on TASK_ID] "prompt..."
@@ -250,6 +250,7 @@ func cmdAdd(args []string) error {
 	model := fs.String("model", "", "覆盖模型（haiku/sonnet/opus 或完整模型名）")
 	effort := fs.String("effort", "", "思考等级（low/medium/high/xhigh/max），传 --effort 给 claude")
 	stakes := fs.String("stakes", "", "投入产出档位（low|normal|high，缺省 normal）：按 config.stakes_policy 查表决定是否配对抗复审/抬思考档，入队即固化到卡面")
+	maxAttempts := fs.Int("max-attempts", 0, "本任务重试上限（正数覆盖全局，0=继承全局）")
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
 	runner := fs.String("runner", "", "钉定执行器：claude / codex / gemini / opencode / kimi-cli / grok-build / cursor")
 	codexModel := fs.String("codex-model", "", "钉定经 codex 执行时的模型（如 gpt-5.6-terra）：配 -runner codex 主跑生效；不配 runner 时作为本卡 codex_fallback 降级模型")
@@ -275,6 +276,9 @@ func cmdAdd(args []string) error {
 	writeResources := fs.String("write-resources", "", "逗号分隔的封闭资源 kind:id")
 	dependsOn := fs.String("depends-on", "", "逗号分隔的前置任务 ID；仅 durably done 才算满足")
 	_ = fs.Parse(args)
+	if *maxAttempts < 0 {
+		return fmt.Errorf("-max-attempts 不能为负数")
+	}
 
 	root := resolveRoot(*rootFlag)
 	cfg, err := loadConfig(root)
@@ -321,6 +325,7 @@ func cmdAdd(args []string) error {
 		}
 	}
 	t := newTask(root, cfg, *typ, orDefaultTitle(*title, prompts[0]), wd, prompts, *priority)
+	t.MaxAttempts = *maxAttempts
 	// -project 显式归组：只 trim，不做白名单校验——新项目的第一张卡本来就没有"已知项目"
 	// 可查，校验会把"开新项目"这条正常路径堵死。写错名字的后果是看板多一个项目，
 	// 可见、可自查、改一次别名表即可收拢，不值得用一道硬闸换。

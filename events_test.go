@@ -604,14 +604,20 @@ func TestConcurrentConsumedReleaseAndHeldRetriesOpenOneEpoch(t *testing.T) {
 	if fresh.ActiveAttemptID != "" {
 		t.Fatalf("retry must not start a provider attempt: %q", fresh.ActiveAttemptID)
 	}
-	queued := 0
+	queued, dispatched := 0, 0
 	for _, event := range readAllEventsRaw(t, root, tk.ID) {
 		if event.Type == evQueued && event.Actor == "cli:retry" {
 			queued++
 		}
+		if event.Type == evDispatched {
+			dispatched++
+		}
 	}
 	if queued != 1 {
 		t.Fatalf("queued retry events=%d want 1", queued)
+	}
+	if dispatched != 0 {
+		t.Fatalf("provider-start-equivalent dispatched events=%d want 0", dispatched)
 	}
 	entries, err := os.ReadDir(attemptsDir(root, tk.ID))
 	if err != nil {

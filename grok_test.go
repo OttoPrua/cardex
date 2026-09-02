@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +11,52 @@ import (
 	"testing"
 	"time"
 )
+
+func TestMain(m *testing.M) {
+	priorHome, hadHome := os.LookupEnv("HOME")
+	home, err := os.MkdirTemp("", "cardex-test-home-")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create hermetic test HOME: %v\n", err)
+		os.Exit(1)
+	}
+	setupErr := func() error {
+		if !filepath.IsAbs(home) {
+			return fmt.Errorf("test HOME is not absolute: %q", home)
+		}
+		if err := os.Chmod(home, 0o700); err != nil {
+			return err
+		}
+		grokHome := filepath.Join(home, ".grok")
+		if err := os.Mkdir(grokHome, 0o700); err != nil {
+			return err
+		}
+		if err := os.Chmod(grokHome, 0o700); err != nil {
+			return err
+		}
+		return os.Setenv("HOME", home)
+	}()
+	if setupErr != nil {
+		fmt.Fprintf(os.Stderr, "prepare hermetic test HOME: %v\n", setupErr)
+		_ = os.RemoveAll(home)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+	if hadHome {
+		err = os.Setenv("HOME", priorHome)
+	} else {
+		err = os.Unsetenv("HOME")
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "restore test HOME: %v\n", err)
+		code = 1
+	}
+	if err := os.RemoveAll(home); err != nil {
+		fmt.Fprintf(os.Stderr, "remove hermetic test HOME: %v\n", err)
+		code = 1
+	}
+	os.Exit(code)
+}
 
 func grokBuildTestConfig(t *testing.T, bin string) *Config {
 	t.Helper()

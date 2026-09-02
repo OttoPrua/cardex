@@ -13,6 +13,11 @@ import (
 
 func grokBuildTestConfig(t *testing.T, bin string) *Config {
 	t.Helper()
+	home := t.TempDir()
+	if err := os.Mkdir(filepath.Join(home, ".grok"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
 	cfg := defaultConfig("")
 	cfg.DefaultRunner = "codex"
 	cfg.CodexBin = "/usr/bin/true"
@@ -41,6 +46,28 @@ func grokBuildTestConfig(t *testing.T, bin string) *Config {
 	cfg.StepTimeoutMin = 1
 	cfg.CooldownMarginSec = 0
 	return cfg
+}
+
+func TestGrokLifecycleProbeFailsBeforeProviderProcess(t *testing.T) {
+	bin, productCalls := fakeGrokBuildCounted(t, `{"type":"end","stopReason":"end_turn"}`, "", 0)
+	cfg := grokBuildTestConfig(t, bin)
+	stateDir := filepath.Join(os.Getenv("HOME"), ".grok")
+	if err := os.Remove(stateDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stateDir, []byte("not-a-directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	task := &Task{ID: "grok-lifecycle-denied", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
+	root := admitDirectInvoke(t, "", task)
+	task.LastProviderPreflight = &ProviderPreflightReadback{Runner: grokBuildRunnerName, State: providerReady}
+	if _, _, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt"); err == nil ||
+		!strings.Contains(err.Error(), "lifecycle-state directory identity invalid") {
+		t.Fatalf("expected lifecycle-state denial before provider, got %v", err)
+	}
+	if n := countProductCalls(t, productCalls); n != 0 {
+		t.Fatalf("provider process started despite lifecycle-state denial: %d", n)
+	}
 }
 
 func TestGrokTierRoutesPinEffortFallbackAndOpusReview(t *testing.T) {

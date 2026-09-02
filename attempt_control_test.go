@@ -997,6 +997,34 @@ func TestTwoDispatchersSingleAttempt(t *testing.T) {
 	}
 }
 
+func TestAttemptEpochGuardUsesDurableRecordUnderTaskLock(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	tk := newTask(root, cfg, typeSequence, "attempt epoch guard", "/tmp", []string{"p"}, 5)
+	tk.Status = statusHeld
+	markControlTerminal(tk)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := checkAttemptEpoch(root, fresh, false); err != nil {
+		t.Fatalf("unused epoch rejected: %v", err)
+	}
+	rec := &AttemptRecord{TaskID: fresh.ID, AttemptID: "durable", ControlEpoch: fresh.ControlEpoch, State: attemptExited, CreatedAt: time.Now().Format(time.RFC3339Nano)}
+	if err := writeAttempt(root, rec); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkAttemptEpoch(root, fresh, false); !errors.Is(err, errAttemptEpochConsumed) {
+		t.Fatalf("consumed epoch error=%v", err)
+	}
+	if err := checkAttemptEpoch(root, fresh, true); err != nil {
+		t.Fatalf("explicit retry could not prove consumed epoch: %v", err)
+	}
+}
+
 func TestRunnerTerminalFailureClosesAttempt(t *testing.T) {
 	root := testRoot(t)
 	cfg := runTaskCfg(t, fakeClaudeBin(t, "", "boom", 1))

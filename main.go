@@ -1933,6 +1933,9 @@ func cmdSetStatus(args []string, action string) error {
 					t.ID, dec.HoldReason)
 			}
 		}
+		if err := checkAttemptEpoch(root, t, false); err != nil {
+			return err
+		}
 		restoreScheduling(t)
 		t.Status = statusQueued
 		t.NotBeforeEpoch = 0
@@ -1943,7 +1946,11 @@ func cmdSetStatus(args []string, action string) error {
 		// 的路径是 release,因此这条被审核审过的 P1 类还有一处同构位点必须一并闭合。
 		_ = resetTombstoneKind(root, t.ID, reconcileCrossKind())
 	case "retry":
-		if !t.terminal() && t.Status != statusLimitPaused {
+		if t.Status == statusHeld {
+			if err := checkAttemptEpoch(root, t, true); err != nil {
+				return err
+			}
+		} else if !t.terminal() && t.Status != statusLimitPaused {
 			return fmt.Errorf("%s 当前状态 %s 无需 retry", t.ID, t.Status)
 		}
 		restoreScheduling(t)

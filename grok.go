@@ -10,12 +10,84 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+func probeGrokBuildLifecycleState(t *Task) (err error) {
+	if t == nil || strings.TrimSpace(t.ID) == "" || strings.TrimSpace(t.ActiveAttemptID) == "" {
+		return fmt.Errorf("Grok lifecycle-state probe requires an exact reserved attempt")
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		return fmt.Errorf("resolve Grok lifecycle-state home: %w", err)
+	}
+	stateDir := filepath.Join(home, ".grok")
+	dirInfo, err := os.Lstat(stateDir)
+	if err != nil {
+		return fmt.Errorf("Grok lifecycle-state directory: %w", err)
+	}
+	if dirInfo.Mode()&os.ModeSymlink != 0 || !dirInfo.IsDir() {
+		return fmt.Errorf("Grok lifecycle-state directory identity invalid")
+	}
+	identity := sha256.Sum256([]byte(t.ID + "\x00" + t.ActiveAttemptID))
+	probePath := filepath.Join(stateDir, fmt.Sprintf(".cardex-lifecycle-probe-%x", identity[:8]))
+	payload := []byte("cardex-grok-lifecycle-probe-v1\n")
+	created := false
+	defer func() {
+		if !created {
+			return
+		}
+		removeErr := os.Remove(probePath)
+		syncErr := syncContainingDirectory(stateDir)
+		if err == nil && removeErr != nil && !os.IsNotExist(removeErr) {
+			err = removeErr
+		}
+		if err == nil && syncErr != nil {
+			err = syncErr
+		}
+	}()
+	f, err := os.OpenFile(probePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("create Grok lifecycle-state probe: %w", err)
+	}
+	created = true
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("chmod Grok lifecycle-state probe: %w", err)
+	}
+	if _, err := f.Write(payload); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("write Grok lifecycle-state probe: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return fmt.Errorf("fsync Grok lifecycle-state probe: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close Grok lifecycle-state probe: %w", err)
+	}
+	info, err := os.Lstat(probePath)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		return fmt.Errorf("Grok lifecycle-state probe metadata mismatch")
+	}
+	readback, err := os.ReadFile(probePath)
+	if err != nil || !bytes.Equal(readback, payload) {
+		return fmt.Errorf("Grok lifecycle-state probe readback mismatch")
+	}
+	if err := os.Remove(probePath); err != nil {
+		return fmt.Errorf("remove Grok lifecycle-state probe: %w", err)
+	}
+	created = false
+	if err := syncContainingDirectory(stateDir); err != nil {
+		return fmt.Errorf("fsync Grok lifecycle-state directory: %w", err)
+	}
+	return nil
+}
 
 const (
 	grokBuildRunnerName         = "grok-build"
@@ -1173,6 +1245,9 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	}
 	if effort == "max" {
 		return nil, "", fmt.Errorf("Grok 4.6 不支持 reasoning effort=max；最高可用档为 xhigh")
+	}
+	if err := probeGrokBuildLifecycleState(t); err != nil {
+		return nil, "", err
 	}
 	// runTaskVia performs the shared value-blind preflight before reaching this adapter. Keep the
 	// direct adapter seam used by focused tests and maintenance callers: when there is no persisted

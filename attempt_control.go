@@ -39,6 +39,8 @@ var (
 	errProducerInvalidated  = errors.New("producer writes stopped after rejected CAS")
 	errTransitionCrash      = errors.New("injected transition crash")
 	errAdmissionDenied      = errors.New("admission denied")
+	errAttemptEpochConsumed = errors.New("current attempt epoch already consumed")
+	errAttemptEpochUnused   = errors.New("current attempt epoch has not been consumed")
 	terminalizeWaitTimeout  = 45 * time.Second
 	reservedAttemptFreshFor = 30 * time.Second
 )
@@ -469,6 +471,51 @@ func loadAttempt(root, taskID, attemptID string) (*AttemptRecord, error) {
 		return nil, fmt.Errorf("attempt identity mismatch: have %s/%s want %s/%s", rec.TaskID, rec.AttemptID, taskID, attemptID)
 	}
 	return &rec, nil
+}
+
+// checkAttemptEpoch serializes the manual held->queued gate with the same task lock used by
+// dispatch reservation. ControlEpoch is already persisted on both Task and AttemptRecord, so a
+// second state field or retry registry would only create another truth owner.
+func checkAttemptEpoch(root string, snapshot *Task, requireConsumed bool) error {
+	if snapshot == nil || snapshot.ID == "" {
+		return fmt.Errorf("empty task")
+	}
+	return withTaskControlLock(root, snapshot.ID, func() error {
+		current, err := loadTask(root, snapshot.ID)
+		if err != nil {
+			return err
+		}
+		if current.Status != statusHeld || current.Revision != snapshot.Revision ||
+			current.ControlEpoch != snapshot.ControlEpoch || current.AdmissionEpoch != snapshot.AdmissionEpoch {
+			return errStaleTaskWrite
+		}
+		consumed := false
+		entries, err := os.ReadDir(attemptsDir(root, current.ID))
+		if err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			attemptID := strings.TrimSuffix(entry.Name(), ".json")
+			rec, err := loadAttempt(root, current.ID, attemptID)
+			if err != nil {
+				return fmt.Errorf("attempt epoch evidence invalid: %w", err)
+			}
+			if rec.ControlEpoch == current.ControlEpoch {
+				consumed = true
+				break
+			}
+		}
+		if requireConsumed && !consumed {
+			return errAttemptEpochUnused
+		}
+		if !requireConsumed && consumed {
+			return errAttemptEpochConsumed
+		}
+		return nil
+	})
 }
 
 func writeTransition(root string, rec *TransitionRecord) error {

@@ -454,6 +454,57 @@ func TestCliSetStatusHoldReleaseCancelEvents(t *testing.T) {
 	}
 }
 
+func TestCliReleaseRejectsConsumedEpochAndRetryOpensExplicitEpoch(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	tk := newTask(root, cfg, typeSequence, "consumed release epoch", "/tmp", []string{"p"}, 5)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSetStatus([]string{"-root", root, tk.ID}, "hold"); err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdSetStatus([]string{"-root", root, tk.ID}, "release"); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &AttemptRecord{TaskID: fresh.ID, AttemptID: "consumed", ControlEpoch: fresh.ControlEpoch, State: attemptExited, CreatedAt: time.Now().Format(time.RFC3339Nano)}
+	if err := writeAttempt(root, rec); err != nil {
+		t.Fatal(err)
+	}
+	fresh.Status = statusHeld
+	markControlTerminal(fresh)
+	fresh.touch()
+	if err := saveTask(root, fresh); err != nil {
+		t.Fatal(err)
+	}
+	beforeTask, _ := os.ReadFile(taskPath(root, fresh.ID))
+	beforeEvents := readAllEventsRaw(t, root, fresh.ID)
+	if err := cmdSetStatus([]string{"-root", root, fresh.ID}, "release"); !errors.Is(err, errAttemptEpochConsumed) {
+		t.Fatalf("release error=%v want errAttemptEpochConsumed", err)
+	}
+	afterTask, _ := os.ReadFile(taskPath(root, fresh.ID))
+	if string(afterTask) != string(beforeTask) {
+		t.Fatal("rejected release mutated task bytes")
+	}
+	if got := readAllEventsRaw(t, root, fresh.ID); len(got) != len(beforeEvents) {
+		t.Fatalf("rejected release emitted an event: before=%d after=%d", len(beforeEvents), len(got))
+	}
+	if err := cmdSetStatus([]string{"-root", root, fresh.ID}, "retry"); err != nil {
+		t.Fatal(err)
+	}
+	retried, err := loadTask(root, fresh.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if retried.Status != statusQueued || retried.ControlEpoch != fresh.ControlEpoch+1 {
+		t.Fatalf("explicit retry did not open one new epoch: %+v", retried)
+	}
+}
+
 // TestReviewVerdictClosepathEmitsCloseoutAndQueued 验证 pass→closeout 时父卡 closeout + 子卡 queued 双事件。
 func TestReviewVerdictClosepathEmitsCloseoutAndQueued(t *testing.T) {
 	root := testRoot(t)

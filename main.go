@@ -109,7 +109,7 @@ func printUsage() {
 添加任务
 	add       [-type sequence|design-review|prompt-assembly|coordinate|progress-pull]
 	          [-title T] [-dir D] [-priority N] [-model haiku|sonnet|opus] [-file steps.md]
-	          [-runner claude|codex|gemini|opencode|kimi-cli|grok-build|cursor] [-opencode-model provider/model]
+	          [-runner claude|codex|agy|opencode|kimi-cli|grok-build|cursor] [-opencode-model provider/model]
 	          [-kimi-model kimi-code/k3] [-grok-model grok-4.6] [-grok-effort xhigh] [-cursor-model MODEL]
 	          [-route-class general|backend] [-risk-class ordinary|high-risk|critical|production]
 	          [-quality-sensitive] [-specialized-frontend] [-owner-critical-bypass-reason REASON]
@@ -252,9 +252,10 @@ func cmdAdd(args []string) error {
 	stakes := fs.String("stakes", "", "投入产出档位（low|normal|high，缺省 normal）：按 config.stakes_policy 查表决定是否配对抗复审/抬思考档，入队即固化到卡面")
 	maxAttempts := fs.Int("max-attempts", 0, "本任务重试上限（正数覆盖全局，0=继承全局）")
 	closeout := fs.String("closeout", "", "收口回写指令：本卡对抗复审 pass 后自动入队一张 haiku 卡跑此 prompt（回写账本 done）")
-	runner := fs.String("runner", "", "钉定执行器：claude / codex / gemini / opencode / kimi-cli / grok-build / cursor")
+	runner := fs.String("runner", "", "钉定执行器：claude / codex / agy / opencode / kimi-cli / grok-build / cursor")
 	codexModel := fs.String("codex-model", "", "钉定经 codex 执行时的模型（如 gpt-5.6-terra）：配 -runner codex 主跑生效；不配 runner 时作为本卡 codex_fallback 降级模型")
-	geminiModel := fs.String("gemini-model", "", "钉定经 gemini 执行时的模型（推荐官方别名 pro/flash/flash-lite）：主跑与降级改道两径生效；空按档位槽映射")
+	geminiModel := fs.String("gemini-model", "", "历史兼容字段；新任务禁止使用，请改用 -runner agy / -agy-model")
+	agyModel := fs.String("agy-model", "", "钉定 Antigravity 模型；空时从 agy models 动态选择实际广告的最高 Claude Opus")
 	openCodeModel := fs.String("opencode-model", "", "钉定原生 OpenCode provider/model（如 opencode-go/gpt-5.6-luna）")
 	kimiModel := fs.String("kimi-model", "", "钉定原生 Kimi Code CLI 模型（如 kimi-code/k3）")
 	grokModel := fs.String("grok-model", "", "钉定原生 Grok Build 模型（如 grok-4.6）")
@@ -285,10 +286,10 @@ func cmdAdd(args []string) error {
 	if err != nil {
 		return err
 	}
-	if *runner != "" && *runner != "claude" && *runner != "codex" && *runner != "gemini" &&
+	if *runner != "" && *runner != "claude" && *runner != "codex" && *runner != antigravityRunnerName && *runner != "gemini" &&
 		*runner != "opencode" && *runner != "kimi-cli" && *runner != grokBuildRunnerName && *runner != cursorRunnerName {
 		if _, ok := cfg.Engines[*runner]; !ok {
-			return fmt.Errorf("未知 runner %q（可选: claude, codex, gemini, opencode, kimi-cli, grok-build, cursor%s；引擎预设用 cardex engines add <名> 并入）",
+			return fmt.Errorf("未知 runner %q（可选: claude, codex, agy, opencode, kimi-cli, grok-build, cursor%s；引擎预设用 cardex engines add <名> 并入）",
 				*runner, engineNamesHint(cfg))
 		}
 	}
@@ -389,12 +390,11 @@ func cmdAdd(args []string) error {
 			return fmt.Errorf("-runner codex 的模型请用 -codex-model 指定（-model 是 claude 专用旗标，对 codex 无效）")
 		}
 	} else if *runner == "gemini" {
-		// gemini 钉定：有会话（--session-id/--resume），不要求 codexEligible，多步可用。
-		// -model 有效且有意义：档位别名（fable/opus/sonnet/haiku）经 gemini_models 槽映射
-		// 解析成 pro/flash/flash-lite；要钉具体 gemini 模型用 -gemini-model。
-		t.PreferRunner = "gemini"
-		if cfg.GeminiBin == "" {
-			return fmt.Errorf("config.json 未配置 gemini_bin，无法钉定 gemini 执行器")
+		return fmt.Errorf("Gemini 新任务已退休；请改用 -runner agy")
+	} else if *runner == antigravityRunnerName {
+		t.PreferRunner = antigravityRunnerName
+		if !antigravityEnabled(cfg) {
+			return fmt.Errorf("config.json 未启用 antigravity/antigravity_bin，无法钉定 agy 执行器")
 		}
 	} else if *runner == "opencode" {
 		t.PreferRunner = "opencode"
@@ -428,6 +428,13 @@ func cmdAdd(args []string) error {
 	}
 	t.CodexModel = strings.TrimSpace(*codexModel)
 	t.GeminiModel = strings.TrimSpace(*geminiModel)
+	t.AgyModel = strings.TrimSpace(*agyModel)
+	if t.GeminiModel != "" {
+		return fmt.Errorf("-gemini-model 已退休；新任务请改用 -runner agy / -agy-model")
+	}
+	if t.AgyModel != "" && t.PreferRunner != antigravityRunnerName {
+		return fmt.Errorf("-agy-model 仅可用于 -runner agy 或 default_runner=agy 的新任务")
+	}
 	t.OpenCodeModel = strings.TrimSpace(*openCodeModel)
 	t.KimiModel = strings.TrimSpace(*kimiModel)
 	t.GrokModel = strings.TrimSpace(*grokModel)
@@ -1559,21 +1566,7 @@ func cmdCmd(args []string) error {
 		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
 		return nil
 	case t.PreferRunner == "gemini":
-		model, _ := resolveGeminiModel(cfg, t)
-		parts = []string{"gemini", "-m", model, "--approval-mode", geminiApprovalModeFor(cfg, t)}
-		if t.SessionID != "" {
-			parts = append(parts, "--resume", t.SessionID)
-		}
-		fmt.Printf("# %s [%s] %s（第 %d/%d 步，状态 %s，优先级 %d）\n",
-			t.ID, t.Type, t.Title, step+1, len(t.Prompts), zhStatus(t.Status), t.Priority)
-		fmt.Printf("cd %s && %s\n", shellQuote(t.Dir), strings.Join(parts, " "))
-		if t.MidStep && t.SessionID != "" {
-			fmt.Printf("\n# 该会话在步骤中途被打断，进入后先发续跑提示：\n%s\n", cfg.ResumePrompt)
-		} else {
-			fmt.Printf("\n# 进入后粘贴当前步骤的 prompt：\n%s\n", prompt)
-		}
-		fmt.Printf("\n# 手动接管前建议先挂起，避免调度器同时跑它: cardex hold %s\n", t.ID)
-		return nil
+		return fmt.Errorf("任务 %s 是历史 Gemini 卡；仅保留展示/解码，不再生成执行命令", t.ID)
 	}
 	// 引擎钉定卡：手动接管命令带 env 前缀（base_url + 认证 + extra_env），密钥只给**引用形态**
 	// （$VAR / $(cat 文件)），绝不解析明文——cmd 输出常被复制进聊天/工单，明文即泄露。
@@ -2189,7 +2182,7 @@ func cmdDoctor(args []string) error {
 		}
 		check("claude 可执行文件 ("+cfg.ClaudeBin+")", err, "确认 claude CLI 已安装，或修改 config.json 的 claude_bin")
 	}
-	// codex/gemini 备用执行器自检（配了才查；此前 codex_bin 从不检查是已知缺口，随 gemini 补齐）。
+	// Codex 与 Antigravity 原生执行器自检。Gemini 仅保留历史解码/展示，不再探测认证。
 	if cfg != nil && cfg.CodexBin != "" {
 		_, err = os.Stat(cfg.CodexBin)
 		if err != nil {
@@ -2197,33 +2190,13 @@ func cmdDoctor(args []string) error {
 		}
 		check("codex 可执行文件 ("+cfg.CodexBin+")", err, "确认 codex CLI 已安装，或修改 config.json 的 codex_bin")
 	}
-	if cfg != nil && cfg.GeminiBin != "" {
-		_, err = os.Stat(cfg.GeminiBin)
+	if cfg != nil && antigravityEnabled(cfg) {
+		_, err = os.Stat(cfg.AntigravityBin)
 		if err != nil {
-			_, err = exec.LookPath(cfg.GeminiBin)
+			_, err = exec.LookPath(cfg.AntigravityBin)
 		}
-		check("gemini 可执行文件 ("+cfg.GeminiBin+")", err, "确认 gemini CLI 已安装，或修改 config.json 的 gemini_bin")
-		// 认证信号只报「已配置/缺失」，值不回显。三条独立路径任一即可：
-		// gemini_auth_env 指名的变量 > 环境 GEMINI_API_KEY > OAuth 缓存凭据。
-		switch {
-		case cfg.GeminiAuthEnv != "" && strings.TrimSpace(os.Getenv(cfg.GeminiAuthEnv)) != "":
-			fmt.Printf("  ✔ gemini 认证（gemini_auth_env=%s，值不回显）\n", cfg.GeminiAuthEnv)
-		case strings.TrimSpace(os.Getenv("GEMINI_API_KEY")) != "":
-			fmt.Println("  ✔ gemini 认证（环境 GEMINI_API_KEY，值不回显）")
-		default:
-			home, _ := os.UserHomeDir()
-			if _, oerr := os.Stat(filepath.Join(home, ".gemini", "oauth_creds.json")); oerr == nil {
-				fmt.Println("  - gemini 认证：仅 OAuth 缓存凭据。注意：个人免费档已被 gemini-cli 0.42+ 拒绝" +
-					"（IneligibleTierError，Google 要求迁移 Antigravity）——需 Google AI Pro/Ultra 订阅 OAuth，" +
-					"或改用 GEMINI_API_KEY（AI Studio；免费档 250 次/天仅 Flash）")
-			} else {
-				check("gemini 认证", fmt.Errorf("未发现 GEMINI_API_KEY / gemini_auth_env / OAuth 凭据"),
-					"export GEMINI_API_KEY=<key>（或 config.gemini_auth_env 指名变量），或先交互跑一次 gemini 完成 OAuth 登录")
-			}
-		}
-		if cd := loadEngineCooldown(root, "gemini"); cd.active(time.Now()) {
-			fmt.Printf("  - gemini 车道冷却中（%s），%s 恢复\n", cd.Reason, fmtClock(cd.UntilEpoch))
-		}
+		check("Antigravity 可执行文件 ("+cfg.AntigravityBin+")", err,
+			"确认 agy CLI 已安装；真实任务会在无模型 preflight 中判断 OAuth/网络/限额")
 	}
 	if cfg != nil && cfg.OpenCodeBin != "" {
 		_, err = os.Stat(cfg.OpenCodeBin)

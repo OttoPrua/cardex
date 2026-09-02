@@ -159,6 +159,20 @@ func TestSessionResumeOverridesOnlyDefaultCodexRunner(t *testing.T) {
 	}
 }
 
+func TestSessionResumeOverridesOnlyDefaultAntigravityRunner(t *testing.T) {
+	cfg := codexPrimaryTestConfig()
+	cfg.DefaultRunner = antigravityRunnerName
+	cfg.AntigravityBin = "agy"
+	cfg.Antigravity = &AntigravityRoute{Enabled: true, Effort: "high"}
+	task := newTask(testRoot(t), cfg, typeSequence, "续跑", t.TempDir(), []string{"继续"}, 1)
+	task.SessionID = "claude-session"
+	preserveSessionRunner(task)
+
+	if task.PreferRunner != "" {
+		t.Fatalf("显式 Claude session 不可被默认 Antigravity 接管, got %q", task.PreferRunner)
+	}
+}
+
 func TestLegacyPendingCardsKeepRunnerIdentityThroughReadback(t *testing.T) {
 	// P1-6: new defaults reach task bytes only through the explicit creation path. Pre-existing
 	// cards — queued, held, limit-paused, failed, or cross/session identities — must pass through
@@ -205,6 +219,26 @@ func TestValidateDefaultRunner(t *testing.T) {
 	}
 	if err := validateDefaultRunner(&Config{DefaultRunner: "codex"}); err == nil {
 		t.Fatal("缺 codex_bin 时必须 fail fast")
+	}
+	agy := &Config{
+		DefaultRunner:  " AGY ",
+		AntigravityBin: "agy",
+		Antigravity:    &AntigravityRoute{Enabled: true, Effort: "high"},
+	}
+	if err := validateDefaultRunner(agy); err != nil {
+		t.Fatalf("启用的 agy 默认路由不应报错: %v", err)
+	}
+	if agy.DefaultRunner != antigravityRunnerName {
+		t.Fatalf("default_runner 应规范化为 agy, got %q", agy.DefaultRunner)
+	}
+	if task := newTask(testRoot(t), agy, typeSequence, "Antigravity", t.TempDir(), []string{"实现"}, 1); task.PreferRunner != antigravityRunnerName {
+		t.Fatalf("default_runner=agy 应烘焙到新卡: %+v", task)
+	}
+	if err := validateDefaultRunner(&Config{DefaultRunner: "agy"}); err == nil {
+		t.Fatal("未启用 antigravity 时 default_runner=agy 必须 fail fast")
+	}
+	if err := validateDefaultRunner(&Config{DefaultRunner: "gemini"}); err == nil {
+		t.Fatal("default_runner=gemini 必须因退役而 fail fast")
 	}
 	if err := validateDefaultRunner(&Config{DefaultRunner: "unknown"}); err == nil {
 		t.Fatal("未知 default_runner 必须 fail fast")

@@ -39,9 +39,13 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 	// patrol.go 收敛到 pgDeadTooLong,阈值现仅影响 reason 分类。抽成 helper 以便直测。
 	updatePatrolHeartbeatTimeout(cfg)
 
-	type doneMsg struct{ t *Task }
+	type doneMsg struct {
+		t   *Task
+		via string
+	}
 	ch := make(chan doneMsg)
 	activeIDs := map[string]bool{}
+	activeRunners := map[string]int{}
 	var activeWriters []*Task
 	activeCancels := map[string]context.CancelFunc{} // 取消对账命中时击杀该任务的执行进程组
 	// CG-5 巡逻累积状态:同一 drain 周期内跨轮记住 pgSeenAlive/日志 size/上次 stall 时间。
@@ -200,13 +204,13 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						// 引擎身份是交叉验证的交付物——甲乙跑成同引擎=验证形同虚设。跳过本轮，等 codex 可用。
 						continue
 					case t.PreferRunner == "gemini":
-						// gemini 钉定：gemini_bin 已配且车道不在冷却（cooldown-gemini.json）才派；
-						// 否则跳过本轮等车道恢复，绝不 fail-open 回 claude——与 codex/引擎钉定同一纪律。
-						// 不要求 codexEligible：gemini 有会话（--session-id/--resume），多步可用。
-						if !pinnedGeminiReady(root, cfg, now) {
+						// Historical Gemini cards remain visible but the retired executor is never resolved.
+						continue
+					case t.PreferRunner == antigravityRunnerName:
+						if !antigravityEnabled(cfg) {
 							continue
 						}
-						viaRunner[t.ID] = "gemini"
+						viaRunner[t.ID] = antigravityRunnerName
 					case t.PreferRunner == "opencode":
 						// 显式钉定 OpenCode：缺二进制或车道冷却时等待，绝不偷换执行器。
 						if !openCodePinnedReady(root, cfg, t, now) {
@@ -276,11 +280,17 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 							continue
 						}
 					}
+					via := viaRunner[t.ID]
+					if (via == grokBuildRunnerName || via == kimiCLIRunnerName) &&
+						activeRunners[via] >= providerParallelLimit(cfg, via) {
+						continue
+					}
 					cands = append(cands, t)
 				}
 				if next := pickNext(cfg, cands, now); next != nil {
 					via := viaRunner[next.ID]
 					activeIDs[next.ID] = true
+					activeRunners[via]++
 					if !taskIsReadOnlyType(next) {
 						activeWriters = append(activeWriters, next)
 						laneMetrics.AddThroughput(1)
@@ -301,7 +311,7 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 						if err := tickRunTask(runCtx, root, taskCfg, t, via); err != nil && !quiet {
 							fmt.Printf("✖ %s 执行出错: %v\n", t.ID, err)
 						}
-						ch <- doneMsg{t}
+						ch <- doneMsg{t: t, via: via}
 					}(next, via, runCfg)
 					continue // 尝试继续填下一个槽位
 				}
@@ -333,6 +343,9 @@ func tick(root string, cfg *Config, force, quiet bool) error {
 		select {
 		case msg := <-ch:
 			delete(activeIDs, msg.t.ID)
+			if activeRunners[msg.via] > 0 {
+				activeRunners[msg.via]--
+			}
 			filtered := activeWriters[:0]
 			for _, w := range activeWriters {
 				if w != nil && w.ID != msg.t.ID {

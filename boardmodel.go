@@ -858,6 +858,14 @@ func taskUsesGrokBuild(t *Task) bool {
 	return runner == grokBuildRunnerName
 }
 
+func taskUsesAntigravity(t *Task) bool {
+	if t == nil {
+		return false
+	}
+	runner, _ := effectiveBoardRunner(t)
+	return runner == antigravityRunnerName
+}
+
 func taskUsesCursor(t *Task) bool {
 	if t == nil {
 		return false
@@ -880,6 +888,11 @@ func effectiveModel(cfg *Config, t *Task) (model, source string) {
 	if taskUsesGrokBuild(t) {
 		if m := resolveGrokBuildModel(cfg, t); m != "" {
 			return m, "grok_model"
+		}
+	}
+	if taskUsesAntigravity(t) {
+		if m := resolveAntigravityModel(cfg, t); m != "" {
+			return m, "agy_model"
 		}
 	}
 	if taskUsesCursor(t) {
@@ -936,6 +949,9 @@ func effectiveEffort(cfg *Config, t *Task) (effort, source string) {
 		if resolved := resolveGrokBuildEffort(cfg, t); resolved != "" {
 			return resolved, "grok_effort"
 		}
+	}
+	if taskUsesAntigravity(t) {
+		return resolveAntigravityEffort(cfg), "agy_effort"
 	}
 	if taskUsesCursor(t) {
 		if resolved := cursorEffortFromModel(resolveCursorModel(cfg, t)); resolved != "" {

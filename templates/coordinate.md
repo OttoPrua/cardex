@@ -43,9 +43,8 @@
    - 用 priority 表达先后：被依赖的排前（priority 更大），可并行的同级；
    - 不要手工扩展复审链；Final Owner resolver 会为 backend 与 specialized frontend 机械设置必需的串行 review/release gate。独立 `design-review`、审计、coordinate、prompt-assembly、progress-pull 以及 Fable reviewer-merger 一律 `review_after:false`，禁止 review-of-review；
    - 填充类任务（独立视角审计、文档整理、低耦合支线）同样省略 `runner`，由 `default_runner=codex` 进入矩阵；须配 `fresh_steps:true` 或单步。
-   - 也可加 "runner":"gemini"（独立 Google 订阅额度，按每日请求数计）：多步可用（有会话），
-     "gemini_model" 可选 pro/flash/flash-lite（默认按档位映射）；注意非 sequence 类型在 gemini
-     上只读运行（plan 模式），写盘类任务须为 sequence 类型。
+   - 需要 Google/Antigravity 原生路由时可显式写 `"runner":"agy"`；模型留空，由派发前
+     `agy models` 动态选最高实际 Opus。Gemini 已退休，不得为新任务生成 `runner=gemini`。
 3. 先用一小节人话说明分工方案，逐个任务给出：做什么、为什么这样分、实际 GPT-5.6 模型/推理档、以及手动接管命令（形如 `cd <dir> && codex -m <实际模型> -c model_reasoning_effort=<档位>`，然后粘贴该任务第一步 prompt）。这段说明会保留在任务日志里供人查阅。
 4. 本任务只做分工，不修改任何代码。如果项目还没有状态/任务清单文件，把"创建它"作为第一个任务（haiku 即可）。
 

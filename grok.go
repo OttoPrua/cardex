@@ -180,6 +180,8 @@ func runGrokBuildAuthProbe(ctx context.Context, cfg *Config, model string) error
 	probeCtx, cancel := context.WithTimeout(ctx, grokBuildAuthProbeTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(probeCtx, cfg.GrokBuildBin, "--no-auto-update", "models")
+	home, _ := os.UserHomeDir()
+	cmd.Env = providerChildEnv(home, nil)
 	setupProcGroup(cmd)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
@@ -1172,17 +1174,14 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	if effort == "max" {
 		return nil, "", fmt.Errorf("Grok 4.6 不支持 reasoning effort=max；最高可用档为 xhigh")
 	}
-	if err := ensureGrokBuildAuth(ctx, root, cfg, model); err != nil {
-		subtype := "grok_build_preflight_error"
-		if isGrokBuildAuthProbeError(err) {
-			subtype = "grok_build_auth_preflight"
+	// runTaskVia performs the shared value-blind preflight before reaching this adapter. Keep the
+	// direct adapter seam used by focused tests and maintenance callers: when there is no persisted
+	// shared preflight, fall back to the original no-model Grok auth probe rather than silently
+	// starting semantic work.
+	if !providerPreflightReady(t, grokBuildRunnerName) {
+		if err := ensureGrokBuildAuth(ctx, root, cfg, model); err != nil {
+			return nil, "", err
 		}
-		if isGrokBuildAuthCircuitError(err) {
-			subtype = "grok_build_auth_circuit_open"
-		}
-		res := &claudeResult{Type: "result", IsError: true, Subtype: subtype,
-			Result: err.Error(), ObservationComplete: true}
-		return res, err.Error(), err
 	}
 	promptFile, err := os.CreateTemp("", "cardex-grok-prompt-*.txt")
 	if err != nil {
@@ -1229,6 +1228,8 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	cmd := exec.CommandContext(runCtx, cfg.GrokBuildBin, args...)
 	setupProcGroup(cmd)
 	cmd.Dir = t.Dir
+	home, _ := os.UserHomeDir()
+	cmd.Env = providerChildEnv(home, nil)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	runErr := runCmdRegisteredForTask(cmd, t.ID)

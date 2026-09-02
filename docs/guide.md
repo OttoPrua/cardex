@@ -577,7 +577,20 @@ Fable 5 首次调用可能要求账号所有者在 Cursor 中确认该模型的�
 
 **其余钉定卡绝不 fail-open**：`no_fallback_models`（默认 `["claude-fable-5","fable"]`）列表中的模型在 claude 冷却/红线期**不降级 codex——宁可排队等 claude 额度恢复**。设计档质量优先；降级会破坏交叉验证的引擎独立性（钉定 `codex` 的交叉卡在 codex 不可用时同样绝不 fail-open 到 claude）。
 
-## Gemini CLI 备用执行器（第二异构执行器）
+## Antigravity 原生执行器（Gemini 仅历史）
+
+Gemini 执行器已从新任务、默认路由、fallback、workflow 和运行时派发面退休；旧字段与旧卡只做
+解码/展示，`cardex add -runner gemini`、`default_runner=gemini` 与 `fallback_order` 中的 Gemini
+都会 fail closed。下方 Gemini 内容仅保留为历史迁移证据，不是当前操作说明。
+
+当前 Google 原生入口是显式 `-runner agy`。配置 `antigravity_bin` 与
+`antigravity.enabled=true` 后，Cardex 在语义 attempt 前以环境白名单运行 `agy models`，只投影
+代理变量和本机 HOME；模型留空时动态选择实际广告的最高 `claude-opus-*`。清单没有 Opus 就
+记录 `MODEL_UNAVAILABLE`，不会静默降到 Sonnet/Gemini。模型 ID 已编码 `thinking` 时不再传
+`--effort`。认证、代理、限额、transport 与模型启动失败均在 preflight 阶段持久化且不烧语义
+attempt。
+
+历史 Gemini 设计如下（只读迁移参考）：
 
 Google 的 `gemini` CLI 是与 codex 并列的**第二个异构执行器**（独立 CLI、独立输出协议、独立
 Google 订阅额度；接入方式以官方文档为准，核实 2026-08-03，设计规格

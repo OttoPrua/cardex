@@ -530,7 +530,8 @@ func invokeKimiCLI(ctx context.Context, root string, cfg *Config, t *Task, promp
 
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(cfg.StepTimeoutMin)*time.Minute)
 	defer cancel()
-	requestedEngine, actualEngine, cmdEnv := kimiChildEngineEnv(os.Environ())
+	userHome, _ := os.UserHomeDir()
+	requestedEngine, actualEngine, cmdEnv := kimiChildEngineEnv(providerChildEnv(userHome, nil))
 	cmdEnv = replaceProcessEnv(cmdEnv, "KIMI_CODE_NO_AUTO_UPDATE", "1")
 	cmdEnv = replaceProcessEnv(cmdEnv, "KIMI_CODE_HOME", runtimeHome)
 	if effort := resolveKimiCLIEffort(cfg, t); effort != "" {

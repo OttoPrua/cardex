@@ -53,6 +53,7 @@ type KimiCLIOpusRoute struct {
 	Model            string `json:"model"`
 	Effort           string `json:"effort"`
 	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
+	MaxParallel      int    `json:"max_parallel,omitempty"`
 }
 
 // GrokTierRoute 把一个来源档位钉到 Grok 推理档。CodexFallback* 是旧通用模式兼容字段；
@@ -82,6 +83,12 @@ type GrokBuildRoute struct {
 	ReviewCodexEffort     string                   `json:"review_codex_effort,omitempty"`
 	OpusAdversarialReview bool                     `json:"opus_adversarial_review,omitempty"`
 	TierRoutes            map[string]GrokTierRoute `json:"tier_routes,omitempty"`
+	MaxParallel           int                      `json:"max_parallel,omitempty"`
+}
+
+type AntigravityRoute struct {
+	Enabled bool   `json:"enabled"`
+	Effort  string `json:"effort,omitempty"`
 }
 
 // CursorFableRoute 把显式 Fable 档交给已登录的 Cursor CLI。模型固定 thinking-max；只有确认
@@ -123,7 +130,7 @@ type Config struct {
 	ResumePrompt   string                  `json:"resume_prompt"`
 	TypeDefaults   map[string]TypeDefaults `json:"type_defaults"`
 	// DefaultRunner 决定未显式钉执行器的新卡默认走哪条主路由。空或 claude 保持历史行为；
-	// codex/gemini 分别把手工卡与 newTask 派生的审核、修复、收口、复盘、emit 卡钉到对应执行器。
+	// codex/agy 把手工卡与 newTask 派生的审核、修复、收口、复盘、emit 卡钉到对应执行器。
 	// 显式会话续跑与 cross profile 仍尊重其已声明的执行器身份。
 	DefaultRunner string `json:"default_runner,omitempty"`
 	// OwnerRoutingEnforced 把 final Owner 矩阵提升为配置加载期硬契约。关闭时 Cardex 仍可作为
@@ -202,11 +209,8 @@ type Config struct {
 	// 这是**全局兜底值**：stakes_policy.<档>.max_fix_rounds 非 0 时按档覆盖它（add 时钉到卡面）。
 	MaxFixRounds int `json:"max_fix_rounds,omitempty"`
 
-	// ---- Gemini CLI 备用执行器（第二异构执行器；Google 订阅额度，设计规格
-	// docs/2026-08-03-gemini-executor-design.md）----
-	// GeminiBin 非空即启用：`-runner gemini` 可钉定主跑；fallback_order 含 "gemini" 时
-	// claude 空窗期还可改道（五道闸与 codex 全量同规）。车道冷却 cooldown-gemini.json（每日
-	// 配额是账号级的，挂车道不挂单卡）；账本打 engine:"gemini" 标，不占 claude 红线预算。
+	// ---- Gemini 历史兼容字段 ----
+	// 仅用于解码和展示旧配置/旧任务；新默认、新卡、fallback、cross、workflow 与执行均拒绝。
 	GeminiBin string `json:"gemini_bin,omitempty"`
 	// GeminiModel 卡无模型时的默认；推荐官方稳定别名（pro/flash/flash-lite，核实 2026-08-03）。
 	// 空 = 内置 "pro"。**永不落空传给 CLI**——空即 auto 路由，撞配额静默换模型，已否决。
@@ -246,6 +250,11 @@ type Config struct {
 	// grok_build 为空/disabled 时完全保留旧 Kimi→Codex 与 Claude 限额行为。
 	GrokBuildBin string          `json:"grok_build_bin,omitempty"`
 	GrokBuild    *GrokBuildRoute `json:"grok_build,omitempty"`
+
+	// Antigravity is the supported Google migration route. It is opt-in until the user completes
+	// OAuth. New Gemini tasks are retired; historical Gemini task fields remain decodable.
+	AntigravityBin string            `json:"antigravity_bin,omitempty"`
+	Antigravity    *AntigravityRoute `json:"antigravity,omitempty"`
 
 	// Cursor Agent CLI 原生执行器：复用 ~/.cursor 的本机登录态，不读取或复制 token。
 	// cursor_fable 只接管默认 Codex 路由中显式标成 Fable 的 fresh 单步卡。
@@ -796,6 +805,9 @@ func loadConfig(root string) (*Config, error) {
 	if err := validateGrokBuild(cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath(root), err)
 	}
+	if err := validateAntigravity(cfg); err != nil {
+		return nil, fmt.Errorf("%s: %w", configPath(root), err)
+	}
 	if err := validateCursor(cfg); err != nil {
 		return nil, fmt.Errorf("%s: %w", configPath(root), err)
 	}
@@ -881,6 +893,12 @@ func validateKimiCLI(cfg *Config) error {
 	if r.LimitFallbackMin < 0 {
 		return fmt.Errorf("kimi_cli_opus.limit_fallback_min 不能为负数")
 	}
+	if r.MaxParallel < 0 {
+		return fmt.Errorf("kimi_cli_opus.max_parallel 不能为负数")
+	}
+	if r.MaxParallel == 0 {
+		r.MaxParallel = defaultProviderMaxParallel
+	}
 	if cfg.GrokBuild == nil || !cfg.GrokBuild.Enabled || !cfg.GrokBuild.KimiOpusFallback {
 		return fmt.Errorf("kimi_cli_opus.enabled=true 需要完整启用 Grok 主腿与 Kimi 第二腿（grok_build.enabled=true 且 kimi_opus_fallback=true）")
 	}
@@ -912,6 +930,12 @@ func validateGrokBuild(cfg *Config) error {
 	}
 	if r.LimitFallbackMin < 0 {
 		return fmt.Errorf("grok_build.limit_fallback_min 不能为负数")
+	}
+	if r.MaxParallel < 0 {
+		return fmt.Errorf("grok_build.max_parallel 不能为负数")
+	}
+	if r.MaxParallel == 0 {
+		r.MaxParallel = defaultProviderMaxParallel
 	}
 	r.CodexFallbackModel = strings.TrimSpace(r.CodexFallbackModel)
 	r.CodexFallbackEffort = strings.ToLower(strings.TrimSpace(r.CodexFallbackEffort))
@@ -1016,6 +1040,25 @@ func validateGrokBuild(cfg *Config) error {
 	return nil
 }
 
+func validateAntigravity(cfg *Config) error {
+	if cfg == nil || cfg.Antigravity == nil || !cfg.Antigravity.Enabled {
+		return nil
+	}
+	cfg.AntigravityBin = strings.TrimSpace(cfg.AntigravityBin)
+	if cfg.AntigravityBin == "" {
+		return fmt.Errorf("antigravity.enabled=true 需要配置 antigravity_bin")
+	}
+	r := cfg.Antigravity
+	r.Effort = strings.ToLower(strings.TrimSpace(r.Effort))
+	if r.Effort == "" {
+		r.Effort = "high"
+	}
+	if r.Effort != "low" && r.Effort != "medium" && r.Effort != "high" {
+		return fmt.Errorf("antigravity.effort %q 非法（可选 low/medium/high）", r.Effort)
+	}
+	return nil
+}
+
 func validateDefaultRunner(cfg *Config) error {
 	if cfg == nil {
 		return nil
@@ -1030,12 +1073,14 @@ func validateDefaultRunner(cfg *Config) error {
 		}
 		return nil
 	case "gemini":
-		if strings.TrimSpace(cfg.GeminiBin) == "" {
-			return fmt.Errorf("default_runner=gemini 需要配置 gemini_bin")
+		return fmt.Errorf("default_runner=gemini 已退休；请使用 agy 或其他受支持 runner")
+	case antigravityRunnerName:
+		if !antigravityEnabled(cfg) {
+			return fmt.Errorf("default_runner=agy 需要启用 antigravity/antigravity_bin")
 		}
 		return nil
 	default:
-		return fmt.Errorf("default_runner %q 非法（可选: claude, codex, gemini）", cfg.DefaultRunner)
+		return fmt.Errorf("default_runner %q 非法（可选: claude, codex, agy）", cfg.DefaultRunner)
 	}
 }
 

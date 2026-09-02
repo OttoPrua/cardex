@@ -605,7 +605,20 @@ but Fable itself is not considered proven until that acknowledgement is complete
 
 **All other pinned cards never fail open**: models in `no_fallback_models` (default `["claude-fable-5","fable"]`) are **never downgraded to the codex backup during a claude cooldown/redline — they queue and wait for the claude window to reopen**. Design-tier cards are quality-first; downgrading them violates the layering principle and breaks the engine independence that cross-verification requires (codex-pinned cross cards equally never fail open to claude when codex is unavailable).
 
-## Gemini CLI fallback executor (second heterogeneous executor)
+## Native Antigravity runner (Gemini is historical only)
+
+Gemini is retired from new cards, defaults, fallback order, workflow pinning, and runtime dispatch.
+Existing fields and tasks remain decodable/displayable; the Gemini material below is retained only as
+migration history, not as current operating instructions.
+
+The supported Google-native entry point is explicit `-runner agy`. With `antigravity_bin` and
+`antigravity.enabled=true`, Cardex runs a value-blind `agy models` preflight with only proxy variables
+and the native HOME. An unpinned task selects the highest actually advertised `claude-opus-*`; no Opus
+means `MODEL_UNAVAILABLE`, never silent Sonnet/Gemini substitution. A model ID containing `thinking`
+does not receive a separate `--effort`. Auth, proxy, rate, transport, and model readiness failures are
+persisted before semantic attempt accounting.
+
+Historical Gemini design follows (read-only migration reference):
 
 Google's `gemini` CLI is a **second heterogeneous executor** alongside codex (its own CLI, its
 own output protocol, its own Google subscription quota; integration follows the official docs,

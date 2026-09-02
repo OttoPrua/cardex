@@ -326,7 +326,7 @@ cardex workflow list|show <id>
 - **一个 writer、一个 reviewer**。writer 或 reviewer 还 live 时重放同一命令返回 duplicate role，不会派第二张卡。manager 重启后重放安全。
 - **候选必须先冻结**。writer 还 live 时 `freeze-candidate` 被拒；没有冻结候选时 `review` 被拒。
 - **reviewer 独立**：另一张 `design-review` 卡、`review_of` 指向 writer、无写域、`session_id` 清空、同一 writer 不得有第二个 active reviewer。
-- **引擎必须可钉定**。`-engine` 只接受 tick 能钉定且不会 fail-open 的执行器（`claude`、`codex`、`gemini`、`opencode`、`kimi-cli`、`grok-build`、`cursor`，或 `config.engines` 里已配的引擎档案）。留空或写未知名字会被拒，避免悄悄落到默认 provider 上——那会让 writer/reviewer 的引擎分离形同虚设。
+- **引擎必须可钉定**。`-engine` 只接受 tick 能钉定且不会 fail-open 的执行器（`claude`、`codex`、`agy`、`opencode`、`kimi-cli`、`grok-build`、`cursor`，或 `config.engines` 里已配的引擎档案）。Gemini 已退休；留空或写未知/退休名字会被拒。
 - **有界轮次**。`max_rounds >= 1`。超轮不再派修复卡，记录转 `exhausted` 并写一条 Root 收据。修复轮会清空上一轮的候选、verdict 与集成门上的候选身份。
 - **写域跨记录互斥**。同一 Git identity 内的 exact/subtree 路径重叠、重复 lineage、以及**跨仓**共享的封闭资源都 fail closed。terminal 记录（`exhausted` / `owner_choice` / `external_blocked`）释放自己的 claim，后继模块才能接手。
 - **三道 effect gate 分离**。`integration` 可以被释放；`live` 与 `cutover` 在本树没有任何释放路径，手改记录会在加载时被拒。

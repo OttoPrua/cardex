@@ -119,7 +119,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 - **[Web 看板](docs/guide.md#web-看板board-命令)**——项目横排 kanban + **剩余**额度燃尽曲线 + 按「设计/落地/修复/审核」拆分的进度 + 目标锚定的「落地进度」+ 进度双口径（现有卡 / 含预估余量，计划锚点或历史膨胀率，口径全披露），数据不足一律显式披露，绝不编造估算；对队列数据只读（唯一写入是看板自己的项目折叠状态）。
 - **[5 小时额度红线](docs/guide.md#5-小时额度红线保底额度)**——给突发/交互任务留余量：本地账本 + CodexBar 用量源 + 订阅端点三通道，分歧时取最保守值；支持分时段红线。
 - **[Codex 备用执行器](docs/guide.md#codex-备用执行器限额空窗不断档)**——claude 冷却期把单步编排卡切给 codex；设计档模型钉定不降级，交叉验证的引擎独立性不被偷换。
-- **[Gemini CLI 备用执行器](docs/guide.md#gemini-cli-备用执行器第二异构执行器)**——第二异构执行器：`-runner gemini` 钉定（有会话、多步可用）、降级链改道、交叉验证第五种引擎；账号级每日配额挂车道冷却，认证故障自愈；模型映射用官方稳定别名（pro/flash/flash-lite），统一标准线定档。
+- **[Antigravity 原生执行器](docs/guide.md#antigravity-原生执行器gemini-仅历史)**——`-runner agy` 使用本机 OAuth 与代理环境，派发前从 `agy models` 动态选择实际广告的最高 Claude Opus；无 Opus 时 fail closed。Gemini 仅保留历史卡解码/展示，不能创建或执行新卡。
 - **[多订阅引擎](docs/guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud)**——Kimi Code / GLM Coding Plan / MiniMax / 小米 MiMo / OpenCode Go / Ollama Cloud 订阅经引擎档案接入：复用 claude CLI + 环境注入，独立冷却、独立记账、统一能力分级（评测源锚定 Claude 各档），降级顺序自定义。
 - **[存量角色会话的接管](docs/guide.md#存量角色会话的接管此前手动维护的-审核装配执行-session)**——手工养的审核/装配/执行 session 按角色收编进队列。
 
@@ -140,7 +140,7 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 | `type_order` | 进度回收>协调>审核>序列>装配 | 同优先级时的类型顺序 |
 | `type_defaults.*.model` | 装配/协调/审核 Opus；落地 Sonnet；回收 Haiku | 各类型默认来源档位；Codex 主路由再映射到实际 GPT-5.6 模型；Fable 仅供显式最难裁决 |
 | `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行，只读类型豁免）。默认 1 时联邦不重叠写域也不会同 tick 并行 |
-| `default_runner` | ""（历史 Claude） | 未显式钉执行器的新卡默认主路由；设为 `codex` 后，手工卡及自动审核/修复/收口/复盘/emit 卡统一烘焙 `runner_pref=codex`。显式 Claude 会话续跑和 cross profile 保留其已声明身份 |
+| `default_runner` | ""（历史 Claude） | 未显式钉执行器的新卡默认主路由；支持 `codex` 或已启用的 `agy`。Gemini 已退休，配置为默认执行器会拒绝加载 |
 | `owner_routing_enforced` | `false` | Final Owner 矩阵的加载期硬锁。设为 `true` 后，全部风险/审核分支、精确 provider/runner/model/effort、Fable 单次 Sol/ultra 终局以及显式 Sol gate 任一漂移都会拒绝加载；新 `sequence` 卡必须写 `route_class=backend|general`，backend 还必须明确任务字段 risk_class，缺失/歧义按 high-risk fail closed。受管 board/tick 配合 `CARDEX_REQUIRE_OWNER_ROUTING=1` 防止删键静默降级 |
 | `automatic_codex_budget_stop_percent` / `owner_provider_targets` | `0` / 空 | Final Owner 模式严格要求自动 Codex 在 provider-specific 已用 65% 时停止，证据不可用同样 held；仅带可见持久原因的 Owner-pinned critical 卡可绕过。provider targets 固定为 Grok 70–80%、Kimi/OpenCode 15–25%、direct Sol 5–10%，只做政策读回，不改已有卡 |
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见[进阶指南](docs/guide.md#5-小时额度红线保底额度) |
@@ -149,12 +149,13 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 | `codex_fallback_model` | "" | 非 Opus claude 卡降级到 codex 时的通用模型；空回退 `codex_model` |
 | `codex_fallback_opus_model` / `codex_fallback_opus_reasoning` | `gpt-5.6-sol` / `xhigh` | Opus 档 claude 卡降级到 codex 时的默认模型与思考档；默认不因 `stakes=low` 降档 |
 | `codex_tier_models` / `codex_tier_reasoning` | 见内置映射 | 只负责人工显式 Codex 与旧通用兼容径。Final Owner 模式移除全局 Codex fallback；每个自动 Sol 都是解析器显式 route gate，同一 lineage 最多一次 |
-| `grok_build_bin` / `grok_build` | 空 / 关闭 | Final Owner 主腿：Fable answer 与 Opus 用 Grok 4.6/xhigh，Sonnet 用 high，Haiku 用 high。非 backend Opus/Sonnet/Haiku 的 eligible 失败串行到 Kimi K3/max；backend ordinary 为 Grok 实现→fresh Kimi 对抗审查/修复，并在确定性 20% 抽样、分歧或验收失败时追加 Sol/xhigh；backend high-risk 为 Grok 实现→fresh Kimi 只读第二视角→fresh Sol/max 发布门。Grok 鉴权严格 fail closed：只有精确单行 bare 诊断或精确 quoted OIDC wrapper 可开熔断，完整 stderr 观察结束且 semantic/model/tool=0/0/0 才成立；鉴权永不授权 fallback |
+| `grok_build_bin` / `grok_build` | 空 / 关闭 | Grok 主腿；`grok_build.max_parallel` 为独立并发上限，空/0 默认 24。模型、认证、代理和限额先做 value-blind preflight，失败不消耗语义 attempt |
+| `kimi_cli_opus.max_parallel` | 24 | Kimi 原生腿的独立并发上限；仍受全局 `max_parallel` 与写域互斥约束 |
 | `cursor_bin` / `cursor_model` / `cursor_fable` | 空 / 关闭 | 显式 Fable 主跑 `claude-fable-5-thinking-max`，始终是 general、只读决策/方案综合角色。仅确认 quota 或 eligible 已证明前语义失败后，串行一份只读 Grok 4.6/xhigh answer，再由唯一一次 fresh Sol/ultra 接收原问题/证据与 Grok 答案，从第一性重建、对抗并修复后直接终局；没有 blind Sol answer B、Sol/max 第三腿或 review-of-review，未决 P0/P1/uncertainty 转 Owner held |
-| `gemini_bin` / `gemini_model` | 空 / ""（内置 pro） | Gemini CLI 第二异构执行器（钉定/降级链/交叉验证），见[进阶指南](docs/guide.md#gemini-cli-备用执行器第二异构执行器) |
-| `gemini_models` | fable/opus→pro，sonnet→flash，haiku→flash-lite | 档位槽映射（官方稳定别名）；非 sequence 卡恒 `--approval-mode plan` 只读 |
+| `antigravity_bin` / `antigravity` | 空 / 关闭 | `agy` 原生路由；复用本机 OAuth，动态选择 `agy models` 中最高实际 Opus。thinking 模型不另传 `--effort`；无 Opus 即 `MODEL_UNAVAILABLE` |
+| `gemini_*` | 仅历史兼容 | 旧卡仍可解码/展示；新卡、默认路由、fallback、workflow 与运行时执行全部拒绝 |
 | `engines` | {}（空） | 多订阅引擎档案（Kimi/GLM/MiniMax/MiMo/OpenCode Go/Ollama Cloud），`cardex engines add <名>` 并入预设，见[进阶指南](docs/guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud) |
-| `fallback_order` | ["codex"] | claude 冷却/红线时的改道顺序（codex/gemini 与引擎名混排，质量地板对全链生效） |
+| `fallback_order` | ["codex"] | claude 冷却/红线时的改道顺序；Gemini 项会拒绝加载，Antigravity 只接受显式 `agy` pin |
 | `model_tiers` | {}（空） | 自定义分级表（模型→档位，优先于内置标准线）：无更强模型的机队按牌面定档 |
 | `default_review_host` / `remote_mirror_root` / `default_review_sync` | "" | 审核分流三件套：三键齐备时本地实现卡的自动审核默认分流到远端 |
 | `remote_hosts.<name>.codex_only` | false | 主机级额度硬边界：为 true 时该远端只运行 Codex，自动审核也不会调用 Claude |

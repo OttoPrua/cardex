@@ -1100,6 +1100,8 @@ func routeAttemptIdentity(cfg *Config, t *Task, remote bool) (provider, runner, 
 		model, effort = resolveKimiCLIModel(cfg, t), resolveKimiCLIEffort(cfg, t)
 	case runner == grokBuildRunnerName:
 		model, effort = resolveGrokBuildModel(cfg, t), resolveGrokBuildEffort(cfg, t)
+	case runner == antigravityRunnerName:
+		model, effort = resolveAntigravityModel(cfg, t), resolveAntigravityEffort(cfg)
 	case runner == cursorRunnerName:
 		model = resolveCursorModel(cfg, t)
 		effort = cursorEffortFromModel(model)
@@ -1254,6 +1256,10 @@ func dispatchEventDetail(cfg *Config, t *Task, useCodex, remote bool) map[string
 		detail["grok_model"] = resolveGrokBuildModel(cfg, t)
 		detail["grok_effort"] = resolveGrokBuildEffort(cfg, t)
 	}
+	if t.Runner == antigravityRunnerName {
+		detail["agy_model"] = resolveAntigravityModel(cfg, t)
+		detail["agy_effort"] = resolveAntigravityEffort(cfg)
+	}
 	if t.Runner == cursorRunnerName {
 		detail["cursor_model"] = resolveCursorModel(cfg, t)
 		detail["cursor_effort"] = cursorEffortFromModel(resolveCursorModel(cfg, t))
@@ -1275,6 +1281,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 	useOpenCode := via == "opencode"
 	useKimiCLI := kimiCLIVia(via)
 	useGrokBuild := grokBuildVia(via)
+	useAntigravity := antigravityVia(via)
 	useCursor := cursorVia(via)
 	engineName := ""
 	if engineVia(via) {
@@ -1314,6 +1321,13 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		t.touch()
 		return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:owner-policy", statusHeld, t.Step,
 			withCostTelemetry(map[string]any{"reason": "closed_owner_task_state_invalid", "detail": reason}, t)))
+	}
+	if useGemini {
+		t.Status = statusHeld
+		t.LastError = "Gemini executor retired; historical task preserved without execution"
+		t.touch()
+		return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:gemini-retired", statusHeld, t.Step,
+			withCostTelemetry(map[string]any{"reason": "gemini_executor_retired"}, t)))
 	}
 	// CG-4 幂等墓碑 reset-at-entry:上一轮盘上状态非 running(即 queued/limit_paused/held)才 reset
 	// 当前步的 resume 墓碑——这是"编排层认可的新一轮尝试"信号(合法限额恢复/人工 release),让新一轮
@@ -1364,6 +1378,51 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			t.GrokEffort = resolveGrokBuildEffort(cfg, t)
 		}
 		ensureGrokOpusAdversarialReview(cfg, t)
+	}
+	if useGrokBuild || useKimiCLI || useAntigravity {
+		preflight := runProviderPreflight(ctx, root, cfg, t, via)
+		t.LastProviderPreflight = &preflight
+		if preflight.State != providerReady {
+			// A failed value-blind preflight is not a semantic attempt, but it is still a complete
+			// route observation. Persist the requested/actual identity and zero-work proof without
+			// incrementing Attempts so operators can distinguish readiness failure from model work.
+			previousRunner := t.Runner
+			t.Runner = via
+			beginRouteAttemptReadback(cfg, t, false)
+			t.Runner = previousRunner
+			t.LastRouteAttempt.ObservationSeen = true
+			t.LastRouteAttempt.ObservationOK = true
+			t.LastRouteAttempt.FailureKind = string(preflight.State)
+			if preflight.State == providerAuthMissing || preflight.State == providerAuthExpiredRefreshable {
+				t.LastRouteAttempt.FailureClass = string(failureAuth)
+				t.Status = statusHeld
+				t.LastError = "[auth] " + strings.TrimSpace(preflight.Reason)
+				if strings.TrimSpace(preflight.Reason) == "" {
+					t.LastError = "[auth] 登录态无效或已过期"
+				}
+				if preflight.CircuitOpen {
+					t.Status = statusQueued
+				}
+				t.touch()
+				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:classifier", t.Status, t.Step,
+					withCostTelemetry(withRouteAttempt(map[string]any{
+						"reason": "auth_class_held", "failure_class": string(failureAuth),
+						"runner": via, "preflight_state": preflight.State,
+						"semantic_attempt_consumed": false,
+					}, t), t)))
+			}
+			t.Status = statusHeld
+			t.LastError = "provider preflight: " + string(preflight.State)
+			t.touch()
+			return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:provider-preflight", statusHeld, t.Step,
+				withCostTelemetry(map[string]any{
+					"reason": "provider_preflight", "runner": via, "preflight_state": preflight.State,
+					"selected_model": preflight.SelectedModel, "semantic_attempt_consumed": false,
+				}, t)))
+		}
+		if useAntigravity {
+			t.AgyModel = preflight.SelectedModel
+		}
 	}
 	t.Status = statusRunning
 	// 交叉 C 重跑（如 cardex retry）先撤下旧的终局报告：否则若这次在执行器层就失败（未进 postComplete），
@@ -1429,6 +1488,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				t.RouteReason = routeReasonGrokExplicit
 			}
 		}
+	case useAntigravity:
+		t.Runner = antigravityRunnerName
+		t.RouteReason = "antigravity_explicit"
 	case useCursor:
 		t.Runner = cursorRunnerName
 		if t.RouteReason == routeReasonCursorFableFallbackPending || t.RouteReason == routeReasonCursorFableFallback {
@@ -1516,6 +1578,8 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			runnerTag = "  runner=" + kimiCLIRunnerName
 		} else if useGrokBuild {
 			runnerTag = "  runner=" + grokBuildRunnerName
+		} else if useAntigravity {
+			runnerTag = "  runner=" + antigravityRunnerName
 		} else if useCursor {
 			runnerTag = "  runner=" + cursorRunnerName
 		} else if engineName != "" {
@@ -1602,6 +1666,8 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				if res != nil {
 					appendUsage(root, cfg, t, res.Usage)
 				}
+			case useAntigravity:
+				res, combined, runErr = invokeAntigravity(ctx, cfg, t, prompt)
 			case useCursor:
 				res, combined, runErr = invokeCursor(ctx, cfg, t, prompt)
 				if t.PreferRunner == cursorRunnerName && res != nil && res.SessionID != "" {
@@ -2107,7 +2173,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		}
 
 		claudeLimit := engineName == "" && !useCodex && !useGemini && !useOpenCode &&
-			!useKimiCLI && !useGrokBuild && !useCursor && !remote && limitHitForEngine(false, false, t, res, combined)
+			!useKimiCLI && !useGrokBuild && !useAntigravity && !useCursor && !remote && limitHitForEngine(false, false, t, res, combined)
 
 		// 1) 限额：记录恢复时间，全局冷却，等 tick 到点自动续跑
 		// 【CG-R1 修复】用 isLimitHitClaude 收敛扫描面到 stderr 尾段 + res.Result(非 transcript),
@@ -2115,7 +2181,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		// 【CG-R1 R3 P2-3】三处 call site 全走 limitHitForEngine 单口路由, 让 (useCodex, remote)
 		// 到 wrapper 的映射被 TestLimitHitForEngineRoutesByFlags 钉住; 错改条件顺序会立即测试红。
 		// 引擎路由（engineName != ""）已被上方 1c 分支独占承接，gemini 被 1d 承接，此处仅本机 claude。
-		if engineName == "" && !useCodex && !useGemini && !useOpenCode && !useKimiCLI && !useGrokBuild && !useCursor && !remote && claudeLimit {
+		if engineName == "" && !useCodex && !useGemini && !useOpenCode && !useKimiCLI && !useGrokBuild && !useAntigravity && !useCursor && !remote && claudeLimit {
 			until := parseResetEpoch(combined+"\n"+resultText(res), cfg, now)
 			setCooldown(root, until, firstLine(combined))
 			t.Status = statusLimitPaused
@@ -3371,9 +3437,11 @@ type emitTask struct {
 	SpecializedFrontend bool   `json:"specialized_frontend"`
 	// CodexModel 卡级钉定 codex 模型（runner=codex 时随卡生效，档位对等制下协调器可按档发 terra/luna）。
 	CodexModel string `json:"codex_model"`
-	// GeminiModel 卡级钉定 gemini 模型（runner=gemini 时随卡生效；推荐官方别名 pro/flash/flash-lite）。
-	GeminiModel string   `json:"gemini_model"`
-	Prompts     []string `json:"prompts"`
+	// GeminiModel 仅用于识别并拒绝旧协调器仍尝试创建的 Gemini 新卡。
+	GeminiModel string `json:"gemini_model"`
+	// AgyModel 可显式钉定模型，但派发前仍必须由 agy models 实际广告清单确认。
+	AgyModel string   `json:"agy_model"`
+	Prompts  []string `json:"prompts"`
 	// 模型常见的字段名漂移，做别名容错：steps=[...] / prompt="..." / 标题写成 role 或 id。
 	Steps  []string `json:"steps"`
 	Prompt string   `json:"prompt"`
@@ -3896,23 +3964,7 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 		t.PreferRunner = "codex"
 		t.Effort = eng.Effort
 	case "gemini":
-		// 本机 gemini：钉 runner=gemini，用独立 Google 订阅额度。模型来自全局 gemini_model
-		//（身份必须显式，不吃内置 pro 回落——冻结的身份串要能对上实际执行）。
-		if cfg.GeminiBin == "" {
-			return fmt.Errorf("gemini 引擎需 config.gemini_bin")
-		}
-		if cfg.GeminiModel == "" {
-			return fmt.Errorf("gemini 交叉引擎需 config.gemini_model 显式指定（如官方别名 pro），否则身份不可冻结")
-		}
-		if eng.Model != "" {
-			return fmt.Errorf("gemini 交叉引擎的 model 由 config.gemini_model 决定，请从 profile 删掉 model 字段（此处写它会被忽略）")
-		}
-		// gemini CLI 没有思考等级参数（无 --effort / reasoning 等价物）：写了必须炸而不是静默吞——
-		// 使用者以为乙引擎跑在 max，实际参数根本没传出去，验证深度被静默降级。
-		if eng.Effort != "" {
-			return fmt.Errorf("gemini 交叉引擎不支持 effort（gemini CLI 无思考等级参数），请从 profile 删掉 effort 字段")
-		}
-		t.PreferRunner = "gemini"
+		return fmt.Errorf("gemini 交叉引擎已退休；历史冻结字段仅供解码/展示")
 	case grokBuildRunnerName:
 		if !grokBuildEnabled(cfg) {
 			return fmt.Errorf("grok-build 交叉引擎需启用 config.grok_build")
@@ -3971,10 +4023,9 @@ func applyCrossEngine(t *Task, eng CrossEngine, cfg *Config) error {
 		t.RemoteHost = eng.Host
 		t.Effort = eng.Effort
 	default:
-		return fmt.Errorf("未知交叉引擎 kind %q（可选 claude/codex/gemini/grok-build/cursor/remote-claude/remote-codex）", eng.Kind)
+		return fmt.Errorf("未知交叉引擎 kind %q（可选 claude/codex/grok-build/cursor/remote-claude/remote-codex）", eng.Kind)
 	}
 	// codex/远端引擎要求 codexEligible（单步无会话）——交叉卡都是单步，正常满足；防御性兜底。
-	// gemini 不在此列：有会话（--session-id/--resume），无此形状约束。
 	if (t.PreferRunner == "codex" || t.PreferRunner == grokBuildRunnerName ||
 		t.PreferRunner == cursorRunnerName || t.RemoteHost != "") && !codexEligible(t) {
 		return fmt.Errorf("codex/远端引擎要求单步无会话")
@@ -4451,6 +4502,9 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 		}
 		nt.QualitySensitive = s.QualitySensitive
 		nt.SpecializedFrontend = s.SpecializedFrontend
+		if s.Runner == "gemini" || strings.TrimSpace(s.GeminiModel) != "" {
+			return ids, fmt.Errorf("产出任务 %q: Gemini 新任务已退休；请改用 runner=agy", title)
+		}
 		// 协调可把填充类任务钉在 codex 上（独立 GPT 额度）；形状不合规则忽略指定。
 		if s.Runner == "codex" {
 			nt.PreferRunner = "codex"
@@ -4464,10 +4518,13 @@ func enqueueEmitted(root string, cfg *Config, parent *Task, result string) ([]st
 				nt.CodexModel = s.CodexModel
 			}
 		}
-		// 协调同样可钉 gemini（独立 Google 订阅额度）。无 eligible 形状门：gemini 有会话，多步可用。
-		if s.Runner == "gemini" {
-			nt.PreferRunner = "gemini"
-			nt.GeminiModel = s.GeminiModel
+		if s.Runner == antigravityRunnerName {
+			if !antigravityEnabled(cfg) {
+				return ids, fmt.Errorf("产出任务 %q: config 未启用 antigravity/antigravity_bin", title)
+			}
+			nt.PreferRunner = antigravityRunnerName
+			nt.RunnerExplicit = true
+			nt.AgyModel = strings.TrimSpace(s.AgyModel)
 		}
 		if validEfforts[s.Effort] {
 			nt.Effort = s.Effort

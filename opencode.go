@@ -101,7 +101,7 @@ func openCodeNightOpusEligible(root string, cfg *Config, t *Task, now time.Time)
 		t.RunnerExplicit || t.RemoteHost != "" || !isOpusTask(cfg, t) {
 		return false
 	}
-	if t.CodexModel != "" || t.XCodexModel != "" || t.GeminiModel != "" || t.OpenCodeModel != "" ||
+	if t.CodexModel != "" || t.XCodexModel != "" || t.GeminiModel != "" || t.AgyModel != "" || t.OpenCodeModel != "" ||
 		t.KimiModel != "" || t.GrokModel != "" || t.GrokEffort != "" || t.CursorModel != "" ||
 		t.XRole != "" || t.SessionID != "" || t.MidStep || !codexEligible(t) {
 		return false

@@ -79,11 +79,11 @@ func TestValidateGeminiRejectsBadConfigs(t *testing.T) {
 	if err := validateEngines(e); err == nil {
 		t.Fatal("引擎名 gemini 应被保留字拒绝")
 	}
-	// fallback_order 里 "gemini" 是白名单执行器，不要求 engines 条目。
+	// 新派发面已退休 Gemini；历史配置字段仍可读取，但不得继续把它放进 fallback_order。
 	f := defaultConfig("")
 	f.FallbackOrder = []string{"codex", "gemini"}
-	if err := validateEngines(f); err != nil {
-		t.Fatalf("fallback_order 的 gemini 白名单项不应报错: %v", err)
+	if err := validateEngines(f); err == nil {
+		t.Fatal("fallback_order 的 gemini 退休项必须拒绝")
 	}
 }
 
@@ -381,7 +381,7 @@ printf '%s' '{"response":"done ok","stats":{"models":{"m":{"tokens":{"prompt":10
 	}
 }
 
-func TestRunTaskGeminiDailyLimitPausesLaneNotClaude(t *testing.T) {
+func TestRunTaskGeminiDailyLimitFixtureIsRetiredBeforeInvocation(t *testing.T) {
 	root := testRoot(t)
 	cfg := defaultConfig("")
 	cfg.GeminiBin = fakeGemini(t, `printf 'Error: You have exhausted your daily quota on this model.\n' >&2
@@ -404,32 +404,22 @@ exit 1
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Status != statusLimitPaused {
-		t.Fatalf("每日配额应挂 limit_paused, got %q (%s)", got.Status, got.LastError)
+	if got.Status != statusHeld || !strings.Contains(got.LastError, "retired") {
+		t.Fatalf("历史 Gemini 卡必须在调用前 held, got %q (%s)", got.Status, got.LastError)
 	}
 	if got.Attempts != 2 {
-		t.Fatalf("车道挂起不得烧 attempts, got %d", got.Attempts)
-	}
-	if !strings.HasPrefix(got.LastError, "gemini 车道挂起(limit)") {
-		t.Fatalf("应记 gemini 车道原因, got %q", got.LastError)
+		t.Fatalf("退休闸不得烧 attempts, got %d", got.Attempts)
 	}
 	cd := loadEngineCooldown(root, "gemini")
-	if cd == nil || !cd.active(time.Now()) {
-		t.Fatal("应写 cooldown-gemini.json 车道冷却")
-	}
-	if cd.UntilEpoch < time.Now().Add(359*time.Minute).Unix() {
-		t.Fatalf("每日配额冷却应 ≥360min, until=%d", cd.UntilEpoch)
+	if cd != nil && cd.active(time.Now()) {
+		t.Fatalf("退休闸不得伪造 Gemini 冷却: %+v", cd)
 	}
 	if _, err := os.Stat(cooldownPath(root)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("gemini 车道挂起不得写 claude 全局冷却, stat err=%v", err)
 	}
-	// 车道冷却期内：钉定不可派、改道不可选。
-	if pinnedGeminiReady(root, cfg, time.Now()) {
-		t.Fatal("车道冷却中钉定应等待")
-	}
 }
 
-func TestRunTaskGeminiAuthErrorSuspendsLane(t *testing.T) {
+func TestRunTaskGeminiAuthFixtureIsRetiredBeforeInvocation(t *testing.T) {
 	root := testRoot(t)
 	cfg := defaultConfig("")
 	cfg.GeminiBin = fakeGemini(t, `printf 'YOLO mode is enabled. All tool calls will be automatically approved.\n' >&2
@@ -446,20 +436,16 @@ exit 1
 		t.Fatal(err)
 	}
 	got, _ := loadTask(root, task.ID)
-	if got.Status != statusLimitPaused || !strings.HasPrefix(got.LastError, "gemini 车道挂起(auth)") {
-		t.Fatalf("认证错误应挂车道并标 auth, status=%q err=%q", got.Status, got.LastError)
-	}
-	// 原因行必须是命中判据的那一行，不是 stderr 首行横幅（实测首行是 "YOLO mode is enabled"）。
-	if !strings.Contains(got.LastError, "IneligibleTierError") {
-		t.Fatalf("挂起原因应披露命中行, got %q", got.LastError)
+	if got.Status != statusHeld || !strings.Contains(got.LastError, "retired") || got.Attempts != 0 {
+		t.Fatalf("历史 Gemini 卡必须在认证/模型调用前 held: %+v", got)
 	}
 	cd := loadEngineCooldown(root, "gemini")
-	if cd == nil || !strings.HasPrefix(cd.Reason, "auth: ") || !strings.Contains(cd.Reason, "IneligibleTierError") {
-		t.Fatalf("车道冷却 reason 应带 auth 前缀且披露命中行, got %+v", cd)
+	if cd != nil && cd.active(time.Now()) {
+		t.Fatalf("未执行的退休卡不得写认证冷却: %+v", cd)
 	}
 }
 
-func TestRunTaskGeminiSuccessClearsOwnLaneOnly(t *testing.T) {
+func TestRunTaskGeminiSuccessFixtureCannotBypassRetirement(t *testing.T) {
 	root := testRoot(t)
 	cfg := defaultConfig("")
 	cfg.GeminiBin = fakeGemini(t, `cat > /dev/null
@@ -481,28 +467,17 @@ printf '%s' '{"response":"完成","stats":{"models":{"m":{"tokens":{"prompt":7,"
 		t.Fatal(err)
 	}
 	got, _ := loadTask(root, task.ID)
-	if got.Status != statusDone {
-		t.Fatalf("应完成, got %q (%s)", got.Status, got.LastError)
+	if got.Status != statusHeld || !strings.Contains(got.LastError, "retired") || got.Attempts != 0 {
+		t.Fatalf("即使 fixture 可成功，历史 Gemini 卡也必须在调用前 held: %+v", got)
 	}
-	if got.Runner != "gemini" {
-		t.Fatalf("Runner 标签应为 gemini, got %q", got.Runner)
-	}
-	if got.SessionID == "" {
-		t.Fatal("钉定主跑应回写会话（限额续跑与多步要用）")
-	}
-	if loadEngineCooldown(root, "gemini").active(time.Now()) {
-		t.Fatal("gemini 成功应清自己的车道冷却")
+	if !loadEngineCooldown(root, "gemini").active(time.Now()) {
+		t.Fatal("退休闸不得改写历史 Gemini 冷却")
 	}
 	if cd := loadCooldown(root); !cd.active(time.Now()) || cd.UntilEpoch != claudeUntil {
 		t.Fatal("gemini 成功不得动 claude 全局冷却（账各归各）")
 	}
-	// 账本：打 engine:"gemini" 标，不占 claude 红线窗口。
-	recs := loadUsage(root)
-	if len(recs) == 0 || recs[len(recs)-1].Engine != "gemini" {
-		t.Fatalf("账本应打 gemini 标, got %+v", recs)
-	}
-	if total, _ := queueWindowSpent(root, time.Now()); total != 0 {
-		t.Fatalf("gemini 用量不得进 claude 红线窗口, got %f", total)
+	if recs := loadUsage(root); len(recs) != 0 {
+		t.Fatalf("未调用的退休卡不得写 usage: %+v", recs)
 	}
 }
 
@@ -528,51 +503,20 @@ printf '%s' '{"response":"完成"}'
 	}
 }
 
-// ---- 交叉验证第五种 kind ----
+// ---- 历史交叉验证 kind 只保留解码/展示 ----
 
 func TestApplyCrossEngineGemini(t *testing.T) {
 	cfg := defaultConfig("")
 	cfg.GeminiBin = "/usr/bin/true"
 	cfg.GeminiModel = "pro"
 
-	tk := &Task{Prompts: []string{"x"}}
-	if err := applyCrossEngine(tk, CrossEngine{Kind: "gemini"}, cfg); err != nil {
-		t.Fatalf("合法 gemini 交叉引擎应通过: %v", err)
+	if err := applyCrossEngine(&Task{Prompts: []string{"x"}}, CrossEngine{Kind: "gemini"}, cfg); err == nil {
+		t.Fatal("新 Gemini 交叉卡必须拒绝")
 	}
-	if tk.PreferRunner != "gemini" {
-		t.Fatalf("应钉 runner=gemini, got %q", tk.PreferRunner)
+	if _, err := freezeCrossEngine(CrossEngine{Kind: "gemini"}, cfg); err == nil {
+		t.Fatal("新 Gemini 冻结规格必须拒绝")
 	}
-	// bin/model 缺失、profile 带 model/effort：全部载入即拒。
-	nb := defaultConfig("")
-	nb.GeminiModel = "pro"
-	if err := applyCrossEngine(&Task{Prompts: []string{"x"}}, CrossEngine{Kind: "gemini"}, nb); err == nil {
-		t.Fatal("缺 gemini_bin 应拒")
-	}
-	nm := defaultConfig("")
-	nm.GeminiBin = "/usr/bin/true"
-	if err := applyCrossEngine(&Task{Prompts: []string{"x"}}, CrossEngine{Kind: "gemini"}, nm); err == nil {
-		t.Fatal("缺 gemini_model 应拒（身份必须显式可冻结）")
-	}
-	if err := applyCrossEngine(&Task{Prompts: []string{"x"}}, CrossEngine{Kind: "gemini", Model: "flash"}, cfg); err == nil {
-		t.Fatal("profile 写 model 应拒（由 config.gemini_model 决定）")
-	}
-	if err := applyCrossEngine(&Task{Prompts: []string{"x"}}, CrossEngine{Kind: "gemini", Effort: "max"}, cfg); err == nil {
-		t.Fatal("profile 写 effort 应拒（gemini 无思考等级参数，静默吞会假装跑在 max）")
-	}
-	// 冻结与套用：GeminiModel 进 XFrozenEngine，applyFrozenEngine 落 XGeminiModel。
-	f, err := freezeCrossEngine(CrossEngine{Kind: "gemini"}, cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f.GeminiModel != "pro" || f.PreferRunner != "gemini" {
-		t.Fatalf("冻结规格不对: %+v", f)
-	}
-	applied := &Task{}
-	applyFrozenEngine(applied, f)
-	if applied.XGeminiModel != "pro" || applied.PreferRunner != "gemini" {
-		t.Fatalf("套用冻结规格不对: %+v", applied)
-	}
-	// 身份串与 codex 区分（甲乙同引擎拦截用）。
+	// 历史 profile identity 仍可稳定显示，不能与 codex 串味。
 	if crossEngineIdentity(CrossEngine{Kind: "gemini"}, cfg) == crossEngineIdentity(CrossEngine{Kind: "codex"}, cfg) {
 		t.Fatal("gemini 与 codex 身份串不得相同")
 	}
@@ -620,20 +564,13 @@ func TestEffectiveModelGeminiSide(t *testing.T) {
 
 // ---- emit 契约 ----
 
-func TestEnqueueEmittedRunnerGemini(t *testing.T) {
+func TestEnqueueEmittedRunnerGeminiRejected(t *testing.T) {
 	root := testRoot(t)
 	cfg := defaultConfig("")
 	parent := newTask(root, cfg, typeCoordinate, "父", t.TempDir(), []string{"p"}, 1)
 	result := "```json\n{\"tasks\":[{\"title\":\"填充\",\"type\":\"sequence\",\"runner\":\"gemini\",\"gemini_model\":\"flash\",\"prompts\":[\"做事\"]}]}\n```"
 	ids, err := enqueueEmitted(root, cfg, parent, result)
-	if err != nil || len(ids) != 1 {
-		t.Fatalf("emit 应入队 1 张: ids=%v err=%v", ids, err)
-	}
-	nt, err := loadTask(root, ids[0])
-	if err != nil {
-		t.Fatal(err)
-	}
-	if nt.PreferRunner != "gemini" || nt.GeminiModel != "flash" {
-		t.Fatalf("emit 的 runner/gemini_model 应随卡, got %q/%q", nt.PreferRunner, nt.GeminiModel)
+	if err == nil || len(ids) != 0 {
+		t.Fatalf("emit 不得创建 Gemini 新卡: ids=%v err=%v", ids, err)
 	}
 }

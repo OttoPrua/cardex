@@ -60,7 +60,7 @@ type EngineProfile struct {
 
 // 引擎名保留字：与原生 Runner 标签的既有语义冲突。
 var engineReservedNames = map[string]bool{
-	"claude": true, "codex": true, "gemini": true, "opencode": true,
+	"claude": true, "codex": true, "gemini": true, antigravityRunnerName: true, "opencode": true,
 	"kimi-cli": true, "grok-build": true, "cursor": true, "remote": true,
 }
 
@@ -96,8 +96,11 @@ func validateEngines(cfg *Config) error {
 		}
 	}
 	for _, name := range cfg.FallbackOrder {
-		if name == "codex" || name == "gemini" {
+		if name == "codex" {
 			continue // 异构执行器白名单：可用性各由 codex_bin / gemini_bin 在派发时把门
+		}
+		if name == "gemini" {
+			return fmt.Errorf("fallback_order 含已退休的 gemini；请使用显式 agy runner")
 		}
 		if _, ok := cfg.Engines[name]; !ok {
 			return fmt.Errorf("fallback_order 含未配置的引擎 %q（engines 里没有这个键）", name)
@@ -473,7 +476,7 @@ func limitHitForRunner(via string, remote bool, t *Task, res *claudeResult, comb
 // 以及显式本机 claude 哨兵必须排除，
 // 否则会误入档案分支撞「档案不存在」。
 func engineVia(via string) bool {
-	return via != "" && via != "claude" && via != "codex" && via != "gemini" && via != "opencode" &&
+	return via != "" && via != "claude" && via != "codex" && via != "gemini" && via != antigravityRunnerName && via != "opencode" &&
 		!kimiCLIVia(via) && !grokBuildVia(via) && !cursorVia(via)
 }
 

@@ -1115,10 +1115,13 @@ func TestWorkflowEnginesMustBePinnableWithoutFailOpen(t *testing.T) {
 			t.Fatalf("engine %q must be refused: %v", engine, err)
 		}
 	}
-	for _, engine := range []string{"claude", "codex", "gemini", grokBuildRunnerName, cursorRunnerName, kimiCLIRunnerName} {
+	for _, engine := range []string{"claude", "codex", antigravityRunnerName, grokBuildRunnerName, cursorRunnerName, kimiCLIRunnerName} {
 		if err := validateWorkflowEngine(cfg, engine); err != nil {
 			t.Fatalf("engine %q is a real pinned lane: %v", engine, err)
 		}
+	}
+	if err := validateWorkflowEngine(cfg, "gemini"); !errors.Is(err, errWorkflowUnknownEngine) {
+		t.Fatalf("retired Gemini must not remain pinnable for a new workflow: %v", err)
 	}
 
 	if err := cmdWorkflowInit([]string{

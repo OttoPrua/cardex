@@ -100,6 +100,9 @@ type Task struct {
 	// flash-lite）。主跑（runner_pref=gemini）与降级改道两径都生效；空 = 按 t.Model 档位查
 	// config.gemini_models 槽映射（见 resolveGeminiModel 优先序）。XGeminiModel 恒优先。
 	GeminiModel string `json:"gemini_model,omitempty"`
+	// AgyModel freezes the actual Antigravity model selected by the value-blind models preflight.
+	// An explicit card pin is accepted only when that exact model appears in the live model list.
+	AgyModel string `json:"agy_model,omitempty"`
 	// OpenCodeModel 钉定原生 OpenCode CLI 的 provider/model。
 	OpenCodeModel string `json:"opencode_model,omitempty"`
 	// KimiModel 钉定原生 Kimi Code CLI 的模型别名（如 kimi-code/k3）。
@@ -127,6 +130,9 @@ type Task struct {
 	// LastRouteAttempt preserves requested/actual identity and the latest observation/proof even
 	// after the task advances to another route leg. It contains no prompt, output, or credential data.
 	LastRouteAttempt *RouteAttemptReadback `json:"last_route_attempt,omitempty"`
+	// LastProviderPreflight is separate from Attempts: a no-model readiness failure is durable and
+	// visible but does not consume a semantic provider attempt.
+	LastProviderPreflight *ProviderPreflightReadback `json:"last_provider_preflight,omitempty"`
 	// RiskClass is the closed Owner risk declaration. For backend work only ordinary is a low-risk
 	// assertion; missing, unknown, critical, and production values all resolve to high-risk. Standalone
 	// reviews use ordinary versus critical/production, with missing or unknown values failing closed.
@@ -459,7 +465,7 @@ func newTask(root string, cfg *Config, typ, title, dir string, prompts []string,
 }
 
 // applyDefaultRunner 把全局默认主路由烘焙到新卡。只填空白偏好，不覆盖 cross profile、
-// -runner 或其他显式执行器选择；会话续跑由各入口在写入 SessionID 后清除此默认 Codex 偏好。
+// -runner 或其他显式执行器选择；会话续跑由各入口在写入 SessionID 后清除此默认外部 runner 偏好。
 // 它只在显式创建路径（newTask）运行：存量 queued/held/limit_paused/failed/done/archived 卡的
 // 字节绝不因新默认值被补写、替换或重解释（P1-6 冻结纪律）。
 func applyDefaultRunner(cfg *Config, t *Task) bool {
@@ -467,7 +473,7 @@ func applyDefaultRunner(cfg *Config, t *Task) bool {
 		return false
 	}
 	switch cfg.DefaultRunner {
-	case "codex", "gemini":
+	case "codex", antigravityRunnerName:
 		t.PreferRunner = cfg.DefaultRunner
 		t.RunnerExplicit = false
 		return true
@@ -476,10 +482,11 @@ func applyDefaultRunner(cfg *Config, t *Task) bool {
 	}
 }
 
-// preserveSessionRunner 处理显式的 Claude 会话续跑。Codex 不可续接 Claude session；
-// 只有 default_runner 自动填入的 Codex 偏好会在这些明确带 session 的入口被撤回。
+// preserveSessionRunner 处理显式的 Claude 会话续跑。Codex/Antigravity 都不可续接 Claude
+// session；只有 default_runner 自动填入的外部 runner 偏好会在这些明确带 session 的入口被撤回。
 func preserveSessionRunner(t *Task) {
-	if t != nil && t.SessionID != "" && t.PreferRunner == "codex" {
+	if t != nil && t.SessionID != "" &&
+		(t.PreferRunner == "codex" || t.PreferRunner == antigravityRunnerName) && !t.RunnerExplicit {
 		t.PreferRunner = ""
 		t.RunnerExplicit = false
 	}

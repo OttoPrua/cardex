@@ -75,7 +75,7 @@ func crossPolicyLeg(cfg *Config, engine CrossEngine) policyLeg {
 // guess about whether a provider will answer this invocation.
 func ownerAutoRouteEligible(t *Task) bool {
 	return t != nil && t.PreferRunner == "codex" && !t.RunnerExplicit && t.RemoteHost == "" && t.XRole == "" &&
-		t.CodexModel == "" && t.XCodexModel == "" && t.GeminiModel == "" && t.OpenCodeModel == "" &&
+		t.CodexModel == "" && t.XCodexModel == "" && t.GeminiModel == "" && t.AgyModel == "" && t.OpenCodeModel == "" &&
 		t.KimiModel == "" && t.GrokModel == "" && t.GrokEffort == "" && t.CursorModel == "" &&
 		t.SessionID == "" && !t.MidStep && codexEligible(t)
 }
@@ -412,20 +412,20 @@ func ownerRouteSnapshotLegMatches(t *Task, leg policyLeg) bool {
 	switch leg.Runner {
 	case kimiCLIRunnerName:
 		return t.PreferRunner == kimiCLIRunnerName && t.CodexModel == "" && t.XCodexModel == "" &&
-			t.GeminiModel == "" && t.OpenCodeModel == "" && (t.KimiModel == "" || t.KimiModel == leg.Model) &&
+			t.GeminiModel == "" && t.AgyModel == "" && t.OpenCodeModel == "" && (t.KimiModel == "" || t.KimiModel == leg.Model) &&
 			t.GrokModel == "" && t.GrokEffort == "" && t.CursorModel == "" &&
 			(t.Effort == "" || (t.Effort == leg.Effort && t.EffortExplicit))
 	case cursorRunnerName:
 		return t.PreferRunner == "codex" && t.CodexModel == "" && t.XCodexModel == "" &&
-			t.GeminiModel == "" && t.OpenCodeModel == "" && t.KimiModel == "" &&
+			t.GeminiModel == "" && t.AgyModel == "" && t.OpenCodeModel == "" && t.KimiModel == "" &&
 			t.GrokModel == "" && t.GrokEffort == "" && (t.CursorModel == "" || t.CursorModel == leg.Model)
 	case grokBuildRunnerName:
 		return t.PreferRunner == grokBuildRunnerName && t.GrokModel == leg.Model && t.GrokEffort == leg.Effort &&
-			t.CodexModel == "" && t.XCodexModel == "" && t.GeminiModel == "" &&
+			t.CodexModel == "" && t.XCodexModel == "" && t.GeminiModel == "" && t.AgyModel == "" &&
 			t.OpenCodeModel == "" && t.KimiModel == "" && t.CursorModel == ""
 	case "codex":
 		return t.PreferRunner == "codex" && t.CodexModel == leg.Model && t.Effort == leg.Effort &&
-			t.EffortExplicit && t.XCodexModel == "" && t.GeminiModel == "" &&
+			t.EffortExplicit && t.XCodexModel == "" && t.GeminiModel == "" && t.AgyModel == "" &&
 			t.OpenCodeModel == "" && t.KimiModel == "" && t.GrokModel == "" &&
 			t.GrokEffort == "" && t.CursorModel == ""
 	default:
@@ -455,6 +455,8 @@ func resolvePinnedTaskLeg(cfg *Config, t *Task) (policyLeg, bool) {
 	case "gemini":
 		model, _ := resolveGeminiModel(cfg, t)
 		return policyLeg{Runner: "gemini", Model: model}, true
+	case antigravityRunnerName:
+		return policyLeg{Runner: antigravityRunnerName, Model: resolveAntigravityModel(cfg, t), Effort: resolveAntigravityEffort(cfg)}, true
 	default:
 		return policyLeg{}, false
 	}

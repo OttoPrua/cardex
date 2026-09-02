@@ -215,7 +215,7 @@ func validateWorkflowEngine(cfg *Config, engine string) error {
 		return fmt.Errorf("%w: empty", errWorkflowUnknownEngine)
 	}
 	switch e {
-	case "claude", "codex", "gemini", "opencode", kimiCLIRunnerName, grokBuildRunnerName, cursorRunnerName:
+	case "claude", "codex", antigravityRunnerName, "opencode", kimiCLIRunnerName, grokBuildRunnerName, cursorRunnerName:
 		return nil
 	}
 	if cfg != nil {

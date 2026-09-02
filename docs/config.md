@@ -25,7 +25,7 @@
 | `queue_budget_tokens` 等 | 0（关） | 5 小时额度红线，见[进阶指南 · 额度红线](guide.md#5-小时额度红线保底额度) |
 | `oauth_usage` / `oauth_usage_*` | false | 订阅端点直读（第三用量源），端点未文档化——异常按数据不足处理 |
 | `max_parallel` | 1 | 单次 tick 并行任务数（写类任务同目录串行；design-review/progress-pull 只读类型豁免，可同仓并发） |
-| `default_runner` | ""（历史 Claude） | 未显式钉执行器的新卡默认主路由；`codex` 会覆盖手工卡和自动审核/修复/收口/复盘/emit 卡。显式 Claude 会话续跑与 cross profile 不被改写 |
+| `default_runner` | ""（历史 Claude） | 支持 `claude`、`codex` 或已启用的 `agy`；`gemini` 已退休并在加载期拒绝 |
 | `owner_routing_enforced` | `false` | Final Owner 矩阵硬锁；开启后，全部风险/审核分支、精确 provider/runner/model/effort、Fable 唯一 Sol/ultra 终局与所有显式 Sol gate 任一漂移均在加载期拒绝。新 `sequence` 卡必须填写 `route_class=backend|general`；backend 只有显式 `risk_class=ordinary` 才走 ordinary，缺失或歧义 fail closed 到 high-risk。受管 board/tick 再设 `CARDEX_REQUIRE_OWNER_ROUTING=1`，防删除该键后静默退回旧策略 |
 | `automatic_codex_budget_stop_percent` / `owner_provider_targets` | `0` / 空 | Final Owner 强制为 65%，provider-specific 自动 Codex 用量达到该值即保留约 35%；证据缺失也 held。只有带可见持久原因的 Owner-pinned critical 卡可绕过。目标固定 Grok 70–80%、Kimi/OpenCode 15–25%、direct Sol 5–10%，仅用于政策/看板读回，不改既有任务 |
 | `codex_bin` / `codex_fallback` | 空 / false | 冷却期备用执行器，见[进阶指南 · Codex 备用执行器](guide.md#codex-备用执行器限额空窗不断档) |
@@ -35,19 +35,16 @@
 | `codex_tier_models` / `codex_tier_reasoning` | 见内置映射 | Codex 主跑与可回退卡的档位槽位：fable→sol/max、opus→sol/xhigh、sonnet→luna/max、haiku→luna/xhigh |
 | `codex_reasoning` | "" | 无来源档位可解析时的全局兜底推理档；卡面显式 effort 优先于档位默认 |
 | `codex_review_sandbox` | "worktree-write" | codex 只读分析卡(design-review/crosscheck 等)的沙箱策略。默认 `worktree-write`:**本机** codex 建一次性隔离副本 + `--sandbox workspace-write`,复审可跑测试/写夹具做动态验证,副本落 `<root>/tmp/codex-review-work/`,卡结束即删,原仓永不受写污染(CG-R3)。**远端** codex 只对 `t.Dir` 位于 `remote_mirror_root` 之下的镜像卡放宽；默认用 `workspace-write`，若该主机显式配置 `sandbox: "danger-full-access"`（Windows OS sandbox runner 不可用），严格镜像子孙继承该值。交叉/协调/回退等真实业务仓仍维持 `--sandbox read-only` 硬保证。改 `readonly` 全线回落旧行为。**取值写错时按最小权限回落 `readonly`(fail-closed)并在日志披露一次**；键留空/不写才用默认 `worktree-write`。sequence 卡不受此配置影响。 |
-| `gemini_bin` | 空 | Gemini CLI 可执行文件路径，非空即启用第二异构执行器：`-runner gemini` 可钉定主跑；`fallback_order` 含 `"gemini"` 时 claude 空窗期也可改道（五道闸与 codex 全量同规）。车道冷却落 `cooldown-gemini.json`（配额是账号级的，挂车道不挂单卡）；账本打 `engine:"gemini"` 标，不占 claude 红线预算。见[进阶指南 · Gemini CLI 备用执行器](guide.md#gemini-cli-备用执行器第二异构执行器) |
-| `gemini_model` | ""（内置 "pro"） | 卡无模型时的默认；推荐官方稳定别名 `pro`/`flash`/`flash-lite`（核实 2026-08-03）。**永不落空传给 CLI**——空即 `auto` 路由，撞配额会静默换模型，已否决 |
-| `gemini_models` | fable/opus→pro，sonnet→flash，haiku→flash-lite | 档位槽映射（fable/opus/sonnet/haiku → gemini 模型/别名），claude 卡改道 gemini 时按 `t.Model` 档位查此表；高档取 `pro` 是按编码交叉信号（SWE-bench）的显式决定 |
-| `gemini_approval_mode` | ""（=yolo） | `sequence` 卡的 `--approval-mode`（default/auto_edit/yolo/plan）。非 `sequence` 卡（复审/协调/装配/交叉/进度回收）恒强制 `plan`（只读）——gemini 无 OS 沙箱，plan 是唯一硬护栏，与 codex「非 sequence 默认 read-only」同一纪律 |
-| `gemini_auth_env` | "" | 可选：命名一个环境变量，其值在执行时注入 `GEMINI_API_KEY`（密钥不进 config，与引擎档案 `auth_env` 同一纪律）。空 = 继承环境（OAuth 缓存凭据 / 已 export 的 `GEMINI_API_KEY`）。注意（2026-08-03 实测）：OAuth 个人免费档已被 gemini-cli 0.42+ 拒绝，需 API key 或 Google AI Pro/Ultra 订阅 OAuth |
+| `antigravity_bin` / `antigravity` | 空 / 关闭 | 原生 `agy` 路由。派发前用代理白名单与本机 HOME 执行 `agy models`，动态选择最高实际广告的 Claude Opus；无 Opus 不降到 Sonnet/Gemini。模型名含 thinking 时不传 `--effort` |
+| `gemini_*` | 仅历史兼容 | 保留旧任务与配置的解码/展示；新卡、默认路由、fallback、workflow 与执行命令全部拒绝 |
 | `opencode_bin` / `opencode_model` / `opencode_models` | 空 | 原生 OpenCode CLI 执行器；复用 OpenCode 本地登录凭据，不复制 API key。`-runner opencode` 可显式钉定 |
 | `opencode_night_opus` | 空（关闭） | 兼容的单目标夜间 OpenCode Opus 自动路由：`enabled/start_hour/end_hour/timezone/model/variant/limit_fallback_min`；显式 `-runner opencode` 不受窗口限制 |
 | `kimi_cli_bin` / `kimi_cli_home` / `kimi_cli_model` / `kimi_cli_effort` | 空 | 原生 Kimi Code CLI 执行器；`kimi_cli_home` 指向已登录目录（空时 `~/.kimi-code`）。Cardex 在自身数据根建立隔离运行目录，只软链接 OAuth credentials，不复制 token；生产 K3 使用 `kimi-code/k3`，max 通过 CLI 官方 `KIMI_MODEL_THINKING_EFFORT` 子进程变量注入 |
-| `kimi_cli_opus` | 空（关闭） | Final Owner 共用 Kimi K3/max 串行腿：非 backend Opus/Sonnet/Haiku 的 eligible fallback，backend ordinary 的 fresh 对抗审查/修复，以及 backend high-risk 的 fresh 只读第二视角。Kimi CLI 与 OpenCode Go Kimi K3 只是容量冗余，同一语义 Kimi 失败不得换 provider 重放并算成独立意见 |
-| `grok_build_bin` / `grok_build` | 空 / 关闭 | Final Owner 主腿：Fable answer/Opus=`grok-4.6/xhigh`，Sonnet=`high`，Haiku=`high`。ordinary backend 为 Grok 实现→Kimi 对抗审查/修复，确定性 20% 抽样、Grok-Kimi 分歧或验收失败才追加 Sol/xhigh；high-risk backend 为 Grok 实现→Kimi 只读第二视角→mandatory Sol/max。身份/凭据、DB/schema/migration、协议/网络执行、manifest/launchd、Control/authority、live cutover、安全和资金均属 high-risk。认证 parser 只接受精确单行 bare 诊断与精确 quoted OIDC wrapper，必须读完 stderr 且 semantic/model/tool=0/0/0；任何多行 unquoted（含完整诊断后跟 Model/Auth/Version/Available）拒绝，鉴权永不授权 fallback |
+| `kimi_cli_opus` | 空（关闭） | Kimi 原生腿；`max_parallel` 是独立并发上限，空/0 默认 24，仍受全局上限与写域互斥约束 |
+| `grok_build_bin` / `grok_build` | 空 / 关闭 | Grok 原生腿；`max_parallel` 同样默认 24。派发前 value-blind preflight 持久化认证/代理/限额/模型状态，失败不消耗语义 attempt |
 | `cursor_bin` / `cursor_model` / `cursor_fable` | 空 / 关闭 | 显式 Fable 必须 `claude-fable-5-thinking-max`，角色固定 general 且只读。确认 quota 或 eligible 已证明 presemantic failure 后只生成 A=`grok-4.6/xhigh` 一份答案，随后 B=`gpt-5.6-sol/ultra` 作为唯一自动 Codex 调用，读取原问题/证据与 A，重建目标约束、对抗并修复后直接终局；profile `merge` 必须省略。语义/验收失败不触发；无 blind Sol answer、Sol/max 第三腿或 review-of-review，未决 P0/P1/uncertainty held for Owner |
 | `engines` | {}（空） | 多订阅引擎档案：键=引擎名（小写字母数字连字符；claude/codex/remote 保留），值含 base_url、认证三选一（auth_env 环境变量名引用 / auth_file 文件 / auth_value 明文）、auth_var（注入变量名，仅 ANTHROPIC_AUTH_TOKEN/ANTHROPIC_API_KEY）、models 档位映射（fable/opus/sonnet/haiku → 供应商模型 ID）、default_model、extra_env、limit_fallback_min（0 继承全局）、tier 展示档位。内置预设用 `cardex engines add <名>` 并入；见[进阶指南 · 多订阅引擎](guide.md#多订阅引擎engine-profileskimi--glm--minimax--mimo--opencode-go--ollama-cloud) |
-| `fallback_order` | ["codex"] | claude 冷却/红线时的改道顺序（`"codex"`/`"gemini"` 与 engines 键混排，逐个找第一个可用出路）；质量地板（`no_fallback_models`/交叉卡/复审位）对链上每一项同等生效 |
+| `fallback_order` | ["codex"] | claude 冷却/红线时的改道顺序；`gemini` 项在加载期拒绝，`agy` 只作为显式原生 runner |
 | `model_tiers` | {}（空） | 自定义分级表：模型 ID（全小写，精确或前缀匹配）→ 档位关键字（fable/opus/sonnet/haiku），优先于内置统一标准线。它同时驱动档位展示、引擎档位推导和 Final Owner 矩阵解析；因此映射变化会改变未显式 pin 新卡的实际派发。坏值载入即拒。见[进阶指南 · 自定义分级](guide.md#自定义分级model_tiers无更强模型的机队按牌面定档) |
 | `cross_profiles` | {opus-codex} | 交叉验证链（`cardex cross`）：A/B 独立作答；可选 `merge` 冻结第三个合并引擎，省略时兼容旧行为由 B 承担 C。见[进阶指南 · 交叉验证](guide.md#交叉验证fable-顶替双引擎独立作答--对抗式交叉查漏) |
 | `default_cross_profile` | "opus-codex" | `cross` 未指定 `-profile` 时用的引擎对 |

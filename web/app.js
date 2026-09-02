@@ -212,7 +212,7 @@ function metaChip(text, opts) {
   });
 }
 
-const RUNNER_ZH = { claude: 'Claude', codex: 'Codex', opencode: 'OpenCode', gemini: 'Gemini', 'kimi-cli': 'Kimi CLI', 'grok-build': 'Grok Build', cursor: 'Cursor CLI' };
+const RUNNER_ZH = { claude: 'Claude', codex: 'Codex', agy: 'Antigravity', opencode: 'OpenCode', gemini: 'Gemini（历史）', 'kimi-cli': 'Kimi CLI', 'grok-build': 'Grok Build', cursor: 'Cursor CLI' };
 const ROUTE_REASON_ZH = {
   opencode_explicit: '显式 OpenCode',
   opencode_night_opus_preferred: '夜间 K3 优先',

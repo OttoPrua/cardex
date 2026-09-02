@@ -1898,6 +1898,21 @@ func zhStatus(s string) string {
 
 // ---- hold / release / retry / cancel ----
 
+func requireIntegrationRelease(root string, t *Task) error {
+	if t == nil || t.IntegrationGate == nil {
+		return nil
+	}
+	cfg, err := loadConfig(root)
+	if err != nil {
+		return err
+	}
+	if dec := evaluateIntegrationRelease(root, cfg, t); !dec.Admit {
+		return fmt.Errorf("%s 集成门仍 held（%s）；durable review done 不等于 verdict=pass，不足以 release",
+			t.ID, dec.HoldReason)
+	}
+	return nil
+}
+
 func cmdSetStatus(args []string, action string) error {
 	fs := flag.NewFlagSet(action, flag.ExitOnError)
 	rootFlag := fs.String("root", "", "数据目录")
@@ -1921,17 +1936,10 @@ func cmdSetStatus(args []string, action string) error {
 		if t.Status != statusHeld {
 			return fmt.Errorf("%s 不在挂起状态（当前: %s）", t.ID, t.Status)
 		}
-		if t.IntegrationGate != nil {
-			// A durable review `done` is not a verdict. Manual release of a gated
-			// integration card re-derives the evidence and refuses without it.
-			cfg, err := loadConfig(root)
-			if err != nil {
-				return err
-			}
-			if dec := evaluateIntegrationRelease(root, cfg, t); !dec.Admit {
-				return fmt.Errorf("%s 集成门仍 held（%s）；durable review done 不等于 verdict=pass，不足以 release",
-					t.ID, dec.HoldReason)
-			}
+		// A durable review `done` is not a verdict. Every held-to-queued path
+		// re-derives the same integration evidence before changing ControlEpoch.
+		if err := requireIntegrationRelease(root, t); err != nil {
+			return err
 		}
 		if err := checkAttemptEpoch(root, t, false); err != nil {
 			return err
@@ -1947,6 +1955,9 @@ func cmdSetStatus(args []string, action string) error {
 		_ = resetTombstoneKind(root, t.ID, reconcileCrossKind())
 	case "retry":
 		if t.Status == statusHeld {
+			if err := requireIntegrationRelease(root, t); err != nil {
+				return err
+			}
 			if err := checkAttemptEpoch(root, t, true); err != nil {
 				return err
 			}

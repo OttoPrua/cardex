@@ -505,6 +505,123 @@ func TestCliReleaseRejectsConsumedEpochAndRetryOpensExplicitEpoch(t *testing.T) 
 	}
 }
 
+func TestCliHeldRetryRevalidatesIntegrationGate(t *testing.T) {
+	root := testRoot(t)
+	if err := saveConfig(root, defaultConfig("claude")); err != nil {
+		t.Fatal(err)
+	}
+	tk := newTask(root, testCfg(), typeSequence, "gated held retry", "/tmp", []string{"p"}, 5)
+	tk.Status = statusHeld
+	tk.IntegrationGate = &IntegrationGate{ReviewTaskID: "missing-review"}
+	markControlTerminal(tk)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	rec := &AttemptRecord{TaskID: tk.ID, AttemptID: "consumed", ControlEpoch: tk.ControlEpoch, State: attemptExited, CreatedAt: time.Now().Format(time.RFC3339Nano)}
+	if err := writeAttempt(root, rec); err != nil {
+		t.Fatal(err)
+	}
+	beforeTask, err := os.ReadFile(taskPath(root, tk.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeEvents := readAllEventsRaw(t, root, tk.ID)
+	if err := cmdSetStatus([]string{"-root", root, tk.ID}, "retry"); err == nil || !strings.Contains(err.Error(), "集成门仍 held") {
+		t.Fatalf("held retry must revalidate the integration gate, got %v", err)
+	}
+	afterTask, err := os.ReadFile(taskPath(root, tk.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterTask) != string(beforeTask) {
+		t.Fatal("rejected gated retry mutated task bytes")
+	}
+	if got := readAllEventsRaw(t, root, tk.ID); len(got) != len(beforeEvents) {
+		t.Fatalf("rejected gated retry emitted an event: before=%d after=%d", len(beforeEvents), len(got))
+	}
+}
+
+func TestConcurrentConsumedReleaseAndHeldRetriesOpenOneEpoch(t *testing.T) {
+	root := testRoot(t)
+	tk := newTask(root, testCfg(), typeSequence, "concurrent consumed epoch", "/tmp", []string{"p"}, 5)
+	tk.Status = statusHeld
+	markControlTerminal(tk)
+	if err := saveTask(root, tk); err != nil {
+		t.Fatal(err)
+	}
+	rec := &AttemptRecord{TaskID: tk.ID, AttemptID: "consumed", ControlEpoch: tk.ControlEpoch, State: attemptExited, CreatedAt: time.Now().Format(time.RFC3339Nano)}
+	if err := writeAttempt(root, rec); err != nil {
+		t.Fatal(err)
+	}
+	const contenders = 8
+	start := make(chan struct{})
+	type result struct {
+		status string
+		err    error
+	}
+	results := make(chan result, contenders+1)
+	var wg sync.WaitGroup
+	wg.Add(contenders + 1)
+	go func() {
+		defer wg.Done()
+		<-start
+		results <- result{status: "release", err: cmdSetStatus([]string{"-root", root, tk.ID}, "release")}
+	}()
+	for i := 0; i < contenders; i++ {
+		go func() {
+			defer wg.Done()
+			<-start
+			results <- result{status: "retry", err: cmdSetStatus([]string{"-root", root, tk.ID}, "retry")}
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	successes := 0
+	releaseRejected := false
+	for result := range results {
+		if result.status == "release" {
+			releaseRejected = result.err != nil
+			continue
+		}
+		if result.err == nil {
+			successes++
+		}
+	}
+	if !releaseRejected {
+		t.Fatal("ordinary release contender unexpectedly succeeded")
+	}
+	if successes != 1 {
+		t.Fatalf("successful retries=%d want 1", successes)
+	}
+	fresh, err := loadTask(root, tk.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fresh.Status != statusQueued || fresh.ControlEpoch != tk.ControlEpoch+1 {
+		t.Fatalf("winning retry must open exactly one epoch: %+v", fresh)
+	}
+	if fresh.ActiveAttemptID != "" {
+		t.Fatalf("retry must not start a provider attempt: %q", fresh.ActiveAttemptID)
+	}
+	queued := 0
+	for _, event := range readAllEventsRaw(t, root, tk.ID) {
+		if event.Type == evQueued && event.Actor == "cli:retry" {
+			queued++
+		}
+	}
+	if queued != 1 {
+		t.Fatalf("queued retry events=%d want 1", queued)
+	}
+	entries, err := os.ReadDir(attemptsDir(root, tk.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "consumed.json" {
+		t.Fatalf("retry created duplicate attempt evidence: %+v", entries)
+	}
+}
+
 // TestReviewVerdictClosepathEmitsCloseoutAndQueued 验证 pass→closeout 时父卡 closeout + 子卡 queued 双事件。
 func TestReviewVerdictClosepathEmitsCloseoutAndQueued(t *testing.T) {
 	root := testRoot(t)

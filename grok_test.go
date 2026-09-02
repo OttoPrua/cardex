@@ -70,6 +70,61 @@ func TestGrokLifecycleProbeFailsBeforeProviderProcess(t *testing.T) {
 	}
 }
 
+func TestGrokLifecycleProbeRejectsRelativeHomeBeforeProviderProcess(t *testing.T) {
+	bin, productCalls := fakeGrokBuildCounted(t, `{"type":"end","stopReason":"end_turn"}`, "", 0)
+	cfg := grokBuildTestConfig(t, bin)
+	t.Setenv("HOME", "relative-home")
+	task := &Task{ID: "grok-relative-home", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
+	root := admitDirectInvoke(t, "", task)
+	task.LastProviderPreflight = &ProviderPreflightReadback{Runner: grokBuildRunnerName, State: providerReady}
+	if _, _, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt"); err == nil ||
+		!strings.Contains(err.Error(), "home must be an absolute path") {
+		t.Fatalf("expected relative HOME denial before provider, got %v", err)
+	}
+	if n := countProductCalls(t, productCalls); n != 0 {
+		t.Fatalf("provider process started with relative HOME: %d", n)
+	}
+}
+
+func TestGrokLifecycleProbePassesExactHomeToProvider(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "grok")
+	homeDump := filepath.Join(dir, "home.txt")
+	payload := `{"type":"text","data":"GROK_OK"}` + "\n" +
+		`{"type":"end","stopReason":"end_turn","sessionId":"session-grok","num_turns":1}`
+	script := "#!/bin/sh\n" +
+		"printf '%s' \"$HOME\" > " + shSingleQuote(homeDump) + "\n" +
+		"printf '%s\\n' " + shSingleQuote(payload) + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg := grokBuildTestConfig(t, bin)
+	wantHome := os.Getenv("HOME")
+	if !filepath.IsAbs(wantHome) {
+		t.Fatalf("test HOME must be absolute: %q", wantHome)
+	}
+	task := &Task{ID: "grok-bound-home", Type: typeSequence, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName}
+	root := admitDirectInvoke(t, "", task)
+	task.LastProviderPreflight = &ProviderPreflightReadback{Runner: grokBuildRunnerName, State: providerReady}
+	if _, _, err := invokeGrokBuild(context.Background(), root, cfg, task, "harmless prompt"); err != nil {
+		t.Fatal(err)
+	}
+	gotHome, err := os.ReadFile(homeDump)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(gotHome) != wantHome {
+		t.Fatalf("provider HOME=%q want exact probe HOME %q", gotHome, wantHome)
+	}
+	entries, err := os.ReadDir(filepath.Join(wantHome, ".grok"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("lifecycle probe residue: %+v", entries)
+	}
+}
+
 func TestGrokTierRoutesPinEffortFallbackAndOpusReview(t *testing.T) {
 	cfg := grokBuildTestConfig(t, "/usr/bin/true")
 	for _, tc := range []struct {

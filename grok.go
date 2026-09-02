@@ -18,13 +18,9 @@ import (
 	"time"
 )
 
-func probeGrokBuildLifecycleState(t *Task) (err error) {
+func probeGrokBuildLifecycleState(t *Task, home string) (err error) {
 	if t == nil || strings.TrimSpace(t.ID) == "" || strings.TrimSpace(t.ActiveAttemptID) == "" {
 		return fmt.Errorf("Grok lifecycle-state probe requires an exact reserved attempt")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || strings.TrimSpace(home) == "" {
-		return fmt.Errorf("resolve Grok lifecycle-state home: %w", err)
 	}
 	stateDir := filepath.Join(home, ".grok")
 	dirInfo, err := os.Lstat(stateDir)
@@ -1246,7 +1242,16 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	if effort == "max" {
 		return nil, "", fmt.Errorf("Grok 4.6 不支持 reasoning effort=max；最高可用档为 xhigh")
 	}
-	if err := probeGrokBuildLifecycleState(t); err != nil {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, "", fmt.Errorf("resolve Grok lifecycle-state home: %w", err)
+	}
+	home = strings.TrimSpace(home)
+	if home == "" || !filepath.IsAbs(home) {
+		return nil, "", fmt.Errorf("Grok lifecycle-state home must be an absolute path")
+	}
+	home = filepath.Clean(home)
+	if err := probeGrokBuildLifecycleState(t, home); err != nil {
 		return nil, "", err
 	}
 	// runTaskVia performs the shared value-blind preflight before reaching this adapter. Keep the
@@ -1303,7 +1308,6 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	cmd := exec.CommandContext(runCtx, cfg.GrokBuildBin, args...)
 	setupProcGroup(cmd)
 	cmd.Dir = t.Dir
-	home, _ := os.UserHomeDir()
 	cmd.Env = providerChildEnv(home, nil)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr

@@ -1378,7 +1378,7 @@ func resolvedGrokBuildReadOnlySandbox(cfg *Config) string {
 	if cfg == nil || cfg.GrokBuild == nil {
 		return grokBuildReadOnlySandboxDefault
 	}
-	switch strings.TrimSpace(cfg.GrokBuild.ReadOnlySandboxProfile) {
+	switch cfg.GrokBuild.ReadOnlySandboxProfile {
 	case grokBuildReadOnlySandboxMacOSNoopNetwork:
 		return grokBuildReadOnlySandboxMacOSNoopNetwork
 	default:

@@ -697,12 +697,21 @@ func TestValidateGrokBuildReadOnlySandboxProfile(t *testing.T) {
 	if err := validateGrokBuild(cfg); err != nil {
 		t.Fatalf("valid macOS read-only sandbox profile rejected: %v", err)
 	}
-	for _, unsafe := range []string{"off", "workspace", "devbox", "strict", "unknown-profile"} {
+	for _, unsafe := range []string{
+		"off", "workspace", "devbox", "strict", "unknown-profile",
+		" read-only", "read-only ", "\t" + grokBuildReadOnlySandboxMacOSNoopNetwork,
+		grokBuildReadOnlySandboxMacOSNoopNetwork + "\n", "../read-only", "profiles/read-only",
+	} {
 		cfg := grokBuildTestConfig(t, "/usr/bin/true")
 		cfg.GrokBuild.ReadOnlySandboxProfile = unsafe
 		if err := validateGrokBuild(cfg); err == nil || !strings.Contains(err.Error(), "read_only_sandbox_profile") {
 			t.Fatalf("unsafe/unknown profile %q must fail closed: %v", unsafe, err)
 		}
+	}
+
+	cfg.GrokBuild.ReadOnlySandboxProfile = " " + grokBuildReadOnlySandboxMacOSNoopNetwork
+	if got := resolvedGrokBuildReadOnlySandbox(cfg); got != grokBuildReadOnlySandboxDefault {
+		t.Fatalf("unvalidated padded profile must fail closed to %q, got %q", grokBuildReadOnlySandboxDefault, got)
 	}
 }
 

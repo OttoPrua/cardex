@@ -920,7 +920,10 @@ func validateGrokBuild(cfg *Config) error {
 		return fmt.Errorf("grok_build.model 不能为空")
 	}
 	r.Effort = strings.ToLower(strings.TrimSpace(r.Effort))
-	r.ReadOnlySandboxProfile = strings.TrimSpace(r.ReadOnlySandboxProfile)
+	if strings.TrimSpace(r.ReadOnlySandboxProfile) != r.ReadOnlySandboxProfile {
+		return fmt.Errorf("grok_build.read_only_sandbox_profile %q 非法（名称必须精确且不能包含首尾空白）",
+			r.ReadOnlySandboxProfile)
+	}
 	switch r.ReadOnlySandboxProfile {
 	case "", grokBuildReadOnlySandboxDefault, grokBuildReadOnlySandboxMacOSNoopNetwork:
 	default:

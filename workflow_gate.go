@@ -15,6 +15,13 @@ type IntegrationReleaseDecision struct {
 	Review     *Task
 }
 
+// holdReasonTrailingVerdict is the refusal for a transcript that still asserts
+// a verdict after its last decodable verdict object. It is deliberately its own
+// reason: "the reviewer wrote something after the terminal block" is a different
+// thing for an operator to go look at than a terminal block that came out
+// malformed.
+const holdReasonTrailingVerdict = "trailing_verdict_claim"
+
 // reviewVerdictIsAdmissiblePass encodes templates/design-review.md: `pass` is
 // only a pass when p0 and p1 are both empty. `ACCEPT`, `HELD`, and any other
 // token are not machine vocabulary at all.
@@ -91,9 +98,12 @@ func integrationCustodyOK(root string, review, writer *Task) (bool, string) {
 		// custody against, and the review is not bound to any candidate producer.
 		return false, holdReasonCustody
 	}
-	tasks, err := loadTasks(root)
+	// The rival-reviewer sweep exists to find a card that should not be there.
+	// A scan that silently drops the files it cannot parse is exactly the wrong
+	// tool for it: a corrupt rival disappears from the sweep looking for it.
+	tasks, err := scanWorkflowTasks(root)
 	if err != nil {
-		return false, holdReasonCustody
+		return false, holdReasonBrokenEvidence
 	}
 	for _, other := range tasks {
 		if other == nil || other.ID == review.ID || other.Type != typeReview {
@@ -164,12 +174,22 @@ func evaluateIntegrationRelease(root string, cfg *Config, t *Task) IntegrationRe
 	}
 	dec.Review = review
 
-	var writer *Task
-	switch {
-	case gate.WriterTaskID != "":
-		writer, _ = findTaskAnywhere(root, gate.WriterTaskID)
-	case review.ReviewOf != "":
-		writer, _ = findTaskAnywhere(root, review.ReviewOf)
+	// The producer of the reviewed bytes has to exist and load. Discarding this
+	// lookup error is what let a deleted or corrupt writer present itself as
+	// "no producer named", which skips every writer-bound custody check and
+	// releases on a review whose subject is gone.
+	producer := strings.TrimSpace(gate.WriterTaskID)
+	if producer == "" {
+		producer = strings.TrimSpace(review.ReviewOf)
+	}
+	if producer == "" {
+		dec.HoldReason = holdReasonCustody
+		return dec
+	}
+	writer, err := loadWorkflowRoleTask(root, "writer", producer)
+	if err != nil {
+		dec.HoldReason = holdReasonBrokenEvidence
+		return dec
 	}
 	if ok, reason := integrationCustodyOK(root, review, writer); !ok {
 		dec.HoldReason = reason
@@ -177,8 +197,12 @@ func evaluateIntegrationRelease(root string, cfg *Config, t *Task) IntegrationRe
 	}
 
 	raw := loadTaskResultForGate(root, review)
-	v := parseReviewVerdict(raw)
+	v, shapeHold := parseReviewVerdictEvidence(raw)
 	dec.Verdict = v
+	if shapeHold != "" {
+		dec.HoldReason = shapeHold
+		return dec
+	}
 	if reason := reviewHoldReason(v, raw); reason != "" {
 		dec.HoldReason = reason
 		return dec
@@ -190,23 +214,33 @@ func evaluateIntegrationRelease(root string, cfg *Config, t *Task) IntegrationRe
 		CandidateCommit: gate.CandidateCommit,
 		CandidateTree:   gate.CandidateTree,
 	}
-	var frozen *WorkflowCandidate
-	if gate.WorkflowID != "" {
-		wf, err := loadWorkflow(root, cfg, gate.WorkflowID)
-		if err != nil {
-			// A gate naming a workflow that will not load is missing evidence,
-			// not a card that happens to have no workflow.
-			dec.HoldReason = holdReasonIncompleteEvidence
-			return dec
+	// The workflow binding and its frozen candidate are required, not optional.
+	// gate.CandidateCommit/Tree live on the very card a release would free, so
+	// they cannot stand alone as the frozen identity — matching them against
+	// themselves proves nothing. Only the separately durable record can say
+	// which bytes the review was actually about.
+	if strings.TrimSpace(gate.WorkflowID) == "" {
+		dec.HoldReason = holdReasonIncompleteEvidence
+		return dec
+	}
+	wf, err := loadWorkflow(root, cfg, gate.WorkflowID)
+	if err != nil {
+		// A gate naming a workflow that will not load is missing evidence,
+		// not a card that happens to have no workflow.
+		dec.HoldReason = holdReasonIncompleteEvidence
+		return dec
+	}
+	frozen := wf.Candidate
+	if frozen == nil || (strings.TrimSpace(frozen.Commit) == "" && strings.TrimSpace(frozen.Tree) == "") {
+		dec.HoldReason = holdReasonIncompleteEvidence
+		return dec
+	}
+	if wf.Review != nil {
+		if wf.Review.CandidateCommit != "" {
+			snapshot.CandidateCommit = wf.Review.CandidateCommit
 		}
-		frozen = wf.Candidate
-		if wf.Review != nil {
-			if wf.Review.CandidateCommit != "" {
-				snapshot.CandidateCommit = wf.Review.CandidateCommit
-			}
-			if wf.Review.CandidateTree != "" {
-				snapshot.CandidateTree = wf.Review.CandidateTree
-			}
+		if wf.Review.CandidateTree != "" {
+			snapshot.CandidateTree = wf.Review.CandidateTree
 		}
 	}
 	if !candidateIdentitiesMatch(gate, snapshot, frozen) {

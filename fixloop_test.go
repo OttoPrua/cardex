@@ -75,6 +75,15 @@ func TestParseReviewVerdict(t *testing.T) {
 	if v4 := parseReviewVerdict("```json\n{\"verdict\":\"maybe\"}\n```"); v4 != nil {
 		t.Fatalf("非法 verdict 应 nil: %+v", v4)
 	}
+	// 宽松解析把缺失的 p0/p1 解成空数组——这正是它只能喂修复闭环、
+	// 不能喂集成闸门的原因；闸门必须走 parseReviewVerdictEvidence。
+	v5 := parseReviewVerdict("```json\n{\"verdict\":\"pass\"}\n```")
+	if v5 == nil || len(v5.P0) != 0 || len(v5.P1) != 0 {
+		t.Fatalf("旧格式兼容: 缺数组的 pass 仍应解出且 p0/p1 为空: %+v", v5)
+	}
+	if _, hold := parseReviewVerdictEvidence("```json\n{\"verdict\":\"pass\"}\n```"); hold != holdReasonIncompleteEvidence {
+		t.Fatalf("闸门读法必须拒绝缺数组的 pass, got %q", hold)
+	}
 }
 
 func TestFixLoopConcernsEmitsFixCard(t *testing.T) {

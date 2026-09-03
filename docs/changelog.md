@@ -2,6 +2,30 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-08-24 · 工作流证据 fail-closed：损坏的耐久任务与非终局 verdict
+
+- **损坏即证据缺失，不是"卡不存在"**（workflow.go / workflow_loop.go / workflow_gate.go）：
+  workflow 的角色扫描与 custody 扫描改走新的 `scanWorkflowTasks`。`loadTasks` 会告警并跳过
+  解析失败的任务文件——对 `cardex list` 是对的，对这里是致命的：被跳过的损坏 writer 会被
+  读成"没有 writer"从而派出第二个，被跳过的损坏 rival reviewer 恰好躲开了为找它而存在的
+  那次扫描。现在只容忍 ReadDir 与逐个读文件之间的归档竞态（`os.IsNotExist`），其余一律
+  `errWorkflowBrokenEvidence`。记录/门指名的角色改走 `loadWorkflowRoleTask`：指名的卡被删或
+  损坏是硬错误，不再被当作"没有指名 producer"而跳过所有与之绑定的 custody 检查。
+- **集成门要求完整绑定**（workflow_gate.go）：`workflow_id` 非空、workflow 可加载、记录里
+  有冻结候选，三者缺一即 held。门上的 candidate commit/tree 与被释放的卡是同一张，
+  自己与自己比对证明不了任何事。
+- **verdict 必须是唯一且终局的完整对象**（runner.go）：集成门改用
+  `parseReviewVerdictEvidence`。`p0`/`p1`/`p2` 与 `summary` 必须显式写出——`{"verdict":"pass"}`
+  在值类型解码下会变成"空 p0/p1"，与审核者真的一条都没提完全无法区分；末尾 verdict 非法
+  即 held，不再向前回溯到更早的合法结论；两个完整 verdict 同样 held。宽松的
+  `parseReviewVerdict` 保留给修复闭环的旧格式兼容，不再供闸门使用。
+- **"终局"不等于"最后一个解得出来的对象"**（runner.go / workflow_gate.go）：上一条的扫描只数
+  得出 JSON 的 verdict 对象，于是完整 pass 之后的一句非 JSON `verdict: block`、一个写到一半被
+  截断的对象、或一个丢了 `verdict` 键的终局块，对扫描完全不可见——更早那个完整 pass 就又成了
+  "末尾对象"并放行，正是这条规则本该消灭的回溯。现在完整对象之后的结论性尾料一律 held
+  （`trailing_verdict_claim`）。判据是"断言"而非"提到"：`verdict` 后面跟赋值号才算，审核正文里
+  谈论 verdict 不算——尾料只看终局对象之后的文本，报告正文从不参与。
+
 ## 2026-08-24 · 工作流模式：串联 / 联邦的耐久记录与强制集成门
 
 - **workflow 记录**（workflow.go）：`cardex workflow` 把 `docs/workflows.md` 的两种拓扑落成

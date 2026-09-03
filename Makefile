@@ -35,4 +35,10 @@ accept-sync:
 	@echo "==> accept-sync: CARDEX_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify|DesignReview' -count=1 -v"
 	CARDEX_REQUIRE_SYNC_SCRIPTS=1 go test -run 'Sync|Verify|DesignReview' -count=1 -v ./...
 
-.PHONY: build test vet install install-shim accept-sync
+# 竞态门:workflow 角色扫描、custody 扫描与集成门判定横跨多个 goroutine 与磁盘扫描,
+# -race 插桩后整套 go test 远超默认 10m 预算——超时会被读成"套件挂了"而不是"还没跑完"。
+# 20m 是让整套在 -race 下真正跑到收尾的预算,不是对某个用例的耐心上限。
+test-race:
+	go test -race -timeout 20m -count=1 ./...
+
+.PHONY: build test test-race vet install install-shim accept-sync

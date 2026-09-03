@@ -43,7 +43,7 @@ func taskIsDispatchable(t *Task) bool {
 
 // workflowDispatchableCards lists cards tick could still run for this workflow.
 func workflowDispatchableCards(root string, wf *WorkflowRecord) ([]*Task, error) {
-	tasks, err := loadTasks(root)
+	tasks, err := scanWorkflowTasks(root)
 	if err != nil {
 		return nil, err
 	}
@@ -57,12 +57,13 @@ func workflowDispatchableCards(root string, wf *WorkflowRecord) ([]*Task, error)
 }
 
 // workflowActiveRole finds a live card already holding the given role for this
-// workflow. A load failure returns fail-closed (found=true, task=nil) so a
-// caller can never mint a duplicate writer just because the disk was unreadable.
-func workflowActiveRole(root string, wf *WorkflowRecord, role string) (*Task, bool) {
-	tasks, err := loadTasks(root)
+// workflow. It scans through scanWorkflowTasks, so a single unreadable card is
+// an error rather than a card that quietly is not there: "the writer's bytes
+// are corrupt" must never be answered as "there is no writer".
+func workflowActiveRole(root string, wf *WorkflowRecord, role string) (*Task, bool, error) {
+	tasks, err := scanWorkflowTasks(root)
 	if err != nil {
-		return nil, true
+		return nil, true, err
 	}
 	want := workflowRoleType(role)
 	for _, t := range tasks {
@@ -76,9 +77,36 @@ func workflowActiveRole(root string, wf *WorkflowRecord, role string) (*Task, bo
 		if !taskIsLive(t) {
 			continue
 		}
-		return t, true
+		return t, true, nil
 	}
-	return nil, false
+	return nil, false, nil
+}
+
+// refuseLiveWorkflowRole folds the two fail-closed answers a role scan can give
+// into one refusal: an unreadable scan and a live rival both stop the caller.
+// It returns the rival card when one was identified, so a refusal can name it.
+func refuseLiveWorkflowRole(root string, wf *WorkflowRecord, role string) (*Task, error) {
+	active, found, err := workflowActiveRole(root, wf, role)
+	if err != nil {
+		return nil, err
+	}
+	if found {
+		return active, duplicateRoleErr(role, active)
+	}
+	return nil, nil
+}
+
+// requireNamedWorkflowRole checks the card a record already names for a role
+// before any scan runs. The scan can only see cards that load; if the named
+// writer's file was deleted or corrupted, the scan reports the role as free and
+// the caller mints a second one. Checking the name first closes that seam. An
+// empty name means the role was never assigned, which is not evidence loss.
+func requireNamedWorkflowRole(root, role, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	_, err := loadWorkflowRoleTask(root, role, id)
+	return err
 }
 
 // duplicateRoleErr renders a duplicate consistently whether or not the rival
@@ -280,8 +308,11 @@ func admitWorkflowWriter(root string, cfg *Config, wf *WorkflowRecord, prompt st
 	if err := refreshWorkflow(root, cfg, wf); err != nil {
 		return nil, err
 	}
-	if active, found := workflowActiveRole(root, wf, "writer"); found {
-		return active, duplicateRoleErr("writer", active)
+	if err := requireNamedWorkflowRole(root, "writer", wf.WriterTaskID); err != nil {
+		return nil, err
+	}
+	if active, err := refuseLiveWorkflowRole(root, wf, "writer"); err != nil {
+		return active, err
 	}
 	if strings.TrimSpace(prompt) == "" {
 		prompt = wf.Goal + "\n\n完成标准:\n" + wf.TerminalCriteria
@@ -337,15 +368,20 @@ func admitWorkflowReviewer(root string, cfg *Config, wf *WorkflowRecord) (*Task,
 	if wf.Candidate == nil || (wf.Candidate.Commit == "" && wf.Candidate.Tree == "") {
 		return nil, fmt.Errorf("%w: freeze a candidate before review", errWorkflowMalformed)
 	}
-	if active, found := workflowActiveRole(root, wf, "reviewer"); found {
-		return active, duplicateRoleErr("reviewer", active)
+	if err := requireNamedWorkflowRole(root, "reviewer", wf.ReviewerTaskID); err != nil {
+		return nil, err
 	}
-	if active, found := workflowActiveRole(root, wf, "writer"); found {
-		return active, fmt.Errorf("%w: writer still live, candidate is not frozen", errWorkflowDuplicateRole)
-	}
-	writer, err := findTaskAnywhere(root, wf.WriterTaskID)
+	writer, err := loadWorkflowRoleTask(root, "writer", wf.WriterTaskID)
 	if err != nil {
 		return nil, err
+	}
+	if active, err := refuseLiveWorkflowRole(root, wf, "reviewer"); err != nil {
+		return active, err
+	}
+	if active, found, err := workflowActiveRole(root, wf, "writer"); err != nil {
+		return nil, err
+	} else if found {
+		return active, fmt.Errorf("%w: writer still live, candidate is not frozen", errWorkflowDuplicateRole)
 	}
 	if writer.Status != statusDone {
 		return nil, fmt.Errorf("%w: writer %s is %s, not done", errWorkflowMalformed, writer.ID, writer.Status)
@@ -396,16 +432,20 @@ func ingestWorkflowReview(root string, cfg *Config, wf *WorkflowRecord) error {
 	if wf.ReviewerTaskID == "" {
 		return fmt.Errorf("%w: no reviewer to ingest", errWorkflowMalformed)
 	}
-	review, err := findTaskAnywhere(root, wf.ReviewerTaskID)
+	review, err := loadWorkflowRoleTask(root, "reviewer", wf.ReviewerTaskID)
 	if err != nil {
 		return err
 	}
 	raw := loadTaskResultForGate(root, review)
-	v := parseReviewVerdict(raw)
+	v, shapeHold := parseReviewVerdictEvidence(raw)
+	hold := shapeHold
+	if hold == "" {
+		hold = reviewHoldReason(v, raw)
+	}
 	snap := &WorkflowReview{
 		TaskID:     review.ID,
 		Round:      wf.CurrentRound,
-		HoldReason: reviewHoldReason(v, raw),
+		HoldReason: hold,
 	}
 	if v != nil {
 		snap.Verdict = v.Verdict
@@ -421,11 +461,13 @@ func ingestWorkflowReview(root string, cfg *Config, wf *WorkflowRecord) error {
 		case wf.Candidate == nil || (wf.Candidate.Commit == "" && wf.Candidate.Tree == ""):
 			snap.HoldReason = holdReasonCandidateMismatch
 		default:
-			var writer *Task
-			if wf.WriterTaskID != "" {
-				writer, _ = findTaskAnywhere(root, wf.WriterTaskID)
-			}
-			if ok, reason := integrationCustodyOK(root, review, writer); !ok {
+			// The producer must exist and load. Swallowing this lookup error
+			// would let a deleted writer present as "no writer named", which
+			// skips every writer-bound custody check below it.
+			writer, err := loadWorkflowRoleTask(root, "writer", wf.WriterTaskID)
+			if err != nil {
+				snap.HoldReason = holdReasonBrokenEvidence
+			} else if ok, reason := integrationCustodyOK(root, review, writer); !ok {
 				snap.HoldReason = reason
 			} else {
 				snap.Admissible = true
@@ -475,15 +517,18 @@ func admitWorkflowRepair(root string, cfg *Config, wf *WorkflowRecord, findings,
 		}
 		return nil, fmt.Errorf("%w: %d/%d", errWorkflowRoundsExceeded, wf.CurrentRound, wf.MaxRounds)
 	}
-	if active, found := workflowActiveRole(root, wf, "writer"); found {
-		return active, duplicateRoleErr("writer", active)
+	if err := requireNamedWorkflowRole(root, "reviewer", wf.ReviewerTaskID); err != nil {
+		return nil, err
 	}
-	if active, found := workflowActiveRole(root, wf, "reviewer"); found {
-		return active, duplicateRoleErr("reviewer", active)
-	}
-	writer, err := findTaskAnywhere(root, wf.WriterTaskID)
+	writer, err := loadWorkflowRoleTask(root, "writer", wf.WriterTaskID)
 	if err != nil {
 		return nil, err
+	}
+	if active, err := refuseLiveWorkflowRole(root, wf, "writer"); err != nil {
+		return active, err
+	}
+	if active, err := refuseLiveWorkflowRole(root, wf, "reviewer"); err != nil {
+		return active, err
 	}
 	round := wf.CurrentRound + 1
 	tpl, err := loadTemplate(root, "fix-cycle")
@@ -584,7 +629,12 @@ func freezeWorkflowCandidate(root string, cfg *Config, wf *WorkflowRecord, cand 
 	if strings.TrimSpace(cand.Commit) == "" || strings.TrimSpace(cand.Tree) == "" {
 		return fmt.Errorf("%w: candidate needs both commit and tree", errWorkflowMalformed)
 	}
-	if active, found := workflowActiveRole(root, wf, "writer"); found {
+	if err := requireNamedWorkflowRole(root, "writer", wf.WriterTaskID); err != nil {
+		return err
+	}
+	if active, found, err := workflowActiveRole(root, wf, "writer"); err != nil {
+		return err
+	} else if found {
 		return fmt.Errorf("%w: writer %s still live; bytes are not frozen",
 			errWorkflowDuplicateRole, taskIDOrUnknown(active))
 	}

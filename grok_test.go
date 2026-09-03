@@ -14,6 +14,7 @@ import (
 
 func TestMain(m *testing.M) {
 	priorHome, hadHome := os.LookupEnv("HOME")
+	priorOwnerRouting, hadOwnerRouting := os.LookupEnv("CARDEX_REQUIRE_OWNER_ROUTING")
 	home, err := os.MkdirTemp("", "cardex-test-home-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create hermetic test HOME: %v\n", err)
@@ -33,7 +34,10 @@ func TestMain(m *testing.M) {
 		if err := os.Chmod(grokHome, 0o700); err != nil {
 			return err
 		}
-		return os.Setenv("HOME", home)
+		if err := os.Setenv("HOME", home); err != nil {
+			return err
+		}
+		return os.Unsetenv("CARDEX_REQUIRE_OWNER_ROUTING")
 	}()
 	if setupErr != nil {
 		fmt.Fprintf(os.Stderr, "prepare hermetic test HOME: %v\n", setupErr)
@@ -49,6 +53,15 @@ func TestMain(m *testing.M) {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "restore test HOME: %v\n", err)
+		code = 1
+	}
+	if hadOwnerRouting {
+		err = os.Setenv("CARDEX_REQUIRE_OWNER_ROUTING", priorOwnerRouting)
+	} else {
+		err = os.Unsetenv("CARDEX_REQUIRE_OWNER_ROUTING")
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "restore CARDEX_REQUIRE_OWNER_ROUTING: %v\n", err)
 		code = 1
 	}
 	if err := os.RemoveAll(home); err != nil {

@@ -308,6 +308,7 @@ func TestManualGrokDispatchCommandWriteCapableNoPlan(t *testing.T) {
 		task       *Task
 		sandbox    string
 		permission string
+		profile    string
 		wantNoPlan bool
 	}{
 		{
@@ -332,6 +333,14 @@ func TestManualGrokDispatchCommandWriteCapableNoPlan(t *testing.T) {
 			wantNoPlan: false,
 		},
 		{
+			name:       "ordinary review configured macOS profile",
+			task:       &Task{Type: typeReview, Dir: t.TempDir()},
+			sandbox:    grokBuildReadOnlySandboxMacOSNoopNetwork,
+			permission: "plan",
+			profile:    grokBuildReadOnlySandboxMacOSNoopNetwork,
+			wantNoPlan: false,
+		},
+		{
 			name:       "crosscheck",
 			task:       &Task{Type: typeCrossCheck, Dir: t.TempDir()},
 			sandbox:    "read-only",
@@ -348,6 +357,7 @@ func TestManualGrokDispatchCommandWriteCapableNoPlan(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			cfg.GrokBuild.ReadOnlySandboxProfile = tc.profile
 			if grokBuildWriteCapable(tc.task) != tc.wantNoPlan {
 				t.Fatalf("write-capable helper=%v want=%v type=%s skip=%v",
 					grokBuildWriteCapable(tc.task), tc.wantNoPlan, tc.task.Type, tc.task.SkipPermissions)

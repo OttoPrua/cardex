@@ -1368,7 +1368,7 @@ func manualDispatchCommandForLeg(cfg *Config, t *Task, prompt string, leg policy
 			bin = "grok"
 		}
 		writeCapable := grokBuildWriteCapable(t)
-		sandbox, permission := "read-only", "plan"
+		sandbox, permission := resolvedGrokBuildReadOnlySandbox(cfg), "plan"
 		if writeCapable {
 			sandbox, permission = "workspace", "auto"
 		}

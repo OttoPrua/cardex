@@ -86,9 +86,11 @@ func probeGrokBuildLifecycleState(t *Task, home string) (err error) {
 }
 
 const (
-	grokBuildRunnerName         = "grok-build"
-	grokBuildCooldownName       = "grok-build"
-	grokBuildAuthCooldownPrefix = "auth: "
+	grokBuildRunnerName                      = "grok-build"
+	grokBuildCooldownName                    = "grok-build"
+	grokBuildReadOnlySandboxDefault          = "read-only"
+	grokBuildReadOnlySandboxMacOSNoopNetwork = "cardex-macos-readonly-noop-network"
+	grokBuildAuthCooldownPrefix              = "auth: "
 
 	routeReasonGrokExplicit            = "grok_build_explicit"
 	routeReasonKimiToGrokPending       = "kimi_to_grok_pending"
@@ -1282,7 +1284,7 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	}
 
 	writeCapable := grokBuildWriteCapable(t)
-	sandbox, permission := "read-only", "plan"
+	sandbox, permission := resolvedGrokBuildReadOnlySandbox(cfg), "plan"
 	if writeCapable {
 		sandbox, permission = "workspace", "auto"
 	}
@@ -1370,6 +1372,18 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 		runErr = fmt.Errorf("Grok Build 未返回最终文本")
 	}
 	return res, combined, runErr
+}
+
+func resolvedGrokBuildReadOnlySandbox(cfg *Config) string {
+	if cfg == nil || cfg.GrokBuild == nil {
+		return grokBuildReadOnlySandboxDefault
+	}
+	switch strings.TrimSpace(cfg.GrokBuild.ReadOnlySandboxProfile) {
+	case grokBuildReadOnlySandboxMacOSNoopNetwork:
+		return grokBuildReadOnlySandboxMacOSNoopNetwork
+	default:
+		return grokBuildReadOnlySandboxDefault
+	}
 }
 
 var grokBuildQuotaRe = regexp.MustCompile(`(?i)(?:^|[^0-9])429(?:[^0-9]|$)|too many requests|rate limit|usage limit|quota (?:exceeded|exhausted)|insufficient (?:quota|credits)|out of (?:credits|usage)|额度(?:不足|已用完)|配额(?:不足|已用尽)|限额(?:不足|已用尽)`)

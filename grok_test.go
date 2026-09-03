@@ -433,10 +433,12 @@ func TestInvokeGrokBuildUses46XHighAndSandboxModes(t *testing.T) {
 		sessionID       string
 		sandbox         string
 		permission      string
+		readOnlyProfile string
 		wantNoPlan      bool
 	}{
 		{name: "implementation", typ: typeSequence, skipPermissions: false, sandbox: "workspace", permission: "auto", wantNoPlan: true},
 		{name: "review", typ: typeReview, skipPermissions: false, sandbox: "read-only", permission: "plan", wantNoPlan: false},
+		{name: "review configured macOS profile", typ: typeReview, skipPermissions: false, sandbox: grokBuildReadOnlySandboxMacOSNoopNetwork, permission: "plan", readOnlyProfile: grokBuildReadOnlySandboxMacOSNoopNetwork, wantNoPlan: false},
 		{name: "review skip-permissions", typ: typeReview, skipPermissions: true, sandbox: "workspace", permission: "auto", wantNoPlan: true},
 		{name: "coordinate skip-permissions", typ: typeCoordinate, skipPermissions: true, sandbox: "workspace", permission: "auto", wantNoPlan: true},
 		{name: "implementation resume", typ: typeSequence, sessionID: "session-grok", sandbox: "workspace", permission: "auto", wantNoPlan: true},
@@ -449,6 +451,7 @@ func TestInvokeGrokBuildUses46XHighAndSandboxModes(t *testing.T) {
 				`{"type":"end","stopReason":"end_turn","sessionId":"session-grok","num_turns":1}`
 			bin, argsDump, promptDump := fakeGrokBuild(t, payload, "", 0)
 			cfg := grokBuildTestConfig(t, bin)
+			cfg.GrokBuild.ReadOnlySandboxProfile = tc.readOnlyProfile
 			task := &Task{
 				ID: "grok-invoke", Type: tc.typ, Dir: t.TempDir(), PreferRunner: grokBuildRunnerName,
 				SkipPermissions: tc.skipPermissions, SessionID: tc.sessionID,
@@ -672,6 +675,21 @@ func TestValidateGrokBuildRejectsUnsupportedMax(t *testing.T) {
 	cfg.GrokBuild.Effort = "max"
 	if err := validateGrokBuild(cfg); err == nil || !strings.Contains(err.Error(), "xhigh") {
 		t.Fatalf("Grok 4.6 max must fail fast with xhigh guidance: %v", err)
+	}
+}
+
+func TestValidateGrokBuildReadOnlySandboxProfile(t *testing.T) {
+	cfg := grokBuildTestConfig(t, "/usr/bin/true")
+	cfg.GrokBuild.ReadOnlySandboxProfile = grokBuildReadOnlySandboxMacOSNoopNetwork
+	if err := validateGrokBuild(cfg); err != nil {
+		t.Fatalf("valid macOS read-only sandbox profile rejected: %v", err)
+	}
+	for _, unsafe := range []string{"off", "workspace", "devbox", "strict", "unknown-profile"} {
+		cfg := grokBuildTestConfig(t, "/usr/bin/true")
+		cfg.GrokBuild.ReadOnlySandboxProfile = unsafe
+		if err := validateGrokBuild(cfg); err == nil || !strings.Contains(err.Error(), "read_only_sandbox_profile") {
+			t.Fatalf("unsafe/unknown profile %q must fail closed: %v", unsafe, err)
+		}
 	}
 }
 

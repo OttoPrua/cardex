@@ -68,11 +68,12 @@ type GrokTierRoute struct {
 // 时校验；final Owner 模式下不存在全局 Codex fallback，每个 Sol 都由解析器显式命名。
 // ReviewCodex* 与 OpusAdversarialReview 仅保留为通用模式兼容字段。
 type GrokBuildRoute struct {
-	Enabled          bool   `json:"enabled"`
-	Model            string `json:"model"`
-	Effort           string `json:"effort"`
-	LimitFallbackMin int    `json:"limit_fallback_min,omitempty"`
-	KimiOpusFallback bool   `json:"kimi_opus_fallback,omitempty"`
+	Enabled                bool   `json:"enabled"`
+	Model                  string `json:"model"`
+	Effort                 string `json:"effort"`
+	ReadOnlySandboxProfile string `json:"read_only_sandbox_profile,omitempty"`
+	LimitFallbackMin       int    `json:"limit_fallback_min,omitempty"`
+	KimiOpusFallback       bool   `json:"kimi_opus_fallback,omitempty"`
 	// FableClaudeFallback/FableFirstPrinciples 仅用于读取并收口已经进入旧链的卡；Owner 路由
 	// 不再从这两个兼容字段创建新链，新 Fable 卡只走 CursorFableRoute。
 	FableClaudeFallback   bool                     `json:"fable_claude_fallback,omitempty"`
@@ -919,6 +920,13 @@ func validateGrokBuild(cfg *Config) error {
 		return fmt.Errorf("grok_build.model 不能为空")
 	}
 	r.Effort = strings.ToLower(strings.TrimSpace(r.Effort))
+	r.ReadOnlySandboxProfile = strings.TrimSpace(r.ReadOnlySandboxProfile)
+	switch r.ReadOnlySandboxProfile {
+	case "", grokBuildReadOnlySandboxDefault, grokBuildReadOnlySandboxMacOSNoopNetwork:
+	default:
+		return fmt.Errorf("grok_build.read_only_sandbox_profile %q 非法（可选 %s/%s）",
+			r.ReadOnlySandboxProfile, grokBuildReadOnlySandboxDefault, grokBuildReadOnlySandboxMacOSNoopNetwork)
+	}
 	// Grok Build 1.0.4 的 grok-4.6 菜单最高只接受 xhigh；max 会在模型调用前退出。
 	if r.Effort == "max" {
 		return fmt.Errorf("grok_build.effort=max 不受当前 Grok 4.6 支持；请使用最高可用档 xhigh")

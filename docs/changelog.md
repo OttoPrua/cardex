@@ -2,6 +2,12 @@
 
 **中文** | [English](changelog.en.md) · 返回 [README](../README.md)
 
+## 2026-09-04 · v0.10.15：低 Token 管理 Skill 与推荐用法
+
+- 随发行版附带可移植的 `skills/perlica-low-token-manager/`，供长期项目管理 Agent 从耐久指针恢复状态、把有界执行交给 Cardex/新鲜 worker，并只在 material event 时唤醒。
+- README 增加 Codex 安装、其他 Agent 附件加载、推荐入口和使用边界；该 Skill 不进入普通 Writer/Reviewer prompt，也不改变 Cardex 运行时。
+- 明确分开统计 management-session token 与 Cardex/Provider 执行 token，避免把执行消耗藏进管理口径。
+
 ## 2026-08-24 · 工作流模式：串联 / 联邦的耐久记录与强制集成门
 
 - **workflow 记录**（workflow.go）：`cardex workflow` 把 `docs/workflows.md` 的两种拓扑落成

@@ -84,6 +84,26 @@ Both modes use Cardex `depends_on`, normalized write-domain/resource claims, sep
 
 `cardex workflow` turns either topology into a durable record: it binds `serial`/`federated` mode, the module goal, a write domain, bounded rounds, and candidate identity, and creates a default-held integration card. Both tick dispatch and `cardex release` **re-derive** the independent review `verdict=pass` (empty `p0`/`p1`), candidate agreement, and reviewer custody for a gated card; a durable review `done` is not enough. Every transition is an explicit command — tick consults the integration gate read-only and never advances a workflow. Live and cutover have no release path in this tree.
 
+## Low-token management sessions (optional Skill)
+
+This repository includes [`perlica-low-token-manager`](skills/perlica-low-token-manager/SKILL.md) as a portable attachment for long-lived project-management agents. It does not change the Cardex scheduler, and it should not be injected into ordinary Writer, Reviewer, test, or release cards; execution cards receive only their bounded task contract.
+
+Install it for Codex on this machine:
+
+```bash
+mkdir -p ~/.codex/skills
+cp -R skills/perlica-low-token-manager ~/.codex/skills/
+```
+
+For another agent, attach the whole `skills/perlica-low-token-manager/` directory and have it read `SKILL.md` first. Recommended entry point:
+
+```text
+Use $perlica-low-token-manager to coordinate this project from durable state,
+delegate bounded execution, and wake only on material changes.
+```
+
+The recommended usage is deliberately small: keep only objectives, DAGs, boundaries, and direction decisions in the manager; send long scans, source changes, tests, and independent review to Cardex cards or fresh bounded workers; wake only for material terminals, Owner decisions, or resource conflicts; and report deltas with durable pointers. Measure management-session tokens separately from Cardex/provider execution tokens rather than hiding execution usage inside a lower manager total.
+
 ## How it works
 
 ```

@@ -84,6 +84,26 @@ cardex board                 # Web 看板 http://127.0.0.1:8787
 
 `cardex workflow` 可以把两种拓扑落成耐久记录：绑定 `serial`/`federated` 模式、模块目标、写域、有界轮次和候选身份，并创建一张默认 held 的集成卡。带门的集成卡在 tick 派发与 `cardex release` 时都会**重新**核验独立审核 `verdict=pass`（`p0`/`p1` 皆空）、候选一致与 reviewer custody；durable review `done` 不够。每一步转移都是显式命令——tick 只读地咨询集成门，不自动推进 workflow。live 与 cutover 在本树没有释放路径。
 
+## 低 Token 管理会话（可选 Skill）
+
+仓内附带 [`perlica-low-token-manager`](skills/perlica-low-token-manager/SKILL.md)，供长期项目管理 Agent 作为便携附件加载。它不改变 Cardex 调度器，也不要注入普通 Writer、Reviewer、测试或发布卡；执行卡只接收自己的有界任务合同。
+
+Codex 本机安装：
+
+```bash
+mkdir -p ~/.codex/skills
+cp -R skills/perlica-low-token-manager ~/.codex/skills/
+```
+
+其他 Agent 可直接附上整个 `skills/perlica-low-token-manager/` 目录，并要求它先读 `SKILL.md`。推荐入口：
+
+```text
+Use $perlica-low-token-manager to coordinate this project from durable state,
+delegate bounded execution, and wake only on material changes.
+```
+
+推荐用法只有四条：manager 只保留目标、DAG、边界与方向决策；长扫描、源码修改、测试和独立审核交给 Cardex 卡或新鲜有界 worker；只在 material terminal、Owner 决策或资源冲突时唤醒；回调只报 delta 与耐久指针。统计时把 management-session token 与 Cardex/Provider 执行 token 分开，不能靠隐藏执行消耗来制造“节省”。
+
 ## 怎么做到的
 
 ```

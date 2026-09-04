@@ -1,5 +1,11 @@
 # cardex changelog
 
+## 2026-09-04 · v0.10.15: low-token manager Skill and recommended usage
+
+- Ships the portable `skills/perlica-low-token-manager/` attachment so long-lived project managers can restore from durable pointers, delegate bounded execution to Cardex/fresh workers, and wake only on material events.
+- Adds Codex installation, cross-agent attachment, entry-point, and boundary guidance to the README. The Skill is not injected into ordinary Writer/Reviewer prompts and does not change Cardex runtime behavior.
+- Keeps management-session token accounting separate from Cardex/provider execution usage instead of hiding execution cost inside the manager total.
+
 ## 2026-08-24 · Workflow modes: durable serial/federated records and an enforced integration gate
 
 - **Workflow records** (workflow.go): `cardex workflow` turns the two topologies in

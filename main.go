@@ -157,6 +157,8 @@ func printUsage() {
             全局准入闸门：pause 拒绝调度；resume 只恢复准入，不派发任务
   manager-wake once|status|install|uninstall [-root ROOT]
             管理卡唤醒：默认关闭；WatchPaths 即时唤醒，StartInterval=1200 仅作丢事件看门狗
+            manager_wake.owner_routing=true 时按卡面 reply_route 投给 owner-<requester_id>；
+            见 docs/manager-wake-sender-contract.md
   clean                            # 把 done/failed/canceled 归档到 archive/
 
 系统
@@ -276,6 +278,7 @@ func cmdAdd(args []string) error {
 	writePaths := fs.String("write-paths", "", "逗号分隔的仓相对写路径")
 	writeResources := fs.String("write-resources", "", "逗号分隔的封闭资源 kind:id")
 	dependsOn := fs.String("depends-on", "", "逗号分隔的前置任务 ID；仅 durably done 才算满足")
+	replyRoute := fs.String("reply-route", "", "回报路由 JSON（"+taskReplyRouteSchemaV1+"）：谁派的卡、终态 wake 回报到哪；入队即钉，落盘后不可改")
 	_ = fs.Parse(args)
 	if *maxAttempts < 0 {
 		return fmt.Errorf("-max-attempts 不能为负数")
@@ -521,6 +524,10 @@ func cmdAdd(args []string) error {
 	if err := applyTaskDependsOn(t, *dependsOn); err != nil {
 		return err
 	}
+	// 回报路由必须在首次落盘前钉好：saveTask 之后任何改动都会被 reply_route_immutable 拒绝。
+	if err := applyTaskReplyRoute(t, *replyRoute); err != nil {
+		return err
+	}
 	if err := saveTask(root, t); err != nil {
 		return err
 	}
@@ -532,6 +539,8 @@ func cmdAdd(args []string) error {
 		"max_fix_rounds": t.MaxFixRounds, "route_class": t.RouteClass, "risk_class": t.RiskClass,
 		"quality_sensitive": t.QualitySensitive, "specialized_frontend": t.SpecializedFrontend,
 		"owner_critical_bypass_reason": t.OwnerCriticalBypassReason,
+		"reply_requester":              replyRouteRequesterLabel(t.ReplyRoute),
+		"reply_endpoint_kind":          replyRouteEndpointLabel(t.ReplyRoute),
 	})
 	if *hold {
 		// 新生卡零用量是真实的，但仍落显式 cost_unavailable 标记：终态事件二选一没有第三种。
@@ -2364,6 +2373,10 @@ func cmdDoctor(args []string) error {
 		}
 		if last, _ := rb["last_err_class"].(string); last != "" {
 			fmt.Printf("  - manager-wake last_err_class=%s\n", last)
+		}
+		for _, blocked := range ownerWakeBlockReadback(root, mw) {
+			fmt.Printf("  - manager-wake owner requester=%v 被拒（%v）：端点不可达，其卡的 wake 一律不投递\n",
+				blocked["requester_id"], blocked["last_err_class"])
 		}
 		for _, d := range diag {
 			if d == "" || d == "manager_wake_disabled" {

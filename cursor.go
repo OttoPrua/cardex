@@ -396,6 +396,10 @@ func prepareCursorFableFallback(root string, cfg *Config, t *Task, reason string
 	}
 	originalTask := t.Prompts[0]
 	next := *t
+	// `next := *t` shallow-copies the reply-route pointer, so both the staged card and
+	// the caller's card would share one struct. The route must survive the fallback
+	// (the requester still owns this work) but must not be aliased across cards.
+	next.ReplyRoute = inheritTaskReplyRoute(t.ReplyRoute)
 	next.Prompts = []string{renderTemplate(tpl, map[string]string{"TASK": originalTask})}
 	next.Type = typeCrossCheck
 	next.SkipPermissions = false

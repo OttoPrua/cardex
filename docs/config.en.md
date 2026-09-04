@@ -52,6 +52,13 @@
 | `remote_mirror_root` | "" | remote mirror root; paired with `default_review_host`; ReviewDir auto-derived as `<root>/<worktree-name>` |
 | `default_review_sync` | "" | global default pre-divert sync command (sh -c, cwd=impl card dir); all three keys must be set for the default to apply |
 | `remote_hosts.<name>.codex_only` | false | When true, mechanically forbids Claude on that host; Claude-model and automatic review tasks are rerouted to remote Codex at dispatch |
+| `manager_wake` | empty (off) | Management-card wake. An incomplete `enabled` block fails closed at load; a wake never authorizes anything beyond one model turn |
+| `manager_wake.owner_routing` | false | R8 sender-receives delivery. Off is a byte-level rollback: no `owner-<requester_id>` subscription is derived, no `owner-*` cursor/receipt/inflight file is created, and a card's pinned `reply_route` stays inert. Unrelated to top-level `owner_routing_enforced` (the Owner provider matrix) |
+| `manager_wake.subscriptions[].role` | "" (plain scoped subscription) | Set to `root` to mark the single root reply endpoint, which receives `endpoint_kind=root` cards and `escalate_to_root` fan-out. Two of them fail closed with `duplicate_root_subscription`; subscription ids may not use the reserved `owner-` prefix |
+
+For the card-face `reply_route` (`cardex.task.reply_route.v1`), the executable versus
+reserved endpoints, the isolation boundary and the M1–M12 targets, see the
+[sender-receives contract](manager-wake-sender-contract.md).
 
 ## Board config quick reference (~/.cardex/board.json)
 

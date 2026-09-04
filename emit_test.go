@@ -106,6 +106,41 @@ func TestExtractPureNarrativeFails(t *testing.T) {
 	}
 }
 
+// TestEmittedChildrenInheritReplyRoute 钉住 R8 谱系的第一层：装配/协调卡派出的子卡
+// 必须带着同一条回报路由，否则"谁派的卡回报给谁"在 emit 处就断了——父卡的终态回到
+// requester，子卡的终态却掉回配置订阅（或无人接收），而卡面上看不出差别。
+// 【突变致死】把 enqueueEmitted 里的 nt.ReplyRoute 赋值删掉 → 本测试红。
+func TestEmittedChildrenInheritReplyRoute(t *testing.T) {
+	root := testRoot(t)
+	cfg := testCfg()
+	parent := newTask(root, cfg, typeAssembly, "装配父", t.TempDir(), []string{"拆"}, 5)
+	parent.EmitTasks = true
+	parent.ReplyRoute = &TaskReplyRoute{
+		Schema:         taskReplyRouteSchemaV1,
+		RequesterID:    "cardex-control-plane",
+		EndpointKind:   replyEndpointCodexThread,
+		EndpointThread: "019fe484-12c5-78b2-986c-6a8bf0d2b079",
+		EscalateToRoot: true,
+	}
+	if err := saveTask(root, parent); err != nil {
+		t.Fatal(err)
+	}
+	ids, err := enqueueEmitted(root, cfg, parent, "产出：\n```json\n"+tasksJSON+"\n```")
+	if err != nil || len(ids) != 1 {
+		t.Fatalf("emit 应入队一张子卡: ids=%v err=%v", ids, err)
+	}
+	child, err := loadTask(root, ids[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if child.ReplyRoute == nil || *child.ReplyRoute != *parent.ReplyRoute {
+		t.Fatalf("emit 子卡未继承回报路由: %+v", child.ReplyRoute)
+	}
+	if child.ReplyRoute == parent.ReplyRoute {
+		t.Fatal("继承必须深拷贝: 共享同一结构时改子卡会静默改掉父卡的回报坐标")
+	}
+}
+
 func TestExtractTasksInsidePromptString(t *testing.T) {
 	// 合法外层 JSON 的 prompt 字符串里也出现 "tasks" 字样，不应干扰解析。
 	out := "产出：\n```json\n{\"tasks\":[{\"title\":\"卡C\",\"prompt\":\"读 tasks JSON 后执行\"}]}\n```"

@@ -366,6 +366,7 @@ func admitWorkflowReviewer(root string, cfg *Config, wf *WorkflowRecord) (*Task,
 	t.ReviewOf = writer.ID
 	t.FixRound = writer.FixRound
 	t.MaxFixRounds = wf.MaxRounds
+	t.ReplyRoute = inheritTaskReplyRoute(writer.ReplyRoute)
 	// A reviewer that inherits the writer's session is not independent, and a
 	// reviewer that claims paths is not read-only.
 	t.SessionID = ""
@@ -508,6 +509,7 @@ func admitWorkflowRepair(root string, cfg *Config, wf *WorkflowRecord, findings,
 	t.MaxFixRounds = wf.MaxRounds
 	t.SkipPermissions = writer.SkipPermissions
 	t.WriteDomain = copyWriteDomain(wf.WriteDomain)
+	t.ReplyRoute = inheritTaskReplyRoute(writer.ReplyRoute)
 	t.PreferRunner = wf.WriterEngine
 	t.RunnerExplicit = true
 	if err := saveTask(root, t); err != nil {

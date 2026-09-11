@@ -246,12 +246,15 @@ func kimiCLIDecodeContent(raw json.RawMessage) (text string, structured bool, to
 	}
 	var texts []string
 	for _, block := range blocks {
-		if block.Text != "" {
-			texts = append(texts, block.Text)
-		}
 		typ := strings.ToLower(strings.TrimSpace(block.Type))
-		if typ == "text" || typ == "thinking" || typ == "" {
+		if typ == "text" || typ == "" {
+			if block.Text != "" {
+				texts = append(texts, block.Text)
+			}
 			continue
+		}
+		if typ == "thinking" {
+			continue // Reasoning is model work, never a deliverable final response.
 		}
 		if typ != "tool_use" && typ != "tool_call" {
 			return "", false, nil, false
@@ -366,6 +369,9 @@ func parseKimiCLIJSONLForEngine(raw, engine string) *claudeResult {
 			kimiCLINoteSubtype(res, kimiCLISubtypeAfterHint)
 		}
 		if role == "assistant" {
+			// Only the current assistant message can own the final response. A later
+			// missing, reasoning-only or tool message invalidates the earlier candidate.
+			finalOutput, finalMessage, finalAfterTools = "", false, false
 			if typ != "" && typ != "assistant" {
 				res.ObservationComplete = false
 			}

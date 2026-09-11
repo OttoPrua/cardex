@@ -398,6 +398,61 @@ func TestNativeKimiVersionAndToolLifecycle(t *testing.T) {
 	}
 }
 
+func TestNativeKimiFinalBelongsToLastAssistant(t *testing.T) {
+	pass := verdictJSON("pass", nil, nil)
+	thinkingPass, _ := json.Marshal(pass)
+	for _, version := range []string{"0.37.2", "0.41.0"} {
+		for _, tc := range []struct {
+			name, content string
+			earlier       bool
+		}{
+			{"missing", "", true},
+			{"null", `,"content":null`, true},
+			{"empty array", `,"content":[]`, true},
+			{"thinking only", `,"content":[{"type":"thinking","thinking":"still reasoning"}]`, true},
+			{"thinking text", `,"content":[{"type":"thinking","text":` + string(thinkingPass) + `}]`, false},
+		} {
+			t.Run(version+"/"+tc.name, func(t *testing.T) {
+				lines := strings.Split(nativeCompletionPayload(kimiCLIRunnerName, pass), "\n")
+				payload := strings.Replace(lines[0], "0.41.0", version, 1) + "\n"
+				if tc.earlier {
+					payload += lines[1] + "\n"
+				}
+				payload += `{"role":"assistant"` + tc.content + `}`
+				if version == "0.41.0" {
+					payload += "\n" + lines[2]
+				}
+				root, cfg, got := runNativeCompletionTask(t, kimiCLIRunnerName, payload, typeReview, 0)
+				assertNativeHeldWithoutReplay(t, root, got)
+				if got.ReviewOutput != nil || got.LastRouteAttempt.TerminalCount != 0 {
+					t.Fatalf("earlier or thinking text became a final artifact: %+v", got)
+				}
+				gate := &Task{IntegrationGate: &IntegrationGate{WriterTaskID: got.ReviewOf, ReviewTaskID: got.ID, CandidateCommit: got.ReviewCandidate.Commit, CandidateTree: got.ReviewCandidate.Tree}}
+				if dec := evaluateIntegrationRelease(root, cfg, gate); dec.Admit {
+					t.Fatalf("non-final assistant output reached consumer: %+v", dec)
+				}
+			})
+		}
+	}
+	for _, content := range []string{
+		`{"verdict":"pass","p0":[],"p1":[]}`,
+		`[{"type":"thinking","text":"private-reasoning-canary"},{"type":"text","text":` + string(thinkingPass) + `}]`,
+	} {
+		t.Run("current supported final "+content[:12], func(t *testing.T) {
+			lines := strings.Split(nativeCompletionPayload(kimiCLIRunnerName, verdictJSON("block", []string{"old finding"}, nil)), "\n")
+			payload := lines[0] + "\n" + lines[1] + "\n" + `{"role":"assistant","content":` + content + `}` + "\n" + lines[2]
+			root, cfg, got := runNativeCompletionTask(t, kimiCLIRunnerName, payload, typeReview, 0)
+			gate := &Task{IntegrationGate: &IntegrationGate{WriterTaskID: got.ReviewOf, ReviewTaskID: got.ID, CandidateCommit: got.ReviewCandidate.Commit, CandidateTree: got.ReviewCandidate.Tree}}
+			if dec := evaluateIntegrationRelease(root, cfg, gate); !dec.Admit {
+				t.Fatalf("supported current final was rejected: %+v", dec)
+			}
+			if strings.Contains(loadTaskResultForGate(root, got), "private-reasoning-canary") {
+				t.Fatal("thinking text entered the delivered artifact")
+			}
+		})
+	}
+}
+
 func TestNativeOpenCodeLifecycle(t *testing.T) {
 	text := `{"type":"text","part":{"text":"OK"}}`
 	stop := `{"type":"step_finish","part":{"reason":"stop"}}`

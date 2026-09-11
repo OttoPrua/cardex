@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
 	"reflect"
 	"strings"
 	"testing"
@@ -625,7 +628,11 @@ func TestGrokBuild105CompleteStdoutOmitsAncillaryWarningStderr(t *testing.T) {
 			if got.Result != tc.want || got.TerminalEvents != 1 {
 				t.Fatalf("stdout semantic/terminal result lost: %+v", got)
 			}
-			if !reflect.DeepEqual(got, want) {
+			// Invocation adds process/channel diagnostics unavailable to the standalone parser.
+			// Compare every pre-existing business and policy field independently of that projection.
+			gotBusiness, wantBusiness := *got, *want
+			gotBusiness.GrokDiagnostics, wantBusiness.GrokDiagnostics = nil, nil
+			if !reflect.DeepEqual(gotBusiness, wantBusiness) {
 				t.Fatalf("ancillary stderr must not alter the stdout-alone parse: got=%+v want=%+v", got, want)
 			}
 			grok105AssertNoOpaqueExposure(t, got, grok105AncillaryWarningToken,
@@ -709,4 +716,254 @@ func TestGrokBuild105NonzeroExitPreservesRootCauseWithAncillaryStderr(t *testing
 			t.Fatalf("exact diagnostic must remain the classified result: %+v", res)
 		}
 	})
+}
+
+const grokDiagnosticCanary = "xai-DIAGNOSTIC-PRIVATE-CONTENT-DO-NOT-RETAIN"
+
+// The task/event readback below runs the real Grok invocation and runner with an offline process.
+// A valid business Result may contain text; only the NEW diagnostic projection must be value-free.
+func TestGrokDiagnosticsTaskEventReadback(t *testing.T) {
+	text := `{"type":"text","data":"` + grokDiagnosticCanary + `"}`
+	end := grok105PublicEnd
+	valid := text + "\n" + end
+	for _, tc := range []struct {
+		name, stdout, stderr, defect, source, stop string
+		ends, legacyEnds                           int
+		complete, success                          bool
+	}{
+		{"valid public", valid, "", "none", "none", "end_turn", 1, 1, true, true},
+		{"valid usage metadata tail", valid + "\n" + grok105PublicUsage + "\n" + grok105ClosedMetadata, "", "none", "none", "end_turn", 1, 1, true, true},
+		{"ancillary stderr", valid, "warning " + grokDiagnosticCanary, "none", "none", "end_turn", 1, 1, true, true},
+		{"closed stderr metadata", valid, grok105ClosedMetadata, "none", "none", "end_turn", 1, 1, true, true},
+		{"missing end", text, "", "missing_end", "observation", "missing", 0, 0, true, false},
+		{"duplicate end", valid + "\n" + end, "", "duplicate_end", "stdout", "end_turn", 2, 1, true, false},
+		{"third end counted", valid + "\n" + end + "\n" + end, "", "duplicate_end", "stdout", "end_turn", 3, 1, true, false},
+		{"bad end shape", text + "\n" + `{"type":"end","stopReason":"end_turn","message":"` + grokDiagnosticCanary + `"}`, "", "invalid_end_shape", "stdout", "end_turn", 1, 1, true, false},
+		{"abnormal end", text + "\n" + strings.Replace(end, "end_turn", "max_tokens", 1), "", "abnormal_stop_reason", "stdout", "max_tokens", 1, 1, true, false},
+		{"private stop reason", text + "\n" + strings.Replace(end, "end_turn", grokDiagnosticCanary, 1), "", "abnormal_stop_reason", "stdout", "unknown", 1, 1, true, false},
+		{"bad end decode", text + "\n" + `{"type":"end","stopReason":123}`, "", "event_decode_before_end", "stdout", "invalid_type", 1, 0, true, false},
+		{"bad json before end", text + "\n" + grokDiagnosticCanary + "\n" + end, "", "malformed_json_before_end", "stdout", "end_turn", 1, 1, true, false},
+		{"bad json after end", valid + "\n" + grokDiagnosticCanary, "", "malformed_json_after_end", "stdout", "end_turn", 1, 1, true, false},
+		{"missing type before end", text + "\n" + `{"private":"` + grokDiagnosticCanary + `"}` + "\n" + end, "", "missing_type_before_end", "stdout", "end_turn", 1, 1, true, false},
+		{"missing type after end", valid + "\n" + `{"private":"` + grokDiagnosticCanary + `"}`, "", "missing_type_after_end", "stdout", "end_turn", 1, 1, true, false},
+		{"unknown before end", text + "\n" + `{"type":"` + grokDiagnosticCanary + `","rawInput":{"secret":"` + grokDiagnosticCanary + `"}}` + "\n" + end, "", "unknown_event_before_end", "stdout", "end_turn", 1, 1, true, false},
+		{"unknown after end", valid + "\n" + `{"type":"` + grokDiagnosticCanary + `"}`, "", "disallowed_event_after_end", "stdout", "end_turn", 1, 1, true, false},
+		{"invalid shape before end", text + "\n" + `{"type":"metadata","data":"` + grokDiagnosticCanary + `"}` + "\n" + end, "", "invalid_event_shape_before_end", "stdout", "end_turn", 1, 1, true, false},
+		{"invalid shape after end", valid + "\n" + `{"type":"usage","usage":"` + grokDiagnosticCanary + `"}`, "", "event_decode_after_end", "stdout", "end_turn", 1, 1, true, false},
+		{"stderr semantic merge", valid, text, "disallowed_event_after_end", "stderr", "end_turn", 1, 1, true, false},
+		{"stderr duplicate merge", valid, end, "duplicate_end", "stderr", "end_turn", 2, 1, true, false},
+		{"stderr malformed merge", valid, `{"private":"` + grokDiagnosticCanary, "malformed_json_after_end", "stderr", "end_turn", 1, 1, true, false},
+		{"CRLF source boundary", strings.ReplaceAll(valid, "\n", "\r\n") + "\r\n", text, "disallowed_event_after_end", "stderr", "end_turn", 1, 1, true, false},
+		{"stdout scanner loss", text + "\n" + strings.Repeat("x", 4*1024*1024) + "\n" + end, "", "scanner_loss", "stdout", "missing", 0, 0, false, false},
+		{"stderr parser scanner loss", valid, `{"type":"` + strings.Repeat("x", 4*1024*1024) + `"}`, "scanner_loss", "stderr", "end_turn", 1, 1, false, false},
+		{"stderr adapter scanner loss", valid, strings.Repeat("x", 8*1024*1024), "stderr_scanner_loss", "stderr", "end_turn", 1, 1, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			bin, calls := fakeGrokBuildCountedStderrFile(t, tc.stdout, tc.stderr, 0)
+			cfg := grokBuildTestConfig(t, bin)
+			cfg.OwnerRoutingEnforced = false
+			task := newTask(root, cfg, typeSequence, "offline diagnostic fixture", t.TempDir(), []string{"fixture"}, 1)
+			task.PreferRunner, task.RunnerExplicit, task.Model = grokBuildRunnerName, true, "sonnet"
+			if err := saveTask(root, task); err != nil {
+				t.Fatal(err)
+			}
+			// Exercise the production parser/adapter directly as well as through the real runner.
+			parsed := parseGrokBuildJSONLChannels(grokBuildJSONObservation(tc.stdout, tc.stderr, nil), len(tc.stdout))
+			if parsed.TerminalEvents != tc.legacyEnds || parsed.GrokDiagnostics.ObservedEndCount != tc.ends {
+				t.Fatalf("legacy and diagnostic counts must stay separate: legacy=%d diagnostic=%d", parsed.TerminalEvents, parsed.GrokDiagnostics.ObservedEndCount)
+			}
+			if parsed.IsError == tc.success {
+				t.Fatalf("parser decision changed: success=%v result=%+v", tc.success, parsed)
+			}
+			if tc.success && parsed.Result != grokDiagnosticCanary {
+				t.Fatal("diagnostic redaction must not change the existing business Result")
+			}
+			if err := runTaskVia(context.Background(), root, cfg, task, grokBuildRunnerName); err != nil {
+				t.Fatal(err)
+			}
+			got, err := loadTask(root, task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantStatus, wantEvent := statusHeld, evHeld
+			if tc.success {
+				wantStatus, wantEvent = statusDone, evStepOK
+			}
+			if got.Status != wantStatus || got.Attempts != 0 || got.PreferRunner != grokBuildRunnerName ||
+				got.NotBeforeEpoch != 0 || got.ResumeAtEpoch != 0 || countProductCalls(t, calls) != 1 {
+				t.Fatalf("decision/retry/fallback changed: %+v", got)
+			}
+			if got.LastRouteAttempt == nil || got.LastRouteAttempt.GrokDiagnostics == nil {
+				t.Fatal("missing task diagnostic readback")
+			}
+			d := got.LastRouteAttempt.GrokDiagnostics
+			if d.TerminalDefect != tc.defect || d.DefectSource != tc.source || d.StopReason != tc.stop ||
+				d.ObservedEndCount != tc.ends || d.ParserScanComplete != tc.complete || d.Subtype != grokBuildDiagnosticSubtype(parsed.Subtype) {
+				t.Fatalf("diagnostic mismatch: %+v", d)
+			}
+			if d.ObservationOrder != "stdout_then_stderr" || d.StdioEOF != "unknown" ||
+				d.ExitCode == nil || *d.ExitCode != 0 || d.Signal == nil || *d.Signal != 0 ||
+				d.TimedOut == nil || *d.TimedOut || d.ProcessError != "none" || d.WaitError != "none" {
+				t.Fatalf("zero/false must be observed and EOF unknown: %+v", d)
+			}
+			events, truncated, err := readEvents(eventsPath(root, task.ID))
+			if err != nil || truncated {
+				t.Fatalf("event readback err=%v truncated=%v", err, truncated)
+			}
+			found := false
+			for _, event := range events {
+				if event.Type == evRetry || event.Actor == "runner:policy-fallback" {
+					t.Fatalf("unexpected retry/fallback event: %+v", event)
+				}
+				if event.Type != wantEvent {
+					continue
+				}
+				raw, err := json.Marshal(event.Detail["grok_diagnostics"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				var eventDiagnostics grokBuildDiagnostics
+				if err := json.Unmarshal(raw, &eventDiagnostics); err != nil || !reflect.DeepEqual(*d, eventDiagnostics) {
+					t.Fatalf("event lost task diagnostic projection: %s err=%v", raw, err)
+				}
+				grokAssertSafeDiagnostics(t, raw)
+				found = true
+			}
+			if !found {
+				t.Fatal("missing result-bearing event diagnostic readback")
+			}
+			raw, err := json.Marshal(d)
+			if err != nil {
+				t.Fatal(err)
+			}
+			grokAssertSafeDiagnostics(t, raw)
+		})
+	}
+}
+
+func grokAssertSafeDiagnostics(t *testing.T, raw []byte) {
+	t.Helper()
+	for _, secret := range []string{grokDiagnosticCanary, "message-public-private", "session-public-private",
+		"request-public-private", "signature-public-private", "rawInput", "secret", "grok-4.6"} {
+		if strings.Contains(string(raw), secret) {
+			t.Fatalf("new diagnostics retained private material %q: %s", secret, raw)
+		}
+	}
+}
+
+func TestGrokDiagnosticsParserAndProcessErrorReadback(t *testing.T) {
+	for _, tc := range []struct {
+		name, category string
+		exit           int
+		timeout        bool
+	}{
+		{"nonzero exit", "exit", 7, false},
+		{"signal", "signal", -1, false},
+		{"step timeout", "signal", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := testRoot(t)
+			payload := `{"type":"text","data":"` + grokDiagnosticCanary + `"}` + "\n" + grok105PublicEnd + "\n" + grok105PublicEnd
+			bin, calls := fakeGrokBuildCounted(t, payload, "", tc.exit)
+			if tc.timeout {
+				script, err := os.ReadFile(bin)
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The production one-minute step deadline kills this exact fake process group.
+				// exec avoids leaving a shell descendant if the test is interrupted.
+				script = []byte(strings.TrimSuffix(string(script), "exit 0\n") + "exec sleep 70\n")
+				if err := os.WriteFile(bin, script, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg := grokBuildTestConfig(t, bin)
+			cfg.OwnerRoutingEnforced = true
+			task := ownerBackendGrokTask(t, root, cfg, t.TempDir())
+			task.Attempts = 2
+			if err := saveTask(root, task); err != nil {
+				t.Fatal(err)
+			}
+			if err := runTaskVia(context.Background(), root, cfg, task, grokBuildRunnerName); err != nil {
+				t.Fatal(err)
+			}
+			assertGrokTerminalUnknownHeld(t, root, task, calls, 2, fallbackInvalidTerminal, 3, 3, 0, false, grokDiagnosticCanary)
+			got, err := loadTask(root, task.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d := got.LastRouteAttempt.GrokDiagnostics
+			if d == nil || d.Subtype != "grok_build_invalid_terminal" || d.TerminalDefect != "duplicate_end" ||
+				d.ObservedEndCount != 2 || d.ProcessError != tc.category || d.WaitError != tc.category ||
+				d.TimedOut == nil || *d.TimedOut != tc.timeout || d.StdioEOF != "unknown" {
+				t.Fatalf("parser error must coexist with original process outcome: %+v", d)
+			}
+			if tc.category == "exit" {
+				if d.ExitCode == nil || *d.ExitCode != 7 || d.Signal == nil || *d.Signal != 0 {
+					t.Fatalf("exit status missing: %+v", d)
+				}
+			} else if d.ExitCode != nil || d.Signal == nil || *d.Signal != 9 {
+				t.Fatalf("signal must not be reported as a known numeric exit code: %+v", d)
+			}
+			events, _, err := readEvents(eventsPath(root, task.ID))
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, event := range events {
+				if event.Type == evHeld {
+					raw, _ := json.Marshal(event.Detail["grok_diagnostics"])
+					var eventDiagnostics grokBuildDiagnostics
+					if err := json.Unmarshal(raw, &eventDiagnostics); err != nil || !reflect.DeepEqual(*d, eventDiagnostics) {
+						t.Fatalf("held event lost coexisting errors: %s err=%v", raw, err)
+					}
+					grokAssertSafeDiagnostics(t, raw)
+					found = true
+				}
+			}
+			if !found {
+				t.Fatal("missing held event")
+			}
+		})
+	}
+}
+
+func TestGrokDiagnosticsUnknownProcessFactsAndClosedValues(t *testing.T) {
+	res := parseGrokBuildJSONL(`{"type":"end","stopReason":"` + grokDiagnosticCanary + `"}`)
+	d := res.GrokDiagnostics
+	if d.ExitCode != nil || d.Signal != nil || d.TimedOut != nil || d.WaitError != "unknown" || d.ProcessError != "unknown" ||
+		d.DefectSource != "unknown" || d.StdioEOF != "unknown" || d.StopReason != "unknown" {
+		t.Fatalf("standalone parser cannot assert process facts: %+v", d)
+	}
+	raw, _ := json.Marshal(d)
+	for _, unknown := range []string{`"exit_code":null`, `"signal":null`, `"timed_out":null`} {
+		if !strings.Contains(string(raw), unknown) {
+			t.Fatalf("unknown must remain explicit in JSON: %s", raw)
+		}
+	}
+	for _, tc := range []struct {
+		err            error
+		category, wait string
+	}{
+		{errors.New(grokDiagnosticCanary), "other", "unknown"},
+		{context.DeadlineExceeded, "deadline", "unknown"},
+		{context.Canceled, "canceled", "unknown"},
+		{exec.ErrWaitDelay, "wait_delay", "wait_delay"},
+	} {
+		d.process(&exec.Cmd{}, tc.err, false)
+		if d.ProcessError != tc.category || d.WaitError != tc.wait || d.ExitCode != nil || d.Signal != nil {
+			t.Fatalf("unproved Wait/exit facts must remain unknown: %+v", d)
+		}
+		raw, _ := json.Marshal(d)
+		grokAssertSafeDiagnostics(t, raw)
+	}
+	if grokBuildDiagnosticSubtype(grokDiagnosticCanary) != "unknown" {
+		t.Fatal("unknown subtype must be closed")
+	}
+	for _, value := range []string{`null`, `[]`, `{}`, `1`, `true`} {
+		if got := grokBuildDiagnosticStopReason(json.RawMessage(value)); got != "invalid_type" {
+			t.Fatalf("stop reason field type was not controlled: %q", got)
+		}
+	}
 }

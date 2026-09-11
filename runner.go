@@ -52,6 +52,9 @@ type claudeResult struct {
 	// 该字段供 runTask 判断是否属 transcript 来源、对终态分类降级 retry_backoff。
 	// json:"-" 不外泄——仅编排侧内部信号，不进 events/进 CLI wire。
 	ResultFromTranscript bool `json:"-"`
+
+	// Grok-only diagnostic projection; absent for other providers and old records.
+	GrokDiagnostics *grokBuildDiagnostics `json:"-"`
 }
 
 var (
@@ -1147,6 +1150,7 @@ func recordRouteAttemptObservation(t *Task, res *claudeResult) {
 	}
 	r.ModelEvents = res.ModelEvents
 	r.ToolEvents = res.ToolEvents
+	r.GrokDiagnostics = res.GrokDiagnostics
 }
 
 // grokBuildZeroEventProcessFailure returns the closed, value-free process class only
@@ -1221,6 +1225,16 @@ func withRouteAttempt(detail map[string]any, t *Task) map[string]any {
 		detail["workspace_fingerprint_after"] = r.WorkspaceAfter
 	}
 	detail["process_residue"] = r.ProcessResidue
+	return withGrokBuildDiagnostics(detail, t)
+}
+
+func withGrokBuildDiagnostics(detail map[string]any, t *Task) map[string]any {
+	if t != nil && t.LastRouteAttempt != nil && t.LastRouteAttempt.GrokDiagnostics != nil {
+		if detail == nil {
+			detail = map[string]any{}
+		}
+		detail["grok_diagnostics"] = t.LastRouteAttempt.GrokDiagnostics
+	}
 	return detail
 }
 
@@ -2458,9 +2472,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					t.Status = statusHeld
 					t.LastError = "required Owner review gate queued: " + plannedReviewStage
 					t.touch()
-					if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+					if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withGrokBuildDiagnostics(map[string]any{
 						"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
-					}); err != nil {
+					}, t)); err != nil {
 						return finishIfStopped(err)
 					}
 					return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:owner-review-plan", statusHeld, t.Step,
@@ -2493,9 +2507,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			}
 			t.touch()
 			// 最后一步的 step_ok 事件先记(与中间步一致语义),再据终局标 done 或交叉契约违规的 failed。
-			if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+			if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withGrokBuildDiagnostics(map[string]any{
 				"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
-			}); err != nil {
+			}, t)); err != nil {
 				return finishIfStopped(err)
 			}
 			if t.Status == statusDone {
@@ -2534,9 +2548,9 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		}
 		t.touch()
 		// 中间步成功事件:每推进一步一条,是"步数一致"验收的锚点(枚举遗漏就红)。
-		if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, map[string]any{
+		if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withGrokBuildDiagnostics(map[string]any{
 			"turns": res.NumTurns, "cost_usd": res.TotalCostUSD,
-		}); err != nil {
+		}, t)); err != nil {
 			return finishIfStopped(err)
 		}
 	}

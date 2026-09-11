@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -766,19 +767,151 @@ func markGrokBuildInvalidTerminal(res *claudeResult) {
 	res.ObservationComplete = false
 }
 
+// This projection contains only closed categories and observed numbers, never event values.
+// It is diagnostic only: TerminalEvents and all existing policy inputs retain their semantics.
+type grokBuildDiagnostics struct {
+	Subtype            string `json:"subtype"`
+	TerminalDefect     string `json:"terminal_defect"`
+	DefectSource       string `json:"defect_source"`
+	ObservationOrder   string `json:"observation_order"`
+	ObservedEndCount   int    `json:"observed_end_count"`
+	ParserScanComplete bool   `json:"parser_scan_complete"`
+	StopReason         string `json:"stop_reason"`
+	StdioEOF           string `json:"stdio_eof"`
+	ExitCode           *int   `json:"exit_code"`
+	Signal             *int   `json:"signal"`
+	TimedOut           *bool  `json:"timed_out"`
+	ProcessError       string `json:"process_error"`
+	WaitError          string `json:"wait_error"`
+}
+
+func (d *grokBuildDiagnostics) defect(category, source string) {
+	// First defect in parser input order, which is NOT cross-channel event chronology.
+	if d.TerminalDefect == "none" {
+		d.TerminalDefect, d.DefectSource = category, source
+	}
+}
+
+func grokBuildDiagnosticStopReason(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return "missing"
+	}
+	if grokBuildJSONType(raw) != "string" {
+		return "invalid_type"
+	}
+	var value string
+	_ = json.Unmarshal(raw, &value)
+	switch value {
+	case "end_turn", "max_tokens", "tool_use", "stop_sequence":
+		return value
+	default:
+		return "unknown"
+	}
+}
+
+func grokBuildDiagnosticSubtype(subtype string) string {
+	switch subtype {
+	case "":
+		return "none"
+	case "grok_build_invalid_terminal", "grok_build_stream_incomplete", "grok_build_error",
+		"grok_build_process_error", "grok_build_process_auth", "grok_build_process_auth_exact",
+		"grok_build_process_transport", "grok_build_process_permission_environment",
+		"grok_build_process_invalid_invocation", "grok_build_process_unclassified":
+		return subtype
+	default:
+		return "unknown"
+	}
+}
+
+func (d *grokBuildDiagnostics) process(cmd *exec.Cmd, runErr error, timedOut bool) {
+	d.TimedOut = &timedOut
+	d.ProcessError, d.WaitError = "none", "unknown"
+	if state := cmd.ProcessState; state != nil {
+		if code := state.ExitCode(); code >= 0 {
+			d.ExitCode = &code
+		}
+		if status, ok := state.Sys().(syscall.WaitStatus); ok {
+			signal := 0
+			if status.Signaled() {
+				signal = int(status.Signal())
+			}
+			d.Signal = &signal
+		}
+		if runErr == nil {
+			d.WaitError = "none"
+		}
+	}
+	var exitErr *exec.ExitError
+	switch {
+	case runErr == nil:
+	case errors.As(runErr, &exitErr):
+		d.ProcessError, d.WaitError = "exit", "exit"
+		if d.Signal != nil && *d.Signal != 0 {
+			d.ProcessError, d.WaitError = "signal", "signal"
+		}
+	case errors.Is(runErr, exec.ErrWaitDelay):
+		d.ProcessError, d.WaitError = "wait_delay", "wait_delay"
+	case errors.Is(runErr, context.DeadlineExceeded):
+		d.ProcessError = "deadline"
+	case errors.Is(runErr, context.Canceled):
+		d.ProcessError = "canceled"
+	default:
+		d.ProcessError = "other"
+	}
+	// The registered-process helper also returns admission/start/registration errors. A generic
+	// error cannot prove what Wait returned, nor does successful Wait prove the stdio EOF state.
+}
+
 func parseGrokBuildJSONL(raw string) *claudeResult {
-	res := &claudeResult{Type: "result", ObservationComplete: true}
+	return parseGrokBuildJSONLChannels(raw, -1)
+}
+
+// stdoutBytes identifies the boundary in the existing appended observation; -1 means unknown.
+// It adds provenance only, without collecting streams or changing the adapter's filtering.
+func parseGrokBuildJSONLChannels(raw string, stdoutBytes int) *claudeResult {
+	d := &grokBuildDiagnostics{Subtype: "none", TerminalDefect: "none", DefectSource: "none",
+		ObservationOrder: "input_order", StopReason: "missing", StdioEOF: "unknown",
+		ProcessError: "unknown", WaitError: "unknown"}
+	if stdoutBytes >= 0 {
+		d.ObservationOrder = "stdout_then_stderr"
+	}
+	res := &claudeResult{Type: "result", ObservationComplete: true, GrokDiagnostics: d}
 	var text bytes.Buffer
 	sawEnd := false
+	offset := 0
+	sourceAt := func(offset int) string {
+		if stdoutBytes < 0 {
+			return "unknown"
+		}
+		if offset < stdoutBytes {
+			return "stdout"
+		}
+		return "stderr"
+	}
 	s := bufio.NewScanner(strings.NewReader(raw))
 	s.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for s.Scan() {
+		source := sourceAt(offset)
+		// ScanLines strips CR; use the original byte offset so CRLF cannot shift provenance.
+		if next := strings.IndexByte(raw[offset:], '\n'); next >= 0 {
+			offset += next + 1
+		} else {
+			offset = len(raw)
+		}
 		line := strings.TrimSpace(s.Text())
 		if line == "" {
 			continue
 		}
 		var fields map[string]json.RawMessage
 		if json.Unmarshal([]byte(line), &fields) != nil || fields == nil {
+			category := "malformed_json_before_end"
+			if sawEnd {
+				category = "malformed_json_after_end"
+			}
+			if source == "stderr" && line == "__CARDEX_UNOBSERVED_STDERR__" {
+				category = "stderr_scanner_loss"
+			}
+			d.defect(category, source)
 			if sawEnd {
 				markGrokBuildInvalidTerminal(res)
 			}
@@ -787,6 +920,11 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 		}
 		var typ string
 		if json.Unmarshal(fields["type"], &typ) != nil || typ == "" {
+			category := "missing_type_before_end"
+			if sawEnd {
+				category = "missing_type_after_end"
+			}
+			d.defect(category, source)
 			if sawEnd {
 				markGrokBuildInvalidTerminal(res)
 			}
@@ -794,8 +932,21 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 			grokBuildCountUnclassified(res, "", fields)
 			continue
 		}
+		if typ == "end" {
+			d.ObservedEndCount++
+			if d.ObservedEndCount == 1 {
+				d.StopReason = grokBuildDiagnosticStopReason(fields["stopReason"])
+			} else {
+				d.defect("duplicate_end", source)
+			}
+		}
 		var ev grokBuildEvent
 		if json.Unmarshal([]byte(line), &ev) != nil {
+			category := "event_decode_before_end"
+			if sawEnd {
+				category = "event_decode_after_end"
+			}
+			d.defect(category, source)
 			if sawEnd {
 				markGrokBuildInvalidTerminal(res)
 			}
@@ -809,6 +960,7 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 			if grokBuildPostEndAccountingOrMetadata(ev.Type, fields) {
 				continue
 			}
+			d.defect("disallowed_event_after_end", source)
 			markGrokBuildInvalidTerminal(res)
 			continue
 		}
@@ -886,6 +1038,11 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 			res.TerminalEvents++
 			validEnd, public105End := grokBuildEndShape(fields)
 			if !validEnd || ev.StopReason != "end_turn" || res.TerminalEvents != 1 {
+				if !validEnd {
+					d.defect("invalid_end_shape", source)
+				} else {
+					d.defect("abnormal_stop_reason", source)
+				}
 				observeGrokBuildUsage(res, ev.Usage, false)
 				grokBuildCountUnclassified(res, ev.Type, fields)
 				markGrokBuildInvalidTerminal(res)
@@ -905,12 +1062,21 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 				res.ModelEvents++
 			}
 		default:
+			d.defect("unknown_event_before_end", source)
 			res.ObservationComplete = false
 			grokBuildCountUnclassified(res, ev.Type, fields)
 		}
+		if !res.ObservationComplete {
+			d.defect("invalid_event_shape_before_end", source)
+		}
 	}
+	d.ParserScanComplete = s.Err() == nil
 	if s.Err() != nil {
+		d.defect("scanner_loss", sourceAt(offset))
 		res.ObservationComplete = false
+	}
+	if !sawEnd {
+		d.defect("missing_end", "observation")
 	}
 	if res.NumTurns > res.SemanticEvents {
 		res.SemanticEvents = res.NumTurns
@@ -929,6 +1095,7 @@ func parseGrokBuildJSONL(raw string) *claudeResult {
 	} else if !res.IsError && text.Len() > 0 {
 		res.Result = text.String()
 	}
+	d.Subtype = grokBuildDiagnosticSubtype(res.Subtype)
 	return res
 }
 
@@ -1313,8 +1480,12 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	cmd.Env = providerChildEnv(home, nil)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	runErr := runCmdRegisteredForTask(cmd, t.ID)
+	processErr := runCmdRegisteredForTask(cmd, t.ID)
+	runErr := processErr
+	// Snapshot at the existing timeout decision, before parsing can consume more time.
+	processTimedOut := false
 	if runCtx.Err() == context.DeadlineExceeded {
+		processTimedOut = true
 		runErr = fmt.Errorf("步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
 	combined := stdout.String() + "\n" + stderr.String()
@@ -1326,7 +1497,8 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 		// observation look partial. Mixed or unknown stderr never reaches this branch.
 		observedStderr = ""
 	}
-	res := parseGrokBuildJSONL(grokBuildJSONObservation(stdout.String(), observedStderr, runErr))
+	res := parseGrokBuildJSONLChannels(grokBuildJSONObservation(stdout.String(), observedStderr, runErr), stdout.Len())
+	diagnostics := res.GrokDiagnostics
 	// Grok 1.0.4/1.0.5 may emit only system.version on stdout and put the concrete OIDC 401 on
 	// stderr. The metadata-only parser correctly calls that stream incomplete, but that synthetic
 	// symptom must not mask a trusted process diagnostic: preserve the auth root cause so the generic
@@ -1370,6 +1542,13 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 	}
 	if res != nil && !res.IsError && strings.TrimSpace(res.Result) == "" && runErr == nil {
 		runErr = fmt.Errorf("Grok Build 未返回最终文本")
+	}
+	if res != nil {
+		// A process classification may replace res with the stdout-only observation. Preserve the
+		// actual parser diagnostics without feeding them into that classification or its policy.
+		res.GrokDiagnostics = diagnostics
+		diagnostics.Subtype = grokBuildDiagnosticSubtype(res.Subtype)
+		diagnostics.process(cmd, processErr, processTimedOut)
 	}
 	return res, combined, runErr
 }

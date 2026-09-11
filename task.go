@@ -61,6 +61,9 @@ type RouteAttemptReadback struct {
 	ProcessResidue  bool   `json:"process_residue,omitempty"`
 	WorkspaceBefore string `json:"workspace_fingerprint_before,omitempty"`
 	WorkspaceAfter  string `json:"workspace_fingerprint_after,omitempty"`
+
+	// Grok-only diagnostic projection; absent for other providers and old records.
+	GrokDiagnostics *grokBuildDiagnostics `json:"grok_diagnostics,omitempty"`
 }
 
 type Task struct {

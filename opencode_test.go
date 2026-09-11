@@ -25,7 +25,7 @@ func TestResolveOpenCodeModel(t *testing.T) {
 
 func TestParseOpenCodeJSONL(t *testing.T) {
 	raw := `{"type":"text","sessionID":"ses-1","part":{"text":"OK","time":{"start":10,"end":25}}}` + "\n" +
-		`{"type":"step_finish","sessionID":"ses-1","part":{"tokens":{"input":7,"output":5},"cost":0.25}}`
+		`{"type":"step_finish","sessionID":"ses-1","part":{"reason":"stop","tokens":{"input":7,"output":5},"cost":0.25}}`
 	res := parseOpenCodeJSONL(raw)
 	if res.Result != "OK" || res.SessionID != "ses-1" || res.NumTurns != 1 || res.TotalCostUSD != 0.25 {
 		t.Fatalf("unexpected result: %+v", res)
@@ -178,7 +178,7 @@ func fakeOpenCode(t *testing.T, payload string, exitCode int) (bin, argsDump str
 
 func TestInvokeOpenCodeNightUsesKimiMax(t *testing.T) {
 	payload := `{"type":"text","sessionID":"ses-ok","part":{"text":"OK"}}` + "\n" +
-		`{"type":"step_finish","sessionID":"ses-ok","part":{"tokens":{"input":7,"output":5},"cost":0.25}}`
+		`{"type":"step_finish","sessionID":"ses-ok","part":{"reason":"stop","tokens":{"input":7,"output":5},"cost":0.25}}`
 	bin, argsDump := fakeOpenCode(t, payload, 0)
 	cfg := openCodeNightTestConfig(bin)
 	task := &Task{ID: "oc-kimi-max", Model: "opus", PreferRunner: "codex", Effort: "xhigh", Dir: t.TempDir()}

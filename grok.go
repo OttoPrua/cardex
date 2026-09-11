@@ -576,6 +576,8 @@ type grokBuildEvent struct {
 	TotalCostUSD float64         `json:"total_cost_usd"`
 	DurationMS   int64           `json:"duration_ms"`
 	Usage        *grokBuildUsage `json:"usage"`
+	ToolCallID   string          `json:"toolCallId"`
+	Status       *string         `json:"status"`
 }
 
 func grokBuildJSONType(raw json.RawMessage) string {
@@ -610,6 +612,35 @@ func grokBuildExactShape(fields map[string]json.RawMessage, keyTypes ...string) 
 		}
 	}
 	return true
+}
+
+func grokBuildBenignSyntheticMeta(fields map[string]json.RawMessage) bool {
+	raw, ok := fields["_meta"]
+	if !ok {
+		return true
+	}
+	var meta map[string]json.RawMessage
+	if json.Unmarshal(raw, &meta) != nil || len(meta) != 1 {
+		return false
+	}
+	var synthetic bool
+	if json.Unmarshal(meta["synthetic"], &synthetic) != nil || !synthetic {
+		return false
+	}
+	return true
+}
+
+func grokBuildExactShapeWithBenignSyntheticMeta(fields map[string]json.RawMessage, keyTypes ...string) bool {
+	if !grokBuildBenignSyntheticMeta(fields) {
+		return false
+	}
+	core := make(map[string]json.RawMessage, len(fields))
+	for key, value := range fields {
+		if key != "_meta" {
+			core[key] = value
+		}
+	}
+	return grokBuildExactShape(core, keyTypes...)
 }
 
 func grokBuildEndForbiddenField(fields map[string]json.RawMessage) bool {
@@ -654,7 +685,10 @@ func grokBuildEndShape(fields map[string]json.RawMessage) (valid, public105 bool
 	for key, raw := range fields {
 		want, ok := known[key]
 		if !ok {
-			continue
+			if key == "_meta" && grokBuildBenignSyntheticMeta(fields) {
+				continue
+			}
+			return false, public105
 		}
 		if grokBuildJSONType(raw) != want {
 			return false, public105
@@ -682,9 +716,9 @@ func grokBuildPostEndAccountingOrMetadata(typ string, fields map[string]json.Raw
 }
 
 func grokBuildUsageShape(fields map[string]json.RawMessage) bool {
-	return grokBuildExactShape(fields,
+	return grokBuildExactShapeWithBenignSyntheticMeta(fields,
 		"signature", "string", "type", "string", "usage", "object") ||
-		grokBuildExactShape(fields,
+		grokBuildExactShapeWithBenignSyntheticMeta(fields,
 			"messageId", "string", "signature", "string", "stopReason", "string",
 			"type", "string", "usage", "object")
 }
@@ -695,12 +729,57 @@ func grokBuildAvailableCommandsShape(fields map[string]json.RawMessage) bool {
 		grokBuildExactShape(fields, "tools", "array", "type", "string")
 }
 
+func grokBuildPlanEntryShape(raw json.RawMessage) bool {
+	var entry map[string]json.RawMessage
+	if json.Unmarshal(raw, &entry) != nil || entry == nil {
+		return false
+	}
+	if grokBuildJSONType(entry["content"]) != "string" {
+		return false
+	}
+	for key, value := range entry {
+		got := grokBuildJSONType(value)
+		if got == "" {
+			return false
+		}
+		switch key {
+		case "content":
+		case "priority", "status":
+			if got != "string" && got != "null" {
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func grokBuildPlanShape(fields map[string]json.RawMessage) bool {
+	if !grokBuildExactShapeWithBenignSyntheticMeta(fields, "type", "string", "entries", "array") {
+		return false
+	}
+	if grokBuildHasContent(fields) {
+		return false
+	}
+	var entries []json.RawMessage
+	if json.Unmarshal(fields["entries"], &entries) != nil {
+		return false
+	}
+	for _, entry := range entries {
+		if !grokBuildPlanEntryShape(entry) {
+			return false
+		}
+	}
+	return true
+}
+
 func grokBuildToolCallShape(fields map[string]json.RawMessage) bool {
-	return grokBuildExactShape(fields,
+	return grokBuildExactShapeWithBenignSyntheticMeta(fields,
 		"content", "array", "kind", "string", "locations", "array", "rawInput", "object",
 		"status", "string", "title", "string", "toolCallId", "string", "toolName", "string",
 		"type", "string") ||
-		grokBuildExactShape(fields,
+		grokBuildExactShapeWithBenignSyntheticMeta(fields,
 			"status", "string", "toolCallId", "string", "toolName", "string", "type", "string")
 }
 
@@ -715,7 +794,7 @@ func grokBuildToolCallUpdateShape(fields map[string]json.RawMessage) bool {
 	rawOutputType := grokBuildJSONType(fields["rawOutput"])
 	statusType := grokBuildJSONType(fields["status"])
 	return rawOutputType == "null" && statusType == "null" ||
-		rawOutputType == "object" && statusType == "string"
+		rawOutputType != "" && rawOutputType != "null" && statusType == "string"
 }
 
 func grokBuildHasContent(fields map[string]json.RawMessage) bool {
@@ -878,6 +957,7 @@ func parseGrokBuildJSONLChannels(raw string, stdoutBytes int) *claudeResult {
 	res := &claudeResult{Type: "result", ObservationComplete: true, GrokDiagnostics: d}
 	var text bytes.Buffer
 	sawEnd := false
+	tools := map[string]bool{} // IDs remain parser-local; true means closed.
 	offset := 0
 	sourceAt := func(offset int) string {
 		if stdoutBytes < 0 {
@@ -969,13 +1049,19 @@ func parseGrokBuildJSONLChannels(raw string, stdoutBytes int) *claudeResult {
 			text.WriteString(ev.Data)
 			res.SemanticEvents++
 			res.ModelEvents++
-			if !grokBuildExactShape(fields, "data", "string", "type", "string") {
+			if !grokBuildExactShapeWithBenignSyntheticMeta(fields, "data", "string", "type", "string") {
 				res.ObservationComplete = false
 			}
 		case "thinking", "thought", "reasoning":
 			res.SemanticEvents++
 			res.ModelEvents++
-			if !grokBuildExactShape(fields, "data", "string", "type", "string") {
+			if !grokBuildExactShapeWithBenignSyntheticMeta(fields, "data", "string", "type", "string") {
+				res.ObservationComplete = false
+			}
+		case "plan":
+			res.SemanticEvents++
+			res.ModelEvents++
+			if !grokBuildPlanShape(fields) {
 				res.ObservationComplete = false
 			}
 		case "model", "model_start", "model_end":
@@ -985,16 +1071,42 @@ func parseGrokBuildJSONLChannels(raw string, stdoutBytes int) *claudeResult {
 			}
 		case "tool", "tool_use", "tool_result":
 			res.ToolEvents++
+			res.ObservationComplete = false // Legacy markers cannot prove call closure.
 			if !grokBuildExactShape(fields, "type", "string") {
 				res.ObservationComplete = false
 			}
 		case "tool_call":
 			res.ToolEvents++
+			_, duplicate := tools[ev.ToolCallID]
+			if ev.ToolCallID == "" || duplicate || ev.Status == nil {
+				res.ObservationComplete = false
+			} else {
+				switch *ev.Status {
+				case "pending", "in_progress":
+					tools[ev.ToolCallID] = false
+				case "completed", "failed":
+					tools[ev.ToolCallID] = true
+				default:
+					res.ObservationComplete = false
+				}
+			}
 			if !grokBuildToolCallShape(fields) {
 				res.ObservationComplete = false
 			}
 		case "tool_call_update":
 			res.ToolEvents++
+			closed, exists := tools[ev.ToolCallID]
+			if !exists || closed {
+				res.ObservationComplete = false
+			} else if ev.Status != nil {
+				switch *ev.Status {
+				case "pending", "in_progress":
+				case "completed", "failed":
+					tools[ev.ToolCallID] = true
+				default:
+					res.ObservationComplete = false
+				}
+			}
 			if !grokBuildToolCallUpdateShape(fields) {
 				res.ObservationComplete = false
 			}
@@ -1034,6 +1146,12 @@ func parseGrokBuildJSONLChannels(raw string, stdoutBytes int) *claudeResult {
 				res.Result = "Grok Build 返回未识别 error 事件"
 			}
 		case "end":
+			res.FinalReason = grokBuildDiagnosticStopReason(fields["stopReason"])
+			for _, closed := range tools {
+				if !closed {
+					res.ObservationComplete = false
+				}
+			}
 			sawEnd = true
 			res.TerminalEvents++
 			validEnd, public105End := grokBuildEndShape(fields)
@@ -1526,23 +1644,10 @@ func invokeGrokBuild(ctx context.Context, root string, cfg *Config, t *Task, pro
 			combined = stdout.String()
 		}
 	}
-	if runErr != nil && (res == nil || !res.IsError) {
-		if res == nil {
-			res = &claudeResult{Type: "result"}
-		}
-		res.IsError = true
-		res.Subtype = "grok_build_process_error"
-		res.Result = firstLine(stderr.String())
-		if res.Result == "" {
-			res.Result = runErr.Error()
-		}
-	}
 	if res != nil && res.IsError && runErr == nil {
 		runErr = fmt.Errorf("Grok Build 返回错误: %s", summarizeResult(res.Result))
 	}
-	if res != nil && !res.IsError && strings.TrimSpace(res.Result) == "" && runErr == nil {
-		runErr = fmt.Errorf("Grok Build 未返回最终文本")
-	}
+
 	if res != nil {
 		// A process classification may replace res with the stdout-only observation. Preserve the
 		// actual parser diagnostics without feeding them into that classification or its policy.

@@ -186,7 +186,7 @@ func TestInvokeKimiCLIReviewUsesIsolatedConfiguredPlanMode(t *testing.T) {
 	}
 }
 
-func TestInvokeKimiCLI0361RetriesMetadataOnlyColdStart(t *testing.T) {
+func TestInvokeKimiCLI0361DoesNotReplayMetadataOnlyColdStart(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "kimi")
 	countPath := filepath.Join(dir, "count")
@@ -206,13 +206,14 @@ func TestInvokeKimiCLI0361RetriesMetadataOnlyColdStart(t *testing.T) {
 	task := &Task{ID: "kimi-0361-cold-start", Model: "opus", Type: typeSequence, Dir: t.TempDir()}
 	root := admitDirectInvoke(t, "", task)
 	res, combined, err := invokeKimiCLI(context.Background(), root, cfg, task, "read only")
-	if err != nil || res == nil || res.Result != "KIMI_0361_OK" || res.SessionID != "session-0361" {
-		t.Fatalf("0.36.1 metadata-only cold start should restart transport once: res=%+v err=%v\n%s", res, err, combined)
+	if err == nil || res == nil || res.TerminalEvents != 0 || strings.Contains(combined, "KIMI_0361_OK") {
+		t.Fatalf("metadata-only child failure must stay incomplete, with no transport restart: res=%+v err=%v", res, err)
 	}
 	count, err := os.ReadFile(countPath)
-	if err != nil || string(count) != "2" {
-		t.Fatalf("expected exactly two transport starts, count=%q err=%v", count, err)
+	if err != nil || string(count) != "1" {
+		t.Fatalf("expected one child only: count=%q err=%v", count, err)
 	}
+
 }
 
 func TestValidateKimiCLIOpenFileLimit(t *testing.T) {

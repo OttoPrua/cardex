@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -36,7 +37,7 @@ func validateKimiCLIOpenFileLimit(limit uint64) error {
 }
 
 func preserveKimiCLIProcessError(res *claudeResult, stderr string, runErr error) {
-	if res == nil || res.IsError || runErr == nil {
+	if res == nil || res.IsError || runErr == nil || res.TerminalEvents != 0 {
 		return
 	}
 	for _, line := range strings.Split(stderr, "\n") {
@@ -183,83 +184,285 @@ func pinKimiCLILimitFallback(cfg *Config, t *Task) {
 var kimiCLIQuotaRe = regexp.MustCompile(`(?i)(?:^|[^0-9])429(?:[^0-9]|$)|too many requests|rate limit|quota (?:exceeded|exhausted)|insufficient (?:quota|credits)|usage limit|额度(?:不足|已用完)|配额(?:不足|已用尽)|限额(?:不足|已用尽)`)
 
 type kimiCLIEvent struct {
-	Role      string          `json:"role"`
-	Type      string          `json:"type"`
-	Version   string          `json:"version"`
-	Content   json.RawMessage `json:"content"`
-	SessionID string          `json:"session_id"`
-	Error     json.RawMessage `json:"error"`
+	Role       string          `json:"role"`
+	Type       string          `json:"type"`
+	Version    string          `json:"version"`
+	Command    string          `json:"command"`
+	Content    json.RawMessage `json:"content"`
+	SessionID  string          `json:"session_id"`
+	Error      json.RawMessage `json:"error"`
+	ToolCallID string          `json:"tool_call_id"`
+	ToolCalls  json.RawMessage `json:"tool_calls"`
 }
 
+const (
+	kimiCLISubtypeUnmatchedTool    = "kimi_cli_unmatched_tool_id"
+	kimiCLISubtypeDuplicateTool    = "kimi_cli_duplicate_tool_id"
+	kimiCLISubtypeMissingFinal     = "kimi_cli_missing_final"
+	kimiCLISubtypeAfterHint        = "kimi_cli_semantic_after_hint"
+	kimiCLISubtypeInvalidPostamble = "kimi_cli_invalid_completion_postamble"
+	kimiCLISubtypeProcessExit      = "kimi_cli_process_exit"
+	kimiCLISubtypeProcessSignal    = "kimi_cli_process_signal"
+	kimiCLISubtypeProcessTimeout   = "kimi_cli_process_timeout"
+	kimiCLISubtypeProcessFailure   = "kimi_cli_process_failure"
+)
+
 func kimiCLIContentText(raw json.RawMessage) string {
-	if len(raw) == 0 {
-		return ""
+	text, _, _, _ := kimiCLIDecodeContent(raw)
+	return text
+}
+
+func kimiCLIDecodeContent(raw json.RawMessage) (text string, structured bool, toolIDs []string, ok bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return "", false, nil, true
 	}
-	var text string
-	if json.Unmarshal(raw, &text) == nil {
-		return text
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return s, false, nil, true
+	}
+	if raw[0] == '{' {
+		var obj map[string]json.RawMessage
+		if json.Unmarshal(raw, &obj) != nil {
+			return "", false, nil, false
+		}
+		var buf bytes.Buffer
+		if json.Compact(&buf, raw) == nil {
+			return buf.String(), true, nil, true
+		}
+		return string(raw), true, nil, true
+	}
+	if raw[0] != '[' {
+		return "", false, nil, false
 	}
 	var blocks []struct {
-		Text string `json:"text"`
+		Type       string `json:"type"`
+		Text       string `json:"text"`
+		ID         string `json:"id"`
+		ToolCallID string `json:"tool_call_id"`
 	}
-	if json.Unmarshal(raw, &blocks) == nil {
-		var texts []string
-		for _, block := range blocks {
-			if block.Text != "" {
-				texts = append(texts, block.Text)
-			}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return "", false, nil, false
+	}
+	var texts []string
+	for _, block := range blocks {
+		if block.Text != "" {
+			texts = append(texts, block.Text)
 		}
-		return strings.Join(texts, "\n")
+		typ := strings.ToLower(strings.TrimSpace(block.Type))
+		if typ == "text" || typ == "thinking" || typ == "" {
+			continue
+		}
+		if typ != "tool_use" && typ != "tool_call" {
+			return "", false, nil, false
+		}
+		id := strings.TrimSpace(block.ID)
+		if id == "" {
+			id = strings.TrimSpace(block.ToolCallID)
+		}
+		if id == "" {
+			return "", false, nil, false
+		}
+		toolIDs = append(toolIDs, id)
 	}
-	return ""
+	return strings.Join(texts, "\n"), false, toolIDs, true
+}
+
+func kimiCLIToolCallIDs(raw json.RawMessage) ([]string, bool) {
+	raw = bytes.TrimSpace(raw)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil, true
+	}
+	var calls []struct {
+		ID string `json:"id"`
+	}
+	if json.Unmarshal(raw, &calls) != nil {
+		return nil, false
+	}
+	ids := make([]string, 0, len(calls))
+	for _, call := range calls {
+		id := strings.TrimSpace(call.ID)
+		if id == "" {
+			return nil, false
+		}
+		ids = append(ids, id)
+	}
+	return ids, true
+}
+
+func kimiCLINoteSubtype(res *claudeResult, subtype string) {
+	if res.Subtype == "" {
+		res.Subtype = subtype
+	}
+}
+
+func kimiCLIResumeHintValid(ev kimiCLIEvent, content string, structured bool) bool {
+	return ev.Role == "meta" && ev.Type == "session.resume_hint" &&
+		strings.TrimSpace(ev.SessionID) != "" && strings.TrimSpace(ev.Command) != "" &&
+		strings.TrimSpace(content) != "" && !structured
+}
+
+// Kimi 0.41's legacy agent-core stream closes an ordinary print with one
+// session.resume_hint containing the resumable identity. Older observed
+// streams did not have that postamble, so their compatibility path remains
+// deliberately narrow instead of treating every assistant message as EOT.
+func kimiCLICompletionContract(version, engine string) (requiresHint, known bool) {
+	switch version {
+	case "0.35.0", "0.36.1", "0.37.2":
+		return false, engine == kimiEngineLegacy
+	case "0.41", "0.41.0":
+		return true, engine == kimiEngineLegacy
+	default:
+		return false, false
+	}
 }
 
 func parseKimiCLIJSONL(raw string) *claudeResult {
+	return parseKimiCLIJSONLForEngine(raw, kimiEngineLegacy)
+}
+
+func parseKimiCLIJSONLForEngine(raw, engine string) *claudeResult {
 	res := &claudeResult{Type: "result", ObservationComplete: true}
-	var texts []string
+	called := map[string]int{}
+	resolved := map[string]int{}
+	openTools := 0
+	sawTool := false
+	sawHint := false
+	hintCount := 0
+	validHintCount := 0
+	version := ""
+	versionCount := 0
+	finalAfterTools := false
+	finalOutput := ""
+	finalMessage := false
+	lastAssistant := ""
 	s := bufio.NewScanner(strings.NewReader(raw))
 	s.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for s.Scan() {
+		line := strings.TrimSpace(s.Text())
+		if line == "" {
+			continue
+		}
 		var ev kimiCLIEvent
-		if json.Unmarshal([]byte(strings.TrimSpace(s.Text())), &ev) != nil {
+		if json.Unmarshal([]byte(line), &ev) != nil {
 			res.ObservationComplete = false
 			continue
 		}
 		if ev.SessionID != "" {
 			res.SessionID = ev.SessionID
 		}
-		text := kimiCLIContentText(ev.Content)
+		text, structured, contentToolIDs, contentOK := kimiCLIDecodeContent(ev.Content)
+		if !contentOK {
+			res.ObservationComplete = false
+		}
 		role := strings.ToLower(strings.TrimSpace(ev.Role))
 		typ := strings.ToLower(strings.TrimSpace(ev.Type))
+		output := strings.TrimSpace(text)
+		if output == "" && structured {
+			output = text
+		}
+		if sawHint {
+			res.ObservationComplete = false
+			kimiCLINoteSubtype(res, kimiCLISubtypeAfterHint)
+		}
 		if role == "assistant" {
+			if typ != "" && typ != "assistant" {
+				res.ObservationComplete = false
+			}
 			// Any assistant event proves model work even when its content is reasoning/tool metadata
 			// that this compatibility parser cannot render as text.
 			res.SemanticEvents++
 			res.ModelEvents++
 			res.NumTurns++
-			if text != "" {
-				texts = append(texts, text)
-				res.TerminalEvents++
+			if sawHint {
+				res.ObservationComplete = false
+				kimiCLINoteSubtype(res, kimiCLISubtypeAfterHint)
+			}
+			callIDs, idsOK := kimiCLIToolCallIDs(ev.ToolCalls)
+			if !idsOK {
+				res.ObservationComplete = false
+			}
+			callIDs = append(callIDs, contentToolIDs...)
+			if output != "" {
+				lastAssistant = output
+			}
+			// A typed empty text message is still a final message; reasoning-only or
+			// missing content is not. The version-specific postamble is checked below.
+			if openTools == 0 && len(callIDs) == 0 && (output != "" || grokBuildJSONType(ev.Content) == "string") {
+				finalOutput, finalMessage, finalAfterTools = output, true, true
+			}
+			for _, id := range callIDs {
+				res.ToolEvents++
+				if called[id] > 0 {
+					res.ObservationComplete = false
+					kimiCLINoteSubtype(res, kimiCLISubtypeDuplicateTool)
+				}
+				called[id]++
+				if resolved[id] == 0 {
+					openTools++
+				}
+				finalAfterTools = false
 			}
 		}
-		if strings.Contains(role, "tool") || strings.Contains(typ, "tool") {
+		if role != "assistant" && (role == "tool" || typ == "tool_result") {
 			res.ToolEvents++
+			sawTool = true
+			finalAfterTools = false
+			if sawHint {
+				res.ObservationComplete = false
+				kimiCLINoteSubtype(res, kimiCLISubtypeAfterHint)
+			}
+			id := strings.TrimSpace(ev.ToolCallID)
+			if id == "" {
+				res.ObservationComplete = false
+				kimiCLINoteSubtype(res, kimiCLISubtypeUnmatchedTool)
+			} else if called[id] == 0 {
+				res.ObservationComplete = false
+				kimiCLINoteSubtype(res, kimiCLISubtypeUnmatchedTool)
+			} else if resolved[id] > 0 {
+				res.ObservationComplete = false
+				kimiCLINoteSubtype(res, kimiCLISubtypeDuplicateTool)
+			} else {
+				resolved[id]++
+				if openTools > 0 {
+					openTools--
+				}
+			}
 		}
 		if strings.Contains(role, "model") || strings.Contains(typ, "model.") {
 			res.ModelEvents++
 		}
 		if typ == "error" || role == "error" {
 			res.IsError = true
-			if text != "" {
-				res.Result = text
+			if output != "" {
+				res.Result = output
 			} else if len(ev.Error) > 0 {
 				res.Result = string(ev.Error)
 			}
 		}
 		presemanticMeta := role == "meta" && (typ == "system.version" || typ == "system.init" || typ == "session.init" || typ == "session.resume_hint" || typ == "start")
+		if role == "meta" && typ == "system.version" {
+			if res.SemanticEvents > 0 || res.ToolEvents > 0 || sawHint {
+				res.ObservationComplete = false
+			}
+			versionCount++
+			if strings.TrimSpace(ev.Version) == "" {
+				res.ObservationComplete = false
+			} else if version == "" {
+				version = strings.TrimSpace(ev.Version)
+			} else if version != strings.TrimSpace(ev.Version) {
+				res.ObservationComplete = false
+			}
+		}
+		if role == "meta" && typ == "session.resume_hint" {
+			hintCount++
+			if kimiCLIResumeHintValid(ev, output, structured) {
+				validHintCount++
+			}
+			sawHint = true
+		}
 		known := role == "assistant" || role == "tool" || role == "error" || presemanticMeta ||
-			role == "system" || role == "user" || typ == "error" || strings.HasPrefix(typ, "system.") ||
-			strings.Contains(typ, "tool")
+			role == "system" || role == "user" || typ == "error" || typ == "tool_result"
 		if !known {
 			res.ObservationComplete = false
 		}
@@ -267,16 +470,72 @@ func parseKimiCLIJSONL(raw string) *claudeResult {
 	if s.Err() != nil {
 		res.ObservationComplete = false
 	}
-	if len(texts) > 0 {
-		res.Result = strings.Join(texts, "\n")
+	// A completely observed typed error before model/tool work preserves the existing
+	// quota policy. It is a failed invocation, never native successful completion.
+	if res.IsError && res.ObservationComplete && res.SemanticEvents == 0 && res.ModelEvents == 0 && res.ToolEvents == 0 {
+		res.Subtype = "kimi_cli_error"
+		return res
+	}
+	if openTools > 0 {
+		res.ObservationComplete = false
+		kimiCLINoteSubtype(res, kimiCLISubtypeUnmatchedTool)
+	}
+	if versionCount != 1 {
+		res.ObservationComplete = false
+		kimiCLINoteSubtype(res, kimiCLISubtypeInvalidPostamble)
+	}
+	if _, known := kimiCLICompletionContract(version, engine); known {
+		res.NativeVersion = version
+	} else {
+		res.NativeVersion = "unsupported"
+	}
+	if requiresHint, known := kimiCLICompletionContract(version, engine); !known {
+		res.ObservationComplete = false
+		kimiCLINoteSubtype(res, kimiCLISubtypeInvalidPostamble)
+	} else if requiresHint && (hintCount != 1 || validHintCount != 1) {
+		res.ObservationComplete = false
+		kimiCLINoteSubtype(res, kimiCLISubtypeInvalidPostamble)
+	}
+	if !res.IsError && finalMessage && openTools == 0 && (!sawTool || finalAfterTools) && res.ObservationComplete {
+		res.TerminalEvents = 1
+		res.FinalReason = "final_assistant_eof"
+		if version == "0.41" || version == "0.41.0" {
+			res.FinalReason = "session.resume_hint"
+		}
+		res.Result = finalOutput
+		return res
+	}
+	if res.Result == "" && lastAssistant != "" {
+		res.Result = lastAssistant
+	} else if res.Result == "" && finalOutput != "" {
+		res.Result = finalOutput
+	}
+	if !res.IsError && res.TerminalEvents == 0 && (sawTool || openTools > 0) && res.Subtype == "" {
+		kimiCLINoteSubtype(res, kimiCLISubtypeMissingFinal)
 	}
 	return res
 }
 
-// kimiCLI0361VersionOnly reports the narrow cold-start signature observed after upgrading the
-// standalone CLI to 0.36.1 before its native search worker cache had been materialized. The process
-// exits non-zero after system.version and before any assistant, tool, error, or resumable session
-// event. No other output shape is safe to replay automatically.
+func kimiCLIProcessFailureSubtype(runErr error) string {
+	if runErr == nil {
+		return ""
+	}
+	if errors.Is(runErr, context.DeadlineExceeded) || strings.Contains(strings.ToLower(runErr.Error()), "步骤超时") {
+		return kimiCLISubtypeProcessTimeout
+	}
+	var exitErr *exec.ExitError
+	if errors.As(runErr, &exitErr) {
+		if exitErr.ExitCode() < 0 {
+			return kimiCLISubtypeProcessSignal
+		}
+		return kimiCLISubtypeProcessExit
+	}
+	return kimiCLISubtypeProcessFailure
+}
+
+// kimiCLI0361VersionOnly reports the narrow 0.36.1 metadata-only exit: non-zero after
+// system.version and before any assistant, tool, error, or resumable session event. A started
+// child with this shape stays fail-closed; it must not restart transport or switch writers.
 func kimiCLI0361VersionOnly(raw string) bool {
 	sawVersion := false
 	s := bufio.NewScanner(strings.NewReader(raw))
@@ -541,42 +800,23 @@ func invokeKimiCLI(ctx context.Context, root string, cfg *Config, t *Task, promp
 		t.LastRouteAttempt.RequestedEngine = requestedEngine
 		t.LastRouteAttempt.ActualEngine = actualEngine
 	}
-	runOnce := func() (string, string, error) {
-		cmd := exec.CommandContext(runCtx, cfg.KimiCLIBin, args...)
-		setupProcGroup(cmd)
-		cmd.Dir = t.Dir
-		cmd.Env = cmdEnv
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout, cmd.Stderr = &stdout, &stderr
-		err := runCmdRegisteredForTask(cmd, t.ID)
-		return stdout.String(), stderr.String(), err
-	}
-
-	stdout, stderr, runErr := runOnce()
+	cmd := exec.CommandContext(runCtx, cfg.KimiCLIBin, args...)
+	setupProcGroup(cmd)
+	cmd.Dir = t.Dir
+	cmd.Env = cmdEnv
+	var stdoutBuf, stderrBuf bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &stdoutBuf, &stderrBuf
+	runErr := runCmdRegisteredForTask(cmd, t.ID)
+	stdout, stderr := stdoutBuf.String(), stderrBuf.String()
 	combined := stdout + "\n" + stderr
-	// Kimi Code 0.36.1 can exit once during first-use native worker materialization after emitting
-	// only system.version. With no stderr, semantic event, session, or resumed context there is no
-	// model/tool work to duplicate, so restart this transport exactly once inside the same Cardex
-	// attempt. Any other shape keeps the original fail-closed behavior.
-	if runErr != nil && runCtx.Err() == nil && t.SessionID == "" && strings.TrimSpace(stderr) == "" &&
-		!policyFallbackCandidate(cfg, t, kimiCLIRunnerName) &&
-		kimiCLI0361VersionOnly(stdout) {
-		retryStdout, retryStderr, retryErr := runOnce()
-		combined += "\n--- KIMI 0.36.1 COLD-START TRANSPORT RETRY ---\n" + retryStdout + "\n" + retryStderr
-		stdout += "\n" + retryStdout
-		stderr += "\n" + retryStderr
-		runErr = retryErr
-	}
 	if runCtx.Err() == context.DeadlineExceeded {
 		runErr = fmt.Errorf("步骤超时（%d 分钟）", cfg.StepTimeoutMin)
 	}
-	res := parseKimiCLIJSONL(providerJSONObservation(kimiCLIRunnerName, stdout, stderr))
+	res := parseKimiCLIJSONLForEngine(providerJSONObservation(kimiCLIRunnerName, stdout, stderr), actualEngine)
 	preserveKimiCLIProcessError(res, stderr, runErr)
 	if res.IsError && runErr == nil {
 		runErr = fmt.Errorf("Kimi CLI 返回错误: %s", summarizeResult(res.Result))
 	}
-	if strings.TrimSpace(res.Result) == "" && runErr == nil {
-		runErr = fmt.Errorf("Kimi CLI 未返回最终文本")
-	}
+
 	return res, combined, runErr
 }

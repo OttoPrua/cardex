@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -40,6 +41,8 @@ type claudeResult struct {
 	ToolEvents                   int    `json:"-"`
 	ObservationComplete          bool   `json:"-"`
 	TerminalEvents               int    `json:"-"`
+	FinalReason                  string `json:"-"`
+	NativeVersion                string `json:"-"`
 	ProcessStderrBytes           int    `json:"-"`
 	ProcessStderrSHA256          string `json:"-"`
 	ProcessStderrLineCountBucket int    `json:"-"`
@@ -1150,7 +1153,36 @@ func recordRouteAttemptObservation(t *Task, res *claudeResult) {
 	}
 	r.ModelEvents = res.ModelEvents
 	r.ToolEvents = res.ToolEvents
+	r.TerminalCount = res.TerminalEvents
+	r.FinalReason = res.FinalReason
+	r.NativeVersion = res.NativeVersion
 	r.GrokDiagnostics = res.GrokDiagnostics
+}
+
+// Native execution facts are independent of business text and required review artifacts.
+func runnerNativeTerminalValid(via string, res *claudeResult, runErr error) bool {
+	if res == nil || runErr != nil || res.IsError || !res.ObservationComplete || res.TerminalEvents != 1 {
+		return false
+	}
+	switch {
+	case grokBuildVia(via), kimiCLIVia(via):
+		return true
+	case via == "opencode":
+		return res.FinalReason == "stop"
+	default:
+		return false
+	}
+}
+
+func holdNativeExecution(root string, t *Task, via, kind, class string) error {
+	if t.LastRouteAttempt != nil {
+		t.LastRouteAttempt.FailureKind, t.LastRouteAttempt.FailureClass = kind, class
+	}
+	t.Status = statusHeld
+	t.LastError = "native execution held: " + kind
+	t.touch()
+	return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:native-terminal", statusHeld, t.Step,
+		withCostTelemetry(withRouteAttempt(map[string]any{"reason": "runner_native_execution_held", "runner": via}, t), t)))
 }
 
 // grokBuildZeroEventProcessFailure returns the closed, value-free process class only
@@ -1188,6 +1220,9 @@ func withRouteAttempt(detail map[string]any, t *Task) map[string]any {
 	if t == nil || t.LastRouteAttempt == nil {
 		return detail
 	}
+	if t.ReviewOutput != nil {
+		detail["review_output"] = t.ReviewOutput
+	}
 	r := t.LastRouteAttempt
 	detail["requested_provider"] = r.RequestedProvider
 	detail["requested_runner"] = r.RequestedRunner
@@ -1217,6 +1252,13 @@ func withRouteAttempt(detail map[string]any, t *Task) map[string]any {
 		detail["semantic_events"] = r.SemanticEvents
 		detail["model_events"] = r.ModelEvents
 		detail["tool_events"] = r.ToolEvents
+		detail["terminal_count"] = r.TerminalCount
+		if r.FinalReason != "" {
+			detail["final_reason"] = r.FinalReason
+		}
+		if r.NativeVersion != "" {
+			detail["native_version"] = r.NativeVersion
+		}
 	}
 	if r.WorkspaceBefore != "" {
 		detail["workspace_fingerprint_before"] = r.WorkspaceBefore
@@ -1620,6 +1662,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				fallbackBefore, fallbackBeforeErr = capturePolicyWorkspaceFingerprint(t.Dir)
 			}
 		}
+		t.ReviewOutput = nil // No previous attempt output may be adopted by this invocation.
 		invoke := func() error {
 			if preexistingPolicyResidue {
 				res = &claudeResult{Type: "result", IsError: true, Subtype: "policy_process_residue",
@@ -1802,6 +1845,29 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		}
 		recordRouteAttemptObservation(t, res)
 
+		if (useGrokBuild || useKimiCLI || useOpenCode) && runErr != nil && runnerNativeTerminalValid(via, res, nil) {
+			kind := "process_failure_after_native_terminal"
+			if useKimiCLI {
+				kind = kimiCLIProcessFailureSubtype(runErr)
+			}
+			if useOpenCode {
+				kind = openCodeProcessFailureSubtype(runErr)
+			}
+			return holdNativeExecution(root, t, via, kind, "process_failure")
+		}
+		if (useKimiCLI || useOpenCode) && !runnerNativeTerminalValid(via, res, nil) {
+			// Only an explicit, completely observed presemantic provider error remains eligible
+			// for the existing quota/error policy. Missing completion never authorizes another run.
+			if res == nil || !res.IsError || !res.ObservationComplete || res.SemanticEvents != 0 || res.ModelEvents != 0 || res.ToolEvents != 0 ||
+				(useKimiCLI && res.Subtype != "kimi_cli_error") || (useOpenCode && res.Subtype != openCodeSubtypeError) {
+				kind := "invalid_terminal_result"
+				if res != nil && res.Subtype != "" {
+					kind = res.Subtype
+				}
+				return holdNativeExecution(root, t, via, kind, "unknown_outcome")
+			}
+		}
+
 		// A non-zero Grok process exit with a complete zero-event observation has a closed,
 		// redacted subtype. Persist that exact class before the fallback and generic retry
 		// machinery: fabricating a permission token makes the ledger lie, while allowing the
@@ -1838,6 +1904,10 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 				return finishIfStopped(persistTaskEvent(root, t, evHeld, "runner:classifier", statusHeld, t.Step,
 					withCostTelemetry(withRouteAttempt(detail, t), t)))
 			}
+		}
+
+		if useGrokBuild && res != nil && res.Subtype == "grok_build_stream_incomplete" && res.SemanticEvents == 0 && res.ModelEvents == 0 && res.ToolEvents == 0 {
+			return holdNativeExecution(root, t, via, "stream_incomplete", "unknown_outcome")
 		}
 
 		// Grok stream_incomplete / invalid_terminal_result with semantic/model/tool activity (or an
@@ -2429,7 +2499,13 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			if s := summarizeResult(res.Result); s != "" {
 				t.LastSummary = s
 			}
-			logBlock(lg, "RESULT", res.Result)
+			if t.Type == typeReview {
+				if err := writeReviewOutput(lg, t, res.Result); err != nil {
+					return holdNativeExecution(root, t, via, "review_output_unreadable", "delivery_failure")
+				}
+			} else {
+				logBlock(lg, "RESULT", res.Result)
+			}
 		} else {
 			logBlock(lg, "RESULT", "[交叉A结论已隔离——不落可达日志,避免引擎乙从盘上读到甲;完整结论见隔离侧车与链汇总 C 卡]")
 		}
@@ -2472,7 +2548,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 					t.Status = statusHeld
 					t.LastError = "required Owner review gate queued: " + plannedReviewStage
 					t.touch()
-					if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withGrokBuildDiagnostics(map[string]any{
+					if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withRouteAttempt(map[string]any{
 						"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
 					}, t)); err != nil {
 						return finishIfStopped(err)
@@ -2507,13 +2583,13 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 			}
 			t.touch()
 			// 最后一步的 step_ok 事件先记(与中间步一致语义),再据终局标 done 或交叉契约违规的 failed。
-			if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withGrokBuildDiagnostics(map[string]any{
+			if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withRouteAttempt(map[string]any{
 				"turns": res.NumTurns, "cost_usd": res.TotalCostUSD, "final_step": true,
 			}, t)); err != nil {
 				return finishIfStopped(err)
 			}
 			if t.Status == statusDone {
-				if err := persistTaskEvent(root, t, evDone, "runner", statusDone, t.Step, withCostTelemetry(nil, t)); err != nil {
+				if err := persistTaskEvent(root, t, evDone, "runner", statusDone, t.Step, withCostTelemetry(withRouteAttempt(nil, t), t)); err != nil {
 					return finishIfStopped(err)
 				}
 				// 复盘计数器：只数真 done。上面交叉 C 契约违规改判 failed 的分支不该计入
@@ -2548,7 +2624,7 @@ func runTaskVia(ctx context.Context, root string, cfg *Config, t *Task, via stri
 		}
 		t.touch()
 		// 中间步成功事件:每推进一步一条,是"步数一致"验收的锚点(枚举遗漏就红)。
-		if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withGrokBuildDiagnostics(map[string]any{
+		if err := persistTaskEvent(root, t, evStepOK, "runner", statusRunning, t.Step, withRouteAttempt(map[string]any{
 			"turns": res.NumTurns, "cost_usd": res.TotalCostUSD,
 		}, t)); err != nil {
 			return finishIfStopped(err)
@@ -3573,17 +3649,21 @@ type reviewVerdict struct {
 	Summary string   `json:"summary"`
 }
 
-// parseReviewVerdict 从审核输出提取 verdict json。围栏块从后往前找（模板要求结论放最后），
-// 兜底走未围栏平衡扫描（对 "verdict" 关键字回溯 '{' 试解）。解析不出返回 nil（旧格式兼容：不闭环只记日志）。
+// parseReviewVerdict reads only the final fenced conclusion required by the
+// review template. A malformed or unknown last conclusion never falls back to
+// an earlier pass. Legacy unfenced output uses only its last verdict object.
 func parseReviewVerdict(result string) *reviewVerdict {
-	try := func(raw string) *reviewVerdict {
-		raw = strings.TrimSpace(raw)
-		if raw == "" || !strings.HasPrefix(raw, "{") {
+	decode := func(raw string, strict bool) *reviewVerdict {
+		var v reviewVerdict
+		dec := json.NewDecoder(strings.NewReader(strings.TrimSpace(raw)))
+		if err := dec.Decode(&v); err != nil {
 			return nil
 		}
-		var v reviewVerdict
-		if err := json.Unmarshal([]byte(raw), &v); err != nil {
-			return nil
+		if strict {
+			var extra any
+			if err := dec.Decode(&extra); err != io.EOF {
+				return nil
+			}
 		}
 		switch v.Verdict {
 		case "pass", "concerns", "block":
@@ -3591,36 +3671,26 @@ func parseReviewVerdict(result string) *reviewVerdict {
 		}
 		return nil
 	}
-	ms := anyFencedRe.FindAllStringSubmatch(result, -1)
-	for i := len(ms) - 1; i >= 0; i-- {
-		if v := try(ms[i][1]); v != nil {
-			return v
+	ms := anyFencedRe.FindAllStringSubmatchIndex(result, -1)
+	if len(ms) > 0 {
+		last := ms[len(ms)-1]
+		if strings.TrimSpace(result[last[1]:]) != "" {
+			return nil
 		}
+		return decode(result[last[2]:last[3]], true)
 	}
-	for off := 0; ; {
-		k := strings.Index(result[off:], `"verdict"`)
-		if k < 0 {
-			break
-		}
-		pos := off + k
-		brace := pos
-		for attempt := 0; attempt < 32; attempt++ {
-			brace = strings.LastIndex(result[:brace], "{")
-			if brace < 0 {
-				break
-			}
-			var v reviewVerdict
-			dec := json.NewDecoder(strings.NewReader(result[brace:]))
-			if err := dec.Decode(&v); err == nil {
-				switch v.Verdict {
-				case "pass", "concerns", "block":
-					return &v
-				}
-			}
-		}
-		off = pos + len(`"verdict"`)
+	if strings.Contains(result, "```") {
+		return nil // An unfinished fence is not a legacy unfenced conclusion.
 	}
-	return nil
+	pos := strings.LastIndex(result, `"verdict"`)
+	if pos < 0 {
+		return nil
+	}
+	brace := strings.LastIndex(result[:pos], "{")
+	if brace < 0 {
+		return nil
+	}
+	return decode(result[brace:], false)
 }
 
 var fixTitleRe = regexp.MustCompile(`^修复R\d+: `)

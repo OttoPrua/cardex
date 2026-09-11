@@ -421,7 +421,7 @@ func grok105AssertNoOpaqueExposure(t *testing.T, res *claudeResult, values ...st
 	}
 }
 
-func TestGrokBuild105AdditiveEndMetadataIsAcceptedWithoutRetention(t *testing.T) {
+func TestGrokBuild105AdditiveEndMetadataIsHeldWithoutRetention(t *testing.T) {
 	rawPrefix := `{"type":"text","data":"PUBLIC_OK"}` + "\n" + grok105PublicUsage + "\n"
 	for _, tc := range []struct {
 		name string
@@ -432,13 +432,9 @@ func TestGrokBuild105AdditiveEndMetadataIsAcceptedWithoutRetention(t *testing.T)
 		{"legacy end", grokLegacyCleanEnd},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			want := parseGrokBuildJSONL(rawPrefix + tc.base)
 			got := parseGrokBuildJSONL(rawPrefix + grok105EndWithAdditiveMetadata(tc.base))
-			if got == nil || got.IsError || !got.ObservationComplete || got.TerminalEvents != 1 {
-				t.Fatalf("additive top-level end metadata must parse: %+v", got)
-			}
-			if !reflect.DeepEqual(got, want) {
-				t.Fatalf("additive end metadata must not be retained or alter parser/accounting output: got=%+v want=%+v", got, want)
+			if got == nil || !got.IsError || got.ObservationComplete {
+				t.Fatalf("unproven additive end metadata must hold: %+v", got)
 			}
 			grok105AssertNoOpaqueExposure(t, got,
 				grokOpaqueEndEventID, grokOpaqueEndTraceID, grokOpaqueEndChannel,
@@ -488,16 +484,9 @@ func TestGrokBuild105UsageAndMetadataTailsAfterEndAreAcceptedWithoutRetention(t 
 	})
 
 	t.Run("additive end plus usage and metadata tails", func(t *testing.T) {
-		want := parseGrokBuildJSONL(publicPrefix + grok105PublicEndWithTicks)
 		got := parseGrokBuildJSONL(publicPrefix + grok105EndWithAdditiveMetadata(grok105PublicEndWithTicks) + "\n" + grok105PublicUsage + "\n" + grok105ClosedMetadata)
-		if got == nil || got.IsError || !got.ObservationComplete || got.TerminalEvents != 1 {
-			t.Fatalf("additive end plus closed post-end tails must parse: %+v", got)
-		}
-		if got.TotalCostUSD != 0 {
-			t.Fatalf("total_cost_usd_ticks must not contribute to TotalCostUSD: %+v", got)
-		}
-		if !reflect.DeepEqual(got, want) {
-			t.Fatalf("additive end plus tails must not retain metadata or alter accounting: got=%+v want=%+v", got, want)
+		if got == nil || !got.IsError || got.ObservationComplete {
+			t.Fatalf("known metadata tails cannot repair unproven end extensions: %+v", got)
 		}
 		grok105AssertNoOpaqueExposure(t, got,
 			grokOpaqueEndEventID, grokOpaqueEndTraceID, grokOpaqueEndChannel,

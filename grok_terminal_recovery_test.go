@@ -388,7 +388,7 @@ func TestRunTaskGrokUnknownOutcomeHoldsDespiteCompetingDiagnostics(t *testing.T)
 	}
 }
 
-func TestRunTaskGrokCompleteMetadataOnlyMissingEndRemainsFallbackEligible(t *testing.T) {
+func TestRunTaskGrokCompleteMetadataOnlyMissingEndDoesNotAuthorizeFallback(t *testing.T) {
 	root := testRoot(t)
 	bin, productCalls := fakeGrokBuildCounted(t, `{"type":"system.version","version":"1.0.5"}`, "", 1)
 	cfg := policyTestConfig()
@@ -405,42 +405,12 @@ func TestRunTaskGrokCompleteMetadataOnlyMissingEndRemainsFallbackEligible(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	// opus_backend_high_risk has a single primary Grok leg: proved 0/0/0 incomplete remains
-	// fallback-eligible, then the existing no-next-leg hold fires. That must not be rewritten
-	// as unknown_outcome.
-	if got.Status != statusHeld || got.PreferRunner != grokBuildRunnerName || got.OwnerRouteLeg != 1 {
-		t.Fatalf("proved complete 0/0/0 metadata-only missing end must remain on existing bounded path: %+v", got)
-	}
-	if got.FallbackReason != string(fallbackStreamIncomplete) {
-		t.Fatalf("existing bounded path should retain stream_incomplete fallback reason: %+v", got)
-	}
-	if got.LastRouteAttempt == nil || got.LastRouteAttempt.FailureClass == "unknown_outcome" ||
-		got.LastRouteAttempt.FailureKind != string(fallbackStreamIncomplete) {
-		t.Fatalf("must not classify proved metadata-only incomplete as unknown_outcome: %+v", got.LastRouteAttempt)
+	assertNativeHeldWithoutReplay(t, root, got)
+	if got.LastRouteAttempt == nil || got.LastRouteAttempt.FailureClass != "unknown_outcome" || got.LastRouteAttempt.FailureKind != "stream_incomplete" || got.FallbackReason != "" {
+		t.Fatalf("missing end cannot authorize a bounded fallback: %+v", got)
 	}
 	if n := countProductCalls(t, productCalls); n != 1 {
-		t.Fatalf("expected one Grok product invocation before existing bounded handling, got %d", n)
-	}
-	events, _, err := loadTaskEvents(root, task.ID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	sawExisting := false
-	for _, ev := range events {
-		if ev.Type == evHeld && ev.Actor == "runner:grok-build" &&
-			ev.Detail["reason"] == "grok_terminal_unknown_outcome_held" {
-			t.Fatalf("proved metadata-only incomplete must not take the unknown-outcome hold: %+v", ev)
-		}
-		if ev.Type == evHeld && ev.Actor == "runner:policy-fallback" &&
-			ev.Detail["reason"] == "no_resolver_proven_next_leg" {
-			sawExisting = true
-		}
-		if ev.Type == evRetry {
-			sawExisting = true
-		}
-	}
-	if !sawExisting {
-		t.Fatalf("expected existing bounded fallback/no-next-leg handling, got %v", eventTypes(events))
+		t.Fatalf("product calls=%d", n)
 	}
 }
 
@@ -1425,7 +1395,7 @@ func TestRunTaskGrokScannerOverflowRemainsFailClosed(t *testing.T) {
 }
 
 func TestCardexReleaseIdentity(t *testing.T) {
-	if version != "0.10.15" {
-		t.Fatalf("release identity %q want 0.10.15", version)
+	if version != "0.10.16" {
+		t.Fatalf("release identity %q want 0.10.16", version)
 	}
 }

@@ -364,6 +364,7 @@ func admitWorkflowReviewer(root string, cfg *Config, wf *WorkflowRecord) (*Task,
 	t.Project = wf.ModuleID
 	t.WorkflowID = wf.ID
 	t.ReviewOf = writer.ID
+	t.ReviewCandidate = &WorkflowCandidate{Commit: wf.Candidate.Commit, Tree: wf.Candidate.Tree}
 	t.FixRound = writer.FixRound
 	t.MaxFixRounds = wf.MaxRounds
 	// A reviewer that inherits the writer's session is not independent, and a
@@ -413,12 +414,12 @@ func ingestWorkflowReview(root string, cfg *Config, wf *WorkflowRecord) error {
 		snap.P1 = append([]string(nil), v.P1...)
 		snap.P2 = append([]string(nil), v.P2...)
 	}
-	if wf.Candidate != nil {
-		snap.CandidateCommit, snap.CandidateTree = wf.Candidate.Commit, wf.Candidate.Tree
+	if review.ReviewOutput != nil {
+		snap.CandidateCommit, snap.CandidateTree = review.ReviewOutput.CandidateCommit, review.ReviewOutput.CandidateTree
 	}
 	if snap.HoldReason == "" {
 		switch {
-		case wf.Candidate == nil || (wf.Candidate.Commit == "" && wf.Candidate.Tree == ""):
+		case wf.Candidate == nil || !candidateIdentitiesMatch(&IntegrationGate{CandidateCommit: wf.Candidate.Commit, CandidateTree: wf.Candidate.Tree}, snap, wf.Candidate):
 			snap.HoldReason = holdReasonCandidateMismatch
 		default:
 			var writer *Task

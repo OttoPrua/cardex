@@ -1,6 +1,9 @@
 package main
 
 import (
+	"crypto/sha256"
+	"fmt"
+	"io"
 	"os"
 	"strings"
 )
@@ -46,14 +49,83 @@ func reviewHoldReason(v *reviewVerdict, raw string) string {
 	}
 }
 
-// loadTaskResultForGate reads the review transcript from disk rather than
-// trusting a cached summary, so replay always re-derives the verdict.
+// reviewOutput binds the existing RESULT log bytes to their actual producer. It is
+// not a new file contract for ordinary tasks or a cached verdict.
+type reviewOutput struct {
+	TaskID          string `json:"task_id"`
+	AttemptID       string `json:"attempt_id"`
+	ControlEpoch    int64  `json:"control_epoch"`
+	Step            int    `json:"step"`
+	Offset          int64  `json:"offset"`
+	Bytes           int64  `json:"bytes"`
+	SHA256          string `json:"sha256"`
+	CandidateCommit string `json:"candidate_commit,omitempty"`
+	CandidateTree   string `json:"candidate_tree,omitempty"`
+}
+
+func writeReviewOutput(f *os.File, t *Task, result string) error {
+	t.ReviewOutput = nil
+	if t.ActiveAttemptID == "" {
+		return fmt.Errorf("review output has no producer attempt")
+	}
+	if _, err := fmt.Fprint(f, "--- RESULT ---\n"); err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	body := strings.TrimSpace(result)
+	if _, err := io.WriteString(f, body+"\n"); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	r := &reviewOutput{TaskID: t.ID, AttemptID: t.ActiveAttemptID, ControlEpoch: t.ControlEpoch,
+		Step: t.Step, Offset: info.Size(), Bytes: int64(len(body)), SHA256: fmt.Sprintf("%x", sha256.Sum256([]byte(body)))}
+	if t.ReviewCandidate != nil {
+		r.CandidateCommit, r.CandidateTree = t.ReviewCandidate.Commit, t.ReviewCandidate.Tree
+	}
+	t.ReviewOutput = r
+	return nil
+}
+
 func loadTaskResultForGate(root string, t *Task) string {
-	if t == nil {
+	if t == nil || t.Type != typeReview || t.Status != statusDone || t.ReviewOutput == nil {
 		return ""
 	}
-	data, err := os.ReadFile(taskLogPath(root, t.ID))
+	r := t.ReviewOutput
+	if r.TaskID != t.ID || r.AttemptID == "" || r.ControlEpoch != t.ControlEpoch || r.Step != t.Step || r.Bytes <= 0 || r.Offset < 0 {
+		return ""
+	}
+	// The terminal transition, not merely any old exited attempt, owns these bytes.
+	terminal, err := loadTransition(root, t.ID, t.LastCommittedTransitionID)
+	if err != nil || terminal == nil || terminal.State != transitionCommitted || terminal.Status != statusDone || terminal.AttemptID != r.AttemptID || terminal.ControlEpoch != t.ControlEpoch {
+		return ""
+	}
+	if t.ReviewCandidate != nil && (r.CandidateCommit != t.ReviewCandidate.Commit || r.CandidateTree != t.ReviewCandidate.Tree) {
+		return ""
+	}
+	attempt, err := loadAttempt(root, t.ID, r.AttemptID)
+	if err != nil || attempt == nil || attempt.State != attemptExited || attempt.ControlEpoch != t.ControlEpoch || attemptProducerAlive(attempt) {
+		return ""
+	}
+	f, info, err := openRegularFileNoBlock(taskLogPath(root, t.ID))
 	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	if r.Offset > info.Size() || r.Bytes > info.Size()-r.Offset {
+		return ""
+	}
+	// Stream the bounded range first: corrupted task metadata cannot force an unbounded allocation.
+	h := sha256.New()
+	if _, err := io.Copy(h, io.NewSectionReader(f, r.Offset, r.Bytes)); err != nil || fmt.Sprintf("%x", h.Sum(nil)) != r.SHA256 {
+		return ""
+	}
+	data, err := io.ReadAll(io.NewSectionReader(f, r.Offset, r.Bytes))
+	if err != nil || fmt.Sprintf("%x", sha256.Sum256(data)) != r.SHA256 {
 		return ""
 	}
 	return string(data)
@@ -139,7 +211,7 @@ func candidateIdentitiesMatch(gate *IntegrationGate, review *WorkflowReview, fro
 			return false
 		}
 	}
-	if review != nil && !agrees(review.CandidateCommit, review.CandidateTree) {
+	if review != nil && ((review.CandidateCommit == "" && review.CandidateTree == "") || !agrees(review.CandidateCommit, review.CandidateTree)) {
 		return false
 	}
 	return true
@@ -187,8 +259,8 @@ func evaluateIntegrationRelease(root string, cfg *Config, t *Task) IntegrationRe
 	snapshot := &WorkflowReview{
 		TaskID:          review.ID,
 		Verdict:         v.Verdict,
-		CandidateCommit: gate.CandidateCommit,
-		CandidateTree:   gate.CandidateTree,
+		CandidateCommit: review.ReviewOutput.CandidateCommit,
+		CandidateTree:   review.ReviewOutput.CandidateTree,
 	}
 	var frozen *WorkflowCandidate
 	if gate.WorkflowID != "" {
@@ -200,14 +272,6 @@ func evaluateIntegrationRelease(root string, cfg *Config, t *Task) IntegrationRe
 			return dec
 		}
 		frozen = wf.Candidate
-		if wf.Review != nil {
-			if wf.Review.CandidateCommit != "" {
-				snapshot.CandidateCommit = wf.Review.CandidateCommit
-			}
-			if wf.Review.CandidateTree != "" {
-				snapshot.CandidateTree = wf.Review.CandidateTree
-			}
-		}
 	}
 	if !candidateIdentitiesMatch(gate, snapshot, frozen) {
 		dec.HoldReason = holdReasonCandidateMismatch

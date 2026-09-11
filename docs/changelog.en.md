@@ -1,5 +1,12 @@
 # cardex changelog
 
+## 2026-09-11 · v0.10.16: native completion and review artifact acceptance
+
+- Grok supports closed plan events and the narrow synthetic `_meta: {synthetic: true}` compatibility shape. Unknown extensions, open tools, abnormal terminals and late semantic events remain held. Bounded diagnostics preserve controlled categories, counts and unknown process values.
+- Kimi reconciles tool calls and final messages under supported version contracts; the 0.41 legacy resume hint is not generalized to other versions or engines. OpenCode `tool-calls` closes an intermediate turn; final completion requires `stop`.
+- A normal native terminal remains observable when the process later fails. Missing or incomplete completion does not trigger retry or fallback. Ordinary tasks without an artifact contract gain no mandatory file or nonempty-text requirement.
+- Workflow reviews bind the current result's byte range and digest in the existing log to the closed producer attempt and frozen candidate. Integration re-reads those bytes rather than borrowing a verdict from the whole transcript. Only the final conclusion is eligible; an invalid last conclusion cannot fall back to an earlier pass. Missing, stale, mismatched or unreadable evidence holds release; legacy reviews without this binding are not retroactively accepted or automatically rerun.
+
 ## 2026-09-04 · v0.10.15: low-token manager Skill and recommended usage
 
 - Ships the portable `skills/perlica-low-token-manager/` attachment so long-lived project managers can restore from durable pointers, delegate bounded execution to Cardex/fresh workers, and wake only on material events.

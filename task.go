@@ -58,6 +58,9 @@ type RouteAttemptReadback struct {
 	SemanticEvents  int    `json:"semantic_events,omitempty"`
 	ModelEvents     int    `json:"model_events,omitempty"`
 	ToolEvents      int    `json:"tool_events,omitempty"`
+	TerminalCount   int    `json:"terminal_count,omitempty"`
+	FinalReason     string `json:"final_reason,omitempty"`
+	NativeVersion   string `json:"native_version,omitempty"`
 	ProcessResidue  bool   `json:"process_residue,omitempty"`
 	WorkspaceBefore string `json:"workspace_fingerprint_before,omitempty"`
 	WorkspaceAfter  string `json:"workspace_fingerprint_after,omitempty"`
@@ -322,6 +325,9 @@ type Task struct {
 	// machine-re-derived review verdict=pass with empty p0/p1 matches the frozen
 	// candidate and passes custody. Absent gates leave a card's behavior unchanged.
 	IntegrationGate *IntegrationGate `json:"integration_gate,omitempty"`
+	// Only review consumers require these. Other tasks have no artifact obligation.
+	ReviewCandidate *WorkflowCandidate `json:"review_candidate,omitempty"`
+	ReviewOutput    *reviewOutput      `json:"review_output,omitempty"`
 }
 
 func (t *Task) touch() { t.UpdatedAt = time.Now().Format(time.RFC3339) }

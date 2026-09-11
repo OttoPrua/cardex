@@ -46,7 +46,7 @@ func TestInvokeKimiCLISelectsLegacyEngineFor0372(t *testing.T) {
 	// environment. Without a caller override, the Cardex child must explicitly select the
 	// official legacy agent-core engine via KIMI_CODE_LEGACY_FLAG=1.
 	unsetenvForTest(t, "KIMI_CODE_LEGACY_FLAG")
-	payload := `{"role":"assistant","content":"OK"}` + "\n" +
+	payload := `{"role":"meta","type":"system.version","version":"0.37.2"}` + "\n" + `{"role":"assistant","content":"OK"}` + "\n" +
 		`{"role":"meta","type":"session.resume_hint","session_id":"session-0372"}`
 	bin, envDump := fakeKimiCLIEngineProbe(t, payload)
 	cfg := kimiCLITestConfig(t, bin)
@@ -66,7 +66,7 @@ func TestInvokeKimiCLISelectsLegacyEngineFor0372(t *testing.T) {
 }
 
 func TestInvokeKimiCLIPreservesExplicitCallerEngineOverride(t *testing.T) {
-	payload := `{"role":"assistant","content":"OK"}`
+	payload := `{"role":"meta","type":"system.version","version":"0.37.2"}` + "\n" + `{"role":"assistant","content":"OK"}`
 	for _, override := range []string{"0", "1"} {
 		t.Run("override="+override, func(t *testing.T) {
 			t.Setenv("KIMI_CODE_LEGACY_FLAG", override)
@@ -98,7 +98,7 @@ func TestKimi0372LegacyStreamStaysCompatible(t *testing.T) {
 		"0.36.1 stream": `{"role":"meta","type":"system.version","version":"0.36.1"}` + "\n" +
 			`{"role":"assistant","content":"OK"}` + "\n" +
 			`{"role":"meta","type":"session.resume_hint","session_id":"s-0361"}`,
-		"0.37.2 legacy stream": `{"role":"assistant","content":"OK"}` + "\n" +
+		"0.37.2 legacy stream": `{"role":"meta","type":"system.version","version":"0.37.2"}` + "\n" + `{"role":"assistant","content":"OK"}` + "\n" +
 			`{"role":"meta","type":"session.resume_hint","session_id":"s-0372"}`,
 	} {
 		res := parseKimiCLIJSONL(raw)
@@ -110,7 +110,7 @@ func TestKimi0372LegacyStreamStaysCompatible(t *testing.T) {
 
 func TestKimiEngineReadbackRecordsRequestedAndActual(t *testing.T) {
 	unsetenvForTest(t, "KIMI_CODE_LEGACY_FLAG")
-	payload := `{"role":"assistant","content":"OK"}`
+	payload := `{"role":"meta","type":"system.version","version":"0.37.2"}` + "\n" + `{"role":"assistant","content":"OK"}`
 	bin, _ := fakeKimiCLIEngineProbe(t, payload)
 	cfg := kimiCLITestConfig(t, bin)
 	task := &Task{ID: "kimi-engine-readback", Model: "opus", Type: typeSequence, Dir: t.TempDir(), PreferRunner: kimiCLIRunnerName}
@@ -141,7 +141,7 @@ func TestKimiEngineReadbackRecordsRequestedAndActual(t *testing.T) {
 }
 
 func TestKimiEngineReadbackReflectsOverrideWithoutEnvValues(t *testing.T) {
-	payload := `{"role":"assistant","content":"OK"}`
+	payload := `{"role":"meta","type":"system.version","version":"0.37.2"}` + "\n" + `{"role":"assistant","content":"OK"}`
 	t.Run("explicit v2 override", func(t *testing.T) {
 		t.Setenv("KIMI_CODE_LEGACY_FLAG", "0")
 		bin, _ := fakeKimiCLIEngineProbe(t, payload)

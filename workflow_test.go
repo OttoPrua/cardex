@@ -92,10 +92,30 @@ func initTestWorkflow(t *testing.T, root, dir string, extra ...string) *Workflow
 
 func writeReviewLog(t *testing.T, root, id, body string) {
 	t.Helper()
-	if err := os.MkdirAll(logsDir(root), 0o755); err != nil {
+	review, err := loadTask(root, id)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(taskLogPath(root, id), []byte(body), 0o644); err != nil {
+	if review.ReviewOutput != nil {
+		if err := os.WriteFile(taskLogPath(root, id), []byte("--- RESULT ---\n"+strings.TrimSpace(body)+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	f, err := openTaskLog(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	review.ActiveAttemptID = newAttemptID()
+	if err := writeReviewOutput(f, review, body); err != nil {
+		t.Fatal(err)
+	}
+	attempt := &AttemptRecord{TaskID: id, AttemptID: review.ActiveAttemptID, ControlEpoch: review.ControlEpoch, State: attemptExited}
+	if err := writeAttempt(root, attempt); err != nil {
+		t.Fatal(err)
+	}
+	if err := persistTaskEvent(root, review, evDone, "test:review-output", statusDone, review.Step, nil); err != nil {
 		t.Fatal(err)
 	}
 }
